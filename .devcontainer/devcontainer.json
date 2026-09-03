@@ -1,0 +1,82 @@
+{
+  "name": "blend-liquidator",
+  // Image is pinned by digest (not just a mutable major tag) so a container
+  // rebuild can't silently pull a different image without a reviewed PR.
+  // The tag is kept alongside the digest for readability; the digest is
+  // what's actually resolved. To refresh deliberately, re-resolve with:
+  //   docker buildx imagetools inspect mcr.microsoft.com/devcontainers/rust:1-bookworm
+  // and update both the tag and the digest together.
+  //
+  // Stays on bookworm to match the production build: the Dockerfile's builder
+  // stage is rust:1.97.0-bookworm, so dev and release compile against the same
+  // glibc (2.36). That parity has a cost worth knowing about — prebuilt Linux
+  // binaries published by upstream projects are increasingly built on Ubuntu
+  // 24.04 and need GLIBC_2.39, so they will not run here. Build such a tool
+  // from source rather than reaching for its release tarball.
+  "image": "mcr.microsoft.com/devcontainers/rust:1-bookworm@sha256:d599b1bc98c3fc53825462ebf1610f39ef9145aeab485deffb8aaef44f349fe1",
+  // Feature ids don't accept a combined tag@digest form (only one or the
+  // other), so these are pinned to the exact semantic version each feature's
+  // current major tag resolves to — same effect, so a rebuild can't silently
+  // execute changed feature install scripts. devcontainer-lock.json records
+  // the content digest each one resolved to, and the `Dev container` workflow
+  // fails if a build resolves something the committed lock does not describe.
+  //
+  // The current major differs per feature: github-cli is on 1.x,
+  // docker-in-docker on 4.x. Don't assume ":1" is current — resolve each one:
+  //   docker buildx imagetools inspect ghcr.io/devcontainers/features/<name>:<major>
+  //
+  // docker-in-docker must stay on 2.x or newer: 1.x installs Compose v1
+  // through the system Python, which bookworm refuses (PEP 668), failing the
+  // build on arm64 hosts while amd64 stays green.
+  //
+  // node is here for the Claude Code CLI that post-create.sh installs, NOT to
+  // build this crate — nothing in the dependency tree shells out to npm. If
+  // that stops being true, say so here, because it changes whether a broken
+  // node install is an inconvenience or a build failure.
+  //
+  // Pinned to 22; Node 20 went end-of-life in April 2026.
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1.1.2": {},
+    "ghcr.io/devcontainers/features/docker-in-docker:4.1.0": {},
+    "ghcr.io/devcontainers/features/node:2.1.0": { "version": "22" }
+  },
+  // Claude Code keeps its session transcripts, config and credentials under
+  // ~/.claude (plus ~/.claude.json, which post-create.sh symlinks into the
+  // same volume). Without a volume both are lost on every rebuild, and this
+  // container gets rebuilt often. Named rather than anonymous so it survives
+  // `--remove-existing-container` and can be inspected with `docker volume`.
+  //
+  // The names are repo-specific on purpose: sharing a volume with a sibling
+  // checkout would mean two repositories sharing one credential store.
+  //
+  // NOTE: these volumes hold credentials — Claude Code's, and gh's OAuth token
+  // under ~/.config/gh. They are covered by neither .gitignore nor
+  // .dockerignore; they live in Docker's volume store on the host. The
+  // container cannot inherit a host gh login (that lives in the macOS
+  // keychain), which is why gh gets a volume rather than a fresh
+  // `gh auth login` on every rebuild. `docker volume rm` both if you hand
+  // this machine over.
+  "mounts": [
+    "source=blend-liquidator-claude-code,target=/home/vscode/.claude,type=volume",
+    "source=blend-liquidator-gh-config,target=/home/vscode/.config/gh,type=volume"
+  ],
+  // Toolchain, CI-parity tooling and the cargo cache warm-up. Kept in a script
+  // rather than inlined here so each step can carry the reasoning for why it
+  // exists and be non-fatal on its own — see .devcontainer/post-create.sh.
+  "postCreateCommand": "${containerWorkspaceFolder}/.devcontainer/post-create.sh",
+  // Commit signing only. It needs the forwarded ssh-agent, and SSH_AUTH_SOCK
+  // is not reliably present during creation — it is set up around the
+  // connection. Re-running on every start wires signing up as soon as the
+  // agent is reachable instead of only on the rebuild where the timing
+  // happened to work. Idempotent and near-instant once configured.
+  "postStartCommand": "${containerWorkspaceFolder}/.devcontainer/git-signing.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "anthropic.claude-code"
+      ]
+    }
+  }
+}

@@ -1,0 +1,41 @@
+# Without this file the build context ships target/, which is gigabytes.
+
+# Build output / VCS / CI
+target/
+.git/
+.github/
+
+# Docs and tooling not needed inside the image
+docs/
+scripts/
+deny.toml
+
+# Secrets and local artifacts
+.env
+*.log
+
+# Editor / dev-container / agent config
+.devcontainer/
+.claude/
+
+# Docs that don't affect the build
+README.md
+CHANGELOG.md
+CONTRIBUTING.md
+SECURITY.md
+CLAUDE.md
+LICENSE
+
+# Dev-only config not read by `cargo build --release --bin liquidator`
+clippy.toml
+rust-toolchain.toml
+
+# Test-only sources — not part of the release binary build
+tests/
+
+# Used to build/run the image from the host, not needed inside it
+Makefile
+docker-compose.yml
+
+# Kept intentionally (do NOT ignore): Cargo.toml, Cargo.lock, src/,
+# .env.example — all required by the Dockerfile's COPY instructions.

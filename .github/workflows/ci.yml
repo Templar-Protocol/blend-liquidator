@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1, reads rust-toolchain.toml
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --lib --bins
+      - run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: false
+
+  # The three-way Rust version pin, which no compiler or linter catches on its
+  # own: it fails by having CI and Docker accept syntax the declared MSRV does
+  # not support, so everything is green until someone builds on the minimum.
+  # Runnable locally: ./scripts/check-repo-invariants.sh
+  invariants:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: ./scripts/check-repo-invariants.sh
+
+  # Gated at `error` rather than shellcheck's default, deliberately. Starting
+  # at `error` means the gate is green from day one and every future finding is
+  # a real one; landing red and being ignored is how a lint gate dies. Tighten
+  # by fixing the warnings first, then raising the level — not the reverse.
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: shellcheck --severity=error scripts/*.sh .devcontainer/*.sh
+
+  # ── CI Summary ──────────────────────────────────────
+  # Aggregate gate: the single required status check on main. Requiring this
+  # rather than each job by name means adding or renaming a job never needs a
+  # matching ruleset edit — only the `needs` list below.
+  #
+  # `skipped` is treated as a failure here, not a pass. Nothing in this
+  # workflow is path-filtered or conditionally gated, so a skipped job means a
+  # condition regressed rather than that work was legitimately avoided — which
+  # is precisely how a green summary can hide a pipeline that ran no tests at
+  # all. (`devcontainer.yml` IS path-filtered, which is exactly why it is kept
+  # out of this list.)
+  ci-summary:
+    name: CI Summary
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - lint-test
+      - deny
+      - docker
+      - invariants
+      - shellcheck
+    steps:
+      - name: Check all jobs
+        run: |
+          declare -A results=(
+            [lint-test]="${{ needs.lint-test.result }}"
+            [deny]="${{ needs.deny.result }}"
+            [docker]="${{ needs.docker.result }}"
+            [invariants]="${{ needs.invariants.result }}"
+            [shellcheck]="${{ needs.shellcheck.result }}"
+          )
+
+          echo "CI pipeline status:"
+          fail=0
+          for job in "${!results[@]}"; do
+            printf "  %-12s %s\n" "$job" "${results[$job]}"
+            if [ "${results[$job]}" != "success" ]; then
+              fail=1
+            fi
+          done
+
+          if [ "$fail" -ne 0 ]; then
+            echo
+            echo "At least one job did not succeed."
+            exit 1
+          fi
+          echo
+          echo "All jobs succeeded."

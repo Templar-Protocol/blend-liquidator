@@ -1,0 +1,49 @@
+services:
+  liquidator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: blend-liquidator:latest
+    container_name: blend-liquidator
+
+    # Room for graceful shutdown. Docker's 10s default would routinely SIGKILL
+    # a bot mid-flush; a liquidator must never be killed between the repay and
+    # the settle.
+    stop_grace_period: 60s
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    environment:
+      - RUST_LOG=${RUST_LOG:-info,blend_liquidator=debug}
+      - RUST_BACKTRACE=${RUST_BACKTRACE:-1}
+
+    # No --dry-run flag and no DRY_RUN override here on purpose: this is the
+    # default, safe path, so it inherits the bot's safe-by-default behaviour
+    # (DRY_RUN=true) unless the operator sets DRY_RUN=false in .env. Never add
+    # a secret to a `command:` array — process arguments are world-readable
+    # through /proc/<pid>/cmdline and show up in `docker inspect`.
+    command: []
+
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    healthcheck:
+      test: ["CMD", "pgrep", "-x", "liquidator"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

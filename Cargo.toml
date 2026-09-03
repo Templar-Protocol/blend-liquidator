@@ -1,0 +1,57 @@
+[package]
+name = "blend-liquidator"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97.0"
+license = "GPL-3.0-only"
+repository = "https://github.com/Templar-Protocol/blend-liquidator"
+description = "Liquidation bot for Blend Protocol lending pools on Stellar"
+
+# Standalone crate: an empty workspace table stops Cargo from adopting any
+# enclosing workspace, wherever this repo happens to be checked out.
+[workspace]
+
+[lib]
+path = "src/liquidator.rs"
+
+[[bin]]
+name = "liquidator"
+path = "src/main.rs"
+
+# Deliberately minimal. Every dependency here is used by the skeleton; the
+# Stellar/Soroban stack arrives with the code that needs it, not before, so
+# that `cargo deny`'s license and advisory surface stays honest about what
+# this crate actually builds.
+[dependencies]
+clap = { version = "4.6.0", features = ["derive", "env"] }
+thiserror = "2.0.18"
+tokio = { version = "1.51.0", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+
+# Set before there is code to lint, which is the cheap moment: retrofitting
+# `unwrap_used = "deny"` onto an existing codebase is not. Tests are exempted
+# through clippy.toml's allow-unwrap-in-tests, never by relaxing this.
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+must_use_candidate = "allow"
+large_futures = "allow"
+redundant_closure_for_method_calls = "allow"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+unwrap_used = "deny"
+expect_used = "warn"
+large_digit_groups = "warn"
+wildcard_imports = "allow"
+doc_markdown = "allow"
+result_large_err = "allow"
+
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = "fat"
+debug = false
+panic = "abort"
+strip = "symbols"
+overflow-checks = true

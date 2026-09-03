@@ -1,0 +1,104 @@
+# Dependabot configuration.
+#
+# One repo invariant shapes this file, and it is enforced by an ignore rule
+# rather than by reviewer vigilance: the Rust version is pinned in THREE places
+# that must move together — Cargo.toml `rust-version`, rust-toolchain.toml
+# `channel`, and the Dockerfile builder's `FROM rust:X-bookworm`. A Dependabot
+# PR bumping only the Dockerfile would desync them, so the docker ecosystem
+# below takes digest refreshes (security-relevant and safe) but not version
+# bumps. scripts/check-repo-invariants.sh is the gate that catches it anyway.
+version: 2
+updates:
+  # ── Cargo ────────────────────────────────────────────
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+    open-pull-requests-limit: 5
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    groups:
+      # One PR for the long tail of compatible updates; anything major still
+      # arrives on its own so it gets read properly. "Major" is by version
+      # position, and for 0.x crates Dependabot counts a leftmost-non-zero
+      # bump (0.10 -> 0.11) as major — matching cargo's own compatibility
+      # rule. So a pre-1.0 crate arriving as its own PR is the group working,
+      # not failing: those bumps genuinely break APIs.
+      cargo-minor-patch:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # ── GitHub Actions ───────────────────────────────────
+  # Every action in this repo is SHA-pinned with a `# vN` comment; Dependabot
+  # maintains both halves. Grouped into one weekly PR so a bump to a
+  # credential-holding action (docker/login-action, claude-code-action) is
+  # never stuck behind unrelated ones competing for the PR limit.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+    open-pull-requests-limit: 3
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "ci"
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # ── Docker ───────────────────────────────────────────
+  # Digest refreshes only. A version bump here would break the three-way Rust
+  # pin described in the header; do those by hand across all three files.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+    open-pull-requests-limit: 3
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "deps(docker)"
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+          - "version-update:semver-patch"
+    groups:
+      # Both images (the rust builder and the debian runtime) refresh in one
+      # PR: digest bumps carry no API risk to weigh individually, and one PR
+      # runs the CI suite once instead of twice.
+      docker-digests:
+        patterns: ["*"]
+
+  # ── Dev container ────────────────────────────────────
+  # Features are pinned to exact versions on purpose, so without Dependabot
+  # watching them nothing ages them forward — and a feature left years behind
+  # eventually ships an install script the current base image refuses to run.
+  - package-ecosystem: "devcontainers"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+    open-pull-requests-limit: 3
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "deps(devcontainer)"
+    groups:
+      # Compatible feature bumps in one PR; a major arrives on its own, the
+      # same carve-out as cargo. Majors are exactly where this ecosystem has
+      # teeth — the docker-in-docker 1.x -> 4.x drift that motivated the
+      # `Dev container` workflow was a major — so that is the one bump that
+      # should not share a PR with routine ones.
+      devcontainer-features:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
