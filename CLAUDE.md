@@ -32,11 +32,21 @@ make help                           # Docker Compose lifecycle
 - `src/config.rs` — CLI and environment configuration (`Args`, `clap`),
   including the strict boolean parser behind `DRY_RUN`.
 - `src/main.rs` — binary entry point: tracing setup, argument parsing, exit.
+- `src/math/` — the pure port of the pool contract's arithmetic: `fixed`
+  (checked rounding), `reserve` (accrual and token conversions), `position`
+  (effective values and health factor), `auction` (Dutch-auction scaling).
+  Nothing here does I/O and nothing panics.
+- `src/chain/xdr/` — ScVal codecs for the pool: `encode` (values, operations,
+  simulation envelopes), `keys` (ledger keys, durability included), `decode`
+  (entries and view-call returns), `events` (pool events).
+- `examples/capture_fixture.rs` — refreshes `tests/fixtures/` from a live
+  RPC through `curl`. See that directory's README.
 
-The module layout beyond this is deliberately **not** pre-declared. A sibling
-NEAR liquidator in this organisation is a reasonable prior for what the seams
-will be, but presuming its shape fits Blend before reading Blend's contracts
-would be a guess dressed as a decision.
+The module layout beyond this follows
+`docs/superpowers/specs/2026-09-04-blend-liquidator-bot-design.md`; the
+phases still to land are the RPC client and pool reads, the store and ledger
+poller, the auctioneer, the filler and executor, unwind, and the operational
+surface.
 
 ## Conventions
 
@@ -72,6 +82,13 @@ would be a guess dressed as a decision.
   path-filtered or conditionally gated, so a skipped job means a condition
   regressed. `devcontainer.yml` is path-filtered, which is exactly why it is
   kept out of that gate.
+- **The maths agrees with the contract, and a fixture proves it.**
+  `tests/fixtures/mainnet-fixed-v2.json` holds one mainnet ledger's entries
+  *and* the contract's own answers at that ledger. Accruing the entries must
+  reproduce `get_reserve` to the stroop, and valuing the positions must
+  reproduce the health factors. If one of those tests fails, the port is
+  wrong or the contract changed — never edit the expectation to match the
+  code.
 
 ## Gotchas
 
@@ -96,6 +113,15 @@ would be a guess dressed as a decision.
   multi-minute source build on every rebuild, and nothing depends on it. Add
   it — and a cgroup-aware build-job cap alongside it — when the first Soroban
   dependency lands.
+- Money is `i128` in each asset's own decimals, but the scales differ by
+  field: v2 rates (`b_rate`, `d_rate`) are 12 decimals, factors and
+  utilisation are 7, prices are in the oracle's own decimals (7 on the
+  mainnet pools, but read it, don't assume it). Mixing two of those silently
+  produces a number that looks plausible.
+- Storage durability is part of a ledger key. Auctions live in *temporary*
+  storage; everything else the bot reads is persistent. Asking for an auction
+  with the persistent durability returns no entry rather than an error, which
+  reads exactly like "no auction exists".
 
 ## Workflow
 
