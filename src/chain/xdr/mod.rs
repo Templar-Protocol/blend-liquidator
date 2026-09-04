@@ -15,6 +15,7 @@ pub use encode::{
     address, from_base64, i128_val, invoke_contract_op, map, sc_address, simulation_envelope,
     stellar_asset, symbol, to_base64, vec,
 };
+pub use events::{decode_pool_event, PoolEvent};
 
 /// Failures turning chain data into bot types, or bot types into chain data.
 ///
