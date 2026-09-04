@@ -335,6 +335,89 @@ mod tests {
     }
 
     #[test]
+    fn values_positions_with_oracle_decimals_that_differ_from_the_reserves() {
+        // The contract's own `health_factor.rs` tests price at 9 oracle
+        // decimals for exactly this reason: a reserve's decimals and the
+        // oracle's decimals are independent numbers, and a port that
+        // silently assumed they matched would be wrong the first time a
+        // pool used a non-7-decimal oracle.
+        //
+        // One reserve at 7 decimals, rate 1.0 on both sides (so token
+        // amounts equal underlying exactly, with no rounding from the
+        // rate), c_factor 0.8, l_factor 0.5 — both chosen so every division
+        // below is exact.
+        let config = ReserveConfig {
+            index: 0,
+            decimals: 7,
+            c_factor: 8_000_000,
+            l_factor: 5_000_000,
+            util: 4_000_000,
+            max_util: 7_000_000,
+            r_base: 100_000,
+            r_one: 300_000,
+            r_two: 3_000_000,
+            r_three: 50_000_000,
+            reactivity: 50,
+            supply_cap: 100_000_000_000_000_000,
+            enabled: true,
+        };
+        let reserve_data = ReserveData {
+            d_rate: 1_000_000_000_000,
+            b_rate: 1_000_000_000_000,
+            ir_mod: SCALAR_7,
+            b_supply: 1_000_000_000,
+            d_supply: 500_000_000,
+            backstop_credit: 0,
+            last_time: 0,
+        };
+        let reserve =
+            Reserve::new(ASSET_A.to_string(), config, reserve_data).expect("7 decimals fit");
+        let reserves = BTreeMap::from([(0, reserve)]);
+
+        // A 9-decimal oracle (scalar 1_000_000_000) pricing the asset at 3.0.
+        let mut price_map = BTreeMap::new();
+        price_map.insert(ASSET_A.to_string(), 3_000_000_000);
+        let prices = OraclePrices::new(9, price_map).expect("9 decimals fit");
+
+        // 1_000_000 b-tokens collateral, 2_000_000 d-tokens liability, both
+        // on the one reserve.
+        let positions = position(&[(0, 1_000_000, 2_000_000)]);
+
+        // Collateral: 1_000_000 b-tokens at rate 1.0 is 1_000_000 underlying
+        // (raw). Effective = floor(1_000_000 * c_factor(0.8) / SCALAR_7)
+        //                  = floor(1_000_000 * 8_000_000 / 10_000_000)
+        //                  = 800_000.
+        // collateral_raw  = floor(price * raw / reserve.scalar)
+        //                 = floor(3_000_000_000 * 1_000_000 / 10_000_000)
+        //                 = 300_000_000
+        // collateral_base = floor(price * effective / reserve.scalar)
+        //                 = floor(3_000_000_000 * 800_000 / 10_000_000)
+        //                 = 240_000_000
+        //
+        // Liability: 2_000_000 d-tokens at rate 1.0 is 2_000_000 underlying
+        // (raw). Effective = ceil(2_000_000 * SCALAR_7 / l_factor(0.5))
+        //                  = ceil(2_000_000 * 10_000_000 / 5_000_000)
+        //                  = 4_000_000.
+        // liability_raw   = ceil(price * raw / reserve.scalar)
+        //                 = ceil(3_000_000_000 * 2_000_000 / 10_000_000)
+        //                 = 600_000_000
+        // liability_base  = ceil(price * effective / reserve.scalar)
+        //                 = ceil(3_000_000_000 * 4_000_000 / 10_000_000)
+        //                 = 1_200_000_000
+        //
+        // health_factor = floor(collateral_base * oracle_scalar / liability_base)
+        //               = floor(240_000_000 * 1_000_000_000 / 1_200_000_000)
+        //               = 200_000_000   (0.2 at the oracle's 9 decimals)
+        let data = calculate_position_data(&reserves, &prices, &positions).expect("values");
+        assert_eq!(data.collateral_base, 240_000_000);
+        assert_eq!(data.collateral_raw, 300_000_000);
+        assert_eq!(data.liability_base, 1_200_000_000);
+        assert_eq!(data.liability_raw, 600_000_000);
+        assert_eq!(data.scalar, 1_000_000_000);
+        assert_eq!(data.health_factor(), Ok(Some(200_000_000)));
+    }
+
+    #[test]
     fn effective_count_ignores_uncollateralised_supply() {
         let mut positions = position(&[(0, 2_000_000, 1_000_000)]);
         positions.supply.insert(1, 5_000_000);

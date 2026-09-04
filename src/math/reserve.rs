@@ -447,4 +447,108 @@ mod tests {
             Err(MathError::Overflow)
         );
     }
+
+    #[test]
+    fn calc_accrual_uses_the_third_rate_branch_above_95_percent_utilisation() {
+        // A synthetic reserve exercising `calc_accrual`'s third branch
+        // (utilisation above 95%). Every field feeds the hand computation
+        // below; factors, utilisation and `ir_mod` are 7 decimals.
+        let config = ReserveConfig {
+            index: 0,
+            decimals: 7,
+            c_factor: 7_500_000,
+            l_factor: 7_500_000,
+            util: 7_500_000, // target_util
+            max_util: 9_500_000,
+            r_base: 1_000_000,
+            r_one: 2_000_000,
+            r_two: 3_000_000,
+            r_three: 50_000_000,
+            reactivity: 5,
+            supply_cap: 100_000_000_000_000_000,
+            enabled: true,
+        };
+        let ir_mod = 10_000_000; // SCALAR_7: a neutral 1.0 multiplier.
+        let cur_util = 9_700_000; // 97%, above the 95% threshold (UTIL_95).
+        let last_time = 0;
+        let now = 15_768_000; // Exactly half of SECONDS_PER_YEAR (31_536_000).
+
+        // Third branch (cur_util > UTIL_95 = 9_500_000):
+        //   util_dif    = cur_util - UTIL_95 = 9_700_000 - 9_500_000 = 200_000
+        //   util_scalar = ceil(util_dif * SCALAR_7 / UTIL_5)
+        //               = ceil(200_000 * 10_000_000 / 500_000) = 4_000_000 (exact)
+        //   extra_rate  = ceil(util_scalar * r_three / SCALAR_7)
+        //               = ceil(4_000_000 * 50_000_000 / 10_000_000) = 20_000_000 (exact)
+        //   rate_sum    = r_base + r_one + r_two
+        //               = 1_000_000 + 2_000_000 + 3_000_000 = 6_000_000
+        //   intersection = ceil(ir_mod * rate_sum / SCALAR_7)
+        //               = ceil(10_000_000 * 6_000_000 / 10_000_000) = 6_000_000 (exact)
+        //   cur_ir      = extra_rate + intersection = 20_000_000 + 6_000_000 = 26_000_000
+        //
+        //   delta_time  = now - last_time = 15_768_000
+        //   time_weight = delta_time * SCALAR_12 / SECONDS_PER_YEAR
+        //               = 15_768_000 * 1_000_000_000_000 / 31_536_000
+        //               = 500_000_000_000 (exactly half a year's worth)
+        //   accrual     = SCALAR_12 + ceil(time_weight * cur_ir / SCALAR_7)
+        //               = 1_000_000_000_000
+        //                 + ceil(500_000_000_000 * 26_000_000 / 10_000_000)
+        //               = 1_000_000_000_000 + 1_300_000_000_000
+        //               = 2_300_000_000_000
+        //
+        //   For new_ir_mod, the utilisation difference is against
+        //   target_util (config.util), not UTIL_95:
+        //   util_dif (vs target) = cur_util - target_util
+        //                        = 9_700_000 - 7_500_000 = 2_200_000 (>= 0)
+        //   util_error  = delta_time * util_dif
+        //               = 15_768_000 * 2_200_000 = 34_689_600_000_000
+        //   rate_dif    = floor(util_error * reactivity / SCALAR_7)
+        //               = floor(34_689_600_000_000 * 5 / 10_000_000) = 17_344_800
+        //   new_ir_mod  = min(ir_mod + rate_dif, IR_MOD_MAX)
+        //               = min(10_000_000 + 17_344_800, 100_000_000)
+        //               = 27_344_800
+        assert_eq!(
+            calc_accrual(&config, cur_util, ir_mod, last_time, now),
+            Ok((2_300_000_000_000, 27_344_800))
+        );
+    }
+
+    #[test]
+    fn calc_accrual_clamps_ir_mod_at_ten_times_scalar_7() {
+        // Same shape as the third-branch test above, but `reactivity` is
+        // large enough that the unclamped `ir_mod` step blows past
+        // `IR_MOD_MAX` (10 * SCALAR_7 = 100_000_000) and must be clamped.
+        let config = ReserveConfig {
+            index: 0,
+            decimals: 7,
+            c_factor: 7_500_000,
+            l_factor: 7_500_000,
+            util: 7_500_000, // target_util
+            max_util: 9_500_000,
+            r_base: 1_000_000,
+            r_one: 2_000_000,
+            r_two: 3_000_000,
+            r_three: 50_000_000,
+            reactivity: 50,
+            supply_cap: 100_000_000_000_000_000,
+            enabled: true,
+        };
+        let ir_mod = 10_000_000; // SCALAR_7
+        let cur_util = 9_700_000;
+        let last_time = 0;
+        let now = 15_768_000;
+
+        // util_dif (vs target_util) = 9_700_000 - 7_500_000 = 2_200_000
+        // util_error = delta_time * util_dif = 15_768_000 * 2_200_000
+        //            = 34_689_600_000_000
+        // rate_dif   = floor(util_error * reactivity / SCALAR_7)
+        //            = floor(34_689_600_000_000 * 50 / 10_000_000)
+        //            = 173_448_000
+        // unclamped next_ir_mod = ir_mod + rate_dif
+        //                       = 10_000_000 + 173_448_000 = 183_448_000
+        // 183_448_000 > IR_MOD_MAX (100_000_000), so the clamp applies:
+        //   new_ir_mod = 100_000_000
+        let (_, new_ir_mod) =
+            calc_accrual(&config, cur_util, ir_mod, last_time, now).expect("accrues");
+        assert_eq!(new_ir_mod, 100_000_000);
+    }
 }

@@ -559,6 +559,46 @@ mod tests {
     }
 
     #[test]
+    fn an_event_with_no_topics_is_not_a_pool_event() {
+        // Zero topics and a non-symbol first topic mean the same thing to
+        // this decoder: it does not recognise the event. Neither may error
+        // the poller.
+        assert_eq!(decode_pool_event(&[], &ScVal::Void).expect("decodes"), None);
+    }
+
+    #[test]
+    fn decodes_a_flash_loan_event() {
+        // `flash_loan` is the only arm that reads a fourth topic: the
+        // contract that received the flash-minted debt. Topics are the
+        // symbol, the asset, the borrower (`from`), then that contract;
+        // data is `(amount, d_tokens)`, the same two-value shape `borrow`
+        // carries, matching the contract's `PoolEvents::flash_loan`.
+        let topics = vec![
+            symbol("flash_loan").expect("symbol"),
+            address(XLM).expect("address"),
+            address(USER).expect("address"),
+            address(FILLER).expect("address"),
+        ];
+        let value =
+            crate::chain::xdr::encode::vec(vec![i128_val(500_000_000), i128_val(499_500_000)])
+                .expect("data");
+        let event = decode_pool_event(&topics, &value)
+            .expect("decodes")
+            .expect("modelled");
+        assert_eq!(
+            event,
+            PoolEvent::FlashLoan {
+                asset: XLM.to_string(),
+                from: USER.to_string(),
+                contract: FILLER.to_string(),
+                amount: 500_000_000,
+                d_tokens: 499_500_000,
+            }
+        );
+        assert_eq!(event.affected_accounts(), vec![USER]);
+    }
+
+    #[test]
     fn a_modelled_event_with_the_wrong_shape_is_an_error() {
         let topics = vec![
             symbol("supply").expect("symbol"),
