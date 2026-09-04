@@ -9,9 +9,10 @@
 //! # Status
 //!
 //! Skeleton. This crate currently parses configuration, sets up logging and
-//! exits; there is no pool client, no scanner and no executor yet. The
-//! repository scaffolding around it — CI gates, lint posture, dev container,
-//! release preflight — is complete and enforced from the first commit, so the
+//! exits; the fixed-point math and XDR codecs exist (`math`, `chain::xdr`);
+//! there is no RPC client, scanner or executor yet. The repository
+//! scaffolding around it — CI gates, lint posture, dev container, release
+//! preflight — is complete and enforced from the first commit, so the
 //! liquidation logic lands into a repo that already fails loudly.
 //!
 //! The module layout is deliberately *not* pre-declared. A prior NEAR bot in
@@ -19,7 +20,13 @@
 //! presuming it fits Blend before reading Blend's contracts would be a guess
 //! dressed as a decision.
 
+pub mod chain;
 pub mod config;
+pub mod math;
+
+/// The committed mainnet snapshot every codec and math test reads.
+#[cfg(test)]
+pub(crate) mod fixture;
 
 /// Errors this crate reports to its caller.
 ///

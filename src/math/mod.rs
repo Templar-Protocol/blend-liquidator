@@ -1,0 +1,12 @@
+//! Pure, chain-agnostic mathematics ported from the Blend v2 pool contract.
+//!
+//! Every function here mirrors a contract function with the same rounding
+//! direction, because the bot's decisions are only as good as their
+//! agreement with what the contract will compute at execution. Nothing in
+//! this module performs I/O or panics: overflow and division by zero are
+//! `MathError`s.
+
+pub mod auction;
+pub mod fixed;
+pub mod position;
+pub mod reserve;
