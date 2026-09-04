@@ -50,21 +50,25 @@ pub struct ScaledAuction {
 /// The bid modifier at `block_delta` blocks after the auction started, at 7
 /// decimals: 100% for the first 200 blocks, then down to 0% at 400.
 ///
-/// Returns `i128` rather than `Result` because the filler's fill-block
-/// search (Phase 5) calls this in a tight loop over candidate blocks; the
-/// arithmetic is bounded by the surrounding branch (see `scale_auction`'s
-/// module docs) for every `block_delta`, but it still saturates instead of
-/// using plain operators so that guarantee is not load-bearing for safety.
+/// Always returns a value in `0..=SCALAR_7`; never panics, for any `u32`
+/// `block_delta`. The decaying branch's arithmetic is plain, not checked:
+/// it is reached only once `block_delta > RAMP_BLOCKS` (the prior branch
+/// having failed), so the `u32` subtraction cannot underflow, and once
+/// bounded by `block_delta < RAMP_END_BLOCKS` the subtrahend is at most
+/// `(RAMP_END_BLOCKS - RAMP_BLOCKS - 1) * PER_BLOCK_SCALAR`, far short of
+/// `i128`'s range in either direction — no `u32` input can make this
+/// overflow. `overflow-checks = true` in the release profile is the
+/// intended backstop if that ever stops being true.
 pub fn bid_modifier(block_delta: u32) -> i128 {
     if block_delta <= RAMP_BLOCKS {
         SCALAR_7
     } else if block_delta < RAMP_END_BLOCKS {
         // The branch guarantees `RAMP_BLOCKS < block_delta < RAMP_END_BLOCKS`,
         // so `elapsed` is in `1..RAMP_BLOCKS` and `decay` is in
-        // `PER_BLOCK_SCALAR..SCALAR_7`: neither saturating op can trigger.
-        let elapsed = block_delta.saturating_sub(RAMP_BLOCKS);
-        let decay = i128::from(elapsed).saturating_mul(PER_BLOCK_SCALAR);
-        SCALAR_7.saturating_sub(decay)
+        // `PER_BLOCK_SCALAR..SCALAR_7`: the subtraction below cannot
+        // underflow `u32`, and the multiply and subtract below cannot
+        // overflow `i128`.
+        SCALAR_7 - i128::from(block_delta - RAMP_BLOCKS) * PER_BLOCK_SCALAR
     } else {
         0
     }
@@ -72,11 +76,15 @@ pub fn bid_modifier(block_delta: u32) -> i128 {
 
 /// The lot modifier at `block_delta` blocks after the auction started, at 7
 /// decimals: 0% rising to 100% over the first 200 blocks, then 100%.
+///
+/// Always returns a value in `0..=SCALAR_7`; never panics, for any `u32`
+/// `block_delta`.
 pub fn lot_modifier(block_delta: u32) -> i128 {
     if block_delta <= RAMP_BLOCKS {
         // Bounded by the branch: `block_delta <= RAMP_BLOCKS` (200), so the
-        // product tops out at `200 * PER_BLOCK_SCALAR == SCALAR_7`.
-        i128::from(block_delta).saturating_mul(PER_BLOCK_SCALAR)
+        // product tops out at `200 * PER_BLOCK_SCALAR == SCALAR_7`, nowhere
+        // near overflowing `i128`.
+        i128::from(block_delta) * PER_BLOCK_SCALAR
     } else {
         SCALAR_7
     }
