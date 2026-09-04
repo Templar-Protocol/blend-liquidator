@@ -1923,9 +1923,8 @@ pub fn stellar_asset(asset: &str) -> Result<ScVal, XdrError> {
 /// Authorisation is empty: simulation fills it in, and the bot's own calls
 /// are covered by the source account's signature.
 pub fn invoke_contract_op(contract: &str, function: &str, args: Vec<ScVal>) -> Result<Operation, XdrError> {
-    let function_name = match symbol(function)? {
-        ScVal::Symbol(name) => name,
-        _ => return Err(XdrError::Symbol(function.to_string())),
+    let ScVal::Symbol(function_name) = symbol(function)? else {
+        return Err(XdrError::Symbol(function.to_string()));
     };
     Ok(Operation {
         source_account: None,
