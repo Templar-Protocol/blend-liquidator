@@ -3081,6 +3081,16 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 //! entries, runs every simulation, reads the entries again, and keeps the
 //! result only if the two reads are byte-identical and every simulation
 //! reported the same ledger. Otherwise it retries.
+//!
+//! The accrual target itself is read from those `get_reserve` returns, not
+//! from a separate RPC call: the pool contract's `Reserve::load` always
+//! stamps `data.last_time` with the timestamp of the ledger it ran in (it
+//! short-circuits when they already agree, and sets it in every other
+//! branch), so each captured reserve already carries the exact second the
+//! fixture's tests must accrue to. A later, independent call — `getHealth`,
+//! say — has no such guarantee: mainnet closes a ledger roughly every five
+//! seconds, and the round trip to ask again almost always lands on a newer
+//! one than the simulations just agreed on.
 
 use std::error::Error;
 use std::process::Command;
@@ -3153,8 +3163,8 @@ fn pool_shape(url: &str, pool: &str) -> Fallible<(Vec<(String, String)>, String,
     let (_, entries) = ledger_entries(url, &[instance_key.clone(), reserve_list_key.clone()])?;
     // The RPC does not promise to return entries in the order they were
     // asked for, so every lookup goes through the key.
-    let instance = decode::pool_instance(&from_base64(entry_for(&entries, &instance_key)?)?)?;
-    let assets = decode::reserve_list(&from_base64(entry_for(&entries, &reserve_list_key)?)?)?;
+    let instance = decode::pool_instance(&decode::entry_from_base64(entry_for(&entries, &instance_key)?)?)?;
+    let assets = decode::reserve_list(&decode::entry_from_base64(entry_for(&entries, &reserve_list_key)?)?)?;
     Ok((entries, instance.config.oracle, assets))
 }
 
@@ -3213,11 +3223,17 @@ fn attempt(url: &str, pool: &str, users: &[String]) -> Fallible<Option<Value>> {
     ledgers.push(ledger);
 
     let mut reserves = Vec::new();
+    // Each `get_reserve` return already carries the ledger's own timestamp
+    // in `data.last_time` — see the module doc comment for why that, and
+    // not a separate `getHealth` call, is the fixture's accrual target.
+    let mut accrual_times = Vec::new();
     for asset in &assets {
         let (get_reserve_ledger, get_reserve) = simulate(url, pool, "get_reserve", vec![address(asset)?])?;
         let (price_ledger, lastprice) = simulate(url, &oracle, "lastprice", vec![stellar_asset(asset)?])?;
         ledgers.push(get_reserve_ledger);
         ledgers.push(price_ledger);
+        let reserve = decode::reserve_value(&from_base64(&get_reserve)?)?;
+        accrual_times.push(reserve.data.last_time);
         reserves.push(json!({
             "asset": asset,
             "config_entry_xdr": entry_for(&first_pass, &to_base64(&keys::reserve_config(pool, asset)?)?)?,
@@ -3248,8 +3264,17 @@ fn attempt(url: &str, pool: &str, users: &[String]) -> Fallible<Option<Value>> {
         return Ok(None);
     }
 
+    // The fixture's accrual target: every reserve's own `last_time`, which
+    // must agree since they all came from simulations against one ledger.
+    let close_time = *accrual_times
+        .first()
+        .ok_or("the pool has no reserves; there is no accrual target")?;
+    if accrual_times.iter().any(|&other| other != close_time) {
+        println!("  reserves disagree on their accrual time ({accrual_times:?})");
+        return Ok(None);
+    }
+
     let health = rpc(url, "getHealth", &json!({}))?;
-    let close_time: u64 = health["latestLedgerCloseTime"].as_str().ok_or("close time missing")?.parse()?;
     let oldest = health["oldestLedger"].as_u64().ok_or("oldestLedger missing")?;
     let events = recent_events(url, pool, oldest, ledger)?;
 
@@ -3288,7 +3313,7 @@ fn main() -> Fallible<()> {
 }
 ```
 
-The `close_time` comes from `getHealth`'s `latestLedgerCloseTime` after the consistency check, so it is the close time of a ledger at or after the one the entries came from. A reserve's accrual target must be exactly the ledger the `get_reserve` simulation ran against; the check that every simulation reported the same `latestLedger` is what makes those the same ledger. If the accrual cross-check in Task 7 ever fails right after a refresh with a one-second discrepancy, this is the place to look: read `latestLedgerCloseTime` in the same `getHealth` call that the consistency check ends with, and re-run.
+The `close_time` is each `get_reserve` return's `data.last_time`. The pool contract's `Reserve::load` always stamps it with the timestamp of the ledger the simulation ran against, so it is exactly the accrual target the Task 7 cross-check needs, and every reserve in one consistent attempt must report the same value — a disagreement is treated like a moved ledger and the attempt retries. Do not read the close time from a later `getHealth` call: it lands on whatever ledger is newest at that moment, which is usually one past the one the simulations agreed on, and the accrual cross-check then fails by a few seconds of interest. `getHealth` is used only for `oldestLedger`, the floor of the event window.
 
 - [ ] **Step 2: Verify the tool reproduces a working fixture**
 
