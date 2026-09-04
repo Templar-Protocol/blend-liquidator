@@ -111,6 +111,10 @@ impl PoolEvent {
             | Self::Borrow { from, .. }
             | Self::Repay { from, .. }
             | Self::FlashLoan { from, .. } => vec![from],
+            // Bad debt (below) moves the liability to the backstop, so the
+            // backstop's own positions change too — but the event carries
+            // no backstop address, so a consumer that wants to refresh it
+            // adds `PoolInstance::backstop` itself.
             Self::NewAuction { user, .. }
             | Self::DeleteAuction { user, .. }
             | Self::BadDebt { user, .. } => vec![user],

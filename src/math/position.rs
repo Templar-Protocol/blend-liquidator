@@ -117,8 +117,13 @@ impl PositionData {
     }
 }
 
-/// Values `positions` against `reserves` (keyed by reserve index, already
-/// accrued to the decision's ledger) and `prices`.
+/// Values `positions` against `reserves` and `prices`.
+///
+/// `reserves` must be keyed by `ReserveConfig::index` — the same key
+/// `Positions`' `collateral` and `liabilities` maps use — and already
+/// accrued to the decision's ledger. A map keyed by a reserve's position in
+/// `ResList` instead is only correct while that position happens to match
+/// the reserve's `index`; the two are not the same number in general.
 ///
 /// A position in an index the pool does not have, or in an asset the oracle
 /// snapshot does not price, is an error rather than a zero: both mean the

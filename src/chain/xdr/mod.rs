@@ -3,6 +3,10 @@
 //! Hand-written rather than generated from the contract spec so that every
 //! shape the bot depends on is visible here and pinned by a fixture test.
 //! A shape mismatch after a contract upgrade fails a test, not a fill.
+//!
+//! Ported from `blend-contracts-v2` tag `v2.0.0`: `pool/src/storage.rs`,
+//! `pool/src/events.rs` and `pool/src/contract.rs`. The next contract
+//! upgrade is a bounded diff against those three files.
 
 use crate::math::MathError;
 

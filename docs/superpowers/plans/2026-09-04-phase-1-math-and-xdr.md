@@ -1548,6 +1548,8 @@ use super::fixed::{mul_ceil, mul_floor, MathError, SCALAR_7};
 const PER_BLOCK_SCALAR: i128 = 50_000;
 /// The block at which the lot ramp ends and the bid ramp begins.
 const RAMP_BLOCKS: u32 = 200;
+/// The block at which the bid ramp ends and the fill is free.
+const RAMP_END_BLOCKS: u32 = 2 * RAMP_BLOCKS;
 
 /// An auction as the contract stores it: what the filler pays (`bid`), what
 /// it receives (`lot`), and the block the auction began on. Amounts are
@@ -1584,7 +1586,7 @@ pub struct ScaledAuction {
 pub fn bid_modifier(block_delta: u32) -> i128 {
     if block_delta <= RAMP_BLOCKS {
         SCALAR_7
-    } else if block_delta < 2 * RAMP_BLOCKS {
+    } else if block_delta < RAMP_END_BLOCKS {
         SCALAR_7 - i128::from(block_delta - RAMP_BLOCKS) * PER_BLOCK_SCALAR
     } else {
         0

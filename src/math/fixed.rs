@@ -106,6 +106,15 @@ fn divide_narrow(r: i128, z: i128, rounding: Rounding) -> Result<i128, MathError
 /// The 256-bit path: the product of two `i128`s always fits, only the
 /// quotient may not.
 fn divide_wide(r: I256, z: I256, rounding: Rounding) -> Result<i128, MathError> {
+    // Both call sites reach here only after `mul_div` has already returned
+    // `DivisionByZero` for `z == 0`, so `z` is never zero on this path.
+    // Asserted rather than re-checked, so this module's "nothing here
+    // panics" holds because the invariant is guaranteed upstream, not
+    // because it goes unstated.
+    debug_assert!(
+        z != I256::ZERO,
+        "divide_wide: z is guarded nonzero by mul_div"
+    );
     let (r, z) = if z < I256::ZERO { (-r, -z) } else { (r, z) };
     let quotient = r.div_euclid(z);
     let quotient = match rounding {

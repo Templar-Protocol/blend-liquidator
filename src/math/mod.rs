@@ -5,6 +5,11 @@
 //! agreement with what the contract will compute at execution. Nothing in
 //! this module performs I/O or panics: overflow and division by zero are
 //! `MathError`s.
+//!
+//! Ported from `blend-contracts-v2` tag `v2.0.0`:
+//! `pool/src/pool/{reserve,interest,health_factor}.rs` and
+//! `pool/src/auctions/auction.rs`. The next contract upgrade is a bounded
+//! diff against those four files.
 
 pub mod auction;
 pub mod fixed;
