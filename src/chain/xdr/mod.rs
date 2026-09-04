@@ -4,7 +4,7 @@
 //! shape the bot depends on is visible here and pinned by a fixture test.
 //! A shape mismatch after a contract upgrade fails a test, not a fill.
 
-// Task 2 adds a Math variant once MathError exists.
+use crate::math::MathError;
 
 pub mod decode;
 pub mod encode;
@@ -34,4 +34,7 @@ pub enum XdrError {
     /// A struct map lacks a field the contract type always has.
     #[error("missing field {0}")]
     MissingField(&'static str),
+    /// Decoded numbers could not be combined (e.g. `10^decimals` overflow).
+    #[error("math: {0}")]
+    Math(#[from] MathError),
 }

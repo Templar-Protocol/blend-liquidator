@@ -10,3 +10,8 @@ pub mod auction;
 pub mod fixed;
 pub mod position;
 pub mod reserve;
+
+pub use fixed::{
+    div_ceil, div_floor, mul_ceil, mul_floor, pow10, MathError, SCALAR_12, SCALAR_7,
+    SECONDS_PER_YEAR,
+};
