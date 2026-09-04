@@ -195,7 +195,10 @@ pub mod events;
 pub mod keys;
 
 /// Failures turning chain data into bot types, or bot types into chain data.
-#[derive(Debug, thiserror::Error)]
+///
+/// `PartialEq` (but not `Eq`: `stellar_xdr::Error` carries an I/O variant)
+/// so tests can compare whole `Result`s.
+#[derive(Debug, PartialEq, thiserror::Error)]
 pub enum XdrError {
     /// The XDR library rejected the bytes or the base64.
     #[error("xdr: {0}")]
