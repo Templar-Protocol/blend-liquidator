@@ -15,11 +15,50 @@ pub mod encode;
 pub mod events;
 pub mod keys;
 
+pub use decode::PoolStatus;
 pub use encode::{
     address, from_base64, i128_val, invoke_contract_op, map, sc_address, simulation_envelope,
     stellar_asset, symbol, to_base64, vec,
 };
 pub use events::{decode_pool_event, PoolEvent};
+
+/// Which auction a key or event names. The numbers are the contract's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AuctionType {
+    /// 0: liquidating an under-collateralised user's position.
+    UserLiquidation,
+    /// 1: auctioning bad debt the backstop absorbed.
+    BadDebt,
+    /// 2: auctioning accrued interest to the backstop.
+    Interest,
+}
+
+impl AuctionType {
+    /// The contract's numeric discriminant for this auction type.
+    pub fn code(self) -> u32 {
+        match self {
+            Self::UserLiquidation => 0,
+            Self::BadDebt => 1,
+            Self::Interest => 2,
+        }
+    }
+}
+
+impl TryFrom<u32> for AuctionType {
+    type Error = XdrError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::UserLiquidation),
+            1 => Ok(Self::BadDebt),
+            2 => Ok(Self::Interest),
+            other => Err(XdrError::Shape {
+                expected: "auction type 0..=2",
+                got: other.to_string(),
+            }),
+        }
+    }
+}
 
 /// Failures turning chain data into bot types, or bot types into chain data.
 ///

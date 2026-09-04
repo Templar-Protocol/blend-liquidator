@@ -244,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn at_block_200_the_whole_auction_changes_hands() {
+    fn two_hundred_blocks_in_the_whole_auction_changes_hands() {
         let scaled = scale_auction(&auction(), 300, 100).expect("scales");
         assert_eq!(scaled.to_fill.bid[ASSET_1], 1_000_000_000);
         assert_eq!(scaled.to_fill.bid[ASSET_2], 2_000_000_001);
@@ -253,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn past_block_200_the_bid_decays_and_then_vanishes() {
+    fn past_two_hundred_blocks_in_the_bid_decays_and_then_vanishes() {
         let half = scale_auction(&auction(), 400, 100).expect("scales");
         assert_eq!(half.to_fill.bid[ASSET_1], 500_000_000);
         assert_eq!(half.to_fill.bid[ASSET_2], 1_000_000_001);

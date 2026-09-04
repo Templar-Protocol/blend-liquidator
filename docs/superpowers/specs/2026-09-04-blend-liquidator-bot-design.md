@@ -165,14 +165,17 @@ store call is short and never held across an await on the network.
 - `chain/pool.rs` — pool reads (instance config, reserve list, reserves,
   positions, auction entry, oracle prices and decimals, token balances) and
   operation builders (`submit`, `new_auction`, `bad_debt`).
-- `chain/xdr.rs` — ScVal encoders and decoders for `PoolConfig`,
-  `ReserveConfig`, `ReserveData`, `Positions`, `AuctionData`, `Request`,
-  storage keys, and the pool event catalogue.
+- `chain/xdr/` — ScVal codecs, one file per concern: `encode` (values,
+  operations, simulation envelopes, `Request`), `keys` (storage keys,
+  durability included), `decode` (`PoolConfig`, `ReserveConfig`,
+  `ReserveData`, `Positions`, `AuctionData`, view-call returns), `events`
+  (the pool event catalogue).
 - `chain/tx.rs` — build, simulate, restore footprint, assemble, fee, sign,
   send, poll, classify.
-- `math.rs` — checked fixed-point helpers, reserve interest accrual to a
-  timestamp, b-token and d-token conversions, effective and raw position
-  values, health factor, auction scaling. Pure.
+- `math/` — pure: `fixed` (checked fixed-point helpers), `reserve`
+  (interest accrual to a timestamp, b-token and d-token conversions),
+  `position` (effective and raw values, health factor), `auction`
+  (Dutch-auction scaling).
 - `store.rs` — Postgres schema, embedded migrations, typed queries.
 - `tracker.rs` — event application, user refresh, recheck flags, seed and
   replay on start.
@@ -301,7 +304,7 @@ deployment safe). Amounts and values are stored as decimal text because
 | Table | Columns | Purpose |
 |---|---|---|
 | `cursors` | `name` pk, `ledger`, `paging_token` | per-task progress |
-| `users` | `pool`, `account`, `health_factor` (7-dec), `collateral` jsonb, `liabilities` jsonb, `updated_ledger`; pk `(pool, account)`; index `(pool, health_factor)` | tracked borrowers with liabilities |
+| `users` | `pool`, `account`, `health_factor` (7-dec, normalised as `hf × 10^7 / oracle_scalar`, so pools with different oracle decimals order and compare alike), `collateral` jsonb, `liabilities` jsonb, `updated_ledger`; pk `(pool, account)`; index `(pool, health_factor)` | tracked borrowers with liabilities |
 | `auctions` | `pool`, `account`, `auction_type`, `start_ledger`, `fill_ledger`, `percent`, `bid` jsonb, `lot` jsonb, `updated_ledger`; pk `(pool, account, auction_type)` | open auctions and the filler's current plan |
 | `fills` | `id`, `tx_hash` nullable unique, `pool`, `account`, `auction_type`, `fill_ledger`, `percent`, `bid` jsonb, `lot` jsonb, `bid_value`, `lot_value`, `est_profit`, `dry_run`, `created_at` | audit of fills, simulated ones included |
 | `creations` | `id`, `tx_hash` nullable, `kind` (`auction` or `bad_debt`), `pool`, `account`, `percent`, `bid` jsonb, `lot` jsonb, `ledger`, `dry_run`, `created_at` | audit of auctioneer submissions |
@@ -312,10 +315,11 @@ trail survives a database loss in the log system.
 ### Discovery and refresh
 
 Any pool event that names a user (supply, withdraw, supply and withdraw
-collateral, borrow, repay, flash loan, fill auction for both the liquidated
-user and the filler, bad debt) refreshes that user from chain: positions entry
-plus reserves accrued to now, health factor recomputed, row kept only while
-liabilities exist.
+collateral, borrow, repay, flash loan, new auction, fill auction for both the
+liquidated user and the filler, delete auction, bad debt) refreshes that user
+from chain: positions entry plus reserves accrued to now, health factor
+recomputed, row kept only while liabilities exist. New, fill and delete
+auction events also open, update or close the matching `auctions` row.
 
 On first start, and whenever the stored cursor is older than the RPC's
 retained window, the tracker seeds the user set:
@@ -327,7 +331,12 @@ retained window, the tracker seeds the user set:
    `SEED_URL` is `https://api.blend.templarfi.org`, which is keyless and free,
    so a third-party operator gets the same coverage. Pages are fetched with a
    small pause to stay under the anonymous rate limit. A failed seed is a
-   warning, not a startup failure.
+   warning and a notification, not a startup failure, and it is retried on
+   the next full scan. It does not gate submissions: every submission acts
+   only on a user the bot has already verified from chain, so an incomplete
+   seed costs coverage, never correctness. `SEED_HF_MAX` bounds that
+   coverage; a position above it needs a price move of that magnitude before
+   it matters, and operators who want more raise it.
 2. From an optional static `SEED_FILE` mapping pool addresses to account
    lists.
 3. By replaying retained events from `oldestLedger` to chain head.
@@ -515,7 +524,7 @@ Environment variable or flag, flag winning, with clap's `env` derive.
 | `RUN_MODE` | `loop`/`check-config` | `loop` | |
 | `LOG_FORMAT` | `text`/`json` | `text` | |
 | `PORT` / `HTTP_PORT` | u16 | unset | `PORT` honoured for Cloud Run; unset disables the server |
-| `HTTP_BIND_ADDR` | IP | `127.0.0.1` | |
+| `HTTP_BIND_ADDR` | IP | `127.0.0.1` | Cloud Run cannot route to loopback: that deployment sets `0.0.0.0` |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | string | unset | both or neither; the token is a secret |
 | `POLL_INTERVAL_MS` | u64 | 1000 | ledger polling |
 | `ORACLE_SCAN_LEDGERS` | u32 | 60 | |
@@ -610,11 +619,19 @@ after a cursor fell out of the retained window, unfunded fill skipped.
 - **Poller.** RPC errors back off from one to thirty seconds and never advance
   the cursor past what was applied. A cursor older than `oldestLedger`
   notifies a gap, reseeds users, and restarts from the window's edge.
-- **Queues.** Sends and timeouts retry with exponential backoff up to a
-  per-submission retry budget (creations 3, fills 10, unwinds 2); a sequence
-  error refetches the sequence and retries once; a decoded contract error is
-  returned to the caller without retry; exhausted retries drop the submission
-  and notify.
+- **Queues.** A send that fails outright retries with exponential backoff up
+  to a per-submission retry budget (creations 3, fills 10, unwinds 2); a
+  sequence error refetches the sequence and retries once; a decoded contract
+  error is returned to the caller without retry; exhausted retries drop the
+  submission and notify. A timeout is `unknown`, never a failure: the
+  transaction may still land. Every transaction the bot signs carries a
+  ledger bound, and the queue records the hash, sequence and bound before
+  sending; on a timeout it polls `getTransaction` for that hash until the
+  outcome is terminal, or until the chain has passed the bound with the
+  transaction still not found, which proves it can never be included. Only
+  then does it retry, with a fresh sequence number. Inventory reservations
+  stay held until the outcome is known, so a retry never sizes against
+  inventory an unknown transaction may have spent.
 - **Tracker.** A failed user refresh logs and leaves the row untouched; the
   next event or refresh pass retries.
 - **Executor.** Reservation settlement happens on every non-panicking path,
@@ -683,9 +700,23 @@ operator:
 The infra repository's own specification covers the GCP project, the Cloud
 Run service (one always-on instance, `max_instances = 1`, CPU always
 allocated), Cloud SQL, Secret Manager, Workload Identity, deployer IAM, and
-alerting. A rolling revision briefly runs two instances; duplicate creations
-and fills fail on chain harmlessly, and `STARTUP_DELAY_LEDGERS` narrows the
-window.
+alerting. The service sets `HTTP_BIND_ADDR=0.0.0.0` and honours the injected
+`PORT`, since Cloud Run cannot route to a loopback listener.
+
+A rolling revision briefly runs two instances, and the signer account is the
+lease that serialises them: Stellar accepts one transaction per account
+sequence number, so when both submit, one lands and the other fails with a
+bad sequence, refetches the sequence and retries once. That retry reaches the
+contract after the winner, where a second `new_auction` for the same user
+fails because the auction already exists, a second fill of a filled auction
+fails because there is nothing left to fill, and a repeated unwind moves
+nothing — decoded contract errors the queues return without retry. Each
+instance's inventory reservations are process-local and rebuilt from chain on
+start, so the one exposure is a fill the loser sized against inventory the
+winner has since spent, which the contract rejects on the token transfer.
+Rolling overlap therefore costs failed transaction fees, never a duplicate
+position, and `STARTUP_DELAY_LEDGERS` must exceed the old revision's shutdown
+drain so the window is normally empty.
 
 ## 11. Seams and extension points
 

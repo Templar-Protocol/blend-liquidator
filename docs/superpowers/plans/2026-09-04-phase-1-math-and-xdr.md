@@ -3380,13 +3380,18 @@ surface.
 Add to the "Safety invariants a change must not break" section:
 
 ```markdown
-- **The maths agrees with the contract, and a fixture proves it.**
-  `tests/fixtures/mainnet-fixed-v2.json` holds one mainnet ledger's entries
-  *and* the contract's own answers at that ledger. Accruing the entries must
-  reproduce `get_reserve` to the stroop, and valuing the positions must
-  reproduce the health factors. If one of those tests fails, the port is
-  wrong or the contract changed — never edit the expectation to match the
-  code.
+- **The maths agrees with the contract, and a fixture proves it — for what
+  the contract actually attests.** `tests/fixtures/mainnet-fixed-v2.json`
+  holds one mainnet ledger's entries *and* the contract's own answers at
+  that ledger. Two things are contract-attested, and are never edited to
+  match the code: accruing the stored entries must reproduce the contract's
+  `get_reserve` to the stroop, and decoding the stored positions must
+  reproduce the contract's `get_positions`. The pool exposes no
+  health-factor view, so the health factors in `src/chain/xdr/decode.rs` and
+  the synthetic-timestamp accrual in `src/math/reserve.rs` are golden values
+  this port derived from those attested inputs, not contract answers.
+  Changing one of those requires re-deriving it from the contract source,
+  never from the code under test.
 ```
 
 Add to "Gotchas":
@@ -3456,8 +3461,9 @@ The load-bearing test is `accruing_the_stored_entries_reproduces_the_contracts_g
 `tests/fixtures/mainnet-fixed-v2.json` holds one mainnet ledger's raw
 entries *and* the contract's own `get_reserve` and `get_positions` answers
 at that same ledger, so accruing the entries has exactly one right answer
-and the test asserts it to the stroop. The position valuation is pinned the
-same way, against two real borrowers' health factors.
+and the test asserts it to the stroop. The position valuation is checked
+against golden health factors derived from those attested inputs; the pool
+exposes no health-factor view, so they are not contract answers.
 
 Also here: the design spec and this plan, and
 `cargo run --example capture_fixture` to refresh the snapshot.

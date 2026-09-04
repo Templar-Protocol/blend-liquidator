@@ -20,14 +20,68 @@ pub struct PoolConfig {
     pub oracle: String,
     /// The backstop's share of accrued interest, 7 decimals.
     pub bstop_rate: u32,
-    /// 0 admin-active, 1 active, 2/3 on-ice, 4/5 frozen, 6 setup.
-    pub status: u32,
+    /// The pool's operating status, which gates what requests it accepts.
+    pub status: PoolStatus,
     /// The most collateral-plus-liability positions one account may hold,
     /// and the most assets one auction may name.
     pub max_positions: u32,
     /// The least collateral, in the oracle's decimals, a borrowing position
     /// must hold.
     pub min_collateral: i128,
+}
+
+/// The pool's operating status, as `PoolConfig.status` stores it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolStatus {
+    /// 0: admin-active.
+    AdminActive,
+    /// 1: active.
+    Active,
+    /// 2: admin on-ice.
+    AdminOnIce,
+    /// 3: on-ice.
+    OnIce,
+    /// 4: admin frozen.
+    AdminFrozen,
+    /// 5: frozen.
+    Frozen,
+    /// 6: setup.
+    Setup,
+}
+
+impl PoolStatus {
+    /// The contract's numeric discriminant for this status.
+    pub fn code(self) -> u32 {
+        match self {
+            Self::AdminActive => 0,
+            Self::Active => 1,
+            Self::AdminOnIce => 2,
+            Self::OnIce => 3,
+            Self::AdminFrozen => 4,
+            Self::Frozen => 5,
+            Self::Setup => 6,
+        }
+    }
+}
+
+impl TryFrom<u32> for PoolStatus {
+    type Error = XdrError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::AdminActive),
+            1 => Ok(Self::Active),
+            2 => Ok(Self::AdminOnIce),
+            3 => Ok(Self::OnIce),
+            4 => Ok(Self::AdminFrozen),
+            5 => Ok(Self::Frozen),
+            6 => Ok(Self::Setup),
+            other => Err(XdrError::Shape {
+                expected: "pool status 0..=6",
+                got: other.to_string(),
+            }),
+        }
+    }
 }
 
 /// Everything the pool keeps in instance storage.
@@ -143,7 +197,7 @@ fn index_map(value: &ScVal) -> Result<BTreeMap<u32, i128>, XdrError> {
             .iter()
             .map(|entry| match (&entry.key, &entry.val) {
                 (ScVal::U32(index), ScVal::I128(amount)) => Ok((*index, as_i128(amount))),
-                (key, _) => Err(shape("u32 to i128", key)),
+                _ => Err(shape("u32 to i128 entry", entry)),
             })
             .collect(),
         other => Err(shape("index map", other)),
@@ -159,7 +213,7 @@ fn address_map(value: &ScVal) -> Result<BTreeMap<String, i128>, XdrError> {
                 (ScVal::Address(asset), ScVal::I128(amount)) => {
                     Ok((asset.to_string(), as_i128(amount)))
                 }
-                (key, _) => Err(shape("address to i128", key)),
+                _ => Err(shape("address to i128 entry", entry)),
             })
             .collect(),
         other => Err(shape("address map", other)),
@@ -194,7 +248,7 @@ pub fn pool_instance(entry: &LedgerEntryData) -> Result<PoolInstance, XdrError> 
         config: PoolConfig {
             oracle: address_field(&config_fields, "oracle")?,
             bstop_rate: u32_field(&config_fields, "bstop_rate")?,
-            status: u32_field(&config_fields, "status")?,
+            status: PoolStatus::try_from(u32_field(&config_fields, "status")?)?,
             max_positions: u32_field(&config_fields, "max_positions")?,
             min_collateral: i128_field(&config_fields, "min_collateral")?,
         },
@@ -369,7 +423,7 @@ mod tests {
             "CCVTVW2CVA7JLH4ROQGP3CU4T3EXVCK66AZGSM4MUQPXAI4QHCZPOATS"
         );
         assert_eq!(instance.config.bstop_rate, 2_000_000);
-        assert_eq!(instance.config.status, 1);
+        assert_eq!(instance.config.status, PoolStatus::Active);
         assert_eq!(instance.config.max_positions, 6);
         assert_eq!(instance.config.min_collateral, 50_000_000);
     }
@@ -626,5 +680,13 @@ mod tests {
     #[test]
     fn a_void_lastprice_is_a_missing_price_not_a_zero() {
         assert_eq!(price_data(&ScVal::Void), Ok(None));
+    }
+
+    #[test]
+    fn an_unknown_pool_status_is_a_shape_error() {
+        assert!(matches!(
+            PoolStatus::try_from(7),
+            Err(XdrError::Shape { .. })
+        ));
     }
 }

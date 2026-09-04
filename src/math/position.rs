@@ -38,21 +38,30 @@ impl Positions {
 }
 
 /// A snapshot of one pool oracle: its decimals and a price per asset, both
-/// as the contract sees them.
+/// as the contract sees them. Every stored price is strictly positive — `new`
+/// is the only way to build one, and it enforces that.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OraclePrices {
     /// The oracle's `decimals()`.
     pub decimals: u32,
     /// `10^decimals`, the scale every base value is expressed in.
     pub scalar: i128,
-    /// Asset contract address to price.
-    pub prices: BTreeMap<String, i128>,
+    /// Asset contract address to price. Private so `new`'s positivity check
+    /// cannot be bypassed by a struct literal.
+    prices: BTreeMap<String, i128>,
 }
 
 impl OraclePrices {
     /// Builds a snapshot, deriving the scalar from the oracle's decimals.
+    ///
+    /// Every price must be strictly positive: a zero or negative price would
+    /// value collateral at nothing (or less), making an underwater account
+    /// look healthy to the bot.
     pub fn new(decimals: u32, prices: BTreeMap<String, i128>) -> Result<Self, MathError> {
         let scalar = pow10(decimals)?;
+        if prices.values().any(|price| *price <= 0) {
+            return Err(MathError::InvalidInput("oracle price must be positive"));
+        }
         Ok(Self {
             decimals,
             scalar,
@@ -62,7 +71,8 @@ impl OraclePrices {
 
     /// The price of `asset`, or `MissingPrice` when the snapshot has none.
     /// A missing price is never a zero: valuing a position at zero would
-    /// make it look liquidatable.
+    /// make it look liquidatable. Every price this returns is strictly
+    /// positive, per the invariant `new` enforces.
     pub fn price(&self, asset: &str) -> Result<i128, MathError> {
         self.prices
             .get(asset)
@@ -429,5 +439,24 @@ mod tests {
         assert_eq!(positions.effective_count(), 2);
         assert!(!positions.is_empty());
         assert!(Positions::default().is_empty());
+    }
+
+    #[test]
+    fn rejects_a_non_positive_price() {
+        // A zero or negative price would value collateral at nothing (or
+        // less), which could make an underwater account look healthy.
+        let mut zero = BTreeMap::new();
+        zero.insert(ASSET_A.to_string(), 0);
+        assert_eq!(
+            OraclePrices::new(7, zero),
+            Err(MathError::InvalidInput("oracle price must be positive"))
+        );
+
+        let mut negative = BTreeMap::new();
+        negative.insert(ASSET_A.to_string(), -1);
+        assert_eq!(
+            OraclePrices::new(7, negative),
+            Err(MathError::InvalidInput("oracle price must be positive"))
+        );
     }
 }

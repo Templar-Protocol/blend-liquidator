@@ -12,8 +12,9 @@
 //! tests accrue the stored entries to that ledger's close time and compare
 //! against the contract's own `get_reserve`. So each attempt reads the
 //! entries, runs every simulation, reads the entries again, and keeps the
-//! result only if the two reads are byte-identical and every simulation
-//! reported the same ledger. Otherwise it retries.
+//! result only if the two reads carry identical entries — keyed by ledger
+//! key, so an RPC that reorders them between reads still compares equal —
+//! and every simulation reported the same ledger. Otherwise it retries.
 //!
 //! The accrual target itself is read from those `get_reserve` returns, not
 //! from a separate RPC call: the pool contract's `Reserve::load` always
@@ -25,6 +26,7 @@
 //! seconds, and the round trip to ask again almost always lands on a newer
 //! one than the simulations just agreed on.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::process::Command;
 
@@ -35,8 +37,11 @@ use blend_liquidator::chain::xdr::{decode, from_base64, keys};
 use serde_json::{json, Value};
 
 type Fallible<T> = Result<T, Box<dyn Error>>;
-/// Ledger entries as `(key base64, entry base64)` pairs.
-type Entries = Vec<(String, String)>;
+/// Ledger entries keyed by their own base64, entry base64 the value: keying
+/// on the entry's key, rather than pairing them positionally, is what makes
+/// the two-pass consistency check in `attempt` order-insensitive, matching
+/// the RPC's own promise (see below).
+type Entries = BTreeMap<String, String>;
 
 const ATTEMPTS: usize = 10;
 /// Topics whose recent events go into the fixture, with their topic arity.
@@ -86,14 +91,14 @@ fn rpc(url: &str, method: &str, params: &Value) -> Fallible<Value> {
         .ok_or_else(|| format!("{method}: no result").into())
 }
 
-/// Reads ledger entries, returning `(latestLedger, [(key, xdr)])`.
+/// Reads ledger entries, returning `(latestLedger, key -> xdr)`.
 fn ledger_entries(url: &str, key_base64: &[String]) -> Fallible<(u64, Entries)> {
     let result = rpc(url, "getLedgerEntries", &json!({ "keys": key_base64 }))?;
     let ledger = result["latestLedger"]
         .as_u64()
         .ok_or("latestLedger missing")?;
-    let mut entries = Vec::new();
-    for entry in result["entries"].as_array().unwrap_or(&Vec::new()) {
+    let mut entries = Entries::new();
+    for entry in result["entries"].as_array().into_iter().flatten() {
         let key = entry["key"]
             .as_str()
             .ok_or("entry key missing")?
@@ -102,7 +107,7 @@ fn ledger_entries(url: &str, key_base64: &[String]) -> Fallible<(u64, Entries)> 
             .as_str()
             .ok_or("entry xdr missing")?
             .to_string();
-        entries.push((key, xdr));
+        entries.insert(key, xdr);
     }
     Ok((ledger, entries))
 }
@@ -167,12 +172,12 @@ fn all_entry_keys(pool: &str, assets: &[String], users: &[String]) -> Fallible<V
     Ok(key_base64)
 }
 
-/// Finds an entry by its key, since the RPC may reorder or omit entries.
-fn entry_for<'a>(entries: &'a [(String, String)], key: &str) -> Fallible<&'a str> {
+/// Looks up an entry by its key; the RPC may omit an entry outright, but
+/// keying `Entries` on the entry's own key means it can never reorder one.
+fn entry_for<'a>(entries: &'a Entries, key: &str) -> Fallible<&'a str> {
     entries
-        .iter()
-        .find(|(entry_key, _)| entry_key == key)
-        .map(|(_, xdr)| xdr.as_str())
+        .get(key)
+        .map(String::as_str)
         .ok_or_else(|| format!("the ledger has no entry for key {key}").into())
 }
 

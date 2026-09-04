@@ -26,7 +26,7 @@ pub mod chain;
 pub mod config;
 pub mod math;
 
-/// The committed mainnet snapshot every codec and math test reads.
+/// The committed mainnet snapshot the `chain::xdr` codec tests read.
 #[cfg(test)]
 pub(crate) mod fixture;
 

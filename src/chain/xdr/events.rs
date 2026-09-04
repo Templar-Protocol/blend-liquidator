@@ -9,8 +9,8 @@
 
 use stellar_xdr::ScVal;
 
-use super::decode::auction_value;
-use super::XdrError;
+use super::decode::{auction_value, PoolStatus};
+use super::{AuctionType, XdrError};
 use crate::math::AuctionData;
 
 /// A Blend v2 pool event the bot acts on.
@@ -66,24 +66,27 @@ pub enum PoolEvent {
         amount: i128,
         d_tokens: i128,
     },
-    /// An auction was created. `auction_type` is 0 liquidation, 1 bad debt,
-    /// 2 interest; `percent` is the share of the user's positions auctioned.
+    /// An auction was created. `percent` is the share of the user's
+    /// positions auctioned.
     NewAuction {
-        auction_type: u32,
+        auction_type: AuctionType,
         user: String,
         percent: u32,
         auction: AuctionData,
     },
     /// An auction was filled, wholly or in part, by `filler`.
     FillAuction {
-        auction_type: u32,
+        auction_type: AuctionType,
         user: String,
         filler: String,
         fill_percent: i128,
         filled: AuctionData,
     },
     /// An auction was deleted before being filled.
-    DeleteAuction { auction_type: u32, user: String },
+    DeleteAuction {
+        auction_type: AuctionType,
+        user: String,
+    },
     /// A user's debt moved to the backstop.
     BadDebt {
         user: String,
@@ -95,7 +98,7 @@ pub enum PoolEvent {
     /// A reserve was added or reconfigured.
     SetReserve { asset: String, index: u32 },
     /// The pool's status changed, which gates what requests it accepts.
-    SetStatus { status: u32 },
+    SetStatus { status: PoolStatus },
 }
 
 impl PoolEvent {
@@ -170,10 +173,34 @@ fn topic(topics: &[ScVal], index: usize) -> Result<&ScVal, XdrError> {
     })
 }
 
+/// Requires exactly `expected` topics. A recognised event with a surplus
+/// topic is as much a shape mismatch as a missing one: silently ignoring
+/// the extra topic would decode a shape this bot does not actually model.
+fn require_topics(
+    topics: &[ScVal],
+    expected: usize,
+    message: &'static str,
+) -> Result<(), XdrError> {
+    if topics.len() == expected {
+        Ok(())
+    } else {
+        Err(XdrError::Shape {
+            expected: message,
+            got: format!("{} topics", topics.len()),
+        })
+    }
+}
+
 /// asset, from, amount, reserve tokens: the shape shared by `supply`,
 /// `withdraw`, `supply_collateral`, `withdraw_collateral`, `borrow` and
-/// `repay`.
-fn two_sided(topics: &[ScVal], value: &ScVal) -> Result<(String, String, i128, i128), XdrError> {
+/// `repay`. `topic_count_message` names the caller's event for the shape
+/// error when the topic count is wrong.
+fn two_sided(
+    topics: &[ScVal],
+    value: &ScVal,
+    topic_count_message: &'static str,
+) -> Result<(String, String, i128, i128), XdrError> {
+    require_topics(topics, 3, topic_count_message)?;
     let asset = as_address(topic(topics, 1)?)?;
     let from = as_address(topic(topics, 2)?)?;
     let items = data(value, 2)?;
@@ -189,7 +216,7 @@ fn decode_position_event(
 ) -> Result<Option<PoolEvent>, XdrError> {
     let event = match name {
         "supply" => {
-            let (asset, from, amount, b_tokens) = two_sided(topics, value)?;
+            let (asset, from, amount, b_tokens) = two_sided(topics, value, "supply with 3 topics")?;
             PoolEvent::Supply {
                 asset,
                 from,
@@ -198,7 +225,8 @@ fn decode_position_event(
             }
         }
         "withdraw" => {
-            let (asset, from, amount, b_tokens) = two_sided(topics, value)?;
+            let (asset, from, amount, b_tokens) =
+                two_sided(topics, value, "withdraw with 3 topics")?;
             PoolEvent::Withdraw {
                 asset,
                 from,
@@ -207,7 +235,8 @@ fn decode_position_event(
             }
         }
         "supply_collateral" => {
-            let (asset, from, amount, b_tokens) = two_sided(topics, value)?;
+            let (asset, from, amount, b_tokens) =
+                two_sided(topics, value, "supply_collateral with 3 topics")?;
             PoolEvent::SupplyCollateral {
                 asset,
                 from,
@@ -216,7 +245,8 @@ fn decode_position_event(
             }
         }
         "withdraw_collateral" => {
-            let (asset, from, amount, b_tokens) = two_sided(topics, value)?;
+            let (asset, from, amount, b_tokens) =
+                two_sided(topics, value, "withdraw_collateral with 3 topics")?;
             PoolEvent::WithdrawCollateral {
                 asset,
                 from,
@@ -225,7 +255,7 @@ fn decode_position_event(
             }
         }
         "borrow" => {
-            let (asset, from, amount, d_tokens) = two_sided(topics, value)?;
+            let (asset, from, amount, d_tokens) = two_sided(topics, value, "borrow with 3 topics")?;
             PoolEvent::Borrow {
                 asset,
                 from,
@@ -234,7 +264,7 @@ fn decode_position_event(
             }
         }
         "repay" => {
-            let (asset, from, amount, d_tokens) = two_sided(topics, value)?;
+            let (asset, from, amount, d_tokens) = two_sided(topics, value, "repay with 3 topics")?;
             PoolEvent::Repay {
                 asset,
                 from,
@@ -243,6 +273,7 @@ fn decode_position_event(
             }
         }
         "flash_loan" => {
+            require_topics(topics, 4, "flash_loan with 4 topics")?;
             let items = data(value, 2)?;
             PoolEvent::FlashLoan {
                 asset: as_address(topic(topics, 1)?)?,
@@ -266,28 +297,36 @@ fn decode_auction_event(
 ) -> Result<Option<PoolEvent>, XdrError> {
     let event = match name {
         "new_auction" => {
+            require_topics(topics, 3, "new_auction with 3 topics")?;
             let items = data(value, 2)?;
             PoolEvent::NewAuction {
-                auction_type: as_u32(topic(topics, 1)?)?,
+                auction_type: AuctionType::try_from(as_u32(topic(topics, 1)?)?)?,
                 user: as_address(topic(topics, 2)?)?,
                 percent: as_u32(&items[0])?,
                 auction: auction_value(&items[1])?,
             }
         }
         "fill_auction" => {
+            require_topics(topics, 3, "fill_auction with 3 topics")?;
             let items = data(value, 3)?;
             PoolEvent::FillAuction {
-                auction_type: as_u32(topic(topics, 1)?)?,
+                auction_type: AuctionType::try_from(as_u32(topic(topics, 1)?)?)?,
                 user: as_address(topic(topics, 2)?)?,
                 filler: as_address(&items[0])?,
                 fill_percent: as_i128(&items[1])?,
                 filled: auction_value(&items[2])?,
             }
         }
-        "delete_auction" => PoolEvent::DeleteAuction {
-            auction_type: as_u32(topic(topics, 1)?)?,
-            user: as_address(topic(topics, 2)?)?,
-        },
+        "delete_auction" => {
+            require_topics(topics, 3, "delete_auction with 3 topics")?;
+            if !matches!(value, ScVal::Void) {
+                return Err(shape("delete_auction with void data", value));
+            }
+            PoolEvent::DeleteAuction {
+                auction_type: AuctionType::try_from(as_u32(topic(topics, 1)?)?)?,
+                user: as_address(topic(topics, 2)?)?,
+            }
+        }
         _ => return Ok(None),
     };
     Ok(Some(event))
@@ -301,16 +340,23 @@ fn decode_admin_event(
     value: &ScVal,
 ) -> Result<Option<PoolEvent>, XdrError> {
     let event = match name {
-        "bad_debt" => PoolEvent::BadDebt {
-            user: as_address(topic(topics, 1)?)?,
-            asset: as_address(topic(topics, 2)?)?,
-            d_tokens: as_i128(value)?,
-        },
-        "defaulted_debt" => PoolEvent::DefaultedDebt {
-            asset: as_address(topic(topics, 1)?)?,
-            d_tokens: as_i128(value)?,
-        },
+        "bad_debt" => {
+            require_topics(topics, 3, "bad_debt with 3 topics")?;
+            PoolEvent::BadDebt {
+                user: as_address(topic(topics, 1)?)?,
+                asset: as_address(topic(topics, 2)?)?,
+                d_tokens: as_i128(value)?,
+            }
+        }
+        "defaulted_debt" => {
+            require_topics(topics, 2, "defaulted_debt with 2 topics")?;
+            PoolEvent::DefaultedDebt {
+                asset: as_address(topic(topics, 1)?)?,
+                d_tokens: as_i128(value)?,
+            }
+        }
         "set_reserve" => {
+            require_topics(topics, 1, "set_reserve with 1 topic")?;
             let items = data(value, 2)?;
             PoolEvent::SetReserve {
                 asset: as_address(&items[0])?,
@@ -319,9 +365,17 @@ fn decode_admin_event(
         }
         // Emitted with one topic by `update_status` and two by the admin's
         // `set_status`; the status itself is the data either way.
-        "set_status" => PoolEvent::SetStatus {
-            status: as_u32(value)?,
-        },
+        "set_status" => {
+            if !matches!(topics.len(), 1 | 2) {
+                return Err(XdrError::Shape {
+                    expected: "set_status with 1 or 2 topics",
+                    got: format!("{} topics", topics.len()),
+                });
+            }
+            PoolEvent::SetStatus {
+                status: PoolStatus::try_from(as_u32(value)?)?,
+            }
+        }
         _ => return Ok(None),
     };
     Ok(Some(event))
@@ -483,7 +537,7 @@ mod tests {
         assert_eq!(
             decode_pool_event(&topics, &value).expect("decodes"),
             Some(PoolEvent::NewAuction {
-                auction_type: 0,
+                auction_type: AuctionType::UserLiquidation,
                 user: USER.to_string(),
                 percent: 42,
                 auction: expected_auction()
@@ -510,7 +564,7 @@ mod tests {
         assert_eq!(
             event,
             PoolEvent::FillAuction {
-                auction_type: 0,
+                auction_type: AuctionType::UserLiquidation,
                 user: USER.to_string(),
                 filler: FILLER.to_string(),
                 fill_percent: 75,
@@ -531,7 +585,7 @@ mod tests {
         assert_eq!(
             decode_pool_event(&topics, &ScVal::Void).expect("decodes"),
             Some(PoolEvent::DeleteAuction {
-                auction_type: 0,
+                auction_type: AuctionType::UserLiquidation,
                 user: USER.to_string()
             })
         );
@@ -615,6 +669,54 @@ mod tests {
     }
 
     #[test]
+    fn a_supply_event_with_a_surplus_topic_is_an_error() {
+        // Four topics is one more than `supply`'s modelled shape (name,
+        // asset, from); a decoder that only reads the first three would
+        // silently accept it.
+        let topics = vec![
+            symbol("supply").expect("symbol"),
+            address(USDC).expect("address"),
+            address(USER).expect("address"),
+            address(FILLER).expect("address"),
+        ];
+        let value = crate::chain::xdr::encode::vec(vec![i128_val(1), i128_val(1)]).expect("data");
+        assert!(matches!(
+            decode_pool_event(&topics, &value),
+            Err(XdrError::Shape { .. })
+        ));
+    }
+
+    #[test]
+    fn a_delete_auction_with_non_void_data_is_an_error() {
+        // The contract publishes `()` as `delete_auction`'s data; anything
+        // else means this bot's model of the event is out of date.
+        let topics = vec![
+            symbol("delete_auction").expect("symbol"),
+            ScVal::U32(0),
+            address(USER).expect("address"),
+        ];
+        assert!(matches!(
+            decode_pool_event(&topics, &i128_val(1)),
+            Err(XdrError::Shape { .. })
+        ));
+    }
+
+    #[test]
+    fn an_unknown_auction_type_is_a_shape_error() {
+        let topics = vec![
+            symbol("new_auction").expect("symbol"),
+            ScVal::U32(3),
+            address(USER).expect("address"),
+        ];
+        let value =
+            crate::chain::xdr::encode::vec(vec![ScVal::U32(42), auction_scval()]).expect("data");
+        assert!(matches!(
+            decode_pool_event(&topics, &value),
+            Err(XdrError::Shape { .. })
+        ));
+    }
+
+    #[test]
     fn affected_accounts_names_every_account_a_position_moved_for() {
         let supply = fixture_event(0).expect("modelled");
         assert_eq!(
@@ -622,7 +724,7 @@ mod tests {
             vec!["CDB2WMKQQNVZMEBY7Q7GZ5C7E7IAFSNMZ7GGVD6WKTCEWK7XOIAVZSAP"]
         );
         let auction = PoolEvent::DeleteAuction {
-            auction_type: 0,
+            auction_type: AuctionType::UserLiquidation,
             user: USER.to_string(),
         };
         assert_eq!(auction.affected_accounts(), vec![USER]);

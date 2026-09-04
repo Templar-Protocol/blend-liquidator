@@ -56,7 +56,9 @@ surface.
   `Cargo.toml`'s `[lints.clippy]`); tests are exempted via
   `allow-unwrap-in-tests` / `allow-expect-in-tests` in `clippy.toml`, **not**
   by relaxing the lint.
-- Structured `tracing` logs, never `println!` or ad hoc formatting.
+- Structured `tracing` logs in the crate, never `println!` or ad hoc
+  formatting. `examples/` are terminal tools an operator runs by hand, and
+  they print to stdout.
 - Doc comments state constraints and invariants, not a narration of what
   changed.
 - Money is never `f64`. Balances, debt, collateral and prices are exact

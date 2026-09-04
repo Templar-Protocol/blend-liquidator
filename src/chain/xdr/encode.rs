@@ -97,14 +97,25 @@ pub fn simulation_envelope(operation: Operation) -> Result<TransactionEnvelope, 
     }))
 }
 
-/// Base64 for the wire, with no depth or length limits imposed by us.
+/// The depth and length an XDR read or write is bounded to.
+///
+/// The network caps a ledger entry and a transaction far below 1 MiB, and
+/// Soroban caps `ScVal` nesting at 100, so these bounds never reject a value
+/// the chain can actually produce — they only bound what a hostile or
+/// broken RPC response can make the decoder allocate or recurse into.
+pub const XDR_LIMITS: Limits = Limits {
+    depth: 500,
+    len: 1_048_576,
+};
+
+/// Base64 for the wire, bounded by `XDR_LIMITS`.
 pub fn to_base64<T: WriteXdr>(value: &T) -> Result<String, XdrError> {
-    value.to_xdr_base64(Limits::none()).map_err(XdrError::Xdr)
+    value.to_xdr_base64(XDR_LIMITS).map_err(XdrError::Xdr)
 }
 
 /// The inverse of `to_base64`.
 pub fn from_base64<T: ReadXdr>(text: &str) -> Result<T, XdrError> {
-    T::from_xdr_base64(text, Limits::none()).map_err(XdrError::Xdr)
+    T::from_xdr_base64(text, XDR_LIMITS).map_err(XdrError::Xdr)
 }
 
 #[cfg(test)]

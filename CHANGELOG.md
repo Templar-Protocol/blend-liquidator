@@ -26,6 +26,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `get_positions` answers. Accruing the former must reproduce the latter to
   the stroop, so a contract upgrade that changes the maths fails a test
   instead of a fill.
+- `PoolStatus` and `AuctionType` enums in `src/chain/xdr`, decoded through
+  `TryFrom<u32>`, so a pool status or auction discriminant the bot does not
+  recognise is a decode error rather than an opaque `u32` a caller could
+  mishandle silently. `keys::auction` and every event carrying an auction
+  type now take `AuctionType` directly.
+- Strict topic-count checking in the pool event decoder
+  (`src/chain/xdr/events.rs`): a modelled event with a surplus topic is now
+  a shape error instead of silently ignoring the extra one, and
+  `delete_auction` requires its data to be the `()` the contract actually
+  publishes.
+- A finite XDR read/write limit, `chain::xdr::encode::XDR_LIMITS`, in place
+  of the previous unbounded `Limits::none()`: generous enough that no value
+  the chain can produce is ever rejected, but no longer letting a hostile or
+  broken RPC response make the decoder recurse or allocate without bound.
+- `OraclePrices::new` now rejects any non-positive price. A zero or negative
+  price would value collateral at nothing, which would make a healthy
+  account look liquidatable; the `prices` field is private so the check
+  cannot be bypassed by a struct literal.
 - `cargo run --example capture_fixture` refreshes that snapshot from a live
   RPC over `curl`, retrying until every entry and simulation describes one
   ledger.

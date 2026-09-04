@@ -9,7 +9,7 @@
 use stellar_xdr::{ContractDataDurability, LedgerKey, LedgerKeyContractData, ScVal};
 
 use super::encode::{address, map, sc_address, symbol, vec};
-use super::XdrError;
+use super::{AuctionType, XdrError};
 
 fn contract_data(
     pool: &str,
@@ -56,10 +56,9 @@ pub fn positions(pool: &str, user: &str) -> Result<LedgerKey, XdrError> {
 }
 
 /// `Auction(AuctionKey { user, auct_type })`, in temporary storage.
-/// `auction_type` is 0 for a user liquidation, 1 for bad debt, 2 for interest.
-pub fn auction(pool: &str, user: &str, auction_type: u32) -> Result<LedgerKey, XdrError> {
+pub fn auction(pool: &str, user: &str, auction_type: AuctionType) -> Result<LedgerKey, XdrError> {
     let auction_key = map(vec![
-        (symbol("auct_type")?, ScVal::U32(auction_type)),
+        (symbol("auct_type")?, ScVal::U32(auction_type.code())),
         (symbol("user")?, address(user)?),
     ])?;
     let key = vec(vec![symbol("Auction")?, auction_key])?;
@@ -69,8 +68,8 @@ pub fn auction(pool: &str, user: &str, auction_type: u32) -> Result<LedgerKey, X
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain::xdr::encode::to_base64;
-    use stellar_xdr::{ContractDataDurability, LedgerKey, Limits, ReadXdr};
+    use crate::chain::xdr::encode::{to_base64, XDR_LIMITS};
+    use stellar_xdr::{ContractDataDurability, LedgerKey, ReadXdr};
 
     const POOL: &str = "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD";
     const XLM: &str = "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA";
@@ -110,7 +109,8 @@ mod tests {
 
     #[test]
     fn auction_key_matches_the_wire_format() {
-        let key = to_base64(&auction(POOL, USER, 0).expect("key")).expect("base64");
+        let key = to_base64(&auction(POOL, USER, AuctionType::UserLiquidation).expect("key"))
+            .expect("base64");
         assert_eq!(key, "AAAABgAAAAESnMjMYzbx/bvcwPOYNDTDzbhf2eqFaXo3gtMY2HSlgAAAABAAAAABAAAAAgAAAA8AAAAHQXVjdGlvbgAAAAARAAAAAQAAAAIAAAAPAAAACWF1Y3RfdHlwZQAAAAAAAAMAAAAAAAAADwAAAAR1c2VyAAAAEgAAAAAAAAAAwWvxVekgt/bc4cnQA7BvYRCl1YIAjrruP0ttEbPr7t0AAAAA");
     }
 
@@ -132,7 +132,7 @@ mod tests {
                 other => panic!("expected contract data, got {other:?}"),
             }
         }
-        match auction(POOL, USER, 0).expect("key") {
+        match auction(POOL, USER, AuctionType::UserLiquidation).expect("key") {
             LedgerKey::ContractData(data) => {
                 assert_eq!(data.durability, ContractDataDurability::Temporary);
             }
@@ -144,7 +144,7 @@ mod tests {
     fn a_key_round_trips_through_base64() {
         let key = positions(POOL, USER).expect("key");
         let text = to_base64(&key).expect("base64");
-        let parsed = LedgerKey::from_xdr_base64(&text, Limits::none()).expect("parses");
+        let parsed = LedgerKey::from_xdr_base64(&text, XDR_LIMITS).expect("parses");
         assert_eq!(parsed, key);
     }
 
