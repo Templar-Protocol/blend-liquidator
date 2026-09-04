@@ -17,7 +17,11 @@ pub use encode::{
 };
 
 /// Failures turning chain data into bot types, or bot types into chain data.
-#[derive(Debug, thiserror::Error)]
+///
+/// `PartialEq` (not `Eq`: `stellar_xdr::Error` carries an unequatable I/O
+/// variant) so tests can assert a decode result directly against `Ok(...)`
+/// or a specific error variant.
+#[derive(Debug, PartialEq, thiserror::Error)]
 pub enum XdrError {
     /// The XDR library rejected the bytes or the base64.
     #[error("xdr: {0}")]
