@@ -209,24 +209,35 @@ pub fn calc_accrual(
     let target_util = i128::from(config.util);
     let cur_ir = if cur_util <= target_util {
         let util_scalar = div_ceil(cur_util, target_util, SCALAR_7)?;
-        let base_rate =
-            mul_ceil(util_scalar, i128::from(config.r_one), SCALAR_7)? + i128::from(config.r_base);
+        let base_rate = mul_ceil(util_scalar, i128::from(config.r_one), SCALAR_7)?
+            .checked_add(i128::from(config.r_base))
+            .ok_or(MathError::Overflow)?;
         mul_ceil(base_rate, ir_mod, SCALAR_7)?
     } else if cur_util <= UTIL_95 {
-        let util_scalar = div_ceil(cur_util - target_util, UTIL_95 - target_util, SCALAR_7)?;
+        let util_dif = cur_util
+            .checked_sub(target_util)
+            .ok_or(MathError::Overflow)?;
+        let util_range = UTIL_95
+            .checked_sub(target_util)
+            .ok_or(MathError::Overflow)?;
+        let util_scalar = div_ceil(util_dif, util_range, SCALAR_7)?;
         let base_rate = mul_ceil(util_scalar, i128::from(config.r_two), SCALAR_7)?
-            + i128::from(config.r_one)
-            + i128::from(config.r_base);
+            .checked_add(i128::from(config.r_one))
+            .and_then(|sum| sum.checked_add(i128::from(config.r_base)))
+            .ok_or(MathError::Overflow)?;
         mul_ceil(base_rate, ir_mod, SCALAR_7)?
     } else {
-        let util_scalar = div_ceil(cur_util - UTIL_95, UTIL_5, SCALAR_7)?;
+        let util_dif = cur_util.checked_sub(UTIL_95).ok_or(MathError::Overflow)?;
+        let util_scalar = div_ceil(util_dif, UTIL_5, SCALAR_7)?;
         let extra_rate = mul_ceil(util_scalar, i128::from(config.r_three), SCALAR_7)?;
-        let intersection = mul_ceil(
-            ir_mod,
-            i128::from(config.r_two) + i128::from(config.r_one) + i128::from(config.r_base),
-            SCALAR_7,
-        )?;
-        extra_rate + intersection
+        let rate_sum = i128::from(config.r_two)
+            .checked_add(i128::from(config.r_one))
+            .and_then(|sum| sum.checked_add(i128::from(config.r_base)))
+            .ok_or(MathError::Overflow)?;
+        let intersection = mul_ceil(ir_mod, rate_sum, SCALAR_7)?;
+        extra_rate
+            .checked_add(intersection)
+            .ok_or(MathError::Overflow)?
     };
 
     let delta_time = i128::from(
@@ -236,23 +247,33 @@ pub fn calc_accrual(
     if delta_time < 1 {
         return Err(MathError::InvalidInput("no time elapsed"));
     }
-    let util_dif = cur_util - target_util;
+    let util_dif = cur_util
+        .checked_sub(target_util)
+        .ok_or(MathError::Overflow)?;
     let util_error = delta_time
         .checked_mul(util_dif)
         .ok_or(MathError::Overflow)?;
     let new_ir_mod = if util_dif >= 0 {
         let rate_dif = mul_floor(util_error, i128::from(config.reactivity), SCALAR_7)?;
-        (ir_mod + rate_dif).min(IR_MOD_MAX)
+        ir_mod
+            .checked_add(rate_dif)
+            .ok_or(MathError::Overflow)?
+            .min(IR_MOD_MAX)
     } else {
         let rate_dif = mul_ceil(util_error, i128::from(config.reactivity), SCALAR_7)?;
-        (ir_mod + rate_dif).max(IR_MOD_MIN)
+        ir_mod
+            .checked_add(rate_dif)
+            .ok_or(MathError::Overflow)?
+            .max(IR_MOD_MIN)
     };
 
     let time_weight = delta_time
         .checked_mul(SCALAR_12)
         .ok_or(MathError::Overflow)?
         / SECONDS_PER_YEAR;
-    let accrual = SCALAR_12 + mul_ceil(time_weight, cur_ir, SCALAR_7)?;
+    let accrual = SCALAR_12
+        .checked_add(mul_ceil(time_weight, cur_ir, SCALAR_7)?)
+        .ok_or(MathError::Overflow)?;
     Ok((accrual, new_ir_mod))
 }
 
@@ -399,6 +420,23 @@ mod tests {
         assert_eq!(
             reserve.accrue(2_000_000, 1_788_533_000),
             Err(MathError::InvalidInput("now is before last_time"))
+        );
+    }
+
+    #[test]
+    fn calc_accrual_reports_overflow_instead_of_panicking_on_ir_mod_add() {
+        // `ir_mod` is decoded straight off the chain, so `calc_accrual`
+        // cannot assume it leaves room for `+ rate_dif`. Above target
+        // utilisation takes the increasing branch, where the next `ir_mod`
+        // is `ir_mod + rate_dif`; with `ir_mod` already at `i128::MAX` and
+        // utilisation above target (a positive `rate_dif`), that addition
+        // must report `Overflow` rather than panic -- `overflow-checks`
+        // is on even in the release profile, so an unchecked `+` here
+        // would abort the process, not just a debug build.
+        let config = xlm_config();
+        assert_eq!(
+            calc_accrual(&config, 5_000_000, i128::MAX, 0, 1),
+            Err(MathError::Overflow)
         );
     }
 }
