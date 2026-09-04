@@ -79,6 +79,14 @@ fn mul_div(x: i128, y: i128, z: i128, rounding: Rounding) -> Result<i128, MathEr
 
 /// Division with a sign-normalised divisor so `div_euclid` is a true floor.
 fn divide_narrow(r: i128, z: i128, rounding: Rounding) -> Result<i128, MathError> {
+    // `i128::MIN` has no positive `i128` counterpart, so negating it below
+    // would report `Overflow` even when the true quotient fits comfortably
+    // in `i128` (e.g. `i128::MIN / -2`). The 256-bit path has the headroom
+    // to negate exactly and is already proven correct for every sign
+    // combination, so route these two cases through it instead.
+    if r == i128::MIN || z == i128::MIN {
+        return divide_wide(I256::new(r), I256::new(z), rounding);
+    }
     let (r, z) = if z < 0 {
         (
             r.checked_neg().ok_or(MathError::Overflow)?,
@@ -151,6 +159,21 @@ mod tests {
         let big = 1_i128 << 126;
         assert_eq!(mul_floor(big, big, 1_i128 << 125), Err(MathError::Overflow));
         assert_eq!(mul_floor(i128::MAX, 2, 1), Err(MathError::Overflow));
+    }
+
+    #[test]
+    fn i128_min_as_divisor_or_dividend_does_not_spuriously_overflow() {
+        // Regression: sign-normalisation used to negate `i128::MIN`
+        // directly, which has no positive `i128` counterpart, and reported
+        // `Overflow` even though the true quotient fits. `1 / i128::MIN` is
+        // a tiny negative fraction: floor is -1, ceil is 0.
+        assert_eq!(mul_floor(1, 1, i128::MIN), Ok(-1));
+        assert_eq!(mul_ceil(1, 1, i128::MIN), Ok(0));
+        // i128::MIN / -2 = 2^126 exactly, well inside i128.
+        assert_eq!(mul_floor(i128::MIN, 1, -2), Ok(1_i128 << 126));
+        assert_eq!(mul_ceil(i128::MIN, 1, -2), Ok(1_i128 << 126));
+        // Control: i128::MIN / -1 = 2^127, which truly does not fit.
+        assert_eq!(mul_floor(i128::MIN, 1, -1), Err(MathError::Overflow));
     }
 
     #[test]
