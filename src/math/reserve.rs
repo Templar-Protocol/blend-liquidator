@@ -376,7 +376,15 @@ mod tests {
     }
 
     #[test]
-    fn accrue_reproduces_the_contracts_get_reserve() {
+    fn accrue_matches_golden_values_at_a_synthetic_timestamp() {
+        // `1_788_533_824` is a synthetic moment, not the fixture's real
+        // ledger close time, so the contract never attested an answer for
+        // it. The expectations below are golden values this port derived
+        // by hand from `calc_accrual`'s own formula, not contract output.
+        // The contract-attested cross-check — accruing to the fixture's
+        // real close time and comparing against the contract's own
+        // `get_reserve` — is `chain::xdr::decode`'s
+        // `accruing_the_stored_entries_reproduces_the_contracts_get_reserve`.
         let mut reserve =
             Reserve::new("XLM".to_string(), xlm_config(), xlm_data()).expect("scalar");
         reserve.accrue(2_000_000, 1_788_533_824).expect("accrues");

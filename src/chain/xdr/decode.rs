@@ -530,9 +530,14 @@ mod tests {
     }
 
     #[test]
-    fn values_the_fixtures_users_the_way_the_contract_would() {
+    fn values_the_fixtures_users_to_the_golden_health_factors() {
         // The payoff test for `math::position`: real positions, real accrued
-        // reserves, real oracle prices, at one ledger.
+        // reserves, real oracle prices, at one ledger. The pool exposes no
+        // health-factor view, so the eight base values and two health
+        // factors asserted below are golden values this port derived by
+        // hand from the fixture's attested reserves, prices and positions —
+        // independently reproduced from the contract's
+        // `calculate_from_positions` during review, not contract answers.
         let fixture = mainnet_fixed_v2();
         let instance =
             pool_instance(&entry(text(&fixture, &["instance_entry_xdr"]))).expect("instance");

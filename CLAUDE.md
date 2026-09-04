@@ -6,8 +6,10 @@ A liquidation bot for [Blend Protocol](https://blend.capital) lending pools on
 Stellar. It is intended to repay the debt of underwater positions and receive
 their collateral at a discount.
 
-**Status: skeleton.** The crate parses configuration, sets up logging and
-exits. There is no pool client, scanner, or executor yet. The repository
+**Status: skeleton.** Phase 1 landed the pure fixed-point math (`math`) and
+the ScVal/ledger-entry codecs (`chain::xdr`) — neither does networking. The
+binary itself still just parses configuration, sets up logging and exits:
+there is no bot loop, pool client, or executor yet. The repository
 scaffolding is complete and enforced.
 
 **This bot is NOT non-custodial.** It is designed to hold a signing key and
@@ -82,13 +84,18 @@ surface.
   path-filtered or conditionally gated, so a skipped job means a condition
   regressed. `devcontainer.yml` is path-filtered, which is exactly why it is
   kept out of that gate.
-- **The maths agrees with the contract, and a fixture proves it.**
-  `tests/fixtures/mainnet-fixed-v2.json` holds one mainnet ledger's entries
-  *and* the contract's own answers at that ledger. Accruing the entries must
-  reproduce `get_reserve` to the stroop, and valuing the positions must
-  reproduce the health factors. If one of those tests fails, the port is
-  wrong or the contract changed — never edit the expectation to match the
-  code.
+- **The maths agrees with the contract, and a fixture proves it — for what
+  the contract actually attests.** `tests/fixtures/mainnet-fixed-v2.json`
+  holds one mainnet ledger's entries *and* the contract's own answers at
+  that ledger. Two things are contract-attested, and are never edited to
+  match the code: accruing the stored entries must reproduce the contract's
+  `get_reserve` to the stroop, and decoding the stored positions must
+  reproduce the contract's `get_positions`. The pool exposes no
+  health-factor view, so the health factors in `src/chain/xdr/decode.rs` and
+  the synthetic-timestamp accrual in `src/math/reserve.rs` are golden values
+  this port derived from those attested inputs, not contract answers.
+  Changing one of those requires re-deriving it from the contract source,
+  never from the code under test.
 
 ## Gotchas
 

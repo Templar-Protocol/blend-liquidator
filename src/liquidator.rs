@@ -15,10 +15,12 @@
 //! preflight — is complete and enforced from the first commit, so the
 //! liquidation logic lands into a repo that already fails loudly.
 //!
-//! The module layout is deliberately *not* pre-declared. A prior NEAR bot in
-//! this organisation is a reasonable prior for what the seams will be, but
-//! presuming it fits Blend before reading Blend's contracts would be a guess
-//! dressed as a decision.
+//! The module layout follows the design spec at
+//! `docs/superpowers/specs/2026-09-04-blend-liquidator-bot-design.md`.
+//! `math` and `chain::xdr` are the two modules it declares that exist
+//! today; the rest — the RPC client and pool reads, the store and ledger
+//! poller, the auctioneer, the filler and executor, unwind, and the
+//! operational surface — do not yet.
 
 pub mod chain;
 pub mod config;
