@@ -302,14 +302,20 @@ pub fn auction_value(value: &ScVal) -> Result<AuctionData, XdrError> {
     })
 }
 
-/// Decodes a SEP-40 `lastprice` return. The oracle returns an `Option`, and
-/// a `None` price is a missing price, not a zero.
-pub fn price_data(value: &ScVal) -> Result<PriceData, XdrError> {
+/// Decodes a SEP-40 `lastprice` return: `Option<PriceData>`, exactly as the
+/// oracle returns it. Soroban encodes `None` as `ScVal::Void`, and a `None`
+/// price is a missing price for the asset — the caller skips it and alerts,
+/// never treats it as a zero. That is a materially different condition from
+/// a shape this decoder does not recognise at all, which stays an error.
+pub fn price_data(value: &ScVal) -> Result<Option<PriceData>, XdrError> {
+    if matches!(value, ScVal::Void) {
+        return Ok(None);
+    }
     let fields = fields(value)?;
-    Ok(PriceData {
+    Ok(Some(PriceData {
         price: i128_field(&fields, "price")?,
         timestamp: u64_field(&fields, "timestamp")?,
-    })
+    }))
 }
 
 /// Decodes a SEP-40 `decimals` return.
@@ -426,7 +432,8 @@ mod tests {
             &fixture,
             &["reserves", "0", "lastprice_return_xdr"],
         )))
-        .expect("price");
+        .expect("price")
+        .expect("the oracle has a price for this asset");
         assert_eq!(price.price, 1_778_617);
         assert_eq!(price.timestamp, 1_788_534_300);
     }
@@ -563,6 +570,7 @@ mod tests {
                     &["reserves", &position, "lastprice_return_xdr"],
                 )))
                 .expect("price")
+                .expect("the oracle has a price for this asset")
                 .price,
             );
             reserves.insert(reserve.config.index, reserve);
@@ -613,5 +621,10 @@ mod tests {
             price_data(&empty),
             Err(XdrError::MissingField("price"))
         ));
+    }
+
+    #[test]
+    fn a_void_lastprice_is_a_missing_price_not_a_zero() {
+        assert_eq!(price_data(&ScVal::Void), Ok(None));
     }
 }

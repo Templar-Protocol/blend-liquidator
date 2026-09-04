@@ -327,9 +327,11 @@ fn decode_admin_event(
 ///
 /// `topics` are the event's topics in order, the first being its name;
 /// `value` is its data. Returns `Ok(None)` when the event is not one the bot
-/// models.
+/// models: no topics at all and a first topic that is not a symbol mean the
+/// same thing — this decoder does not recognise the event — and neither may
+/// stall the poller with an error.
 pub fn decode_pool_event(topics: &[ScVal], value: &ScVal) -> Result<Option<PoolEvent>, XdrError> {
-    let ScVal::Symbol(name) = topic(topics, 0)? else {
+    let Some(ScVal::Symbol(name)) = topics.first() else {
         return Ok(None);
     };
     let name = name.to_utf8_string_lossy();
