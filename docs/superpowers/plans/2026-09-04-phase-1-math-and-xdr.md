@@ -383,6 +383,18 @@ mod tests {
     }
 
     #[test]
+    fn i128_min_as_divisor_or_dividend_does_not_spuriously_overflow() {
+        // Negating either operand to normalise the divisor's sign would
+        // report Overflow for results that fit; only a true 2^127 result
+        // may.
+        assert_eq!(mul_floor(1, 1, i128::MIN), Ok(-1));
+        assert_eq!(mul_ceil(1, 1, i128::MIN), Ok(0));
+        assert_eq!(mul_floor(i128::MIN, 1, -2), Ok(1_i128 << 126));
+        assert_eq!(mul_ceil(i128::MIN, 1, -2), Ok(1_i128 << 126));
+        assert_eq!(mul_floor(i128::MIN, 1, -1), Err(MathError::Overflow));
+    }
+
+    #[test]
     fn pow10_covers_token_decimals_and_rejects_overflow() {
         assert_eq!(pow10(0), Ok(1));
         assert_eq!(pow10(7), Ok(SCALAR_7));
@@ -396,7 +408,7 @@ mod tests {
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test --lib math::fixed`
-Expected: the five tests panic on `todo!()`.
+Expected: the six tests panic on `todo!()`.
 
 - [ ] **Step 3: Implement**
 
@@ -484,6 +496,14 @@ fn mul_div(x: i128, y: i128, z: i128, rounding: Rounding) -> Result<i128, MathEr
 
 /// Division with a sign-normalised divisor so `div_euclid` is a true floor.
 fn divide_narrow(r: i128, z: i128, rounding: Rounding) -> Result<i128, MathError> {
+    // `i128::MIN` has no positive `i128` counterpart, so negating it below
+    // would report `Overflow` even when the true quotient fits comfortably
+    // in `i128` (e.g. `i128::MIN / -2`). The 256-bit path has the headroom
+    // to negate exactly and is already proven correct for every sign
+    // combination, so route these two cases through it instead.
+    if r == i128::MIN || z == i128::MIN {
+        return divide_wide(I256::new(r), I256::new(z), rounding);
+    }
     let (r, z) = if z < 0 {
         (r.checked_neg().ok_or(MathError::Overflow)?, z.checked_neg().ok_or(MathError::Overflow)?)
     } else {
@@ -514,7 +534,7 @@ fn divide_wide(r: I256, z: I256, rounding: Rounding) -> Result<i128, MathError> 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test --lib math::fixed`
-Expected: `5 passed`.
+Expected: `6 passed`.
 
 - [ ] **Step 5: Lint and commit**
 
