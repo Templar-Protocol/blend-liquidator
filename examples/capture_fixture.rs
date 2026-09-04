@@ -14,6 +14,16 @@
 //! entries, runs every simulation, reads the entries again, and keeps the
 //! result only if the two reads are byte-identical and every simulation
 //! reported the same ledger. Otherwise it retries.
+//!
+//! The accrual target itself is read from those `get_reserve` returns, not
+//! from a separate RPC call: the pool contract's `Reserve::load` always
+//! stamps `data.last_time` with the timestamp of the ledger it ran in (it
+//! short-circuits when they already agree, and sets it in every other
+//! branch), so each captured reserve already carries the exact second the
+//! fixture's tests must accrue to. A later, independent call — `getHealth`,
+//! say — has no such guarantee: mainnet closes a ledger roughly every five
+//! seconds, and the round trip to ask again almost always lands on a newer
+//! one than the simulations just agreed on.
 
 use std::error::Error;
 use std::process::Command;
@@ -21,7 +31,7 @@ use std::process::Command;
 use blend_liquidator::chain::xdr::encode::{
     address, invoke_contract_op, simulation_envelope, stellar_asset, symbol, to_base64,
 };
-use blend_liquidator::chain::xdr::{decode, keys};
+use blend_liquidator::chain::xdr::{decode, from_base64, keys};
 use serde_json::{json, Value};
 
 type Fallible<T> = Result<T, Box<dyn Error>>;
@@ -199,6 +209,10 @@ fn attempt(url: &str, pool: &str, users: &[String]) -> Fallible<Option<Value>> {
     ledgers.push(ledger);
 
     let mut reserves = Vec::new();
+    // Each `get_reserve` return already carries the ledger's own timestamp
+    // in `data.last_time` — see the module doc comment for why that, and
+    // not a separate `getHealth` call, is the fixture's accrual target.
+    let mut accrual_times = Vec::new();
     for asset in &assets {
         let (get_reserve_ledger, get_reserve) =
             simulate(url, pool, "get_reserve", vec![address(asset)?])?;
@@ -206,6 +220,8 @@ fn attempt(url: &str, pool: &str, users: &[String]) -> Fallible<Option<Value>> {
             simulate(url, &oracle, "lastprice", vec![stellar_asset(asset)?])?;
         ledgers.push(get_reserve_ledger);
         ledgers.push(price_ledger);
+        let reserve = decode::reserve_value(&from_base64(&get_reserve)?)?;
+        accrual_times.push(reserve.data.last_time);
         reserves.push(json!({
             "asset": asset,
             "config_entry_xdr": entry_for(&first_pass, &to_base64(&keys::reserve_config(pool, asset)?)?)?,
@@ -237,11 +253,17 @@ fn attempt(url: &str, pool: &str, users: &[String]) -> Fallible<Option<Value>> {
         return Ok(None);
     }
 
+    // The fixture's accrual target: every reserve's own `last_time`, which
+    // must agree since they all came from simulations against one ledger.
+    let close_time = *accrual_times
+        .first()
+        .ok_or("the pool has no reserves; there is no accrual target")?;
+    if accrual_times.iter().any(|&other| other != close_time) {
+        println!("  reserves disagree on their accrual time ({accrual_times:?})");
+        return Ok(None);
+    }
+
     let health = rpc(url, "getHealth", &json!({}))?;
-    let close_time: u64 = health["latestLedgerCloseTime"]
-        .as_str()
-        .ok_or("close time missing")?
-        .parse()?;
     let oldest = health["oldestLedger"]
         .as_u64()
         .ok_or("oldestLedger missing")?;
