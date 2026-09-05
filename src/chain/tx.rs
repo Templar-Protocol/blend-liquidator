@@ -2,12 +2,17 @@
 //! poll, classify — section 3 of the design spec.
 //!
 //! Every transaction carries two bounds. The time bound (now + 5 minutes)
-//! is the network's convention; the ledger bound, `latest_ledger +
-//! poll_ledgers + 1` and exclusive, is what makes the outcome decidable:
-//! once the RPC's `latestLedger` reaches it, a transaction the RPC has not
-//! seen can never be applied, and `wait` reports `Expired` — provably not
-//! included — instead of leaving the caller to guess. `Unknown` is kept for
-//! the case where the RPC could not answer for the whole window.
+//! is the network's convention; the ledger bounds — `min_ledger`, the
+//! ledger it was built against, and `max_ledger`, `latest_ledger +
+//! poll_ledgers + 1` and exclusive — are what make the outcome decidable:
+//! once the RPC's `latestLedger` reaches `max_ledger`, a transaction the RPC
+//! has not seen can never be applied. That alone is not proof, though: a
+//! `NOT_FOUND` only means the RPC did not find it among the ledgers it
+//! still retains, so `wait` reports `Expired` — provably not included —
+//! only when the RPC's retention also still reaches back to `min_ledger`.
+//! `Unknown` is kept both for the case where the RPC could not answer for
+//! the whole window, and for the case where it answered but its retention
+//! had already moved past `min_ledger`, so a `NOT_FOUND` proved nothing.
 //!
 //! This layer never consults `DRY_RUN`: nothing here should be called by a
 //! dry-run path. The decision to sign and submit at all belongs to the
@@ -94,6 +99,11 @@ pub struct Prepared {
     pub hash: TxHash,
     /// The sequence number it consumes.
     pub sequence: i64,
+    /// Inclusive: the ledger the transaction was built against
+    /// (`latest_ledger` at prepare or restore time). The transaction cannot
+    /// be applied before it, and a `NOT_FOUND` only proves the transaction
+    /// expired when the RPC's retention still reaches back this far.
+    pub min_ledger: u32,
     /// Exclusive: the transaction cannot be applied in this ledger or later.
     pub max_ledger: u32,
     /// The total fee: inclusion plus resource.
@@ -125,8 +135,10 @@ pub enum TxOutcome {
         /// The decoded result.
         result: TransactionResult,
     },
-    /// The chain passed the ledger bound without applying it: it never will.
-    /// A retry with a fresh sequence number is safe.
+    /// The chain passed the ledger bound without applying it, and the RPC's
+    /// retention still reached back to `min_ledger`, so the `NOT_FOUND` is
+    /// proof, not merely the RPC having forgotten the window: it never will
+    /// apply. A retry with a fresh sequence number is safe.
     Expired {
         /// The transaction.
         hash: TxHash,
@@ -135,15 +147,22 @@ pub enum TxOutcome {
         /// The ledger the RPC had when that became certain.
         latest_ledger: u32,
     },
-    /// The RPC could not say within the window. The transaction may still
-    /// land; the caller keeps polling `getTransaction` for `hash` until it
-    /// does or the chain passes `max_ledger`.
+    /// The RPC could not say within the window — either it never answered
+    /// in time, or it answered `NOT_FOUND` after its retention had already
+    /// moved past the transaction's `min_ledger`, which proves nothing. The
+    /// transaction may still land; the caller keeps polling `getTransaction`
+    /// for `hash` until it does or the chain passes `max_ledger`. When the
+    /// RPC's retention has moved past the whole window, reconciliation needs
+    /// another source: the account's sequence number — if it has passed
+    /// `sequence`, this transaction or another one consumed it.
     Unknown {
         /// The transaction.
         hash: TxHash,
         /// The sequence it would consume if it lands.
         sequence: i64,
-        /// The bound after which it cannot.
+        /// The lower ledger bound it was built against.
+        min_ledger: u32,
+        /// The bound after which it cannot land.
         max_ledger: u32,
     },
 }
@@ -203,16 +222,20 @@ impl<'a> Submitter<'a> {
         }
     }
 
-    /// An unsigned transaction with both bounds. Returns the exclusive
-    /// ledger bound alongside it.
+    /// An unsigned transaction with both ledger bounds: `min_ledger` is the
+    /// ledger this was built against — `latest_ledger` at build time — so
+    /// the transaction cannot be applied before the ledger it was built
+    /// from; `max_ledger` is exclusive. Returns both bounds alongside the
+    /// transaction.
     fn unsigned(
         &self,
         operation: Operation,
         sequence: i64,
         latest_ledger: u32,
         fee: u32,
-    ) -> Result<(Transaction, u32), ChainError> {
+    ) -> Result<(Transaction, u32, u32), ChainError> {
         let now = unix_now()?;
+        let min_ledger = latest_ledger;
         let max_ledger = latest_ledger
             .checked_add(self.config.poll_ledgers)
             .and_then(|ledger| ledger.checked_add(1))
@@ -230,7 +253,7 @@ impl<'a> Submitter<'a> {
                     max_time: TimePoint(now.saturating_add(TIME_BOUND_SECS)),
                 }),
                 ledger_bounds: Some(LedgerBounds {
-                    min_ledger: 0,
+                    min_ledger,
                     max_ledger,
                 }),
                 min_seq_num: None,
@@ -242,7 +265,7 @@ impl<'a> Submitter<'a> {
             operations: VecM::try_from(vec![operation]).map_err(XdrError::Xdr)?,
             ext: TransactionExt::V0,
         };
-        Ok((tx, max_ledger))
+        Ok((tx, min_ledger, max_ledger))
     }
 
     /// Simulates `operation` as the signer at `sequence`. A refusal is
@@ -253,7 +276,7 @@ impl<'a> Submitter<'a> {
         sequence: i64,
         latest_ledger: u32,
     ) -> Result<(SimulatedCall, u32), ChainError> {
-        let (tx, _) = self.unsigned(operation.clone(), sequence, latest_ledger, 100)?;
+        let (tx, _, _) = self.unsigned(operation.clone(), sequence, latest_ledger, 100)?;
         let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
             tx,
             signatures: VecM::default(),
@@ -311,7 +334,8 @@ impl<'a> Submitter<'a> {
             }),
         };
         let fee = total_fee(inclusion, preamble.min_resource_fee)?;
-        let (mut tx, max_ledger) = self.unsigned(operation, sequence, latest_ledger, fee)?;
+        let (mut tx, min_ledger, max_ledger) =
+            self.unsigned(operation, sequence, latest_ledger, fee)?;
         tx.ext = TransactionExt::V1(preamble.transaction_data);
         let envelope = self.signer.sign(&tx, self.network)?;
         let hash = TxHash(envelope.hash(self.network.id).map_err(XdrError::Xdr)?);
@@ -319,6 +343,7 @@ impl<'a> Submitter<'a> {
             envelope,
             hash,
             sequence,
+            min_ledger,
             max_ledger,
             fee,
             resource_fee: preamble.min_resource_fee,
@@ -363,7 +388,7 @@ impl<'a> Submitter<'a> {
                 ));
             }
         }
-        let (tx, max_ledger) = self.unsigned(operation, sequence, latest_ledger, 0)?;
+        let (tx, min_ledger, max_ledger) = self.unsigned(operation, sequence, latest_ledger, 0)?;
         let tx = Self::assemble(tx, &call, inclusion)?;
         let envelope = self.signer.sign(&tx, self.network)?;
         let hash = TxHash(envelope.hash(self.network.id).map_err(XdrError::Xdr)?);
@@ -371,6 +396,7 @@ impl<'a> Submitter<'a> {
             envelope,
             hash,
             sequence,
+            min_ledger,
             max_ledger,
             fee: tx.fee,
             resource_fee: call.min_resource_fee,
@@ -379,13 +405,24 @@ impl<'a> Submitter<'a> {
 }
 
 /// What a `getTransaction` answer means for a transaction identified by
-/// `hash` and bounded by `max_ledger`: a terminal outcome, or `None` while
-/// the transaction may still land. `NotFound` becomes `Expired` the moment
-/// the RPC's ledger reaches the bound. Takes the hash and bound rather than
-/// a whole `Prepared` so a caller resuming an `Unknown` outcome — which
-/// carries only those two fields, not a `Prepared` — can call it too.
+/// `hash` and bounded by `[min_ledger, max_ledger)`: a terminal outcome, or
+/// `None` while the transaction may still land. Two things must both hold
+/// for a `NotFound` to become `Expired`: the chain must have passed
+/// `max_ledger` (`latest_ledger >= max_ledger`), and the RPC's retention
+/// must still reach back to `min_ledger` (`oldest_ledger <= min_ledger`) —
+/// otherwise the `NOT_FOUND` only reflects that the RPC no longer holds the
+/// ledgers in question, not that the transaction never applied, so this
+/// returns `None` and the caller keeps polling until the wait cap yields
+/// `Unknown`. Takes the hash and bounds rather than a whole `Prepared` so a
+/// caller resuming an `Unknown` outcome — which carries only those fields,
+/// not a `Prepared` — can call it too.
 #[must_use]
-pub fn classify(status: TransactionStatus, hash: TxHash, max_ledger: u32) -> Option<TxOutcome> {
+pub fn classify(
+    status: TransactionStatus,
+    hash: TxHash,
+    min_ledger: u32,
+    max_ledger: u32,
+) -> Option<TxOutcome> {
     match status {
         TransactionStatus::Success {
             ledger,
@@ -407,7 +444,10 @@ pub fn classify(status: TransactionStatus, hash: TxHash, max_ledger: u32) -> Opt
             contract_error,
             result,
         }),
-        TransactionStatus::NotFound { latest_ledger } if latest_ledger >= max_ledger => {
+        TransactionStatus::NotFound {
+            latest_ledger,
+            oldest_ledger,
+        } if latest_ledger >= max_ledger && oldest_ledger <= min_ledger => {
             Some(TxOutcome::Expired {
                 hash,
                 max_ledger,
@@ -416,6 +456,20 @@ pub fn classify(status: TransactionStatus, hash: TxHash, max_ledger: u32) -> Opt
         }
         TransactionStatus::NotFound { .. } => None,
     }
+}
+
+/// Whether `error` is worth retrying while polling for a transaction's
+/// outcome: a transport failure or an HTTP 429/5xx status can plausibly
+/// resolve on the next poll of the same query. Anything else — a JSON-RPC
+/// error object, an unreadable response body, or any other HTTP status —
+/// means the request itself was rejected, and polling again cannot change
+/// that, so it propagates immediately instead of being retried into an
+/// `Unknown`.
+fn is_transient(error: &ChainError) -> bool {
+    matches!(
+        error,
+        ChainError::Transport(_) | ChainError::Http(429 | 500..=599)
+    )
 }
 
 impl Submitter<'_> {
@@ -455,37 +509,44 @@ impl Submitter<'_> {
     }
 
     /// This is how a queue resumes an `Unknown` outcome from the hash,
-    /// sequence and bound it recorded before sending, after a restart or a
-    /// send that timed out — the three fields `Unknown` carries and
-    /// `Prepared` does not outlive.
+    /// sequence and bounds it recorded before sending, after a restart or a
+    /// send that timed out — the fields `Unknown` carries and `Prepared`
+    /// does not outlive.
     ///
     /// Polls `getTransaction` until the outcome is terminal, the chain has
-    /// passed the ledger bound (`Expired`), or the wait cap passes without an
-    /// answer (`Unknown`, carrying the same three fields for a later
-    /// resumption). RPC errors while polling are transient here: the
-    /// transaction is in flight and only the chain can say what happened.
+    /// passed the ledger bound and the RPC's retention still proves it
+    /// (`Expired`), or the wait cap passes without a provable answer
+    /// (`Unknown`, carrying the same fields for a later resumption). Only a
+    /// transient failure — a transport error, or an HTTP 429/5xx status —
+    /// is retried while polling; a JSON-RPC error object, a malformed
+    /// response or any other HTTP status propagates immediately, since
+    /// polling the same query again cannot change what the RPC just said
+    /// about it.
     pub async fn wait_for(
         &self,
         hash: TxHash,
         sequence: i64,
+        min_ledger: u32,
         max_ledger: u32,
     ) -> Result<TxOutcome, ChainError> {
         let deadline = Instant::now() + self.config.wait_cap;
         loop {
             match self.rpc.transaction(&hash).await {
                 Ok(status) => {
-                    if let Some(outcome) = classify(status, hash, max_ledger) {
+                    if let Some(outcome) = classify(status, hash, min_ledger, max_ledger) {
                         return Ok(outcome);
                     }
                 }
-                Err(error) => {
+                Err(error) if is_transient(&error) => {
                     tracing::warn!(%hash, %error, "getTransaction failed; polling again");
                 }
+                Err(error) => return Err(error),
             }
             if Instant::now() >= deadline {
                 return Ok(TxOutcome::Unknown {
                     hash,
                     sequence,
+                    min_ledger,
                     max_ledger,
                 });
             }
@@ -493,10 +554,15 @@ impl Submitter<'_> {
         }
     }
 
-    /// `wait_for` on the hash, sequence and bound `prepared` carries.
+    /// `wait_for` on the hash, sequence and bounds `prepared` carries.
     pub async fn wait(&self, prepared: &Prepared) -> Result<TxOutcome, ChainError> {
-        self.wait_for(prepared.hash, prepared.sequence, prepared.max_ledger)
-            .await
+        self.wait_for(
+            prepared.hash,
+            prepared.sequence,
+            prepared.min_ledger,
+            prepared.max_ledger,
+        )
+        .await
     }
 
     /// The whole write path: prepare, send, wait. A convenience for a
@@ -657,7 +723,12 @@ mod tests {
                 .contains(&time.max_time.0)
         );
         let ledgers = cond.ledger_bounds.as_ref().unwrap();
-        assert_eq!((ledgers.min_ledger, ledgers.max_ledger), (0, 104));
+        assert_eq!(
+            (ledgers.min_ledger, ledgers.max_ledger),
+            (100, 104),
+            "the lower bound is the ledger the transaction was built against"
+        );
+        assert_eq!(prepared.min_ledger, 100);
         let TransactionExt::V1(data) = &v1.tx.ext else {
             panic!("soroban data attached")
         };
@@ -818,6 +889,7 @@ mod tests {
             envelope,
             hash: TxHash([0x42; 32]),
             sequence: 42,
+            min_ledger: 100,
             max_ledger,
             fee: 100,
             resource_fee: 0,
@@ -905,7 +977,12 @@ mod tests {
             return_value: Some(ScVal::U32(7)),
         };
         assert!(matches!(
-            classify(success, prepared.hash, prepared.max_ledger),
+            classify(
+                success,
+                prepared.hash,
+                prepared.min_ledger,
+                prepared.max_ledger
+            ),
             Some(TxOutcome::Succeeded {
                 ledger: 102,
                 return_value: Some(ScVal::U32(7)),
@@ -923,7 +1000,12 @@ mod tests {
             contract_error: Some(1205),
         };
         assert!(matches!(
-            classify(failed, prepared.hash, prepared.max_ledger),
+            classify(
+                failed,
+                prepared.hash,
+                prepared.min_ledger,
+                prepared.max_ledger
+            ),
             Some(TxOutcome::Failed {
                 ledger: 103,
                 contract_error: Some(1205),
@@ -931,15 +1013,23 @@ mod tests {
             })
         ));
         assert!(classify(
-            TransactionStatus::NotFound { latest_ledger: 103 },
+            TransactionStatus::NotFound {
+                latest_ledger: 103,
+                oldest_ledger: 1
+            },
             prepared.hash,
+            prepared.min_ledger,
             prepared.max_ledger
         )
         .is_none());
         assert!(matches!(
             classify(
-                TransactionStatus::NotFound { latest_ledger: 104 },
+                TransactionStatus::NotFound {
+                    latest_ledger: 104,
+                    oldest_ledger: 1
+                },
                 prepared.hash,
+                prepared.min_ledger,
                 prepared.max_ledger
             ),
             Some(TxOutcome::Expired {
@@ -948,6 +1038,25 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn classify_never_calls_a_transaction_expired_when_the_rpc_forgot_the_window() {
+        // The chain has passed max_ledger (104), but the RPC's oldest_ledger
+        // (103) has already moved past min_ledger (100): its NOT_FOUND
+        // cannot distinguish "never applied" from "applied in a ledger this
+        // RPC no longer retains", so classify refuses to call it Expired.
+        let hash = TxHash([0x42; 32]);
+        assert!(classify(
+            TransactionStatus::NotFound {
+                latest_ledger: 104,
+                oldest_ledger: 103
+            },
+            hash,
+            100,
+            104
+        )
+        .is_none());
     }
 
     #[tokio::test]
@@ -1013,7 +1122,7 @@ mod tests {
         let (network, signer) = (Network::testnet(), signer());
         let submitter = submitter_for(&client, &network, &signer);
         let hash = TxHash([0x42; 32]);
-        let outcome = submitter.wait_for(hash, 42, 104).await.unwrap();
+        let outcome = submitter.wait_for(hash, 42, 100, 104).await.unwrap();
         assert!(
             matches!(
                 outcome,
@@ -1025,6 +1134,25 @@ mod tests {
             ),
             "{outcome:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn wait_for_propagates_a_permanent_rpc_error() {
+        // A JSON-RPC error object is not something polling again can fix,
+        // so it must surface immediately rather than being retried into an
+        // eventual Unknown.
+        let rpc = ScriptedRpc::start().await;
+        rpc.expect_error("getTransaction", -32_602, "invalid hash");
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let (network, signer) = (Network::testnet(), signer());
+        let submitter = submitter_for(&client, &network, &signer);
+        let hash = TxHash([0x42; 32]);
+        let error = submitter.wait_for(hash, 42, 100, 104).await.unwrap_err();
+        assert!(
+            matches!(error, ChainError::Rpc { code: -32_602, .. }),
+            "{error:?}"
+        );
+        assert_eq!(rpc.calls("getTransaction").len(), 1);
     }
 
     #[tokio::test]

@@ -1,5 +1,5 @@
-//! Prints a pool's reserves and, for each user given, the user's health
-//! factor, read from a live RPC through the real client. The phase's
+//! Prints a pool's reserves and, for each user given, the user's projected
+//! health factor, read from a live RPC through the real client. The phase's
 //! dry-run demonstration: nothing is signed or sent.
 //!
 //! ```text
@@ -8,9 +8,10 @@
 //! ```
 //!
 //! `RPC_API_KEY_HEADER` and `RPC_API_KEY` are honoured together. The health
-//! factor is computed at the latest ledger's close time, read after the
-//! snapshot, so it is at or after the snapshot's ledger: that is the
-//! accrual the contract would apply to a call landing now.
+//! factor is projected: it accrues the snapshot's reserves to the latest
+//! ledger's close time, read after the snapshot, and values the position
+//! against that — the accrual the contract would apply to a call landing
+//! now, not a figure the contract has itself attested to.
 
 use std::error::Error;
 
@@ -65,10 +66,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     for user in users {
         match snapshot.position_data(user, latest.close_time)? {
             Some(data) => println!(
-                "  user {user}: collateral {} liabilities {} health factor {:?}",
+                "  user {user}: collateral {} liabilities {} projected health factor {:?} \
+                 (snapshot ledger {} accrued to {})",
                 data.collateral_base,
                 data.liability_base,
-                data.health_factor()?
+                data.health_factor()?,
+                snapshot.ledger,
+                latest.close_time
             ),
             None => println!("  user {user}: no positions"),
         }

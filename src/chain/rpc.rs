@@ -466,6 +466,9 @@ impl RpcClient {
     /// `getEvents` for the given contracts: one page, topics and values
     /// decoded. Contract ids are grouped five per filter, the RPC's cap.
     pub async fn events(&self, query: &EventQuery<'_>) -> Result<Events, ChainError> {
+        if query.limit == 0 || query.limit > 10_000 {
+            return Err(ChainError::Config("getEvents limit is 1 to 10000"));
+        }
         let filters: Vec<serde_json::Value> = query
             .contract_ids
             .chunks(IDS_PER_FILTER)
@@ -678,6 +681,7 @@ pub struct SendStatus {
 struct RawTransaction {
     status: String,
     latest_ledger: u32,
+    oldest_ledger: u32,
     ledger: Option<u32>,
     result_xdr: Option<String>,
     result_meta_xdr: Option<String>,
@@ -693,6 +697,9 @@ pub enum TransactionStatus {
         /// The newest ledger the RPC had; against the transaction's ledger
         /// bound this decides between "still possible" and "never".
         latest_ledger: u32,
+        /// The oldest ledger the RPC holds; a transaction older than that
+        /// cannot be found even if it applied.
+        oldest_ledger: u32,
     },
     /// Applied and succeeded.
     Success {
@@ -855,7 +862,10 @@ impl RpcClient {
             .await?;
         let latest_ledger = raw.latest_ledger;
         if raw.status == "NOT_FOUND" {
-            return Ok(TransactionStatus::NotFound { latest_ledger });
+            return Ok(TransactionStatus::NotFound {
+                latest_ledger,
+                oldest_ledger: raw.oldest_ledger,
+            });
         }
         let missing =
             |field: &'static str| ChainError::Shape(format!("{} without {field}", raw.status));
@@ -1261,6 +1271,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn events_refuse_a_limit_outside_the_rpcs_range() {
+        let rpc = ScriptedRpc::start().await;
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        for limit in [0, 10_001] {
+            let error = client
+                .events(&EventQuery {
+                    start_ledger: Some(1),
+                    cursor: None,
+                    contract_ids: &[POOL],
+                    limit,
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ChainError::Config(_)), "{error:?}");
+        }
+        assert!(rpc.calls("getEvents").is_empty());
+    }
+
+    #[tokio::test]
     async fn events_paginate_by_cursor_without_a_start_ledger_and_refuse_neither_or_both() {
         let rpc = ScriptedRpc::start().await;
         rpc.expect("getEvents", json!({"latestLedger": 1, "events": []}));
@@ -1491,7 +1520,10 @@ mod tests {
         let client = RpcClient::new(&rpc.url(), None).unwrap();
         assert!(matches!(
             client.transaction(&hash).await.unwrap(),
-            TransactionStatus::NotFound { latest_ledger: 100 }
+            TransactionStatus::NotFound {
+                latest_ledger: 100,
+                oldest_ledger: 1
+            }
         ));
         let TransactionStatus::Success {
             ledger,

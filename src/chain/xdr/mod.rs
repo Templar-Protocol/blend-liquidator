@@ -18,7 +18,7 @@ pub mod keys;
 pub use decode::PoolStatus;
 pub use encode::{
     address, from_base64, i128_val, invoke_contract_op, map, request, sc_address,
-    simulation_envelope, stellar_asset, symbol, to_base64, vec, Request, RequestType,
+    simulation_envelope, stellar_asset, symbol, to_base64, vec, FillPercent, Request, RequestType,
 };
 pub use events::{decode_pool_event, PoolEvent};
 

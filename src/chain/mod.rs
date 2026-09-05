@@ -88,7 +88,8 @@ pub enum ChainError {
     BadSequence,
 }
 
-/// A transaction hash, rendered as 64 lowercase hex digits on the wire.
+/// A transaction hash: rendered as 64 lowercase hex digits; parsed
+/// case-insensitively.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TxHash(pub [u8; 32]);
 
@@ -104,7 +105,8 @@ impl TxHash {
         hex
     }
 
-    /// Parses the wire form; any other length or character is a shape error.
+    /// Parses the wire form, case-insensitively; any other length or
+    /// character is a shape error.
     pub fn from_hex(text: &str) -> Result<Self, ChainError> {
         let bytes = text.as_bytes();
         if bytes.len() != 64 {
@@ -142,6 +144,10 @@ mod tests {
         assert_eq!(&hex[..4], "abab");
         assert_eq!(TxHash::from_hex(&hex).expect("parses"), hash);
         assert_eq!(hash.to_string(), hex);
+        assert_eq!(
+            TxHash::from_hex(&hex.to_uppercase()).expect("parses case-insensitively"),
+            hash
+        );
     }
 
     #[test]

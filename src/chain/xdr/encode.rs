@@ -171,7 +171,10 @@ pub struct Request {
     /// The asset for supply, withdraw, borrow and repay; the user for the
     /// auction requests.
     pub address: String,
-    /// The amount in the asset's decimals, or the fill percent.
+    /// The amount in the asset's decimals for supply, withdraw, borrow and
+    /// repay. The three fill request types instead carry a percent, 1 to
+    /// 100 — `Request::fill` is the way to build one of those, so this
+    /// field need not be set directly by a caller filling an auction.
     pub amount: i128,
 }
 
@@ -186,6 +189,61 @@ pub fn request(request: &Request) -> Result<ScVal, XdrError> {
             ScVal::U32(request.request_type.code()),
         ),
     ])
+}
+
+/// A fill or auction percent, 1 to 100, the contract's range for
+/// `new_auction`'s `percent` and the `amount` of the three fill requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FillPercent(u32);
+
+impl FillPercent {
+    /// The value, known to be 1 to 100.
+    #[must_use]
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl TryFrom<u32> for FillPercent {
+    type Error = XdrError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        if (1..=100).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(XdrError::Shape {
+                expected: "percent 1..=100",
+                got: value.to_string(),
+            })
+        }
+    }
+}
+
+impl Request {
+    /// A fill request: `FillUserLiquidationAuction`, `FillBadDebtAuction` or
+    /// `FillInterestAuction`, the three request types that carry a user and
+    /// a fill percent rather than an asset and an amount. Any other
+    /// request type is refused here, before a request the contract would
+    /// reject is ever built.
+    pub fn fill(
+        request_type: RequestType,
+        user: &str,
+        percent: FillPercent,
+    ) -> Result<Self, XdrError> {
+        match request_type {
+            RequestType::FillUserLiquidationAuction
+            | RequestType::FillBadDebtAuction
+            | RequestType::FillInterestAuction => Ok(Self {
+                request_type,
+                address: user.to_string(),
+                amount: i128::from(percent.get()),
+            }),
+            other => Err(XdrError::Shape {
+                expected: "a fill request type",
+                got: format!("{other:?}"),
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -323,5 +381,51 @@ mod tests {
         assert_eq!(entries[0].val, address(user).expect("address"));
         assert_eq!(entries[1].val, i128_val(60));
         assert_eq!(entries[2].val, ScVal::U32(6));
+    }
+
+    #[test]
+    fn a_fill_percent_outside_one_to_a_hundred_and_a_non_fill_request_type_are_refused() {
+        for percent in [0, 101] {
+            let error = FillPercent::try_from(percent).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    XdrError::Shape {
+                        expected: "percent 1..=100",
+                        ..
+                    }
+                ),
+                "{error:?}"
+            );
+        }
+        let user = "GDAWX4KV5EQLP5W44HE5AA5QN5QRBJOVQIAI5OXOH5FW2ENT5PXN33DE";
+        let percent = FillPercent::try_from(50).expect("50 is in range");
+        let error = Request::fill(RequestType::Supply, user, percent).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                XdrError::Shape {
+                    expected: "a fill request type",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn fill_builds_a_request_for_each_of_the_three_fill_types() {
+        let user = "GDAWX4KV5EQLP5W44HE5AA5QN5QRBJOVQIAI5OXOH5FW2ENT5PXN33DE";
+        let percent = FillPercent::try_from(60).expect("60 is in range");
+        for request_type in [
+            RequestType::FillUserLiquidationAuction,
+            RequestType::FillBadDebtAuction,
+            RequestType::FillInterestAuction,
+        ] {
+            let built = Request::fill(request_type, user, percent).expect("a fill type");
+            assert_eq!(built.request_type, request_type);
+            assert_eq!(built.address, user);
+            assert_eq!(built.amount, 60);
+        }
     }
 }

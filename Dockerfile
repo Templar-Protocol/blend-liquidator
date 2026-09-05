@@ -50,15 +50,10 @@ FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe6
 # ca-certificates: TLS to the RPC / price / notification endpoints this bot
 #                  will talk to — verified through rustls's own root store,
 #                  not OpenSSL, but the roots themselves still come from here.
-# libssl3:         not linked by today's binary (it is rustls-only, see the
-#                  builder stage); kept only so a future dependency that does
-#                  link OpenSSL does not fail at container start instead of
-#                  at build time.
 # procps:          provides `pgrep`, used by HEALTHCHECK below — not installed
 #                  in bookworm-slim by default.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    libssl3 \
     procps \
     && rm -rf /var/lib/apt/lists/*
 

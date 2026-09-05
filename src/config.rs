@@ -84,7 +84,8 @@ pub struct ChainConfig {
     /// The Soroban RPC endpoint.
     pub rpc_url: String,
     /// Header name and secret value for a keyed RPC provider, both or
-    /// neither.
+    /// neither. `Args::chain` validates the header name is one `reqwest`
+    /// accepts before this is built.
     pub rpc_api_key: Option<(String, Secret)>,
     /// Inclusion-fee floor for a normal-priority transaction, in stroops.
     pub base_fee: u32,
@@ -142,24 +143,40 @@ pub struct Args {
     #[arg(long, env = "HIGH_FEE", default_value_t = 10_000)]
     pub high_fee: u32,
 
-    /// Ledgers a submitted transaction stays valid and is polled for.
-    #[arg(long, env = "TX_POLL_LEDGERS", default_value_t = 3)]
+    /// Ledgers a submitted transaction stays valid and is polled for. Must
+    /// be at least 1: the ledger bound is exclusive, so a zero window would
+    /// make every transaction unlandable before it starts.
+    #[arg(
+        long,
+        env = "TX_POLL_LEDGERS",
+        default_value_t = 3,
+        value_parser = clap::value_parser!(u32).range(1..),
+    )]
     pub tx_poll_ledgers: u32,
 }
 
 impl Args {
     /// The chain configuration, reading `RPC_API_KEY` from the environment.
+    /// An empty value counts as absent, the same as the variable not being
+    /// set at all — a shell that exports `RPC_API_KEY=` should not silently
+    /// behave differently from one that never set it.
     pub fn chain(&self) -> Result<ChainConfig, LiquidatorError> {
-        self.chain_with_secret(std::env::var("RPC_API_KEY").ok())
+        self.chain_with_secret(
+            std::env::var("RPC_API_KEY")
+                .ok()
+                .filter(|key| !key.is_empty()),
+        )
     }
 
     /// The chain configuration with the API key supplied by the caller —
     /// what `chain` does after reading the environment, separated so tests
-    /// never touch process-global state.
+    /// never touch process-global state. `Some(String::new())` is treated as
+    /// `None`, the same as `chain` does for an empty environment variable.
     pub fn chain_with_secret(
         &self,
         rpc_api_key: Option<String>,
     ) -> Result<ChainConfig, LiquidatorError> {
+        let rpc_api_key = rpc_api_key.filter(|key| !key.is_empty());
         let network_passphrase = match (&self.network_passphrase, self.network) {
             (Some(passphrase), _) => passphrase.clone(),
             (None, Some(name)) => name.passphrase().to_string(),
@@ -173,6 +190,11 @@ impl Args {
             .rpc_url
             .clone()
             .ok_or_else(|| LiquidatorError::Config("RPC_URL is required".to_string()))?;
+        if let Some(header) = &self.rpc_api_key_header {
+            reqwest::header::HeaderName::from_bytes(header.as_bytes()).map_err(|_| {
+                LiquidatorError::Config("RPC_API_KEY_HEADER is not a valid header name".to_string())
+            })?;
+        }
         let rpc_api_key = match (&self.rpc_api_key_header, rpc_api_key) {
             (Some(header), Some(key)) => Some((header.clone(), Secret::new(key))),
             (None, None) => None,
@@ -336,6 +358,66 @@ mod tests {
     #[test]
     fn the_api_key_is_not_a_command_line_argument() {
         assert!(Args::try_parse_from(["liquidator", "--rpc-api-key", "k"]).is_err());
+    }
+
+    /// `RPC_API_KEY=` (set but empty) must behave exactly like the variable
+    /// being unset, in both `chain` (via an empty environment read) and
+    /// `chain_with_secret` (via a bare `Some(String::new())`).
+    #[test]
+    fn an_empty_api_key_counts_as_absent() {
+        let with_header = parse(&[
+            "liquidator",
+            "--network",
+            "mainnet",
+            "--rpc-url",
+            "http://rpc",
+            "--rpc-api-key-header",
+            "X-Api-Key",
+        ]);
+        assert!(matches!(
+            with_header.chain_with_secret(Some(String::new())),
+            Err(LiquidatorError::Config(_))
+        ));
+        let without_header = parse(&[
+            "liquidator",
+            "--network",
+            "mainnet",
+            "--rpc-url",
+            "http://rpc",
+        ]);
+        let chain = without_header
+            .chain_with_secret(Some(String::new()))
+            .unwrap();
+        assert_eq!(chain.rpc_api_key, None);
+    }
+
+    /// `ChainConfig`'s doc claims the header name is validated; this is
+    /// where that validation happens, since `ChainConfig` itself has no
+    /// constructor of its own that could enforce it.
+    #[test]
+    fn an_invalid_api_key_header_name_is_a_config_error() {
+        let args = parse(&[
+            "liquidator",
+            "--network",
+            "mainnet",
+            "--rpc-url",
+            "http://rpc",
+            "--rpc-api-key-header",
+            "bad header",
+        ]);
+        assert!(matches!(
+            args.chain_with_secret(Some("k".to_string())),
+            Err(LiquidatorError::Config(_))
+        ));
+    }
+
+    /// The transaction's ledger bound is exclusive, so `TX_POLL_LEDGERS=0`
+    /// would make every transaction unlandable before it starts. Refusing
+    /// it at parse time means the failure is a startup error, not a bot that
+    /// runs and never lands a fill.
+    #[test]
+    fn a_zero_poll_window_is_refused_at_parse() {
+        assert!(Args::try_parse_from(["liquidator", "--tx-poll-ledgers", "0"]).is_err());
     }
 
     /// The global safety invariant applied to configuration: a secret must

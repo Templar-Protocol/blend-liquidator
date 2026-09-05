@@ -11,8 +11,8 @@ the ScVal/ledger-entry codecs (`chain::xdr`); Phase 2 landed the chain layer
 (`chain::rpc`, `chain::pool`, `chain::signer`, `chain::tx`), which can read a
 pool and sign and submit a transaction but is not yet driven by anything.
 The binary itself still just parses configuration, sets up logging and
-exits: there is no bot loop, pool client, or executor yet. The repository
-scaffolding is complete and enforced.
+exits: there is no bot loop or executor yet. The repository scaffolding is
+complete and enforced.
 
 **This bot is NOT non-custodial.** It is designed to hold a signing key and
 submit transactions itself — that is the point of a liquidation bot. Treat

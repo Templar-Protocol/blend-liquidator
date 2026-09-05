@@ -15,7 +15,7 @@ use crate::chain::rpc::{RpcClient, SimulationOutcome};
 use crate::chain::xdr::decode::{self, PoolInstance};
 use crate::chain::xdr::encode::{
     address, invoke_contract_op, request, simulation_envelope, stellar_asset, vec as sc_vec,
-    Request,
+    FillPercent, Request,
 };
 use crate::chain::xdr::{keys, AuctionType, XdrError};
 use crate::chain::ChainError;
@@ -47,23 +47,18 @@ pub fn submit_op(
     )
 }
 
-/// `new_auction(auction_type, user, bid, lot, percent)`. `percent` is the
-/// contract's own range, 1 to 100 inclusive; anything else is refused
-/// before a request is built, rather than sent for the contract to reject.
+/// `new_auction(auction_type, user, bid, lot, percent)`. `percent` is a
+/// `FillPercent`, so the contract's 1 to 100 range is already validated by
+/// construction — never checked again here, and never sent out of range for
+/// the contract to reject.
 pub fn new_auction_op(
     pool: &str,
     auction_type: AuctionType,
     user: &str,
     bid: &[&str],
     lot: &[&str],
-    percent: u32,
+    percent: FillPercent,
 ) -> Result<Operation, XdrError> {
-    if !(1..=100).contains(&percent) {
-        return Err(XdrError::Shape {
-            expected: "percent 1..=100",
-            got: percent.to_string(),
-        });
-    }
     let addresses = |assets: &[&str]| {
         assets
             .iter()
@@ -79,7 +74,7 @@ pub fn new_auction_op(
             address(user)?,
             addresses(bid)?,
             addresses(lot)?,
-            ScVal::U32(percent),
+            ScVal::U32(percent.get()),
         ],
     )
 }
@@ -150,8 +145,8 @@ pub struct PoolReader<'a> {
     pool: &'a str,
 }
 
-/// How many times `PoolReader::snapshot` retries a ledger that moved
-/// between reads before giving up.
+/// How many attempts `snapshot` makes; a moved ledger is retried until the
+/// last.
 const SNAPSHOT_ATTEMPTS: usize = 3;
 
 fn same_ledger(expected: u32, actual: u32) -> Result<(), ChainError> {
@@ -254,11 +249,12 @@ impl<'a> PoolReader<'a> {
     /// full reserve and position read, then one oracle simulation per
     /// asset, and every one of those must describe the same ledger. A
     /// ledger can close in between, so a `ChainError::LedgerMoved` is
-    /// retried up to three times before it is returned to the caller. A
-    /// caller that still receives `LedgerMoved` after that should try again
-    /// on the next tick rather than treat the snapshot as valid — averaging
-    /// fields from two different ledgers is exactly the failure mode this
-    /// refusal exists to prevent.
+    /// retried across up to `SNAPSHOT_ATTEMPTS` attempts — two retries after
+    /// the first try — before it is returned to the caller. A caller that
+    /// still receives `LedgerMoved` after that should try again on the next
+    /// tick rather than treat the snapshot as valid — averaging fields from
+    /// two different ledgers is exactly the failure mode this refusal
+    /// exists to prevent.
     pub async fn snapshot(&self, users: &[&str]) -> Result<PoolSnapshot, ChainError> {
         let mut attempt = 1;
         loop {
@@ -381,7 +377,7 @@ mod tests {
     use super::*;
     use crate::chain::script::{scval_b64, transaction_data_b64, ScriptedRpc};
     use crate::chain::xdr::encode::{
-        i128_val, map, sc_address, symbol, to_base64, vec as sc_vec, RequestType,
+        i128_val, map, sc_address, symbol, to_base64, vec as sc_vec, FillPercent, RequestType,
     };
     use crate::chain::xdr::keys;
     use crate::fixture::{mainnet_fixed_v2, text};
@@ -429,8 +425,16 @@ mod tests {
 
     #[test]
     fn new_auction_op_and_bad_debt_op_match_the_contract_signatures() {
-        let op =
-            new_auction_op(POOL, AuctionType::UserLiquidation, USER, &[USDC], &[], 50).unwrap();
+        let percent = FillPercent::try_from(50).expect("50 is in range");
+        let op = new_auction_op(
+            POOL,
+            AuctionType::UserLiquidation,
+            USER,
+            &[USDC],
+            &[],
+            percent,
+        )
+        .unwrap();
         let (function, args) = invoke(&op);
         assert_eq!(function, "new_auction");
         assert_eq!(args[0], ScVal::U32(0));
@@ -446,34 +450,9 @@ mod tests {
             USER,
             &["not-an-address"],
             &[],
-            50
+            percent
         )
         .is_err());
-    }
-
-    #[test]
-    fn new_auction_op_rejects_a_percent_outside_one_to_a_hundred() {
-        for percent in [0, 101] {
-            let error = new_auction_op(
-                POOL,
-                AuctionType::UserLiquidation,
-                USER,
-                &[USDC],
-                &[],
-                percent,
-            )
-            .unwrap_err();
-            assert!(
-                matches!(
-                    error,
-                    XdrError::Shape {
-                        expected: "percent 1..=100",
-                        ..
-                    }
-                ),
-                "{error:?}"
-            );
-        }
     }
 
     fn entry(key: &stellar_xdr::LedgerKey, xdr: &str) -> Value {
