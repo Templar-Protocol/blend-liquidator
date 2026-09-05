@@ -139,9 +139,10 @@ impl Reserve {
     }
 
     /// Accrues interest to `now` exactly as the contract's `Reserve::load`:
-    /// no-op within the same second, time-stamp only when nothing is
-    /// supplied or borrowed, otherwise update `ir_mod`, `d_rate`, the
-    /// backstop credit and `b_rate`. `now` before `last_time` is invalid.
+    /// no-op within the same second; time-stamp only when `b_supply` is zero
+    /// (nothing supplied, whatever `d_supply` says) or utilisation is zero
+    /// (nothing borrowed); otherwise update `ir_mod`, `d_rate`, the backstop
+    /// credit and `b_rate`. `now` before `last_time` is invalid.
     pub fn accrue(&mut self, bstop_rate: u32, now: u64) -> Result<(), MathError> {
         if now == self.data.last_time {
             return Ok(());
@@ -415,10 +416,18 @@ mod tests {
         reserve.accrue(2_000_000, 100).expect("accrues");
         assert_eq!(reserve.data.d_rate, 1_100_000_000_000);
         assert_eq!(reserve.data.last_time, 100);
+    }
+
+    #[test]
+    fn accrue_only_stamps_time_when_nothing_is_supplied() {
         let mut empty = simple_reserve();
         empty.data.b_supply = 0;
+        let before = empty.data.clone();
         empty.accrue(2_000_000, 100).expect("accrues");
         assert_eq!(empty.data.last_time, 100);
+        assert_eq!(empty.data.d_rate, before.d_rate);
+        assert_eq!(empty.data.b_rate, before.b_rate);
+        assert_eq!(empty.data.ir_mod, before.ir_mod);
     }
 
     #[test]

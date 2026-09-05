@@ -483,9 +483,11 @@ executor handed `DryRun` fails, so the two cannot be mixed up.
 3. Sign and send on the filler queue; await the classified result.
 4. On success: record the fill, consume the reservation, refresh inventory,
    enqueue unwind, notify.
-5. On a send failure or timeout: the queue retries with backoff. On a
-   contract failure: release the reservation, record the outcome, and let the
-   next tick re-evaluate with fresh chain state.
+5. On a send failure: the queue retries with backoff; a sequence error or a
+   timeout instead follows section 8 — re-plan before any resend, and never
+   resend a stale plan. On a contract failure: release the reservation,
+   record the outcome, and let the next tick re-evaluate with fresh chain
+   state.
 
 Dry-run stops after logging and recording the plan; it takes no reservation
 and sends nothing.
@@ -665,7 +667,10 @@ after a cursor fell out of the retained window, unfunded fill skipped.
 - `config.rs`: strict dry-run parsing, redaction, pools file validation,
   decimal-to-fixed-point conversion bounds.
 - `queue.rs`, `inventory.rs`, `executor.rs`: ordering, retry budgets,
-  reservation typestates, the four settlement guards.
+  reservation typestates, the four settlement guards, and the re-plan a
+  sequence error forces — including the overlap case where the winner's
+  partial fill leaves the auction open and the loser must plan against the
+  remainder.
 - `chain/tx.rs`: a scripted localhost JSON-RPC server driving the real client
   through restore, `TRY_AGAIN_LATER`, timeout, and decoded-error paths.
 
