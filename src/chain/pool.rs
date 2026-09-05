@@ -91,7 +91,10 @@ pub struct PoolSnapshot {
     /// Instance storage: admin, backstop, config.
     pub instance: PoolInstance,
     /// Reserves keyed by `config.index`, the key `Positions` uses, as
-    /// stored — not yet accrued.
+    /// stored — not yet accrued. Indexes are unique by construction in the
+    /// contract's reserve list; `PoolReader::snapshot` fails with
+    /// `ChainError::Shape` rather than silently overwrite one if two ever
+    /// collide.
     pub reserves: BTreeMap<u32, Reserve>,
     /// Asset address to reserve index.
     pub asset_index: BTreeMap<String, u32>,
@@ -265,8 +268,14 @@ impl<'a> PoolReader<'a> {
                     .data,
             )?;
             let reserve = Reserve::new(asset.clone(), config, data)?;
-            asset_index.insert(asset.clone(), reserve.config.index);
-            reserves.insert(reserve.config.index, reserve);
+            let index = reserve.config.index;
+            asset_index.insert(asset.clone(), index);
+            if reserves.insert(index, reserve).is_some() {
+                return Err(ChainError::Shape(format!(
+                    "pool {} lists two reserves with index {index}",
+                    self.pool
+                )));
+            }
         }
 
         let mut positions = BTreeMap::new();
@@ -460,6 +469,50 @@ mod tests {
         }
     }
 
+    /// Like `script_fixture`, but the second reserve's `ResConfig` entry is
+    /// swapped for the first reserve's, so both decode to `config.index` 0
+    /// — the collision `snapshot` must refuse. The refusal happens before
+    /// any oracle read, so no simulation is scripted.
+    fn script_fixture_with_duplicate_index(rpc: &ScriptedRpc, fixture: &Value, ledger: u32) {
+        rpc.expect(
+            "getLedgerEntries",
+            json!({"latestLedger": ledger, "entries": [
+                entry(&keys::instance(POOL).unwrap(), text(fixture, &["instance_entry_xdr"])),
+                entry(&keys::reserve_list(POOL).unwrap(), text(fixture, &["res_list_entry_xdr"])),
+            ]}),
+        );
+        let reserves = fixture["reserves"].as_array().unwrap();
+        let duplicate_config = reserves[0]["config_entry_xdr"].as_str().unwrap();
+        let mut entries = Vec::new();
+        for (index, reserve) in reserves.iter().enumerate() {
+            let asset = reserve["asset"].as_str().unwrap();
+            let config_xdr = if index == 1 {
+                duplicate_config
+            } else {
+                reserve["config_entry_xdr"].as_str().unwrap()
+            };
+            entries.push(entry(
+                &keys::reserve_config(POOL, asset).unwrap(),
+                config_xdr,
+            ));
+            entries.push(entry(
+                &keys::reserve_data(POOL, asset).unwrap(),
+                reserve["data_entry_xdr"].as_str().unwrap(),
+            ));
+        }
+        for user in fixture["users"].as_array().unwrap() {
+            let account = user["account"].as_str().unwrap();
+            entries.push(entry(
+                &keys::positions(POOL, account).unwrap(),
+                user["positions_entry_xdr"].as_str().unwrap(),
+            ));
+        }
+        rpc.expect(
+            "getLedgerEntries",
+            json!({"latestLedger": ledger, "entries": entries}),
+        );
+    }
+
     /// The payoff: read through the client, value through `math`, and land
     /// on the same golden health factors `chain::xdr::decode`'s test derives
     /// from the same attested inputs.
@@ -527,6 +580,25 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, ChainError::LedgerMoved { .. }), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_refuses_two_reserves_with_one_index() {
+        let fixture = mainnet_fixed_v2();
+        let ledger = u32::try_from(fixture["ledger"].as_u64().unwrap()).unwrap();
+        let rpc = ScriptedRpc::start().await;
+        script_fixture_with_duplicate_index(&rpc, &fixture, ledger);
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let error = PoolReader::new(&client, POOL)
+            .snapshot(&[USER])
+            .await
+            .unwrap_err();
+        let ChainError::Shape(message) = error else {
+            panic!("expected a shape error, got {error:?}")
+        };
+        assert!(message.contains("two reserves with index"), "{message}");
+        // The collision is caught before any oracle read.
+        assert!(rpc.calls("simulateTransaction").is_empty());
     }
 
     #[tokio::test]
