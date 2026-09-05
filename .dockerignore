@@ -33,6 +33,9 @@ rust-toolchain.toml
 # Test-only sources — not part of the release binary build
 tests/
 
+# Example-only sources — not part of the release binary build
+examples/
+
 # Used to build/run the image from the host, not needed inside it
 Makefile
 docker-compose.yml
