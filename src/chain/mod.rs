@@ -14,10 +14,12 @@ pub mod rpc;
 #[cfg(test)]
 pub(crate) mod script;
 pub mod signer;
+pub mod tx;
 pub mod xdr;
 
 pub use rpc::RpcClient;
 pub use signer::{Network, Signer};
+pub use tx::{Prepared, Priority, Submitter, TxConfig, TxOutcome};
 
 /// A failure anywhere between the bot and the chain.
 ///
