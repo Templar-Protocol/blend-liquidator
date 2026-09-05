@@ -10,7 +10,7 @@
 //! returns it, because a snapshot used for a decision must never be older
 //! than the tick that triggered it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use reqwest::header::{HeaderName, HeaderValue};
@@ -362,19 +362,23 @@ impl RpcClient {
 impl RpcClient {
     /// `getLedgerEntries` for every key, in batches of 200. Every batch must
     /// report the same `latestLedger`, or the result would describe two
-    /// ledgers: a moved ledger is `LedgerMoved` and the caller retries.
+    /// ledgers: a moved ledger is `LedgerMoved` and the caller retries. An
+    /// entry whose key was not among those requested is dropped rather than
+    /// trusted, so `LedgerEntries::len` and lookups stay keyed only by what
+    /// the caller asked for, regardless of what an RPC hands back.
     pub async fn ledger_entries(&self, keys: &[LedgerKey]) -> Result<LedgerEntries, ChainError> {
         if keys.is_empty() {
             return Err(ChainError::Config(
                 "getLedgerEntries needs at least one key",
             ));
         }
+        let encoded_keys: Vec<String> = keys.iter().map(to_base64).collect::<Result<_, _>>()?;
+        let requested: BTreeSet<&str> = encoded_keys.iter().map(String::as_str).collect();
         let mut latest_ledger = None;
         let mut entries = BTreeMap::new();
-        for batch in keys.chunks(ENTRY_BATCH) {
-            let encoded: Vec<String> = batch.iter().map(to_base64).collect::<Result<_, _>>()?;
+        for batch in encoded_keys.chunks(ENTRY_BATCH) {
             let raw: RawEntries = self
-                .call("getLedgerEntries", json!({ "keys": encoded }))
+                .call("getLedgerEntries", json!({ "keys": batch }))
                 .await?;
             match latest_ledger {
                 None => latest_ledger = Some(raw.latest_ledger),
@@ -387,6 +391,13 @@ impl RpcClient {
                 Some(_) => {}
             }
             for entry in raw.entries {
+                if !requested.contains(entry.key.as_str()) {
+                    tracing::warn!(
+                        key = entry.key,
+                        "the RPC returned an entry that was not requested"
+                    );
+                    continue;
+                }
                 let data = from_base64(&entry.xdr)?;
                 entries.insert(
                     entry.key,
@@ -1053,6 +1064,34 @@ mod tests {
         // The request carried both keys, base64.
         let params = rpc.calls("getLedgerEntries");
         assert_eq!(params[0]["keys"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn ledger_entries_ignore_an_entry_that_was_not_requested() {
+        let instance = keys::instance(POOL).unwrap();
+        let positions = keys::positions(POOL, ACCOUNT).unwrap();
+        let fixture = crate::fixture::mainnet_fixed_v2();
+        let instance_xdr = crate::fixture::text(&fixture, &["instance_entry_xdr"]);
+        let rpc = ScriptedRpc::start().await;
+        rpc.expect(
+            "getLedgerEntries",
+            json!({"latestLedger": 64_271_347, "entries": [
+                {"key": encode::to_base64(&instance).unwrap(), "xdr": instance_xdr,
+                 "lastModifiedLedgerSeq": 61_962_028, "liveUntilLedgerSeq": 64_814_477},
+                {"key": encode::to_base64(&positions).unwrap(), "xdr": instance_xdr,
+                 "lastModifiedLedgerSeq": 61_962_028}
+            ]}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        // Only the instance key was requested; the RPC hands back an entry
+        // for the positions key too, which must not count or be reachable.
+        let entries = client
+            .ledger_entries(std::slice::from_ref(&instance))
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries.get(&positions).unwrap().is_none());
+        assert!(entries.get(&instance).unwrap().is_some());
     }
 
     #[tokio::test]
