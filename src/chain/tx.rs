@@ -468,6 +468,24 @@ impl Submitter<'_> {
             tokio::time::sleep(self.config.poll_interval).await;
         }
     }
+
+    /// The whole write path: prepare, send, wait.
+    pub async fn submit(
+        &self,
+        operation: Operation,
+        priority: Priority,
+    ) -> Result<TxOutcome, ChainError> {
+        let prepared = self.prepare(operation, priority).await?;
+        tracing::info!(
+            hash = %prepared.hash,
+            sequence = prepared.sequence,
+            max_ledger = prepared.max_ledger,
+            fee = prepared.fee,
+            "sending transaction"
+        );
+        self.send(&prepared).await?;
+        self.wait(&prepared).await
+    }
 }
 
 #[cfg(test)]
@@ -754,5 +772,272 @@ mod tests {
             rpc.calls("sendTransaction").is_empty(),
             "nothing is sent after a failed simulation"
         );
+    }
+
+    fn prepared(max_ledger: u32) -> Prepared {
+        let envelope = crate::chain::xdr::encode::simulation_envelope(operation()).unwrap();
+        Prepared {
+            envelope,
+            hash: TxHash([0x42; 32]),
+            sequence: 42,
+            max_ledger,
+            fee: 100,
+            resource_fee: 0,
+        }
+    }
+
+    fn submitter_for<'a>(
+        client: &'a RpcClient,
+        network: &'a Network,
+        signer: &'a Signer,
+    ) -> Submitter<'a> {
+        // The test config: millisecond pauses, a 200 ms wait cap.
+        Submitter::new(client, network, signer, config())
+    }
+
+    #[tokio::test]
+    async fn send_retries_try_again_later_exactly_once() {
+        let hash = "42".repeat(32);
+        let rpc = ScriptedRpc::start().await;
+        rpc.expect(
+            "sendTransaction",
+            json!({"status": "TRY_AGAIN_LATER", "hash": hash, "latestLedger": 1}),
+        );
+        rpc.expect(
+            "sendTransaction",
+            json!({"status": "PENDING", "hash": hash, "latestLedger": 1}),
+        );
+        rpc.expect(
+            "sendTransaction",
+            json!({"status": "TRY_AGAIN_LATER", "hash": hash, "latestLedger": 1}),
+        );
+        rpc.expect(
+            "sendTransaction",
+            json!({"status": "TRY_AGAIN_LATER", "hash": hash, "latestLedger": 1}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let (network, signer) = (Network::testnet(), signer());
+        let submitter = submitter_for(&client, &network, &signer);
+        submitter.send(&prepared(104)).await.unwrap();
+        assert!(matches!(
+            submitter.send(&prepared(104)).await.unwrap_err(),
+            ChainError::Rejected(_)
+        ));
+        assert_eq!(rpc.calls("sendTransaction").len(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_bad_sequence_at_send_is_bad_sequence_and_other_rejections_are_rejected() {
+        let hash = "42".repeat(32);
+        let rpc = ScriptedRpc::start().await;
+        rpc.expect(
+            "sendTransaction",
+            json!({"status": "ERROR", "hash": hash, "latestLedger": 1,
+                   "errorResultXdr": result_b64(TransactionResultResult::TxBadSeq)}),
+        );
+        rpc.expect(
+            "sendTransaction",
+            json!({"status": "ERROR", "hash": hash, "latestLedger": 1,
+                   "errorResultXdr": result_b64(TransactionResultResult::TxInsufficientFee)}),
+        );
+        rpc.expect(
+            "sendTransaction",
+            json!({"status": "DUPLICATE", "hash": hash, "latestLedger": 1}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let (network, signer) = (Network::testnet(), signer());
+        let submitter = submitter_for(&client, &network, &signer);
+        assert!(matches!(
+            submitter.send(&prepared(104)).await.unwrap_err(),
+            ChainError::BadSequence
+        ));
+        assert!(matches!(
+            submitter.send(&prepared(104)).await.unwrap_err(),
+            ChainError::Rejected(_)
+        ));
+        submitter.send(&prepared(104)).await.unwrap();
+    }
+
+    #[test]
+    fn classify_decides_from_the_status_and_the_ledger_bound() {
+        let prepared = prepared(104);
+        let success = TransactionStatus::Success {
+            ledger: 102,
+            latest_ledger: 102,
+            return_value: Some(ScVal::U32(7)),
+        };
+        assert!(matches!(
+            classify(success, &prepared),
+            Some(TxOutcome::Succeeded {
+                ledger: 102,
+                return_value: Some(ScVal::U32(7)),
+                ..
+            })
+        ));
+        let result: TransactionResult = from_base64(&result_b64(
+            TransactionResultResult::TxFailed(VecM::default()),
+        ))
+        .unwrap();
+        let failed = TransactionStatus::Failed {
+            ledger: 103,
+            latest_ledger: 103,
+            result,
+            contract_error: Some(1205),
+        };
+        assert!(matches!(
+            classify(failed, &prepared),
+            Some(TxOutcome::Failed {
+                ledger: 103,
+                contract_error: Some(1205),
+                ..
+            })
+        ));
+        assert!(classify(
+            TransactionStatus::NotFound { latest_ledger: 103 },
+            &prepared
+        )
+        .is_none());
+        assert!(matches!(
+            classify(
+                TransactionStatus::NotFound { latest_ledger: 104 },
+                &prepared
+            ),
+            Some(TxOutcome::Expired {
+                max_ledger: 104,
+                latest_ledger: 104,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn wait_polls_until_a_terminal_status_or_expiry() {
+        let rpc = ScriptedRpc::start().await;
+        let not_found = |latest: u32| json!({"status": "NOT_FOUND", "latestLedger": latest, "oldestLedger": 1, "ledger": 0});
+        rpc.expect("getTransaction", not_found(101));
+        rpc.expect("getTransaction", not_found(102));
+        rpc.expect(
+            "getTransaction",
+            json!({"status": "SUCCESS", "latestLedger": 102, "oldestLedger": 1, "ledger": 102,
+                   "resultXdr": result_b64(TransactionResultResult::TxSuccess(VecM::default())),
+                   "resultMetaXdr": meta_v4_b64(Some(ScVal::U32(7)), vec![])}),
+        );
+        rpc.expect("getTransaction", not_found(104));
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let (network, signer) = (Network::testnet(), signer());
+        let submitter = submitter_for(&client, &network, &signer);
+        let outcome = submitter.wait(&prepared(104)).await.unwrap();
+        assert!(
+            matches!(
+                outcome,
+                TxOutcome::Succeeded {
+                    ledger: 102,
+                    return_value: Some(ScVal::U32(7)),
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(rpc.calls("getTransaction").len(), 3);
+        let expired = submitter.wait(&prepared(104)).await.unwrap();
+        assert!(
+            matches!(
+                expired,
+                TxOutcome::Expired {
+                    max_ledger: 104,
+                    latest_ledger: 104,
+                    ..
+                }
+            ),
+            "{expired:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_reports_a_failed_transaction_with_its_contract_error() {
+        let rpc = ScriptedRpc::start().await;
+        let failed = TransactionResultResult::TxFailed(VecM::default());
+        rpc.expect(
+            "getTransaction",
+            json!({"status": "FAILED", "latestLedger": 103, "oldestLedger": 1, "ledger": 103,
+                   "resultXdr": result_b64(failed), "resultMetaXdr": meta_v4_b64(None, vec![]),
+                   "diagnosticEventsXdr": [diagnostic_error_b64(1205)]}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let (network, signer) = (Network::testnet(), signer());
+        let submitter = submitter_for(&client, &network, &signer);
+        let outcome = submitter.wait(&prepared(104)).await.unwrap();
+        assert!(
+            matches!(
+                outcome,
+                TxOutcome::Failed {
+                    ledger: 103,
+                    contract_error: Some(1205),
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_is_unknown_when_the_rpc_cannot_answer_for_the_whole_window() {
+        // Nothing scripted: every poll is an HTTP 500, which is transient
+        // from the caller's point of view, so wait keeps trying until its cap.
+        let rpc = ScriptedRpc::start().await;
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let (network, signer) = (Network::testnet(), signer());
+        let submitter = submitter_for(&client, &network, &signer);
+        let started = Instant::now();
+        let outcome = submitter.wait(&prepared(104)).await.unwrap();
+        assert!(
+            matches!(
+                outcome,
+                TxOutcome::Unknown {
+                    sequence: 42,
+                    max_ledger: 104,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert!(rpc.calls("getTransaction").len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn submit_runs_the_whole_path() {
+        let rpc = ScriptedRpc::start().await;
+        script_account(&rpc, 41, 100);
+        script_fees(&rpc, 200, 200);
+        script_simulation(&rpc, 300, 100, None);
+        rpc.expect(
+            "sendTransaction",
+            json!({"status": "PENDING", "hash": "77".repeat(32), "latestLedger": 100}),
+        );
+        rpc.expect(
+            "getTransaction",
+            json!({"status": "SUCCESS", "latestLedger": 101, "oldestLedger": 1, "ledger": 101,
+                   "resultXdr": result_b64(TransactionResultResult::TxSuccess(VecM::default())),
+                   "resultMetaXdr": meta_v4_b64(Some(ScVal::I32(-1)), vec![])}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let (network, signer) = (Network::testnet(), signer());
+        let submitter = submitter_for(&client, &network, &signer);
+        let outcome = submitter.submit(operation(), Priority::High).await.unwrap();
+        let TxOutcome::Succeeded {
+            ledger,
+            return_value,
+            hash,
+        } = outcome
+        else {
+            panic!("succeeded")
+        };
+        assert_eq!((ledger, return_value), (101, Some(ScVal::I32(-1))));
+        // The hash polled is the hash of the envelope that was sent.
+        let sent = sent_transaction(&rpc, 0);
+        assert_eq!(sent.fee, 10_000 + 300);
+        assert_eq!(rpc.calls("getTransaction")[0]["hash"], hash.to_hex());
+        assert_eq!(rpc.remaining(), 0);
     }
 }
