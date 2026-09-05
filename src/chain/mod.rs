@@ -10,7 +10,12 @@
 use crate::chain::xdr::XdrError;
 use crate::math::MathError;
 
+pub mod rpc;
+#[cfg(test)]
+pub(crate) mod script;
 pub mod xdr;
+
+pub use rpc::RpcClient;
 
 /// A failure anywhere between the bot and the chain.
 ///
