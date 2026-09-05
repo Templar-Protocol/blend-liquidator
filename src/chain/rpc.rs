@@ -34,6 +34,13 @@ use crate::config::ChainConfig;
 /// sensitive: its `Debug` prints `Sensitive` rather than the bytes, so the
 /// derived `Debug` on this struct — and any `tracing::debug!(?client)` — can
 /// never put the key in a log line.
+///
+/// `url` renders in full through that same derived `Debug`: the crate
+/// treats the RPC URL as configuration, not a secret. A provider whose
+/// authentication is keyed through the URL path itself (rather than a
+/// header) must not be used that way with this client — pass the key
+/// through the header form (`api_key`) instead, or it ends up in a log line
+/// the moment something debug-prints the client.
 #[derive(Debug, Clone)]
 pub struct RpcClient {
     http: reqwest::Client,
