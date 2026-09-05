@@ -972,6 +972,16 @@ mod tests {
             Err(ChainError::Config(_))
         ));
     }
+
+    /// The key is a secret: the client's `Debug` must never render it.
+    #[test]
+    fn the_api_key_never_appears_in_the_clients_debug_rendering() {
+        let client = RpcClient::new("http://localhost", Some(("X-Api-Key", "secret-123"))).unwrap();
+        let rendered = format!("{client:?}");
+        assert!(rendered.contains("x-api-key"), "{rendered}");
+        assert!(rendered.contains("Sensitive"), "{rendered}");
+        assert!(!rendered.contains("secret-123"), "{rendered}");
+    }
 }
 ```
 
@@ -1007,6 +1017,9 @@ use crate::chain::ChainError;
 use crate::config::ChainConfig;
 
 /// A connected client. Cheap to clone: `reqwest::Client` is a handle.
+///
+/// The API key is held as a *sensitive* `HeaderValue`, which renders as
+/// `Sensitive`, so the derived `Debug` can never put it in a log line.
 #[derive(Debug, Clone)]
 pub struct RpcClient {
     http: reqwest::Client,
@@ -1093,8 +1106,12 @@ impl RpcClient {
             .map(|(name, value)| {
                 let name = HeaderName::from_bytes(name.as_bytes())
                     .map_err(|_| ChainError::Config("RPC_API_KEY_HEADER is not a valid header name"))?;
-                let value = HeaderValue::from_str(value)
+                let mut value = HeaderValue::from_str(value)
                     .map_err(|_| ChainError::Config("RPC_API_KEY is not a valid header value"))?;
+                // The key is a secret: a sensitive HeaderValue renders as
+                // `Sensitive` in Debug, so the derived Debug on RpcClient
+                // can never put it in a log line.
+                value.set_sensitive(true);
                 Ok::<_, ChainError>((name, value))
             })
             .transpose()?;
@@ -1168,7 +1185,7 @@ In `src/chain/mod.rs` add `pub mod rpc;` and `#[cfg(test)] pub(crate) mod script
 - [ ] **Step 5: Run the tests**
 
 Run: `cargo test --lib chain::rpc`
-Expected: 8 passed.
+Expected: 9 passed.
 
 - [ ] **Step 6: `make check`, then commit**
 
@@ -1662,7 +1679,7 @@ impl RpcClient {
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo test --lib chain::rpc`
-Expected: 15 passed.
+Expected: 16 passed.
 
 - [ ] **Step 5: `make check`, then commit**
 
@@ -2235,7 +2252,7 @@ The closure `missing` in `transaction` borrows `raw.status`, which `match raw.st
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo test --lib chain::rpc`
-Expected: 22 passed.
+Expected: 23 passed.
 
 - [ ] **Step 5: `make check`, then commit**
 
