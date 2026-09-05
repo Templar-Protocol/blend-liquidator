@@ -3149,7 +3149,7 @@ Append to the test module in `src/chain/tx.rs`:
         Prepared { envelope, hash: TxHash([0x42; 32]), sequence: 42, max_ledger, fee: 100, resource_fee: 0 }
     }
 
-    fn submitter_for(client: &RpcClient, network: &Network, signer: &Signer) -> Submitter<'_> {
+    fn submitter_for<'a>(client: &'a RpcClient, network: &'a Network, signer: &'a Signer) -> Submitter<'a> {
         // The test config: millisecond pauses, a 200 ms wait cap.
         Submitter::new(client, network, signer, config())
     }
