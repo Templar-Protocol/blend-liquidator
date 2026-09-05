@@ -20,6 +20,11 @@ use crate::chain::ChainError;
 use crate::config::ChainConfig;
 
 /// A connected client. Cheap to clone: `reqwest::Client` is a handle.
+///
+/// The API key, when configured, is stored as a `HeaderValue` marked
+/// sensitive: its `Debug` prints `Sensitive` rather than the bytes, so the
+/// derived `Debug` on this struct — and any `tracing::debug!(?client)` — can
+/// never put the key in a log line.
 #[derive(Debug, Clone)]
 pub struct RpcClient {
     http: reqwest::Client,
@@ -96,6 +101,9 @@ impl RpcClient {
     /// A client for `url`, sending `api_key` as `(header name, value)` on
     /// every request when given. Requests time out after 30 seconds and
     /// connections after 10.
+    ///
+    /// The value is marked as a sensitive header, so it never renders
+    /// through `Debug` — see the invariant on [`RpcClient`].
     pub fn new(url: &str, api_key: Option<(&str, &str)>) -> Result<Self, ChainError> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -107,8 +115,12 @@ impl RpcClient {
                 let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
                     ChainError::Config("RPC_API_KEY_HEADER is not a valid header name")
                 })?;
-                let value = HeaderValue::from_str(value)
+                let mut value = HeaderValue::from_str(value)
                     .map_err(|_| ChainError::Config("RPC_API_KEY is not a valid header value"))?;
+                // The key is a secret: a sensitive HeaderValue renders as
+                // `Sensitive` in Debug, so the derived Debug on RpcClient
+                // can never put it in a log line.
+                value.set_sensitive(true);
                 Ok::<_, ChainError>((name, value))
             })
             .transpose()?;
@@ -252,6 +264,15 @@ mod tests {
         client.health().await.unwrap();
         let requests = rpc.received().await;
         assert_eq!(requests[0].headers.get("x-api-key").unwrap(), "secret-123");
+    }
+
+    #[test]
+    fn the_api_key_never_appears_in_the_clients_debug_rendering() {
+        let client = RpcClient::new("http://localhost", Some(("X-Api-Key", "secret-123"))).unwrap();
+        let rendered = format!("{client:?}");
+        assert!(rendered.contains("x-api-key"), "{rendered}");
+        assert!(rendered.contains("Sensitive"), "{rendered}");
+        assert!(!rendered.contains("secret-123"), "{rendered}");
     }
 
     #[tokio::test]
