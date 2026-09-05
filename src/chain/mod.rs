@@ -13,9 +13,11 @@ use crate::math::MathError;
 pub mod rpc;
 #[cfg(test)]
 pub(crate) mod script;
+pub mod signer;
 pub mod xdr;
 
 pub use rpc::RpcClient;
+pub use signer::{Network, Signer};
 
 /// A failure anywhere between the bot and the chain.
 ///
