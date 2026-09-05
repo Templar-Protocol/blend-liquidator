@@ -51,16 +51,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`rpc`) for the eight methods the bot uses, with every base64 XDR field
   decoded at the boundary and every result carrying its ledger; pool reads
   (`pool`) that assemble one ledger's instance, reserves, oracle prices and
-  positions into a `PoolSnapshot` and refuse a ledger that moved between
-  reads; the network id and an Ed25519 `Signer` that renders as its address
-  only (`signer`); and the one write path (`tx`): build with a five-minute
-  time bound and a ledger bound of `TX_POLL_LEDGERS`, simulate, restore
-  archived entries, assemble, fee from the p70/p90 inclusion percentiles
-  floored at `BASE_FEE`/`HIGH_FEE`, sign, send with one `TRY_AGAIN_LATER`
-  retry, poll, and classify into succeeded, failed with the pool's error
-  code, expired (provably never included) or unknown. A `TxBadSeq` at send
-  is its own error, `BadSequence`, because the plan behind such a
-  transaction is stale and must be rebuilt.
+  positions into a `PoolSnapshot`, refuse a ledger that moved between reads,
+  and retry a moved ledger up to three times before giving up, since the
+  pool is read in several round trips and a ledger closing mid-read is
+  expected, not exceptional; `new_auction_op` rejects a `percent` outside
+  the contract's 1 to 100 range before a request is even built; the network
+  id and an Ed25519 `Signer` that renders as its address only (`signer`);
+  and the one write path (`tx`): build with a five-minute time bound and a
+  ledger bound of `TX_POLL_LEDGERS`, simulate, restore archived entries,
+  assemble, fee from the p70/p90 inclusion percentiles floored at
+  `BASE_FEE`/`HIGH_FEE`, sign, send with one `TRY_AGAIN_LATER` retry, poll,
+  and classify into succeeded, failed with the pool's error code, expired
+  (provably never included) or unknown. A `TxBadSeq` at send is its own
+  error, `BadSequence`, because the plan behind such a transaction is stale
+  and must be rebuilt. `wait_for` polls to that same outcome from a bare
+  hash, sequence and ledger bound — the fields an `Unknown` outcome carries
+  — so a submission queue can resume a transaction after a restart or a
+  send that timed out without resending it; `wait` is `wait_for` on the
+  fields a `Prepared` already holds.
 - Configuration for the chain: `NETWORK` or `NETWORK_PASSPHRASE`,
   `RPC_URL`, `RPC_API_KEY_HEADER` with `RPC_API_KEY` read from the
   environment only, `BASE_FEE`, `HIGH_FEE`, `TX_POLL_LEDGERS`.
