@@ -95,7 +95,7 @@ XDR facts (stellar-xdr 28.0.0): `Transaction { source_account: MuxedAccount, fee
 - Produces:
   - `pub enum chain::ChainError` (variants below) and `pub struct chain::TxHash([u8; 32])` with `to_hex()`, `from_hex()`, `Display`.
   - `pub enum config::NetworkName { Mainnet, Testnet }` with `passphrase()`.
-  - `pub struct config::ChainConfig { pub network_passphrase: String, pub rpc_url: String, pub rpc_api_key: Option<(String, String)>, pub base_fee: u32, pub high_fee: u32, pub tx_poll_ledgers: u32 }`.
+  - `pub struct config::Secret(String)` (redacting `Debug`, `Secret::new`, `expose(&self) -> &str`) and `pub struct config::ChainConfig { pub network_passphrase: String, pub rpc_url: String, pub rpc_api_key: Option<(String, Secret)>, pub base_fee: u32, pub high_fee: u32, pub tx_poll_ledgers: u32 }`.
   - `Args::chain(&self) -> Result<ChainConfig, LiquidatorError>` (reads `RPC_API_KEY` from the environment) and `Args::chain_with_secret(&self, rpc_api_key: Option<String>) -> Result<ChainConfig, LiquidatorError>`.
 
 - [ ] **Step 1: Add the dependencies**
@@ -347,7 +347,7 @@ Append to `src/config.rs`'s test module:
         assert!(matches!(with_header.chain_with_secret(None), Err(LiquidatorError::Config(_))));
         assert_eq!(
             with_header.chain_with_secret(Some("k".to_string())).unwrap().rpc_api_key,
-            Some(("X-Api-Key".to_string(), "k".to_string()))
+            Some(("X-Api-Key".to_string(), Secret::new("k")))
         );
         let without = parse(&base);
         assert!(matches!(without.chain_with_secret(Some("k".to_string())), Err(LiquidatorError::Config(_))));
@@ -358,6 +358,18 @@ Append to `src/config.rs`'s test module:
     #[test]
     fn the_api_key_is_not_a_command_line_argument() {
         assert!(Args::try_parse_from(["liquidator", "--rpc-api-key", "k"]).is_err());
+    }
+
+    /// Nor may it reach a log line through `Debug`.
+    #[test]
+    fn the_api_key_never_appears_in_a_debug_rendering() {
+        let args = parse(&["liquidator", "--network", "mainnet", "--rpc-url", "http://rpc", "--rpc-api-key-header", "X-Api-Key"]);
+        let config = args.chain_with_secret(Some("secret-123".to_string())).unwrap();
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("X-Api-Key"));
+        assert!(rendered.contains("Secret(<redacted>)"));
+        assert!(!rendered.contains("secret-123"));
+        assert_eq!(Secret::new("secret-123").expose(), "secret-123");
     }
 ```
 
@@ -391,6 +403,32 @@ impl NetworkName {
     }
 }
 
+/// A secret configuration value. Renders as `Secret(<redacted>)` so it can
+/// never reach a log line through `Debug`; the text is available only
+/// through `expose`, which every caller must name deliberately.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    /// Wraps the secret text.
+    #[must_use]
+    pub fn new(text: impl Into<String>) -> Self {
+        Self(text.into())
+    }
+
+    /// The secret text, for the one place that puts it on the wire.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(<redacted>)")
+    }
+}
+
 /// Everything the chain layer needs, validated. Built by [`Args::chain`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainConfig {
@@ -398,8 +436,9 @@ pub struct ChainConfig {
     pub network_passphrase: String,
     /// The Soroban RPC endpoint.
     pub rpc_url: String,
-    /// Header name and value for a keyed RPC provider, both or neither.
-    pub rpc_api_key: Option<(String, String)>,
+    /// Header name and secret value for a keyed RPC provider, both or
+    /// neither. The value is a `Secret`: it never renders.
+    pub rpc_api_key: Option<(String, Secret)>,
     /// Inclusion-fee floor for a normal-priority transaction, in stroops.
     pub base_fee: u32,
     /// Inclusion-fee floor for a high-priority transaction, in stroops.
@@ -472,7 +511,7 @@ impl Args {
             .clone()
             .ok_or_else(|| LiquidatorError::Config("RPC_URL is required".to_string()))?;
         let rpc_api_key = match (&self.rpc_api_key_header, rpc_api_key) {
-            (Some(header), Some(key)) => Some((header.clone(), key)),
+            (Some(header), Some(key)) => Some((header.clone(), Secret::new(key))),
             (None, None) => None,
             (Some(_), None) => {
                 return Err(LiquidatorError::Config(
@@ -1071,7 +1110,7 @@ impl RpcClient {
         let api_key = config
             .rpc_api_key
             .as_ref()
-            .map(|(name, value)| (name.as_str(), value.as_str()));
+            .map(|(name, value)| (name.as_str(), value.expose()));
         Self::new(&config.rpc_url, api_key)
     }
 
