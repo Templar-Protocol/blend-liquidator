@@ -47,7 +47,9 @@ pub fn submit_op(
     )
 }
 
-/// `new_auction(auction_type, user, bid, lot, percent)`.
+/// `new_auction(auction_type, user, bid, lot, percent)`. `percent` is the
+/// contract's own range, 1 to 100 inclusive; anything else is refused
+/// before a request is built, rather than sent for the contract to reject.
 pub fn new_auction_op(
     pool: &str,
     auction_type: AuctionType,
@@ -56,6 +58,12 @@ pub fn new_auction_op(
     lot: &[&str],
     percent: u32,
 ) -> Result<Operation, XdrError> {
+    if !(1..=100).contains(&percent) {
+        return Err(XdrError::Shape {
+            expected: "percent 1..=100",
+            got: percent.to_string(),
+        });
+    }
     let addresses = |assets: &[&str]| {
         assets
             .iter()
@@ -141,6 +149,10 @@ pub struct PoolReader<'a> {
     rpc: &'a RpcClient,
     pool: &'a str,
 }
+
+/// How many times `PoolReader::snapshot` retries a ledger that moved
+/// between reads before giving up.
+const SNAPSHOT_ATTEMPTS: usize = 3;
 
 fn same_ledger(expected: u32, actual: u32) -> Result<(), ChainError> {
     if expected == actual {
@@ -237,7 +249,38 @@ impl<'a> PoolReader<'a> {
     }
 
     /// One ledger's view of the pool for `users`.
+    ///
+    /// The pool is not read atomically: this makes the shape read, then the
+    /// full reserve and position read, then one oracle simulation per
+    /// asset, and every one of those must describe the same ledger. A
+    /// ledger can close in between, so a `ChainError::LedgerMoved` is
+    /// retried up to three times before it is returned to the caller. A
+    /// caller that still receives `LedgerMoved` after that should try again
+    /// on the next tick rather than treat the snapshot as valid — averaging
+    /// fields from two different ledgers is exactly the failure mode this
+    /// refusal exists to prevent.
     pub async fn snapshot(&self, users: &[&str]) -> Result<PoolSnapshot, ChainError> {
+        let mut attempt = 1;
+        loop {
+            match self.snapshot_once(users).await {
+                Err(ChainError::LedgerMoved { first, second }) if attempt < SNAPSHOT_ATTEMPTS => {
+                    tracing::debug!(
+                        pool = self.pool,
+                        first,
+                        second,
+                        attempt,
+                        "the ledger moved between reads; retrying the snapshot"
+                    );
+                    attempt += 1;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// One attempt at `snapshot`'s body: no retry, so a moved ledger comes
+    /// back as `ChainError::LedgerMoved` for the caller to decide about.
+    async fn snapshot_once(&self, users: &[&str]) -> Result<PoolSnapshot, ChainError> {
         let (ledger, instance, assets) = self.shape().await?;
         let mut wanted = Vec::with_capacity(assets.len() * 2 + users.len());
         for asset in &assets {
@@ -408,6 +451,31 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn new_auction_op_rejects_a_percent_outside_one_to_a_hundred() {
+        for percent in [0, 101] {
+            let error = new_auction_op(
+                POOL,
+                AuctionType::UserLiquidation,
+                USER,
+                &[USDC],
+                &[],
+                percent,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    XdrError::Shape {
+                        expected: "percent 1..=100",
+                        ..
+                    }
+                ),
+                "{error:?}"
+            );
+        }
+    }
+
     fn entry(key: &stellar_xdr::LedgerKey, xdr: &str) -> Value {
         json!({"key": to_base64(key).unwrap(), "xdr": xdr, "lastModifiedLedgerSeq": 1, "liveUntilLedgerSeq": 99_999_999})
     }
@@ -415,6 +483,26 @@ mod tests {
     fn simulation(return_xdr: &str, ledger: u32) -> Value {
         json!({"transactionData": transaction_data_b64(1), "events": [], "minResourceFee": "1",
                "results": [{"auth": [], "xdr": return_xdr}], "latestLedger": ledger})
+    }
+
+    /// Scripts just the shape read and a full read reporting `full_ledger`,
+    /// with no oracle simulation — a snapshot attempt whose full read
+    /// disagrees with the shape read never gets that far, so this is enough
+    /// to script one moved-ledger attempt without leaving unconsumed
+    /// simulation stubs for a later, successful attempt to trip over.
+    fn script_fixture_reads(rpc: &ScriptedRpc, fixture: &Value, full_ledger: u32) {
+        let ledger = fixture["ledger"].as_u64().unwrap();
+        rpc.expect(
+            "getLedgerEntries",
+            json!({"latestLedger": ledger, "entries": [
+                entry(&keys::instance(POOL).unwrap(), text(fixture, &["instance_entry_xdr"])),
+                entry(&keys::reserve_list(POOL).unwrap(), text(fixture, &["res_list_entry_xdr"])),
+            ]}),
+        );
+        rpc.expect(
+            "getLedgerEntries",
+            json!({"latestLedger": full_ledger, "entries": []}),
+        );
     }
 
     /// Scripts the fixture's ledger: the shape read, the full read, then the
@@ -573,6 +661,10 @@ mod tests {
         let fixture = mainnet_fixed_v2();
         let ledger = u32::try_from(fixture["ledger"].as_u64().unwrap()).unwrap();
         let rpc = ScriptedRpc::start().await;
+        // Three attempts, each one a moved ledger: snapshot retries twice
+        // and gives up on the third.
+        script_fixture(&rpc, &fixture, ledger + 1);
+        script_fixture(&rpc, &fixture, ledger + 1);
         script_fixture(&rpc, &fixture, ledger + 1);
         let client = RpcClient::new(&rpc.url(), None).unwrap();
         let error = PoolReader::new(&client, POOL)
@@ -580,6 +672,33 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, ChainError::LedgerMoved { .. }), "{error:?}");
+        assert_eq!(
+            rpc.calls("getLedgerEntries").len(),
+            6,
+            "three attempts of a shape read and a full read each"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_retries_a_moved_ledger_once_and_succeeds() {
+        let fixture = mainnet_fixed_v2();
+        let ledger = u32::try_from(fixture["ledger"].as_u64().unwrap()).unwrap();
+        let rpc = ScriptedRpc::start().await;
+        script_fixture_reads(&rpc, &fixture, ledger + 1); // moved: retried
+        script_fixture(&rpc, &fixture, ledger); // consistent: succeeds
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let users: Vec<&str> = fixture["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["account"].as_str().unwrap())
+            .collect();
+        let snapshot = PoolReader::new(&client, POOL)
+            .snapshot(&users)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.ledger, ledger);
+        assert_eq!(rpc.remaining(), 0);
     }
 
     #[tokio::test]
