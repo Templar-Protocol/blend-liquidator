@@ -3703,6 +3703,22 @@ mod tests {
         assert!(matches!(error, ChainError::LedgerMoved { .. }), "{error:?}");
     }
 
+    /// Two reserves with one index would value positions against the wrong
+    /// reserve; the snapshot refuses before it reads a single price.
+    #[tokio::test]
+    async fn a_snapshot_refuses_two_reserves_with_one_index() {
+        let mut fixture = mainnet_fixed_v2();
+        let first_config = fixture["reserves"][0]["config_entry_xdr"].clone();
+        fixture["reserves"][1]["config_entry_xdr"] = first_config;
+        let ledger = u32::try_from(fixture["ledger"].as_u64().unwrap()).unwrap();
+        let rpc = ScriptedRpc::start().await;
+        script_fixture(&rpc, &fixture, ledger);
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let error = PoolReader::new(&client, POOL).snapshot(&[USER]).await.unwrap_err();
+        assert!(matches!(&error, ChainError::Shape(message) if message.contains("two reserves with index")), "{error:?}");
+        assert!(rpc.calls("simulateTransaction").is_empty());
+    }
+
     #[tokio::test]
     async fn a_user_without_a_positions_entry_has_empty_positions() {
         let fixture = mainnet_fixed_v2();
@@ -4002,8 +4018,16 @@ impl<'a> PoolReader<'a> {
                 &entries.get(&keys::reserve_data(self.pool, asset)?)?.ok_or_else(|| missing("data"))?.data,
             )?;
             let reserve = Reserve::new(asset.clone(), config, data)?;
-            asset_index.insert(asset.clone(), reserve.config.index);
-            reserves.insert(reserve.config.index, reserve);
+            let index = reserve.config.index;
+            asset_index.insert(asset.clone(), index);
+            // Indexes are unique by construction in the contract's reserve
+            // list; a duplicate is a shape error, never a silent overwrite.
+            if reserves.insert(index, reserve).is_some() {
+                return Err(ChainError::Shape(format!(
+                    "pool {} lists two reserves with index {index}",
+                    self.pool
+                )));
+            }
         }
 
         let mut positions = BTreeMap::new();
