@@ -550,7 +550,7 @@ pub struct SimulatedCall {
 /// Success or the host's refusal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SimulationOutcome {
-    /// The call ran.
+    /// The call ran. Boxed so the enum stays small next to `Failure`.
     Success(Box<SimulatedCall>),
     /// The host refused: a contract error, a trap, or a malformed envelope.
     Failure {

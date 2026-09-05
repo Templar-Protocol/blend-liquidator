@@ -47,5 +47,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo run --example capture_fixture` refreshes that snapshot from a live
   RPC over `curl`, retrying until every entry and simulation describes one
   ledger.
+- The chain layer (`src/chain/`): a hand-written Soroban JSON-RPC client
+  (`rpc`) for the eight methods the bot uses, with every base64 XDR field
+  decoded at the boundary and every result carrying its ledger; pool reads
+  (`pool`) that assemble one ledger's instance, reserves, oracle prices and
+  positions into a `PoolSnapshot` and refuse a ledger that moved between
+  reads; the network id and an Ed25519 `Signer` that renders as its address
+  only (`signer`); and the one write path (`tx`): build with a five-minute
+  time bound and a ledger bound of `TX_POLL_LEDGERS`, simulate, restore
+  archived entries, assemble, fee from the p70/p90 inclusion percentiles
+  floored at `BASE_FEE`/`HIGH_FEE`, sign, send with one `TRY_AGAIN_LATER`
+  retry, poll, and classify into succeeded, failed with the pool's error
+  code, expired (provably never included) or unknown. A `TxBadSeq` at send
+  is its own error, `BadSequence`, because the plan behind such a
+  transaction is stale and must be rebuilt.
+- Configuration for the chain: `NETWORK` or `NETWORK_PASSPHRASE`,
+  `RPC_URL`, `RPC_API_KEY_HEADER` with `RPC_API_KEY` read from the
+  environment only, `BASE_FEE`, `HIGH_FEE`, `TX_POLL_LEDGERS`.
+- `cargo run --example pool_snapshot` prints a live pool's reserves and its
+  users' health factors through the real client.
+- Every chain test drives the real client through a scripted localhost
+  JSON-RPC server (`src/chain/script.rs`), covering the restore,
+  `TRY_AGAIN_LATER`, timeout and decoded-error paths without a network.
 - The repository itself: a Rust service scaffold for a Blend Protocol liquidation bot, green on its first commit. CI gates `cargo fmt`/`clippy -D warnings`/`test`/`doc -D warnings`, `cargo-deny`, the Docker build, `shellcheck` and the three-way Rust version pin behind one aggregate `CI Summary` check — the single required status check, so adding or renaming a job never needs a ruleset edit. `clippy::pedantic` is warn-level with `unwrap_used = "deny"` from the first commit, which is the cheap moment: retrofitting that onto an existing codebase is not. The dev container pins its base image by digest and its features by exact version, with a lock file CI verifies.
 - `DRY_RUN` / `--dry-run`, defaulting to `true`, before there is anything to trade. The parser accepts only the literal strings `true` and `false`; `1`, `yes` and `on` are refused at startup. Every extra spelling is another way into live trading, and the dangerous direction is silent — a `DRY_RUN=yes` read as false would arm the bot while reading, to the operator, like it had been disarmed. This is the invariant most expensive to retrofit: a bot that defaults to live and is made safe-by-default later leaves every existing deployment silently changing behaviour on upgrade.
