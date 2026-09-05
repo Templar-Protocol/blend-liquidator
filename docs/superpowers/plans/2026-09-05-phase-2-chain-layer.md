@@ -3588,7 +3588,7 @@ mod tests {
 
     const POOL: &str = "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD";
     const USER: &str = "GDAWX4KV5EQLP5W44HE5AA5QN5QRBJOVQIAI5OXOH5FW2ENT5PXN33DE";
-    const FILLER: &str = "GCIH7OYRDHJ3IOPFEM7DMUX3SXTVHOO2XSWLGBMSVQ3EIHPHYUTNJ7OL";
+    const FILLER: &str = "GCIH7OYRDHJ3IOPFEM7DMUX3SXTVHOO2XSWLGBMSVQ3EIHPHYUTNJID3";
     const USDC: &str = "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75";
 
     fn invoke(operation: &Operation) -> (String, Vec<ScVal>) {
@@ -4046,7 +4046,7 @@ impl<'a> PoolReader<'a> {
     pub async fn balance(&self, token: &str, account: &str) -> Result<(u32, i128), ChainError> {
         let (ledger, value) = self.view(token, "balance", vec![address(account)?]).await?;
         match value {
-            ScVal::I128(parts) => Ok((ledger, i128::from(parts))),
+            ScVal::I128(parts) => Ok((ledger, i128::from(&parts))),
             other => Err(ChainError::Xdr(XdrError::Shape {
                 expected: "i128 balance",
                 got: format!("{other:?}"),
@@ -4056,7 +4056,7 @@ impl<'a> PoolReader<'a> {
 }
 ```
 
-`i128::from(Int128Parts)`: `stellar_xdr` implements `From<Int128Parts> for i128`; `decode.rs` already has an `as_i128` helper for the same conversion — reuse it if it is `pub(crate)`, else make it so. If `snapshot` exceeds clippy's line limit, move the reserve loop into `fn reserves_from(entries, pool, assets)` and the positions loop into `fn positions_from(entries, pool, users)`.
+`i128::from(&Int128Parts)`: `stellar_xdr` 28.0.0 implements `From<&Int128Parts> for i128` (the borrowed form only). If `snapshot` exceeds clippy's line limit, move the reserve loop into `fn reserves_from(entries, pool, assets)` and the positions loop into `fn positions_from(entries, pool, users)`.
 
 In `src/chain/mod.rs` add `pub mod pool;` and `pub use pool::{PoolReader, PoolSnapshot};`.
 
