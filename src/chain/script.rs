@@ -15,9 +15,9 @@ use stellar_xdr::{
     AccountEntry, AccountEntryExt, AccountId, ContractEvent, ContractEventBody, ContractEventType,
     ContractEventV0, DiagnosticEvent, ExtensionPoint, LedgerEntryChanges, LedgerEntryData,
     LedgerFootprint, ScError, ScVal, SorobanResources, SorobanTransactionData,
-    SorobanTransactionDataExt, SorobanTransactionMetaExt, SorobanTransactionMetaV2, String32,
-    StringM, Thresholds, TransactionMeta, TransactionMetaV4, TransactionResult,
-    TransactionResultExt, TransactionResultResult, VecM,
+    SorobanTransactionDataExt, SorobanTransactionMeta, SorobanTransactionMetaExt,
+    SorobanTransactionMetaV2, String32, StringM, Thresholds, TransactionMeta, TransactionMetaV3,
+    TransactionMetaV4, TransactionResult, TransactionResultExt, TransactionResultResult, VecM,
 };
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -244,6 +244,25 @@ pub(crate) fn meta_v4_b64(
         }),
         events: VecM::default(),
         diagnostic_events: VecM::try_from(diagnostics).expect("diagnostics fit"),
+    });
+    to_base64(&meta).expect("encodes")
+}
+
+/// A V3 transaction meta carrying a Soroban return value and diagnostics,
+/// base64, as `resultMetaXdr` — the pre-Protocol-23 shape, still one an RPC
+/// can hand back for an older transaction.
+pub(crate) fn meta_v3_b64(return_value: ScVal, diagnostics: Vec<DiagnosticEvent>) -> String {
+    let meta = TransactionMeta::V3(TransactionMetaV3 {
+        ext: ExtensionPoint::V0,
+        tx_changes_before: LedgerEntryChanges(VecM::default()),
+        operations: VecM::default(),
+        tx_changes_after: LedgerEntryChanges(VecM::default()),
+        soroban_meta: Some(SorobanTransactionMeta {
+            ext: SorobanTransactionMetaExt::V0,
+            events: VecM::default(),
+            return_value,
+            diagnostic_events: VecM::try_from(diagnostics).expect("fit"),
+        }),
     });
     to_base64(&meta).expect("encodes")
 }

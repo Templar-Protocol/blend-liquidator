@@ -902,7 +902,8 @@ mod tests {
     use crate::chain::script::account_entry_b64;
     use crate::chain::script::ScriptedRpc;
     use crate::chain::script::{
-        diagnostic_error_b64, meta_v4_b64, result_b64, scval_b64, transaction_data_b64,
+        diagnostic_error, diagnostic_error_b64, meta_v3_b64, meta_v4_b64, result_b64, scval_b64,
+        transaction_data_b64,
     };
     use crate::chain::xdr::encode::{address, invoke_contract_op, simulation_envelope};
     use crate::chain::xdr::{encode, keys};
@@ -979,6 +980,27 @@ mod tests {
         let rpc = ScriptedRpc::start().await;
         rpc.expect("getHealth", health_json());
         let client = RpcClient::new(&rpc.url(), Some(("X-Api-Key", "secret-123"))).unwrap();
+        client.health().await.unwrap();
+        let requests = rpc.received().await;
+        assert_eq!(requests[0].headers.get("x-api-key").unwrap(), "secret-123");
+    }
+
+    #[tokio::test]
+    async fn from_config_sends_the_header_from_the_secret() {
+        let rpc = ScriptedRpc::start().await;
+        rpc.expect("getHealth", health_json());
+        let config = ChainConfig {
+            network_passphrase: "Test SDF Network ; September 2015".to_string(),
+            rpc_url: rpc.url(),
+            rpc_api_key: Some((
+                "X-Api-Key".to_string(),
+                crate::config::Secret::new("secret-123"),
+            )),
+            base_fee: 5_000,
+            high_fee: 10_000,
+            tx_poll_ledgers: 3,
+        };
+        let client = RpcClient::from_config(&config).unwrap();
         client.health().await.unwrap();
         let requests = rpc.received().await;
         assert_eq!(requests[0].headers.get("x-api-key").unwrap(), "secret-123");
@@ -1498,5 +1520,36 @@ mod tests {
             TransactionResultResult::TxFailed(_)
         ));
         assert_eq!(rpc.calls("getTransaction")[0]["hash"], hash.to_hex());
+    }
+
+    #[tokio::test]
+    async fn transaction_status_reads_v3_meta_too() {
+        let hash = TxHash([0xcd; 32]);
+        let rpc = ScriptedRpc::start().await;
+        rpc.expect(
+            "getTransaction",
+            json!({"status": "SUCCESS", "latestLedger": 101, "oldestLedger": 1, "ledger": 100,
+                   "resultXdr": result_b64(TransactionResultResult::TxSuccess(VecM::default())),
+                   "resultMetaXdr": meta_v3_b64(ScVal::U32(9), vec![])}),
+        );
+        rpc.expect(
+            "getTransaction",
+            json!({"status": "FAILED", "latestLedger": 102, "oldestLedger": 1, "ledger": 101,
+                   "resultXdr": result_b64(TransactionResultResult::TxFailed(VecM::default())),
+                   "resultMetaXdr": meta_v3_b64(ScVal::Void, vec![diagnostic_error(1207)])}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let TransactionStatus::Success { return_value, .. } =
+            client.transaction(&hash).await.unwrap()
+        else {
+            panic!("expected success");
+        };
+        assert_eq!(return_value, Some(ScVal::U32(9)));
+        let TransactionStatus::Failed { contract_error, .. } =
+            client.transaction(&hash).await.unwrap()
+        else {
+            panic!("expected failed");
+        };
+        assert_eq!(contract_error, Some(1207));
     }
 }
