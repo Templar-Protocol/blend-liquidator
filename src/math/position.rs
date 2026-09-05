@@ -43,11 +43,10 @@ impl Positions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OraclePrices {
     /// The oracle's `decimals()`.
-    pub decimals: u32,
+    decimals: u32,
     /// `10^decimals`, the scale every base value is expressed in.
-    pub scalar: i128,
-    /// Asset contract address to price. Private so `new`'s positivity check
-    /// cannot be bypassed by a struct literal.
+    scalar: i128,
+    /// Asset contract address to price.
     prices: BTreeMap<String, i128>,
 }
 
@@ -55,8 +54,10 @@ impl OraclePrices {
     /// Builds a snapshot, deriving the scalar from the oracle's decimals.
     ///
     /// Every price must be strictly positive: a zero or negative price would
-    /// value collateral at nothing (or less), making an underwater account
-    /// look healthy to the bot.
+    /// value collateral at nothing (or less), collapsing the health factor and
+    /// making a healthy account look liquidatable to the bot. The fields are
+    /// private so `scalar` always equals `10^decimals` and no price can be
+    /// inserted past this check.
     pub fn new(decimals: u32, prices: BTreeMap<String, i128>) -> Result<Self, MathError> {
         let scalar = pow10(decimals)?;
         if prices.values().any(|price| *price <= 0) {
@@ -67,6 +68,18 @@ impl OraclePrices {
             scalar,
             prices,
         })
+    }
+
+    /// The oracle's `decimals()`.
+    #[must_use]
+    pub fn decimals(&self) -> u32 {
+        self.decimals
+    }
+
+    /// `10^decimals`, the scale every base value is expressed in.
+    #[must_use]
+    pub fn scalar(&self) -> i128 {
+        self.scalar
     }
 
     /// The price of `asset`, or `MissingPrice` when the snapshot has none.
@@ -149,7 +162,7 @@ pub fn calculate_position_data(
         collateral_raw: 0,
         liability_base: 0,
         liability_raw: 0,
-        scalar: prices.scalar,
+        scalar: prices.scalar(),
     };
 
     for (index, b_tokens) in &positions.collateral {
@@ -444,7 +457,8 @@ mod tests {
     #[test]
     fn rejects_a_non_positive_price() {
         // A zero or negative price would value collateral at nothing (or
-        // less), which could make an underwater account look healthy.
+        // less), collapsing the health factor so a healthy account looks
+        // liquidatable.
         let mut zero = BTreeMap::new();
         zero.insert(ASSET_A.to_string(), 0);
         assert_eq!(

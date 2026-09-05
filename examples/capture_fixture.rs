@@ -45,8 +45,9 @@ type Entries = BTreeMap<String, String>;
 
 const ATTEMPTS: usize = 10;
 /// Topics whose recent events go into the fixture, with their topic arity.
-const EVENT_TOPICS: [(&str, usize); 8] = [
+const EVENT_TOPICS: [(&str, usize); 9] = [
     ("supply", 3),
+    ("flash_loan", 4),
     ("supply_collateral", 3),
     ("borrow", 3),
     ("repay", 3),
@@ -139,7 +140,7 @@ fn simulate(
 }
 
 /// The pool's oracle and reserve list, from its instance and `ResList`.
-fn pool_shape(url: &str, pool: &str) -> Fallible<(Entries, String, Vec<String>)> {
+fn pool_shape(url: &str, pool: &str) -> Fallible<(String, Vec<String>)> {
     let instance_key = to_base64(&keys::instance(pool)?)?;
     let reserve_list_key = to_base64(&keys::reserve_list(pool)?)?;
     let (_, entries) = ledger_entries(url, &[instance_key.clone(), reserve_list_key.clone()])?;
@@ -153,7 +154,7 @@ fn pool_shape(url: &str, pool: &str) -> Fallible<(Entries, String, Vec<String>)>
         &entries,
         &reserve_list_key,
     )?)?)?;
-    Ok((entries, instance.config.oracle, assets))
+    Ok((instance.config.oracle, assets))
 }
 
 /// Every ledger entry the fixture holds, in a stable order.
@@ -205,7 +206,7 @@ fn recent_events(url: &str, pool: &str, oldest: u64, ledger: u64) -> Fallible<Ve
 
 /// One capture attempt. Returns `Ok(None)` when the ledger moved under it.
 fn attempt(url: &str, pool: &str, users: &[String]) -> Fallible<Option<Value>> {
-    let (_, oracle, assets) = pool_shape(url, pool)?;
+    let (oracle, assets) = pool_shape(url, pool)?;
     let key_base64 = all_entry_keys(pool, &assets, users)?;
     let (_, first_pass) = ledger_entries(url, &key_base64)?;
 

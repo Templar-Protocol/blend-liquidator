@@ -42,8 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   broken RPC response make the decoder recurse or allocate without bound.
 - `OraclePrices::new` now rejects any non-positive price. A zero or negative
   price would value collateral at nothing, which would make a healthy
-  account look liquidatable; the `prices` field is private so the check
-  cannot be bypassed by a struct literal.
+  account look liquidatable; the fields are private so the check cannot be
+  bypassed by a struct literal and `scalar` always equals `10^decimals`.
 - `cargo run --example capture_fixture` refreshes that snapshot from a live
   RPC over `curl`, retrying until every entry and simulation describes one
   ledger.

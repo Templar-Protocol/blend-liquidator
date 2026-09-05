@@ -299,12 +299,15 @@ Postgres through `sqlx` with compile-time checked queries, migrations
 embedded in the binary and applied at startup under an advisory lock (the
 production deployment runs one instance, but the lock makes a rolling
 deployment safe). Amounts and values are stored as decimal text because
-`i128` exceeds `bigint`; health factors and ledgers fit `bigint`.
+`i128` exceeds `bigint`; ledgers fit `bigint`. Health factors are `numeric`:
+a borrower with a stroop of debt against real collateral has a ratio far
+beyond `bigint`, and `numeric` orders and indexes correctly across the whole
+range.
 
 | Table | Columns | Purpose |
 |---|---|---|
 | `cursors` | `name` pk, `ledger`, `paging_token` | per-task progress |
-| `users` | `pool`, `account`, `health_factor` (7-dec, normalised as `hf × 10^7 / oracle_scalar`, so pools with different oracle decimals order and compare alike), `collateral` jsonb, `liabilities` jsonb, `updated_ledger`; pk `(pool, account)`; index `(pool, health_factor)` | tracked borrowers with liabilities |
+| `users` | `pool`, `account`, `health_factor` (`numeric`, 7-dec, normalised as `hf × 10^7 / oracle_scalar`, so pools with different oracle decimals order and compare alike), `collateral` jsonb, `liabilities` jsonb, `updated_ledger`; pk `(pool, account)`; index `(pool, health_factor)` | tracked borrowers with liabilities |
 | `auctions` | `pool`, `account`, `auction_type`, `start_ledger`, `fill_ledger`, `percent`, `bid` jsonb, `lot` jsonb, `updated_ledger`; pk `(pool, account, auction_type)` | open auctions and the filler's current plan |
 | `fills` | `id`, `tx_hash` nullable unique, `pool`, `account`, `auction_type`, `fill_ledger`, `percent`, `bid` jsonb, `lot` jsonb, `bid_value`, `lot_value`, `est_profit`, `dry_run`, `created_at` | audit of fills, simulated ones included |
 | `creations` | `id`, `tx_hash` nullable, `kind` (`auction` or `bad_debt`), `pool`, `account`, `percent`, `bid` jsonb, `lot` jsonb, `ledger`, `dry_run`, `created_at` | audit of auctioneer submissions |
@@ -621,9 +624,14 @@ after a cursor fell out of the retained window, unfunded fill skipped.
   notifies a gap, reseeds users, and restarts from the window's edge.
 - **Queues.** A send that fails outright retries with exponential backoff up
   to a per-submission retry budget (creations 3, fills 10, unwinds 2); a
-  sequence error refetches the sequence and retries once; a decoded contract
-  error is returned to the caller without retry; exhausted retries drop the
-  submission and notify. A timeout is `unknown`, never a failure: the
+  decoded contract error is returned to the caller without retry; exhausted
+  retries drop the submission and notify. A sequence error means another
+  signer of the same account got in first, so the submission's plan is
+  stale: the queue refetches the sequence and hands the submission back to
+  its planner, which re-reads the auction entry, the user's positions, the
+  oracle and the bot's inventory and rebuilds the plan before one more
+  submission — or drops it, when the auction is gone or the headroom is
+  spent. A stale plan is never resent. A timeout is `unknown`, never a failure: the
   transaction may still land. Every transaction the bot signs carries a
   ledger bound, and the queue records the hash, sequence and bound before
   sending; on a timeout it polls `getTransaction` for that hash until the
@@ -706,17 +714,19 @@ alerting. The service sets `HTTP_BIND_ADDR=0.0.0.0` and honours the injected
 A rolling revision briefly runs two instances, and the signer account is the
 lease that serialises them: Stellar accepts one transaction per account
 sequence number, so when both submit, one lands and the other fails with a
-bad sequence, refetches the sequence and retries once. That retry reaches the
-contract after the winner, where a second `new_auction` for the same user
-fails because the auction already exists, a second fill of a filled auction
-fails because there is nothing left to fill, and a repeated unwind moves
-nothing — decoded contract errors the queues return without retry. Each
-instance's inventory reservations are process-local and rebuilt from chain on
-start, so the one exposure is a fill the loser sized against inventory the
-winner has since spent, which the contract rejects on the token transfer.
-Rolling overlap therefore costs failed transaction fees, never a duplicate
-position, and `STARTUP_DELAY_LEDGERS` must exceed the old revision's shutdown
-drain so the window is normally empty.
+bad sequence. The loser never resends its plan. Per section 8, a sequence
+error sends the submission back to its planner, which re-reads the auction
+entry, positions, prices and inventory before deciding again: a creation
+finds the auction already exists and drops; a fill finds the auction closed
+and drops, or finds the remainder a partial fill left and plans against
+*that* remainder with the health headroom and inventory the winner's fill
+has already consumed, which is the same decision a single instance would
+make on its next pass; an unwind finds nothing left to move. What the loser
+can do is therefore exactly what one instance would do one ledger later,
+never a second copy of the winner's fill. `STARTUP_DELAY_LEDGERS` must
+exceed the old revision's shutdown drain so the window is normally empty,
+and the Phase 5 test suite covers the overlap case where a partial fill
+leaves the auction open.
 
 ## 11. Seams and extension points
 
