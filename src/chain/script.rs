@@ -151,11 +151,6 @@ impl ScriptedRpc {
 }
 
 /// A `LedgerEntryData::Account` for `account` at `sequence`, base64.
-///
-/// `allow(dead_code)`: this task's tests only exercise `getHealth` and
-/// `getLatestLedger`, neither of which needs canned XDR. The pool-read and
-/// transaction tasks later in this phase are this builder's callers.
-#[allow(dead_code)]
 pub(crate) fn account_entry_b64(account: &str, sequence: i64) -> String {
     let account_id: AccountId = account.parse().expect("account strkey");
     let entry = LedgerEntryData::Account(AccountEntry {
