@@ -10,6 +10,7 @@
 use crate::chain::xdr::XdrError;
 use crate::math::MathError;
 
+pub mod pool;
 pub mod rpc;
 #[cfg(test)]
 pub(crate) mod script;
@@ -17,6 +18,7 @@ pub mod signer;
 pub mod tx;
 pub mod xdr;
 
+pub use pool::{PoolReader, PoolSnapshot};
 pub use rpc::RpcClient;
 pub use signer::{Network, Signer};
 pub use tx::{Prepared, Priority, Submitter, TxConfig, TxOutcome};
