@@ -8,6 +8,10 @@
 //! seen can never be applied, and `wait` reports `Expired` — provably not
 //! included — instead of leaving the caller to guess. `Unknown` is kept for
 //! the case where the RPC could not answer for the whole window.
+//!
+//! This layer never consults `DRY_RUN`: nothing here should be called by a
+//! dry-run path. The decision to sign and submit at all belongs to the
+//! executor that owns it.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -58,6 +62,9 @@ impl TxConfig {
             poll_ledgers,
             poll_interval: Duration::from_secs(1),
             send_retry_pause: Duration::from_secs(1),
+            // `Duration` holds up to 2^64 seconds and `poll_ledgers` is a
+            // `u32` operator knob, so `10 * (poll_ledgers + 1)` seconds
+            // never overflows either the multiplication or the `Duration`.
             wait_cap: Duration::from_secs(10) * poll_ledgers.saturating_add(1),
         }
     }
@@ -217,6 +224,9 @@ impl<'a> Submitter<'a> {
             cond: Preconditions::V2(PreconditionsV2 {
                 time_bounds: Some(TimeBounds {
                     min_time: TimePoint(0),
+                    // `saturating_add` never actually saturates here: that
+                    // would need the system clock to read within 300
+                    // seconds of `u64::MAX`, i.e. the year 584942417355.
                     max_time: TimePoint(now.saturating_add(TIME_BOUND_SECS)),
                 }),
                 ledger_bounds: Some(LedgerBounds {
@@ -368,18 +378,21 @@ impl<'a> Submitter<'a> {
     }
 }
 
-/// What a `getTransaction` answer means for `prepared`: a terminal outcome,
-/// or `None` while the transaction may still land. `NotFound` becomes
-/// `Expired` the moment the RPC's ledger reaches the bound.
+/// What a `getTransaction` answer means for a transaction identified by
+/// `hash` and bounded by `max_ledger`: a terminal outcome, or `None` while
+/// the transaction may still land. `NotFound` becomes `Expired` the moment
+/// the RPC's ledger reaches the bound. Takes the hash and bound rather than
+/// a whole `Prepared` so a caller resuming an `Unknown` outcome — which
+/// carries only those two fields, not a `Prepared` — can call it too.
 #[must_use]
-pub fn classify(status: TransactionStatus, prepared: &Prepared) -> Option<TxOutcome> {
+pub fn classify(status: TransactionStatus, hash: TxHash, max_ledger: u32) -> Option<TxOutcome> {
     match status {
         TransactionStatus::Success {
             ledger,
             return_value,
             ..
         } => Some(TxOutcome::Succeeded {
-            hash: prepared.hash,
+            hash,
             ledger,
             return_value,
         }),
@@ -389,15 +402,15 @@ pub fn classify(status: TransactionStatus, prepared: &Prepared) -> Option<TxOutc
             contract_error,
             ..
         } => Some(TxOutcome::Failed {
-            hash: prepared.hash,
+            hash,
             ledger,
             contract_error,
             result,
         }),
-        TransactionStatus::NotFound { latest_ledger } if latest_ledger >= prepared.max_ledger => {
+        TransactionStatus::NotFound { latest_ledger } if latest_ledger >= max_ledger => {
             Some(TxOutcome::Expired {
-                hash: prepared.hash,
-                max_ledger: prepared.max_ledger,
+                hash,
+                max_ledger,
                 latest_ledger,
             })
         }
@@ -441,35 +454,60 @@ impl Submitter<'_> {
         }
     }
 
+    /// This is how a queue resumes an `Unknown` outcome from the hash,
+    /// sequence and bound it recorded before sending, after a restart or a
+    /// send that timed out — the three fields `Unknown` carries and
+    /// `Prepared` does not outlive.
+    ///
     /// Polls `getTransaction` until the outcome is terminal, the chain has
     /// passed the ledger bound (`Expired`), or the wait cap passes without an
-    /// answer (`Unknown`). RPC errors while polling are transient here: the
+    /// answer (`Unknown`, carrying the same three fields for a later
+    /// resumption). RPC errors while polling are transient here: the
     /// transaction is in flight and only the chain can say what happened.
-    pub async fn wait(&self, prepared: &Prepared) -> Result<TxOutcome, ChainError> {
+    pub async fn wait_for(
+        &self,
+        hash: TxHash,
+        sequence: i64,
+        max_ledger: u32,
+    ) -> Result<TxOutcome, ChainError> {
         let deadline = Instant::now() + self.config.wait_cap;
         loop {
-            match self.rpc.transaction(&prepared.hash).await {
+            match self.rpc.transaction(&hash).await {
                 Ok(status) => {
-                    if let Some(outcome) = classify(status, prepared) {
+                    if let Some(outcome) = classify(status, hash, max_ledger) {
                         return Ok(outcome);
                     }
                 }
                 Err(error) => {
-                    tracing::warn!(hash = %prepared.hash, %error, "getTransaction failed; polling again");
+                    tracing::warn!(%hash, %error, "getTransaction failed; polling again");
                 }
             }
             if Instant::now() >= deadline {
                 return Ok(TxOutcome::Unknown {
-                    hash: prepared.hash,
-                    sequence: prepared.sequence,
-                    max_ledger: prepared.max_ledger,
+                    hash,
+                    sequence,
+                    max_ledger,
                 });
             }
             tokio::time::sleep(self.config.poll_interval).await;
         }
     }
 
-    /// The whole write path: prepare, send, wait.
+    /// `wait_for` on the hash, sequence and bound `prepared` carries.
+    pub async fn wait(&self, prepared: &Prepared) -> Result<TxOutcome, ChainError> {
+        self.wait_for(prepared.hash, prepared.sequence, prepared.max_ledger)
+            .await
+    }
+
+    /// The whole write path: prepare, send, wait. A convenience for a
+    /// caller that can afford to lose the handle when `send` fails in
+    /// transport: on that failure this has already returned the error, and
+    /// there is no `Prepared` left to resume from. A submission queue does
+    /// not call this — it calls `prepare`, records the returned
+    /// `Prepared`'s hash, sequence and bound as its own crash-recovery
+    /// state, then `send` and `wait`, so a send that timed out is resumed
+    /// with `wait_for` from the recorded fields instead of resent: a stale
+    /// plan is never resent (section 8 of the spec).
     pub async fn submit(
         &self,
         operation: Operation,
@@ -867,7 +905,7 @@ mod tests {
             return_value: Some(ScVal::U32(7)),
         };
         assert!(matches!(
-            classify(success, &prepared),
+            classify(success, prepared.hash, prepared.max_ledger),
             Some(TxOutcome::Succeeded {
                 ledger: 102,
                 return_value: Some(ScVal::U32(7)),
@@ -885,7 +923,7 @@ mod tests {
             contract_error: Some(1205),
         };
         assert!(matches!(
-            classify(failed, &prepared),
+            classify(failed, prepared.hash, prepared.max_ledger),
             Some(TxOutcome::Failed {
                 ledger: 103,
                 contract_error: Some(1205),
@@ -894,13 +932,15 @@ mod tests {
         ));
         assert!(classify(
             TransactionStatus::NotFound { latest_ledger: 103 },
-            &prepared
+            prepared.hash,
+            prepared.max_ledger
         )
         .is_none());
         assert!(matches!(
             classify(
                 TransactionStatus::NotFound { latest_ledger: 104 },
-                &prepared
+                prepared.hash,
+                prepared.max_ledger
             ),
             Some(TxOutcome::Expired {
                 max_ledger: 104,
@@ -950,6 +990,40 @@ mod tests {
                 }
             ),
             "{expired:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_resumes_from_the_recorded_fields() {
+        // No `Prepared` in sight: a queue resuming an `Unknown` outcome
+        // after a restart has only the hash, sequence and bound it
+        // persisted, not the envelope that produced them.
+        let rpc = ScriptedRpc::start().await;
+        rpc.expect(
+            "getTransaction",
+            json!({"status": "NOT_FOUND", "latestLedger": 101, "oldestLedger": 1, "ledger": 0}),
+        );
+        rpc.expect(
+            "getTransaction",
+            json!({"status": "SUCCESS", "latestLedger": 102, "oldestLedger": 1, "ledger": 102,
+                   "resultXdr": result_b64(TransactionResultResult::TxSuccess(VecM::default())),
+                   "resultMetaXdr": meta_v4_b64(Some(ScVal::U32(7)), vec![])}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let (network, signer) = (Network::testnet(), signer());
+        let submitter = submitter_for(&client, &network, &signer);
+        let hash = TxHash([0x42; 32]);
+        let outcome = submitter.wait_for(hash, 42, 104).await.unwrap();
+        assert!(
+            matches!(
+                outcome,
+                TxOutcome::Succeeded {
+                    hash: resumed,
+                    ledger: 102,
+                    ..
+                } if resumed == hash
+            ),
+            "{outcome:?}"
         );
     }
 
