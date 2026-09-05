@@ -169,17 +169,11 @@ pub(crate) fn account_entry_b64(account: &str, sequence: i64) -> String {
 }
 
 /// Any `ScVal`, base64.
-///
-/// `allow(dead_code)`: see `account_entry_b64` — later tasks are the caller.
-#[allow(dead_code)]
 pub(crate) fn scval_b64(value: &ScVal) -> String {
     to_base64(value).expect("encodes")
 }
 
 /// Empty resources with the given resource fee, base64, as `transactionData`.
-///
-/// `allow(dead_code)`: see `account_entry_b64` — later tasks are the caller.
-#[allow(dead_code)]
 pub(crate) fn transaction_data_b64(resource_fee: i64) -> String {
     let data = SorobanTransactionData {
         ext: SorobanTransactionDataExt::V0,
@@ -199,9 +193,6 @@ pub(crate) fn transaction_data_b64(resource_fee: i64) -> String {
 
 /// The diagnostic event the host emits for a contract error:
 /// topics `[error, Error(Contract, code)]`.
-///
-/// `allow(dead_code)`: see `account_entry_b64` — later tasks are the caller.
-#[allow(dead_code)]
 pub(crate) fn diagnostic_error(code: u32) -> DiagnosticEvent {
     DiagnosticEvent {
         in_successful_contract_call: false,
@@ -222,17 +213,11 @@ pub(crate) fn diagnostic_error(code: u32) -> DiagnosticEvent {
 }
 
 /// `diagnostic_error`, base64.
-///
-/// `allow(dead_code)`: see `account_entry_b64` — later tasks are the caller.
-#[allow(dead_code)]
 pub(crate) fn diagnostic_error_b64(code: u32) -> String {
     to_base64(&diagnostic_error(code)).expect("encodes")
 }
 
 /// A `TransactionResult` with the given result, base64.
-///
-/// `allow(dead_code)`: see `account_entry_b64` — later tasks are the caller.
-#[allow(dead_code)]
 pub(crate) fn result_b64(result: TransactionResultResult) -> String {
     to_base64(&TransactionResult {
         fee_charged: 100,
@@ -244,9 +229,6 @@ pub(crate) fn result_b64(result: TransactionResultResult) -> String {
 
 /// A V4 transaction meta carrying a Soroban return value and diagnostics,
 /// base64, as `resultMetaXdr`.
-///
-/// `allow(dead_code)`: see `account_entry_b64` — later tasks are the caller.
-#[allow(dead_code)]
 pub(crate) fn meta_v4_b64(
     return_value: Option<ScVal>,
     diagnostics: Vec<DiagnosticEvent>,

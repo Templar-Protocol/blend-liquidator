@@ -17,7 +17,11 @@ use reqwest::header::{HeaderName, HeaderValue};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
-use stellar_xdr::{LedgerEntryData, LedgerKey, LedgerKeyAccount, ScVal};
+use stellar_xdr::{
+    ContractEventBody, DiagnosticEvent, LedgerEntryData, LedgerKey, LedgerKeyAccount, ScError,
+    ScVal, SorobanAuthorizationEntry, SorobanTransactionData, TransactionEnvelope, TransactionMeta,
+    TransactionResult,
+};
 
 use crate::chain::xdr::encode::{from_base64, to_base64};
 use crate::chain::xdr::XdrError;
@@ -488,14 +492,407 @@ impl RpcClient {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawSimulation {
+    latest_ledger: u32,
+    error: Option<String>,
+    min_resource_fee: Option<String>,
+    transaction_data: Option<String>,
+    #[serde(default)]
+    results: Vec<RawSimulationResult>,
+    restore_preamble: Option<RawPreamble>,
+    #[serde(default)]
+    events: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct RawSimulationResult {
+    #[serde(default)]
+    auth: Vec<String>,
+    xdr: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawPreamble {
+    min_resource_fee: String,
+    transaction_data: String,
+}
+
+/// What a `RestoreFootprint` transaction needs to bring archived entries
+/// back before the simulated call can run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestorePreamble {
+    /// The restore transaction's Soroban data (its footprint and resources).
+    pub transaction_data: SorobanTransactionData,
+    /// Its resource fee, stroops.
+    pub min_resource_fee: i64,
+}
+
+/// A simulation that ran to completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimulatedCall {
+    /// The host function's return value.
+    pub return_value: ScVal,
+    /// Authorisation entries the call needs; empty when the source account
+    /// covers it.
+    pub auth: Vec<SorobanAuthorizationEntry>,
+    /// The footprint and resources to attach to the transaction.
+    pub transaction_data: SorobanTransactionData,
+    /// The resource fee to add to the inclusion fee, stroops.
+    pub min_resource_fee: i64,
+    /// Present when archived entries must be restored first; the data and
+    /// fee above are then not to be trusted until a second simulation.
+    pub restore: Option<RestorePreamble>,
+}
+
+/// Success or the host's refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SimulationOutcome {
+    /// The call ran.
+    Success(Box<SimulatedCall>),
+    /// The host refused: a contract error, a trap, or a malformed envelope.
+    Failure {
+        /// The RPC's text, diagnostic log included.
+        message: String,
+        /// The pool's error code when the failure was a contract error.
+        contract_error: Option<u32>,
+    },
+}
+
+/// `simulateTransaction`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Simulation {
+    /// The ledger the simulation ran against.
+    pub latest_ledger: u32,
+    /// The diagnostic events the host emitted, decoded.
+    pub events: Vec<DiagnosticEvent>,
+    /// What happened.
+    pub outcome: SimulationOutcome,
+}
+
+fn parse_i64(name: &str, text: &str) -> Result<i64, ChainError> {
+    text.parse::<i64>()
+        .map_err(|_| ChainError::Shape(format!("{name} = {text:?} is not an integer")))
+}
+
+/// The contract error code in a diagnostic event log: the host emits an
+/// event with topics `[error, Error(Contract, code)]` when a contract
+/// fails with an error. The first such event wins.
+#[must_use]
+pub fn contract_error_in_events(events: &[DiagnosticEvent]) -> Option<u32> {
+    events.iter().find_map(|event| {
+        let ContractEventBody::V0(body) = &event.event.body;
+        let topics = body.topics.as_slice();
+        match (topics.first(), topics.get(1)) {
+            (Some(ScVal::Symbol(name)), Some(ScVal::Error(ScError::Contract(code))))
+                if name.to_utf8_string_lossy() == "error" =>
+            {
+                Some(*code)
+            }
+            _ => None,
+        }
+    })
+}
+
+/// The contract error code in a simulation error message, which the host
+/// renders as `Error(Contract, #1200)`. Only that form counts; a WasmVm or
+/// budget error carries no pool code.
+#[must_use]
+pub fn contract_error_in_message(message: &str) -> Option<u32> {
+    const MARKER: &str = "Error(Contract, #";
+    let start = message.find(MARKER)? + MARKER.len();
+    let rest = &message[start..];
+    let end = rest.find(')')?;
+    rest[..end].parse().ok()
+}
+
+fn decode_events(events: &[String]) -> Result<Vec<DiagnosticEvent>, ChainError> {
+    events
+        .iter()
+        .map(|event| from_base64(event).map_err(ChainError::Xdr))
+        .collect()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawSend {
+    status: String,
+    hash: String,
+    latest_ledger: u32,
+    error_result_xdr: Option<String>,
+    #[serde(default)]
+    diagnostic_events_xdr: Vec<String>,
+}
+
+/// What `sendTransaction` said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendOutcome {
+    /// Accepted into the queue; poll for the result.
+    Pending,
+    /// Already in the queue or applied; poll for the result.
+    Duplicate,
+    /// The queue is full; send again after a pause.
+    TryAgainLater,
+    /// Rejected before the queue: bad sequence, bad auth, insufficient fee.
+    Error {
+        /// The decoded result, when the RPC gave one.
+        result: Option<TransactionResult>,
+        /// The pool's error code, when the rejection was a contract error.
+        contract_error: Option<u32>,
+    },
+}
+
+/// `sendTransaction`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendStatus {
+    /// The hash the transaction will be found under.
+    pub hash: TxHash,
+    /// The ledger the RPC had when it answered.
+    pub latest_ledger: u32,
+    /// What happened.
+    pub outcome: SendOutcome,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawTransaction {
+    status: String,
+    latest_ledger: u32,
+    ledger: Option<u32>,
+    result_xdr: Option<String>,
+    result_meta_xdr: Option<String>,
+    #[serde(default)]
+    diagnostic_events_xdr: Vec<String>,
+}
+
+/// `getTransaction`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransactionStatus {
+    /// The RPC has not seen the transaction in any ledger it holds.
+    NotFound {
+        /// The newest ledger the RPC had; against the transaction's ledger
+        /// bound this decides between "still possible" and "never".
+        latest_ledger: u32,
+    },
+    /// Applied and succeeded.
+    Success {
+        /// The ledger it was applied in.
+        ledger: u32,
+        /// The newest ledger the RPC had.
+        latest_ledger: u32,
+        /// The host function's return value, when the meta carries one.
+        return_value: Option<ScVal>,
+    },
+    /// Applied and failed; the fee was charged.
+    Failed {
+        /// The ledger it was applied in.
+        ledger: u32,
+        /// The newest ledger the RPC had.
+        latest_ledger: u32,
+        /// The decoded result.
+        result: TransactionResult,
+        /// The pool's error code, when the failure was a contract error.
+        contract_error: Option<u32>,
+    },
+}
+
+/// The Soroban return value a transaction meta carries, if any.
+fn return_value(meta: &TransactionMeta) -> Option<ScVal> {
+    match meta {
+        TransactionMeta::V4(meta) => meta
+            .soroban_meta
+            .as_ref()
+            .and_then(|soroban| soroban.return_value.clone()),
+        TransactionMeta::V3(meta) => meta
+            .soroban_meta
+            .as_ref()
+            .map(|soroban| soroban.return_value.clone()),
+        _ => None,
+    }
+}
+
+/// The diagnostic events a transaction meta carries, if any.
+fn meta_diagnostics(meta: &TransactionMeta) -> Vec<DiagnosticEvent> {
+    match meta {
+        TransactionMeta::V4(meta) => meta.diagnostic_events.iter().cloned().collect(),
+        TransactionMeta::V3(meta) => meta
+            .soroban_meta
+            .as_ref()
+            .map(|soroban| soroban.diagnostic_events.iter().cloned().collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+impl RpcClient {
+    /// `simulateTransaction`. A failure is an `Ok(Simulation)` whose outcome
+    /// is `Failure`, because the caller usually wants the contract code; a
+    /// response that is neither a result nor an error is `Shape`.
+    pub async fn simulate(&self, envelope: &TransactionEnvelope) -> Result<Simulation, ChainError> {
+        let raw: RawSimulation = self
+            .call(
+                "simulateTransaction",
+                json!({ "transaction": to_base64(envelope)? }),
+            )
+            .await?;
+        let events = decode_events(&raw.events)?;
+        if let Some(message) = raw.error {
+            let contract_error =
+                contract_error_in_events(&events).or_else(|| contract_error_in_message(&message));
+            return Ok(Simulation {
+                latest_ledger: raw.latest_ledger,
+                events,
+                outcome: SimulationOutcome::Failure {
+                    message,
+                    contract_error,
+                },
+            });
+        }
+        let missing =
+            |field: &'static str| ChainError::Shape(format!("simulation without {field}"));
+        let result = raw.results.first().ok_or_else(|| missing("results"))?;
+        let auth = result
+            .auth
+            .iter()
+            .map(|entry| from_base64(entry).map_err(ChainError::Xdr))
+            .collect::<Result<Vec<SorobanAuthorizationEntry>, _>>()?;
+        let restore = raw
+            .restore_preamble
+            .map(|preamble| {
+                Ok::<_, ChainError>(RestorePreamble {
+                    transaction_data: from_base64(&preamble.transaction_data)?,
+                    min_resource_fee: parse_i64(
+                        "restorePreamble.minResourceFee",
+                        &preamble.min_resource_fee,
+                    )?,
+                })
+            })
+            .transpose()?;
+        let call = SimulatedCall {
+            return_value: from_base64(&result.xdr)?,
+            auth,
+            transaction_data: from_base64(
+                raw.transaction_data
+                    .as_deref()
+                    .ok_or_else(|| missing("transactionData"))?,
+            )?,
+            min_resource_fee: parse_i64(
+                "minResourceFee",
+                raw.min_resource_fee
+                    .as_deref()
+                    .ok_or_else(|| missing("minResourceFee"))?,
+            )?,
+            restore,
+        };
+        Ok(Simulation {
+            latest_ledger: raw.latest_ledger,
+            events,
+            outcome: SimulationOutcome::Success(Box::new(call)),
+        })
+    }
+
+    /// `sendTransaction`.
+    pub async fn send(&self, envelope: &TransactionEnvelope) -> Result<SendStatus, ChainError> {
+        let raw: RawSend = self
+            .call(
+                "sendTransaction",
+                json!({ "transaction": to_base64(envelope)? }),
+            )
+            .await?;
+        let outcome = match raw.status.as_str() {
+            "PENDING" => SendOutcome::Pending,
+            "DUPLICATE" => SendOutcome::Duplicate,
+            "TRY_AGAIN_LATER" => SendOutcome::TryAgainLater,
+            "ERROR" => {
+                let result = raw
+                    .error_result_xdr
+                    .as_deref()
+                    .map(from_base64::<TransactionResult>)
+                    .transpose()?;
+                let events = decode_events(&raw.diagnostic_events_xdr)?;
+                SendOutcome::Error {
+                    result,
+                    contract_error: contract_error_in_events(&events),
+                }
+            }
+            other => {
+                return Err(ChainError::Shape(format!(
+                    "sendTransaction status {other:?}"
+                )))
+            }
+        };
+        Ok(SendStatus {
+            hash: TxHash::from_hex(&raw.hash)?,
+            latest_ledger: raw.latest_ledger,
+            outcome,
+        })
+    }
+
+    /// `getTransaction`.
+    pub async fn transaction(&self, hash: &TxHash) -> Result<TransactionStatus, ChainError> {
+        let raw: RawTransaction = self
+            .call("getTransaction", json!({ "hash": hash.to_hex() }))
+            .await?;
+        let latest_ledger = raw.latest_ledger;
+        if raw.status == "NOT_FOUND" {
+            return Ok(TransactionStatus::NotFound { latest_ledger });
+        }
+        let missing =
+            |field: &'static str| ChainError::Shape(format!("{} without {field}", raw.status));
+        let ledger = raw
+            .ledger
+            .filter(|ledger| *ledger > 0)
+            .ok_or_else(|| missing("ledger"))?;
+        let meta: TransactionMeta = from_base64(
+            raw.result_meta_xdr
+                .as_deref()
+                .ok_or_else(|| missing("resultMetaXdr"))?,
+        )?;
+        match raw.status.as_str() {
+            "SUCCESS" => Ok(TransactionStatus::Success {
+                ledger,
+                latest_ledger,
+                return_value: return_value(&meta),
+            }),
+            "FAILED" => {
+                let result: TransactionResult = from_base64(
+                    raw.result_xdr
+                        .as_deref()
+                        .ok_or_else(|| missing("resultXdr"))?,
+                )?;
+                let mut events = decode_events(&raw.diagnostic_events_xdr)?;
+                events.extend(meta_diagnostics(&meta));
+                Ok(TransactionStatus::Failed {
+                    ledger,
+                    latest_ledger,
+                    result,
+                    contract_error: contract_error_in_events(&events),
+                })
+            }
+            other => Err(ChainError::Shape(format!(
+                "getTransaction status {other:?}"
+            ))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::chain::script::account_entry_b64;
     use crate::chain::script::ScriptedRpc;
+    use crate::chain::script::{
+        diagnostic_error_b64, meta_v4_b64, result_b64, scval_b64, transaction_data_b64,
+    };
+    use crate::chain::xdr::encode::{address, invoke_contract_op, simulation_envelope};
     use crate::chain::xdr::{encode, keys};
     use serde_json::json;
-    use stellar_xdr::{LedgerEntryData, LedgerKey, ScVal};
+    use stellar_xdr::{
+        InvokeHostFunctionResult, LedgerEntryData, LedgerKey, OperationResult, OperationResultTr,
+        ScVal, TransactionResultResult, VecM,
+    };
 
     fn health_json() -> serde_json::Value {
         json!({
@@ -834,5 +1231,226 @@ mod tests {
                 ChainError::Config(_)
             ));
         }
+    }
+
+    fn envelope() -> stellar_xdr::TransactionEnvelope {
+        let op =
+            invoke_contract_op(POOL, "get_positions", vec![address(ACCOUNT).unwrap()]).unwrap();
+        simulation_envelope(op).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_successful_simulation_decodes_its_return_value_data_and_fee() {
+        let rpc = ScriptedRpc::start().await;
+        rpc.expect(
+            "simulateTransaction",
+            json!({"transactionData": transaction_data_b64(446_953), "events": [],
+                   "minResourceFee": "446953",
+                   "results": [{"auth": [], "xdr": scval_b64(&ScVal::U32(7))}],
+                   "latestLedger": 64_289_527}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let simulation = client.simulate(&envelope()).await.unwrap();
+        assert_eq!(simulation.latest_ledger, 64_289_527);
+        let SimulationOutcome::Success(call) = simulation.outcome else {
+            panic!("expected success");
+        };
+        assert_eq!(call.return_value, ScVal::U32(7));
+        assert!(call.auth.is_empty());
+        assert_eq!(call.transaction_data.resource_fee, 446_953);
+        assert_eq!(call.min_resource_fee, 446_953);
+        assert!(call.restore.is_none());
+        let params = &rpc.calls("simulateTransaction")[0];
+        assert_eq!(
+            params["transaction"],
+            encode::to_base64(&envelope()).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restore_preamble_is_carried_with_the_success() {
+        let rpc = ScriptedRpc::start().await;
+        rpc.expect(
+            "simulateTransaction",
+            json!({"transactionData": transaction_data_b64(10), "minResourceFee": "10",
+                   "results": [{"auth": [], "xdr": scval_b64(&ScVal::Void)}],
+                   "restorePreamble": {"minResourceFee": "77", "transactionData": transaction_data_b64(77)},
+                   "latestLedger": 5}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let simulation = client.simulate(&envelope()).await.unwrap();
+        let SimulationOutcome::Success(call) = simulation.outcome else {
+            panic!("expected success");
+        };
+        let restore = call.restore.unwrap();
+        assert_eq!(restore.min_resource_fee, 77);
+        assert_eq!(restore.transaction_data.resource_fee, 77);
+    }
+
+    #[tokio::test]
+    async fn a_failed_simulation_reports_the_contract_error_from_events_or_message() {
+        let message = "HostError: Error(Contract, #1200)\n\nEvent log (newest first):\n 0: [Diagnostic Event] …";
+        let rpc = ScriptedRpc::start().await;
+        rpc.expect(
+            "simulateTransaction",
+            json!({"error": message, "events": [diagnostic_error_b64(1200)], "latestLedger": 9}),
+        );
+        rpc.expect(
+            "simulateTransaction",
+            json!({"error": message, "events": [], "latestLedger": 9}),
+        );
+        rpc.expect(
+            "simulateTransaction",
+            json!({"error": "HostError: Error(WasmVm, UnexpectedSize)", "latestLedger": 9}),
+        );
+        rpc.expect(
+            "simulateTransaction",
+            json!({"error": "Could not unmarshal transaction", "latestLedger": 0}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        for expected in [Some(1200), Some(1200), None, None] {
+            let simulation = client.simulate(&envelope()).await.unwrap();
+            let SimulationOutcome::Failure { contract_error, .. } = simulation.outcome else {
+                panic!("expected failure");
+            };
+            assert_eq!(contract_error, expected);
+        }
+        assert_eq!(rpc.remaining(), 0);
+    }
+
+    #[test]
+    fn contract_error_parsing_reads_only_the_contract_code() {
+        assert_eq!(
+            contract_error_in_message("HostError: Error(Contract, #1205)\n\nEvent log"),
+            Some(1205)
+        );
+        assert_eq!(contract_error_in_message("Error(Contract, #7)"), Some(7));
+        assert_eq!(
+            contract_error_in_message("HostError: Error(WasmVm, UnexpectedSize)"),
+            None
+        );
+        assert_eq!(
+            contract_error_in_message("Error(Contract, #notanumber)"),
+            None
+        );
+        assert_eq!(
+            contract_error_in_events(&[crate::chain::script::diagnostic_error(1212)]),
+            Some(1212)
+        );
+        assert_eq!(contract_error_in_events(&[]), None);
+    }
+
+    #[tokio::test]
+    async fn send_decodes_every_status_and_the_error_result() {
+        let hash = "ab".repeat(32);
+        let rpc = ScriptedRpc::start().await;
+        for status in ["PENDING", "DUPLICATE", "TRY_AGAIN_LATER"] {
+            rpc.expect("sendTransaction", json!({"status": status, "hash": hash, "latestLedger": 3, "latestLedgerCloseTime": "1"}));
+        }
+        rpc.expect(
+            "sendTransaction",
+            json!({"status": "ERROR", "hash": hash, "latestLedger": 3, "latestLedgerCloseTime": "1",
+                   "errorResultXdr": result_b64(TransactionResultResult::TxBadSeq),
+                   "diagnosticEventsXdr": [diagnostic_error_b64(1201)]}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let mut outcomes = Vec::new();
+        for _ in 0..4 {
+            let status = client.send(&envelope()).await.unwrap();
+            assert_eq!(status.hash.to_hex(), hash);
+            assert_eq!(status.latest_ledger, 3);
+            outcomes.push(status.outcome);
+        }
+        assert!(matches!(outcomes[0], SendOutcome::Pending));
+        assert!(matches!(outcomes[1], SendOutcome::Duplicate));
+        assert!(matches!(outcomes[2], SendOutcome::TryAgainLater));
+        let SendOutcome::Error {
+            result,
+            contract_error,
+        } = &outcomes[3]
+        else {
+            panic!("expected error");
+        };
+        assert!(matches!(
+            result.as_ref().unwrap().result,
+            TransactionResultResult::TxBadSeq
+        ));
+        assert_eq!(*contract_error, Some(1201));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_send_status_is_a_shape_error() {
+        let rpc = ScriptedRpc::start().await;
+        rpc.expect(
+            "sendTransaction",
+            json!({"status": "WEIRD", "hash": "ab".repeat(32), "latestLedger": 3}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        assert!(matches!(
+            client.send(&envelope()).await.unwrap_err(),
+            ChainError::Shape(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn transaction_status_decodes_not_found_success_and_failed() {
+        let hash = TxHash([0xcd; 32]);
+        let failed = TransactionResultResult::TxFailed(
+            VecM::try_from(vec![OperationResult::OpInner(
+                OperationResultTr::InvokeHostFunction(InvokeHostFunctionResult::Trapped),
+            )])
+            .unwrap(),
+        );
+        let rpc = ScriptedRpc::start().await;
+        rpc.expect(
+            "getTransaction",
+            json!({"status": "NOT_FOUND", "latestLedger": 100, "latestLedgerCloseTime": "1", "oldestLedger": 1,
+                   "txHash": hash.to_hex(), "applicationOrder": 0, "feeBump": false, "events": {}, "ledger": 0, "createdAt": "0"}),
+        );
+        rpc.expect(
+            "getTransaction",
+            json!({"status": "SUCCESS", "latestLedger": 101, "oldestLedger": 1, "ledger": 99, "createdAt": "1788618724",
+                   "txHash": hash.to_hex(), "envelopeXdr": "AAAA",
+                   "resultXdr": result_b64(TransactionResultResult::TxSuccess(VecM::default())),
+                   "resultMetaXdr": meta_v4_b64(Some(ScVal::U32(7)), vec![]), "diagnosticEventsXdr": []}),
+        );
+        rpc.expect(
+            "getTransaction",
+            json!({"status": "FAILED", "latestLedger": 102, "oldestLedger": 1, "ledger": 100, "createdAt": 1_788_618_800,
+                   "txHash": hash.to_hex(), "resultXdr": result_b64(failed),
+                   "resultMetaXdr": meta_v4_b64(None, vec![]), "diagnosticEventsXdr": [diagnostic_error_b64(1205)]}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        assert!(matches!(
+            client.transaction(&hash).await.unwrap(),
+            TransactionStatus::NotFound { latest_ledger: 100 }
+        ));
+        let TransactionStatus::Success {
+            ledger,
+            latest_ledger,
+            return_value,
+        } = client.transaction(&hash).await.unwrap()
+        else {
+            panic!("expected success");
+        };
+        assert_eq!(
+            (ledger, latest_ledger, return_value),
+            (99, 101, Some(ScVal::U32(7)))
+        );
+        let TransactionStatus::Failed {
+            ledger,
+            contract_error,
+            result,
+            ..
+        } = client.transaction(&hash).await.unwrap()
+        else {
+            panic!("expected failed");
+        };
+        assert_eq!((ledger, contract_error), (100, Some(1205)));
+        assert!(matches!(
+            result.result,
+            TransactionResultResult::TxFailed(_)
+        ));
+        assert_eq!(rpc.calls("getTransaction")[0]["hash"], hash.to_hex());
     }
 }
