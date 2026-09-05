@@ -32,13 +32,16 @@ pub(crate) mod fixture;
 
 /// Errors this crate reports to its caller.
 ///
-/// One variant today, and it exists so the error taxonomy has a home before
-/// there is a pipeline to attribute failures to — a bot that liquidates real
-/// positions needs to say *which phase* failed, and bolting that on later
-/// means revisiting every call site.
+/// One variant per phase that exists, so the error taxonomy has a home
+/// before there is a full pipeline to attribute failures to — a bot that
+/// liquidates real positions needs to say *which phase* failed, and bolting
+/// that on later means revisiting every call site.
 #[derive(Debug, thiserror::Error)]
 pub enum LiquidatorError {
     /// Configuration was rejected at startup, before anything could act on it.
     #[error("invalid configuration: {0}")]
     Config(String),
+    /// The chain layer failed: transport, RPC, decoding, signing or submission.
+    #[error("chain: {0}")]
+    Chain(#[from] chain::ChainError),
 }

@@ -24,9 +24,24 @@ path = "src/main.rs"
 # crate actually builds.
 [dependencies]
 clap = { version = "4.6.0", features = ["derive", "env"] }
+# Ed25519 signing of transaction hashes.
+ed25519-dalek = "2.2"
 # 256-bit integers for the fixed-point widening path. Already in the tree
 # through stellar-xdr, so this adds no new code to audit.
 ethnum = "1.5"
+# JSON-RPC over HTTPS to the Soroban RPC. rustls with the system root store:
+# the runtime image ships ca-certificates, and this is the feature set whose
+# licence tree cargo-deny accepts — `rustls-tls` would pull webpki-roots
+# (CDLA-Permissive-2.0) and 0.13's `rustls` routes through aws-lc-rs
+# (OpenSSL licence), neither of which deny.toml allows.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Network id is sha256(passphrase). Already in the tree through stellar-xdr.
+sha2 = "0.10"
+# Decodes an S… secret. The version stellar-xdr already depends on, so no
+# second copy; public keys parse through stellar-xdr's own FromStr impls.
+stellar-strkey = "0.0.13"
 # XDR types plus base64 for RPC payloads. No `soroban-sdk`: the handful of
 # pool types the bot touches are encoded and decoded by hand in
 # `chain::xdr`, which keeps every ScVal shape visible in one place.
@@ -37,8 +52,8 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 
 [dev-dependencies]
-# Reads the JSON fixture in unit tests and drives the capture example.
-serde_json = "1"
+# The scripted JSON-RPC server the chain tests drive the real client through.
+wiremock = "0.6"
 
 # Set before there is code to lint, which is the cheap moment: retrofitting
 # `unwrap_used = "deny"` onto an existing codebase is not. Tests are exempted
