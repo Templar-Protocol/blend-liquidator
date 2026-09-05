@@ -1700,7 +1700,7 @@ git commit -m "feat(chain): ledger entries, account sequence, fee stats and even
 - Produces:
   - `pub struct RestorePreamble { pub transaction_data: SorobanTransactionData, pub min_resource_fee: i64 }`.
   - `pub struct SimulatedCall { pub return_value: ScVal, pub auth: Vec<SorobanAuthorizationEntry>, pub transaction_data: SorobanTransactionData, pub min_resource_fee: i64, pub restore: Option<RestorePreamble> }`.
-  - `pub enum SimulationOutcome { Success(SimulatedCall), Failure { message: String, contract_error: Option<u32> } }`.
+  - `pub enum SimulationOutcome { Success(Box<SimulatedCall>), Failure { message: String, contract_error: Option<u32> } }` (boxed: `large_enum_variant` is a default clippy warning and CI denies warnings).
   - `pub struct Simulation { pub latest_ledger: u32, pub events: Vec<DiagnosticEvent>, pub outcome: SimulationOutcome }` and `pub async fn simulate(&self, envelope: &TransactionEnvelope) -> Result<Simulation, ChainError>`.
   - `pub fn contract_error_in_events(events: &[DiagnosticEvent]) -> Option<u32>` and `pub fn contract_error_in_message(message: &str) -> Option<u32>`.
   - `pub enum SendOutcome { Pending, Duplicate, TryAgainLater, Error { result: Option<TransactionResult>, contract_error: Option<u32> } }`, `pub struct SendStatus { pub hash: TxHash, pub latest_ledger: u32, pub outcome: SendOutcome }`, `pub async fn send(&self, envelope: &TransactionEnvelope) -> Result<SendStatus, ChainError>`.
@@ -1951,8 +1951,8 @@ pub struct SimulatedCall {
 /// Success or the host's refusal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SimulationOutcome {
-    /// The call ran.
-    Success(SimulatedCall),
+    /// The call ran. Boxed so the enum stays small next to `Failure`.
+    Success(Box<SimulatedCall>),
     /// The host refused: a contract error, a trap, or a malformed envelope.
     Failure {
         /// The RPC's text, diagnostic log included.
@@ -2177,7 +2177,7 @@ impl RpcClient {
         Ok(Simulation {
             latest_ledger: raw.latest_ledger,
             events,
-            outcome: SimulationOutcome::Success(call),
+            outcome: SimulationOutcome::Success(Box::new(call)),
         })
     }
 
@@ -3006,7 +3006,7 @@ impl<'a> Submitter<'a> {
         });
         let simulation = self.rpc.simulate(&envelope).await?;
         match simulation.outcome {
-            SimulationOutcome::Success(call) => Ok((call, simulation.latest_ledger)),
+            SimulationOutcome::Success(call) => Ok((*call, simulation.latest_ledger)),
             SimulationOutcome::Failure {
                 message,
                 contract_error,
