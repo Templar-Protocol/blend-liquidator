@@ -8,9 +8,9 @@
 //! ```
 //!
 //! `RPC_API_KEY_HEADER` and `RPC_API_KEY` are honoured together. The health
-//! factor is computed at the latest ledger's close time, which may be one or
-//! two ledgers after the snapshot's: that is the accrual the contract would
-//! apply to a call landing now.
+//! factor is computed at the latest ledger's close time, read after the
+//! snapshot, so it is at or after the snapshot's ledger: that is the
+//! accrual the contract would apply to a call landing now.
 
 use std::error::Error;
 
@@ -34,8 +34,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     let client = RpcClient::new(&url, api_key)?;
-    let latest = client.latest_ledger().await?;
     let snapshot = PoolReader::new(&client, pool).snapshot(&users).await?;
+    let latest = client.latest_ledger().await?;
 
     println!(
         "pool {pool} at ledger {} (latest {} closed at {})",
