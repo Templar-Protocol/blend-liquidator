@@ -597,7 +597,7 @@ git commit -m "feat(chain): dependencies, ChainError and the network and RPC kno
 - Consumes: `ChainError`, `TxHash` (Task 1); `chain::xdr::{to_base64, from_base64, XdrError}` (Phase 1).
 - Produces:
   - test-only `ScriptedRpc::start().await`, `url()`, `expect(method, result: Value)`, `expect_error(method, code, message)`, `expect_http(method, status)`, `calls(method) -> Vec<Value>` (the `params` of each call, in order), `remaining() -> usize`, `received().await -> Vec<wiremock::Request>`.
-  - test-only canned-XDR builders: `account_entry_b64(account: &str, sequence: i64)`, `scval_b64(&ScVal)`, `transaction_data_b64(resource_fee: i64)`, `diagnostic_error(code: u32) -> DiagnosticEvent`, `diagnostic_error_b64(code)`, `result_b64(TransactionResultResult)`, `meta_v4_b64(return_value: Option<ScVal>, diagnostics: Vec<DiagnosticEvent>)`.
+  - test-only canned-XDR builders: `account_entry_b64(account: &str, sequence: i64)`, `scval_b64(&ScVal)`, `transaction_data_b64(resource_fee: i64)`, `diagnostic_error(code: u32) -> DiagnosticEvent`, `diagnostic_error_b64(code)`, `result_b64(TransactionResultResult)`, `meta_v4_b64(return_value: Option<ScVal>, diagnostics: Vec<DiagnosticEvent>)`, `meta_v3_b64(return_value: ScVal, diagnostics: Vec<DiagnosticEvent>)`.
   - `pub struct RpcClient` with `RpcClient::new(url: &str, api_key: Option<(&str, &str)>) -> Result<Self, ChainError>`, `RpcClient::from_config(&ChainConfig) -> Result<Self, ChainError>`.
   - `pub struct Health { pub status: String, pub latest_ledger: u32, pub latest_ledger_close_time: u64, pub oldest_ledger: u32, pub ledger_retention_window: u32 }` and `pub async fn health(&self) -> Result<Health, ChainError>`.
   - `pub struct LatestLedger { pub sequence: u32, pub protocol_version: u32, pub close_time: u64 }` and `pub async fn latest_ledger(&self) -> Result<LatestLedger, ChainError>`.
@@ -1206,7 +1206,7 @@ git commit -m "feat(chain): JSON-RPC client core with a scripted server for test
 - Produces:
   - `pub struct LedgerEntry { pub data: LedgerEntryData, pub last_modified_ledger: u32, pub live_until_ledger: Option<u32> }`.
   - `pub struct LedgerEntries { pub latest_ledger: u32, .. }` with `get(&self, key: &LedgerKey) -> Result<Option<&LedgerEntry>, ChainError>` and `len()`.
-  - `pub async fn ledger_entries(&self, keys: &[LedgerKey]) -> Result<LedgerEntries, ChainError>` — batches of 200, all batches must agree on `latestLedger`.
+  - `pub async fn ledger_entries(&self, keys: &[LedgerKey]) -> Result<LedgerEntries, ChainError>` — batches of 200, all batches must agree on `latestLedger`; an entry whose key was not requested is dropped with a warning, so `len()` counts requested keys only.
   - `pub struct Account { pub sequence: i64, pub latest_ledger: u32 }` and `pub async fn account(&self, account: &str) -> Result<Account, ChainError>` (`NoAccount` when absent).
   - `pub struct FeeStats { pub soroban_percentile_70: u32, pub soroban_percentile_90: u32, pub latest_ledger: u32 }` and `pub async fn fee_stats(&self) -> Result<FeeStats, ChainError>`.
   - `pub struct EventQuery<'a> { pub start_ledger: Option<u32>, pub cursor: Option<&'a str>, pub contract_ids: &'a [&'a str], pub limit: u32 }`, `pub struct Event { pub ledger: u32, pub id: String, pub tx_hash: TxHash, pub contract_id: String, pub in_successful_contract_call: bool, pub topics: Vec<ScVal>, pub value: ScVal }`, `pub struct Events { pub latest_ledger: u32, pub cursor: Option<String>, pub events: Vec<Event> }`, and `pub async fn events(&self, query: &EventQuery<'_>) -> Result<Events, ChainError>`.
@@ -3137,7 +3137,7 @@ git commit -m "feat(chain): transaction preparation with restore, fee policy and
 - Modify: `src/chain/tx.rs`
 
 **Interfaces:**
-- Produces on `Submitter`: `pub async fn send(&self, prepared: &Prepared) -> Result<(), ChainError>` (one retry of `TRY_AGAIN_LATER`; `TxBadSeq` is `BadSequence`; any other rejection is `Rejected`), `pub async fn wait(&self, prepared: &Prepared) -> Result<TxOutcome, ChainError>`, `pub async fn submit(&self, operation: Operation, priority: Priority) -> Result<TxOutcome, ChainError>`; and the pure `pub fn classify(status: TransactionStatus, prepared: &Prepared) -> Option<TxOutcome>` (`None` = keep polling).
+- Produces on `Submitter`: `pub async fn send(&self, prepared: &Prepared) -> Result<(), ChainError>` (one retry of `TRY_AGAIN_LATER`; `TxBadSeq` is `BadSequence`; any other rejection is `Rejected`), `pub async fn wait(&self, prepared: &Prepared) -> Result<TxOutcome, ChainError>`, `pub async fn wait_for(&self, hash: TxHash, sequence: i64, max_ledger: u32) -> Result<TxOutcome, ChainError>` (how a queue resumes an `Unknown` from the fields it recorded; `wait` delegates to it), `pub async fn submit(&self, operation: Operation, priority: Priority) -> Result<TxOutcome, ChainError>` (a convenience; a queue uses prepare/send/wait and keeps the `Prepared`); and the pure `pub fn classify(status: TransactionStatus, hash: TxHash, max_ledger: u32) -> Option<TxOutcome>` (`None` = keep polling).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3438,9 +3438,9 @@ git commit -m "feat(chain): send with one retry, bounded polling and outcome cla
 - Produces:
   - `pub enum RequestType { Supply, Withdraw, SupplyCollateral, WithdrawCollateral, Borrow, Repay, FillUserLiquidationAuction, FillBadDebtAuction, FillInterestAuction, DeleteLiquidationAuction }` with `code(self) -> u32` (0 to 9 in that order).
   - `pub struct Request { pub request_type: RequestType, pub address: String, pub amount: i128 }` and `pub fn request(request: &Request) -> Result<ScVal, XdrError>` (a struct map with keys `address`, `amount`, `request_type`).
-  - `pub fn submit_op(pool, from, spender, to: &str, requests: &[Request]) -> Result<Operation, XdrError>`, `pub fn new_auction_op(pool: &str, auction_type: AuctionType, user: &str, bid: &[&str], lot: &[&str], percent: u32) -> Result<Operation, XdrError>`, `pub fn bad_debt_op(pool: &str, user: &str) -> Result<Operation, XdrError>`.
+  - `pub fn submit_op(pool, from, spender, to: &str, requests: &[Request]) -> Result<Operation, XdrError>`, `pub fn new_auction_op(pool: &str, auction_type: AuctionType, user: &str, bid: &[&str], lot: &[&str], percent: u32) -> Result<Operation, XdrError>` (`percent` is 1 to 100, the contract's range; anything else is `XdrError::Shape`), `pub fn bad_debt_op(pool: &str, user: &str) -> Result<Operation, XdrError>`.
   - `pub struct PoolSnapshot { pub ledger: u32, pub pool: String, pub instance: PoolInstance, pub reserves: BTreeMap<u32, Reserve>, pub asset_index: BTreeMap<String, u32>, pub prices: OraclePrices, pub price_timestamps: BTreeMap<String, u64>, pub positions: BTreeMap<String, Positions> }` with `position_data(&self, user: &str, close_time: u64) -> Result<Option<PositionData>, ChainError>`.
-  - `pub struct PoolReader<'a>` with `PoolReader::new(rpc: &'a RpcClient, pool: &str)`, `snapshot(&self, users: &[&str]) -> Result<PoolSnapshot, ChainError>`, `auction(&self, user: &str, auction_type: AuctionType) -> Result<Option<(u32, AuctionData)>, ChainError>`, `balance(&self, token: &str, account: &str) -> Result<(u32, i128), ChainError>`.
+  - `pub struct PoolReader<'a>` with `PoolReader::new(rpc: &'a RpcClient, pool: &str)`, `snapshot(&self, users: &[&str]) -> Result<PoolSnapshot, ChainError>` (retries a moved ledger up to `SNAPSHOT_ATTEMPTS = 3` times through a private `snapshot_once`; the last attempt's `LedgerMoved` propagates and the caller tries again on the next tick), `auction(&self, user: &str, auction_type: AuctionType) -> Result<Option<(u32, AuctionData)>, ChainError>`, `balance(&self, token: &str, account: &str) -> Result<(u32, i128), ChainError>`.
 
 The contract facts (blend-contracts-v2 v2.0.0, `pool/src/contract.rs` and `pool/src/pool/actions.rs`): `submit(from: Address, spender: Address, to: Address, requests: Vec<Request>)`; `Request { request_type: u32, address: Address, amount: i128 }`; `new_auction(auction_type: u32, user: Address, bid: Vec<Address>, lot: Vec<Address>, percent: u32)`; `bad_debt(user: Address)`; a SEP-41 token's `balance(id: Address) -> i128`; the oracle's `decimals() -> u32` and `lastprice(asset: Asset) -> Option<PriceData>`.
 
@@ -4288,3 +4288,19 @@ git commit -m "docs: live pool snapshot example, module map and changelog for ph
 - [ ] The pool snapshot test lands on the golden health factors that `chain::xdr::decode` derives from the same fixture.
 - [ ] `pool_snapshot` output against mainnet is in the pull request.
 - [ ] The pull request is opened against `main` with a summary of the rulings above.
+
+---
+
+## Corrections after the final review
+
+The whole-branch review (2026-09-05) returned four Important findings and a set of minors; one fix wave (`aa5f10c`..`6c3e2a7`) addressed them. The interface lines above were updated; the code blocks for these items are superseded by the named commits:
+
+- `src/liquidator.rs` crate docs describe the chain layer (`9735f89`).
+- `PoolReader::snapshot` retries a moved ledger up to three times through `snapshot_once`; the moved-ledger test scripts three moved attempts and a second test covers one retry then success (`3bf153e`).
+- `classify(status, hash, max_ledger)` and `Submitter::wait_for(hash, sequence, max_ledger)`, which `wait` delegates to, so a queue resumes an `Unknown` from persisted fields; `submit` is documented as a convenience; `tx.rs`'s module doc states the layer never consults `DRY_RUN` (`0b07c52`).
+- `meta_v3_b64` in `script.rs` and a test that V3 metas yield the return value and the contract error (`914633e`), which also tests `RpcClient::from_config` sending the header from a `Secret`.
+- `ledger_entries` drops entries whose key was not requested, with a warning (`aa5f10c`).
+- `new_auction_op` documents and bounds `percent` to 1..=100; `RpcClient`'s doc notes that the URL renders in `Debug`; proof comments on the two saturating additions in `tx.rs` (`0b07c52`, `0a9519c`).
+- The example reads the latest ledger after the snapshot (`28c03ef`); the Dockerfile builder no longer installs `pkg-config` and `libssl-dev`, since the crate links no OpenSSL (`8cc1fd4`); changelog entries (`6c3e2a7`).
+
+Parked for later phases, recorded in the execution ledger: `position_data` re-accrues per call (Phase 4 chooses the memo shape); `Submitter` and `PoolReader` are borrow-holding `Copy` types a queue rebuilds per call (Phase 4's queue design decides whether to own handles); a startup check of the RPC's protocol version (Phase 3's service owns startup).
