@@ -6,6 +6,16 @@
 //! method name in the body: a test that forgot to script a method fails
 //! loudly instead of hanging. The canned-XDR builders below produce the
 //! base64 the RPC would put in its responses.
+//!
+//! A canned `Result` may contain the literal string `"$ENVELOPE_HASH"`
+//! anywhere in its JSON tree; the responder replaces every occurrence with
+//! the lowercase hex hash of the `TransactionEnvelope` in the request's own
+//! `params.transaction`, hashed for `Network::testnet` — the network every
+//! `tx.rs` test signs for. This lets a script assert against the hash of
+//! whatever envelope the client actually built and sent (which `send` now
+//! checks its `sendTransaction` response against) instead of an arbitrary
+//! literal that would never match. A request with no `transaction` param
+//! leaves the placeholder text as it is.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -16,13 +26,51 @@ use stellar_xdr::{
     ContractEventV0, DiagnosticEvent, ExtensionPoint, LedgerEntryChanges, LedgerEntryData,
     LedgerFootprint, ScError, ScVal, SorobanResources, SorobanTransactionData,
     SorobanTransactionDataExt, SorobanTransactionMeta, SorobanTransactionMetaExt,
-    SorobanTransactionMetaV2, String32, StringM, Thresholds, TransactionMeta, TransactionMetaV3,
-    TransactionMetaV4, TransactionResult, TransactionResultExt, TransactionResultResult, VecM,
+    SorobanTransactionMetaV2, String32, StringM, Thresholds, TransactionEnvelope, TransactionMeta,
+    TransactionMetaV3, TransactionMetaV4, TransactionResult, TransactionResultExt,
+    TransactionResultResult, VecM,
 };
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-use crate::chain::xdr::encode::{symbol, to_base64};
+use crate::chain::signer::Network;
+use crate::chain::xdr::encode::{from_base64, symbol, to_base64};
+use crate::chain::TxHash;
+
+/// The placeholder a canned `Result` substitutes for the hash of the
+/// request's own envelope. See the module doc.
+const ENVELOPE_HASH_PLACEHOLDER: &str = "$ENVELOPE_HASH";
+
+/// The hex hash of the `TransactionEnvelope` in `request`'s
+/// `params.transaction`, hashed for testnet, when there is one to decode.
+fn request_envelope_hash(request: &Value) -> Option<String> {
+    let encoded = request["params"]["transaction"].as_str()?;
+    let envelope: TransactionEnvelope = from_base64(encoded).ok()?;
+    let hash = envelope.hash(Network::testnet().id).ok()?;
+    Some(TxHash(hash).to_hex())
+}
+
+/// Replaces every `ENVELOPE_HASH_PLACEHOLDER` string found anywhere in
+/// `value` with `hash`, walking arrays and objects. Any other JSON value is
+/// left untouched.
+fn substitute_envelope_hash(value: &mut Value, hash: &str) {
+    match value {
+        Value::String(text) if text.as_str() == ENVELOPE_HASH_PLACEHOLDER => {
+            hash.clone_into(text);
+        }
+        Value::Array(items) => {
+            for item in items {
+                substitute_envelope_hash(item, hash);
+            }
+        }
+        Value::Object(fields) => {
+            for field in fields.values_mut() {
+                substitute_envelope_hash(field, hash);
+            }
+        }
+        _ => {}
+    }
+}
 
 /// One canned answer.
 pub(crate) enum Canned {
@@ -64,8 +112,13 @@ impl Respond for Responder {
         let mut state = self.state.lock().expect("script mutex");
         state.calls.push((method.clone(), body["params"].clone()));
         match state.script.get_mut(&method).and_then(VecDeque::pop_front) {
-            Some(Canned::Result(result)) => ResponseTemplate::new(200)
-                .set_body_json(json!({"jsonrpc": "2.0", "id": id, "result": result})),
+            Some(Canned::Result(mut result)) => {
+                if let Some(hash) = request_envelope_hash(&body) {
+                    substitute_envelope_hash(&mut result, &hash);
+                }
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"jsonrpc": "2.0", "id": id, "result": result}))
+            }
             Some(Canned::Error { code, message }) => ResponseTemplate::new(200).set_body_json(
                 json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}),
             ),

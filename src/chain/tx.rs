@@ -10,9 +10,11 @@
 //! `NOT_FOUND` only means the RPC did not find it among the ledgers it
 //! still retains, so `wait` reports `Expired` — provably not included —
 //! only when the RPC's retention also still reaches back to `min_ledger`.
-//! `Unknown` is kept both for the case where the RPC could not answer for
-//! the whole window, and for the case where it answered but its retention
-//! had already moved past `min_ledger`, so a `NOT_FOUND` proved nothing.
+//! `Unknown` is kept for three cases: the RPC could not answer for the whole
+//! window; it answered, but its retention had already moved past
+//! `min_ledger`, so a `NOT_FOUND` proved nothing; or polling stopped on an
+//! error no retry can fix, which ends the wait at once rather than at the
+//! cap.
 //!
 //! This layer never consults `DRY_RUN`: nothing here should be called by a
 //! dry-run path. The decision to sign and submit at all belongs to the
@@ -397,6 +399,15 @@ impl<'a> Submitter<'a> {
         self.send(&prepared).await?;
         match self.wait(&prepared).await? {
             TxOutcome::Succeeded { .. } => Ok(()),
+            TxOutcome::Unknown {
+                hash,
+                sequence,
+                window,
+            } => Err(ChainError::RestoreUnknown {
+                hash,
+                sequence,
+                window,
+            }),
             other => Err(ChainError::Restore(format!("{other:?}"))),
         }
     }
@@ -517,15 +528,35 @@ fn is_transient(error: &ChainError) -> bool {
 }
 
 impl Submitter<'_> {
-    /// `sendTransaction`, retrying a `TRY_AGAIN_LATER` once after a pause.
-    /// A `TxBadSeq` rejection is `BadSequence`: the plan is stale and must be
-    /// rebuilt, never resent. Any other rejection is `Rejected`.
+    /// `sendTransaction`, retrying a `TRY_AGAIN_LATER` once after a pause. A
+    /// `TxBadSeq` rejection is `BadSequence`: the plan is stale and must be
+    /// rebuilt, never resent. Any other rejection is `Rejected`. A `Pending`
+    /// or `Duplicate` outcome is checked against the envelope's own hash: a
+    /// mismatch is `Shape`, since the RPC returning a hash for a different
+    /// transaction than the one just sent means this client's assumptions
+    /// about the wire shape are wrong, which is worth failing loudly over
+    /// rather than polling under the wrong hash forever.
+    ///
+    /// An `Err` from `send` does not prove the envelope was not forwarded:
+    /// the request can fail (transport, an HTTP status, a JSON-RPC error, or
+    /// the hash mismatch above) after the RPC has already queued it. The
+    /// caller still holds `Prepared` either way; one that must be sure may
+    /// `wait` on it before retrying, since a transaction that did land will
+    /// be found under that hash regardless of what `send` returned.
     pub async fn send(&self, prepared: &Prepared) -> Result<(), ChainError> {
         let mut retried = false;
         loop {
             let status = self.rpc.send(&prepared.envelope).await?;
             match status.outcome {
-                SendOutcome::Pending | SendOutcome::Duplicate => return Ok(()),
+                SendOutcome::Pending | SendOutcome::Duplicate => {
+                    let (returned, expected) = (status.hash, prepared.hash);
+                    if returned != expected {
+                        return Err(ChainError::Shape(format!(
+                            "sendTransaction returned hash {returned} for envelope hash {expected}"
+                        )));
+                    }
+                    return Ok(());
+                }
                 SendOutcome::TryAgainLater if !retried => {
                     retried = true;
                     tokio::time::sleep(self.config.send_retry_pause).await;
@@ -617,18 +648,17 @@ impl Submitter<'_> {
             .await
     }
 
-    /// The whole write path: prepare, send, wait. A convenience for a
-    /// caller that can afford to lose the handle when `send` itself fails
-    /// in transport: on that failure this has already returned the error,
-    /// and there is no `Prepared` left to resume from. Once `send`
-    /// succeeds, `wait` always returns an outcome — even a permanent
-    /// polling failure becomes `Unknown` rather than an `Err` — so `send`
-    /// failing in transport is the only way this loses the handle. A
-    /// submission queue does not call this — it calls `prepare`, records
-    /// the returned `Prepared`'s hash, sequence and window as its own
-    /// crash-recovery state, then `send` and `wait`, so a send that timed
-    /// out is resumed with `wait_for` from the recorded fields instead of
-    /// resent: a stale plan is never resent (section 8 of the spec).
+    /// The whole write path: prepare, send, wait. A convenience: any error
+    /// after `prepare` loses the handle — `send` failing for any reason
+    /// (transport, an HTTP status, a JSON-RPC error, or a hash mismatch), or
+    /// a restore inside `prepare` ending `Unknown`, whose handle then
+    /// travels only inside `ChainError::RestoreUnknown` — while a permanent
+    /// polling failure after a successful send does not, because `wait`
+    /// reports it as `Unknown` rather than an `Err`. A submission queue uses
+    /// `prepare`, records the returned `Prepared`, then calls `send` and
+    /// `wait` itself, and resumes an interrupted submission with `wait_for`
+    /// from the hash, sequence and window it persisted rather than
+    /// resending a stale plan (section 8 of the spec).
     pub async fn submit(
         &self,
         operation: Operation,
@@ -841,7 +871,7 @@ mod tests {
         script_simulation(&rpc, 10, 100, Some(77));
         rpc.expect(
             "sendTransaction",
-            json!({"status": "PENDING", "hash": "11".repeat(32), "latestLedger": 100}),
+            json!({"status": "PENDING", "hash": "$ENVELOPE_HASH", "latestLedger": 100}),
         );
         rpc.expect(
             "getTransaction",
@@ -888,7 +918,7 @@ mod tests {
         script_simulation(&rpc, 10, 100, Some(77));
         rpc.expect(
             "sendTransaction",
-            json!({"status": "PENDING", "hash": "11".repeat(32), "latestLedger": 100}),
+            json!({"status": "PENDING", "hash": "$ENVELOPE_HASH", "latestLedger": 100}),
         );
         rpc.expect(
             "getTransaction",
@@ -906,6 +936,38 @@ mod tests {
                 .unwrap_err(),
             ChainError::Restore(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_restore_whose_outcome_is_unknown_returns_its_handle() {
+        // A permanent `getTransaction` error after the restore was sent
+        // means `wait` cannot say what became of it: `restore` must keep
+        // the hash, sequence and window in `RestoreUnknown` rather than
+        // flattening them into `Restore`'s opaque string, since the
+        // transaction may still land and only those fields let a caller
+        // resume it with `wait_for`.
+        let rpc = ScriptedRpc::start().await;
+        script_account(&rpc, 41, 100);
+        script_fees(&rpc, 200, 200);
+        script_simulation(&rpc, 10, 100, Some(77));
+        rpc.expect(
+            "sendTransaction",
+            json!({"status": "PENDING", "hash": "$ENVELOPE_HASH", "latestLedger": 100}),
+        );
+        rpc.expect_error("getTransaction", -32_602, "invalid hash");
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let (network, signer) = (Network::testnet(), signer());
+        let submitter = Submitter::new(&client, &network, &signer, config());
+
+        let error = submitter
+            .prepare(operation(), Priority::Normal)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ChainError::RestoreUnknown { sequence: 42, .. }),
+            "{error:?}"
+        );
+        assert_eq!(rpc.remaining(), 0);
     }
 
     #[tokio::test]
@@ -1022,6 +1084,27 @@ mod tests {
             ChainError::Rejected(_)
         ));
         submitter.send(&prepared(104)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_refuses_a_hash_that_is_not_the_envelopes() {
+        // A `PENDING`/`DUPLICATE` outcome is trusted only when the RPC
+        // echoes back the hash of the envelope this client actually sent;
+        // any other hash means the wire shape is not what this client
+        // assumes, which must fail loudly rather than poll under the wrong
+        // hash forever.
+        let rpc = ScriptedRpc::start().await;
+        rpc.expect(
+            "sendTransaction",
+            json!({"status": "PENDING", "hash": "ab".repeat(32), "latestLedger": 1}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let (network, signer) = (Network::testnet(), signer());
+        let submitter = submitter_for(&client, &network, &signer);
+        assert!(matches!(
+            submitter.send(&prepared(104)).await.unwrap_err(),
+            ChainError::Shape(_)
+        ));
     }
 
     #[test]
@@ -1279,7 +1362,7 @@ mod tests {
         script_simulation(&rpc, 300, 100, None);
         rpc.expect(
             "sendTransaction",
-            json!({"status": "PENDING", "hash": "77".repeat(32), "latestLedger": 100}),
+            json!({"status": "PENDING", "hash": "$ENVELOPE_HASH", "latestLedger": 100}),
         );
         rpc.expect(
             "getTransaction",

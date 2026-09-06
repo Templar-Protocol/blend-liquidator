@@ -2540,8 +2540,9 @@ git commit -m "feat(chain): network id and Ed25519 signer" -m "Co-Authored-By: C
   - `pub const TIME_BOUND_SECS: u64 = 300`.
   - `pub struct TxConfig { pub base_fee: u32, pub high_fee: u32, pub poll_ledgers: u32, pub poll_interval: Duration, pub send_retry_pause: Duration, pub wait_cap: Duration }` with `TxConfig::new(base_fee, high_fee, poll_ledgers)` (1 s, 1 s, 10 s × (poll_ledgers + 1)) and `TxConfig::from_config(&ChainConfig)`.
   - `pub enum Priority { Normal, High }`.
-  - `pub struct Prepared { pub envelope: TransactionEnvelope, pub hash: TxHash, pub sequence: i64, pub max_ledger: u32, pub fee: u32, pub resource_fee: i64 }`.
-  - `pub enum TxOutcome { Succeeded { hash: TxHash, ledger: u32, return_value: Option<ScVal> }, Failed { hash: TxHash, ledger: u32, contract_error: Option<u32>, result: TransactionResult }, Expired { hash: TxHash, max_ledger: u32, latest_ledger: u32 }, Unknown { hash: TxHash, sequence: i64, max_ledger: u32 } }` (Task 7 fills in its use).
+  - `pub struct LedgerWindow` (`try_new(min_ledger, max_ledger)`, min inclusive, max exclusive) — the `[min_ledger, max_ledger)` pair `Prepared` and `TxOutcome` carry instead of a bare `u32`, so a window can never be empty or inverted.
+  - `pub struct Prepared { pub envelope: TransactionEnvelope, pub hash: TxHash, pub sequence: i64, pub window: LedgerWindow, pub fee: u32, pub resource_fee: i64 }`.
+  - `pub enum TxOutcome { Succeeded { hash: TxHash, ledger: u32, return_value: Option<ScVal> }, Failed { hash: TxHash, ledger: u32, contract_error: Option<u32>, result: TransactionResult }, Expired { hash: TxHash, window: LedgerWindow, latest_ledger: u32 }, Unknown { hash: TxHash, sequence: i64, window: LedgerWindow } }` (Task 7 fills in its use).
   - `pub struct Submitter<'a>` with `Submitter::new(rpc: &'a RpcClient, network: &'a Network, signer: &'a Signer, config: TxConfig)`, `pub fn inclusion_fee(&self, fees: &FeeStats, priority: Priority) -> u32`, `pub async fn prepare(&self, operation: Operation, priority: Priority) -> Result<Prepared, ChainError>`.
   - Task 7 adds `send`, `wait`, `classify`, `submit` on the same type; this task's `restore` already needs a minimal send-and-wait, so `send` and `wait` are implemented here and tested in Task 7.
 
@@ -4305,7 +4306,7 @@ The whole-branch review (2026-09-05) returned four Important findings and a set 
 
 ### Corrections after the pull-request review
 
-Review rounds 1 and 2 on the open pull request found further gaps, folded into the branch's history rather than the plan's original code blocks:
+Review rounds 1, 2 and 3 on the open pull request found further gaps, folded into the branch's history rather than the plan's original code blocks:
 
 - The retention-floor rule: `getTransaction`'s `oldestLedger` is decoded, and `classify` calls a `NOT_FOUND` `Expired` only when the RPC's retention still reaches back to the transaction's lower ledger bound — otherwise a `NOT_FOUND` proves nothing and the outcome stays `Unknown`.
 - `LedgerWindow`, a `try_new`-only newtype for the `[min_ledger, max_ledger)` pair, so a window can never be empty or inverted; `Prepared`, `TxOutcome::Expired`, `TxOutcome::Unknown`, `classify` and `wait_for` all carry it instead of two independent `u32`s.
@@ -4317,5 +4318,9 @@ Review rounds 1 and 2 on the open pull request found further gaps, folded into t
 - The runtime Docker image no longer installs `libssl3`: the binary links no OpenSSL, so the package bought nothing.
 - The configuration tests assert none of the network, RPC or logging environment variables are set before parsing, so a developer's shell exporting one cannot silently change what a test exercises.
 - The scripted server answers a request whose body is not valid JSON with HTTP 400 and the parse error, instead of decaying to "unscripted method".
+- `Submitter::send` checks a `Pending`/`Duplicate` `sendTransaction` response's hash against the envelope it just sent, refusing a mismatch as `ChainError::Shape` rather than trusting the RPC's echo blindly; the scripted server substitutes the literal `"$ENVELOPE_HASH"` inside a canned result for the hex hash of the request's own envelope, hashed for `Network::testnet` (the network every `tx.rs` test signs for), so a script can assert against the hash of whatever it actually sent instead of an arbitrary literal.
+- `ChainError::RestoreUnknown { hash, sequence, window }`: a restore transaction whose outcome comes back `Unknown` keeps its handle in this variant instead of losing it inside `ChainError::Restore`'s formatted string, so a caller can still resume it with `wait_for`.
+- The configuration tests' clean-environment assertion is its own function, `assert_clean_environment`, called by the `parse` test helper and directly by `dry_run_defaults_to_true` — whose doc claims the default holds "absent any argument or environment", a claim that test now actually checks rather than relying on `parse` being called first.
+- An empty `RPC_API_KEY_HEADER` counts as absent, the same as an unset one, in `Args::chain_with_secret` — matching the empty-`RPC_API_KEY` rule already there and the `pool_snapshot` example's own filtering.
 
 Parked for later phases, recorded in the execution ledger: `position_data` re-accrues per call (Phase 4 chooses the memo shape); `Submitter` and `PoolReader` are borrow-holding `Copy` types a queue rebuilds per call (Phase 4's queue design decides whether to own handles); a startup check of the RPC's protocol version (Phase 3's service owns startup).

@@ -79,6 +79,18 @@ pub enum ChainError {
     /// The restore-footprint transaction did not succeed.
     #[error("restoring archived entries failed: {0}")]
     Restore(String),
+    /// A restore-footprint transaction was sent, but its outcome is unknown.
+    /// The caller resumes it with `Submitter::wait_for` from these fields
+    /// before doing anything else with the account's sequence.
+    #[error("restore transaction {hash} (sequence {sequence}) has an unknown outcome")]
+    RestoreUnknown {
+        /// The restore transaction's hash; what `getTransaction` is polled by.
+        hash: TxHash,
+        /// The sequence number the restore transaction would consume.
+        sequence: i64,
+        /// The window the restore transaction was built against.
+        window: LedgerWindow,
+    },
     /// `sendTransaction` refused the transaction outright.
     #[error("transaction rejected at send: {0}")]
     Rejected(String),

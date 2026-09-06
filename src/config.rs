@@ -131,7 +131,8 @@ pub struct Args {
     pub rpc_url: Option<String>,
 
     /// Header that carries the RPC API key. The key itself is `RPC_API_KEY`
-    /// in the environment only — never an argument.
+    /// in the environment only — never an argument. An empty value counts
+    /// as unset, the same as the variable not being set at all.
     #[arg(long, env = "RPC_API_KEY_HEADER")]
     pub rpc_api_key_header: Option<String>,
 
@@ -190,13 +191,20 @@ impl Args {
             .rpc_url
             .clone()
             .ok_or_else(|| LiquidatorError::Config("RPC_URL is required".to_string()))?;
-        if let Some(header) = &self.rpc_api_key_header {
+        // An empty header name counts as absent, the same as an empty
+        // RPC_API_KEY above: a shell that exports RPC_API_KEY_HEADER= should
+        // not behave differently from one that never set it.
+        let header = self
+            .rpc_api_key_header
+            .as_deref()
+            .filter(|header| !header.is_empty());
+        if let Some(header) = header {
             reqwest::header::HeaderName::from_bytes(header.as_bytes()).map_err(|_| {
                 LiquidatorError::Config("RPC_API_KEY_HEADER is not a valid header name".to_string())
             })?;
         }
-        let rpc_api_key = match (&self.rpc_api_key_header, rpc_api_key) {
-            (Some(header), Some(key)) => Some((header.clone(), Secret::new(key))),
+        let rpc_api_key = match (header, rpc_api_key) {
+            (Some(header), Some(key)) => Some((header.to_string(), Secret::new(key))),
             (None, None) => None,
             (Some(_), None) => {
                 return Err(LiquidatorError::Config(
@@ -228,6 +236,7 @@ mod tests {
     /// argument or environment, the bot is disarmed.
     #[test]
     fn dry_run_defaults_to_true() {
+        assert_clean_environment();
         let args = Args::try_parse_from(["liquidator"]).unwrap();
         assert!(args.dry_run, "dry-run must default to true");
     }
@@ -264,7 +273,7 @@ mod tests {
     /// shell exporting any of these would silently change what the config
     /// tests exercise. Asserted, never mutated: fail loudly instead of
     /// passing for the wrong reason.
-    fn parse(argv: &[&str]) -> Args {
+    fn assert_clean_environment() {
         for name in [
             "RPC_URL",
             "NETWORK",
@@ -282,6 +291,10 @@ mod tests {
                  environment or they exercise the shell's values instead of the argv given"
             );
         }
+    }
+
+    fn parse(argv: &[&str]) -> Args {
+        assert_clean_environment();
         Args::try_parse_from(argv).unwrap()
     }
 
@@ -383,7 +396,9 @@ mod tests {
 
     /// `RPC_API_KEY=` (set but empty) must behave exactly like the variable
     /// being unset, in both `chain` (via an empty environment read) and
-    /// `chain_with_secret` (via a bare `Some(String::new())`).
+    /// `chain_with_secret` (via a bare `Some(String::new())`); the same goes
+    /// for an empty `RPC_API_KEY_HEADER`, which `chain_with_secret` also
+    /// treats as absent.
     #[test]
     fn an_empty_api_key_counts_as_absent() {
         let with_header = parse(&[
@@ -410,6 +425,25 @@ mod tests {
             .chain_with_secret(Some(String::new()))
             .unwrap();
         assert_eq!(chain.rpc_api_key, None);
+
+        // An empty header behaves like an absent one, both alone and paired
+        // with an empty key, but not paired with a real key: that is still
+        // "the key is set but the header is not".
+        let empty_header = parse(&[
+            "liquidator",
+            "--network",
+            "mainnet",
+            "--rpc-url",
+            "http://rpc",
+            "--rpc-api-key-header",
+            "",
+        ]);
+        let chain = empty_header.chain_with_secret(Some(String::new())).unwrap();
+        assert_eq!(chain.rpc_api_key, None);
+        assert!(matches!(
+            empty_header.chain_with_secret(Some("k".to_string())),
+            Err(LiquidatorError::Config(_))
+        ));
     }
 
     /// `ChainConfig`'s doc claims the header name is validated; this is

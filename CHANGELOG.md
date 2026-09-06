@@ -74,23 +74,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stays `Unknown` for reconciliation by other means (the account's sequence
   number) instead of being called `Expired` on a guess. A `TxBadSeq` at send
   is its own error, `BadSequence`, because the plan behind such a
-  transaction is stale and must be rebuilt. `wait_for` polls to that same
-  outcome from a bare hash, sequence and window — the fields an `Unknown`
-  outcome carries — so a submission queue can resume a transaction after a
-  restart or a send that timed out without resending it; `wait` is
-  `wait_for` on the fields a `Prepared` already holds. Only a transient
-  failure (a transport error, or an HTTP 429/5xx) is retried while polling;
-  a permanent one — a JSON-RPC error object, a malformed response, or any
-  other HTTP status — stops polling and is reported as `Unknown` rather than
-  an `Err`, since the transaction may already have landed and only the chain
-  can say what happened: `wait_for` never loses the handle while the
-  transaction could still be in flight.
+  transaction is stale and must be rebuilt. `send` also checks the hash a
+  `Pending`/`Duplicate` `sendTransaction` response carries against the
+  envelope it just sent, refusing a mismatch as `Shape` rather than trusting
+  the RPC's echo blindly. `wait_for` polls to that same outcome from a bare
+  hash, sequence and window — the fields an `Unknown` outcome carries — so a
+  submission queue can resume a transaction after a restart or a send that
+  timed out without resending it; `wait` is `wait_for` on the fields a
+  `Prepared` already holds. Only a transient failure (a transport error, or
+  an HTTP 429/5xx) is retried while polling; a permanent one — a JSON-RPC
+  error object, a malformed response, or any other HTTP status — stops
+  polling and is reported as `Unknown` rather than an `Err`, since the
+  transaction may already have landed and only the chain can say what
+  happened: `wait_for` never loses the handle while the transaction could
+  still be in flight. A restore transaction whose own outcome comes back
+  `Unknown` keeps its hash, sequence and window too, in
+  `ChainError::RestoreUnknown`, instead of losing them inside `Restore`'s
+  formatted string.
 - Configuration for the chain: `NETWORK` or `NETWORK_PASSPHRASE`,
-  `RPC_URL`, `RPC_API_KEY_HEADER` with `RPC_API_KEY` read from the
-  environment only (an empty value counts as absent), `BASE_FEE`,
-  `HIGH_FEE`, `TX_POLL_LEDGERS` (minimum 1: the ledger bound is exclusive,
-  so a zero window would make every transaction unlandable before it
-  starts).
+  `RPC_URL`, `RPC_API_KEY_HEADER` (an empty value counts as absent, the same
+  as an unset one) with `RPC_API_KEY` read from the environment only (an
+  empty value counts as absent here too), `BASE_FEE`, `HIGH_FEE`,
+  `TX_POLL_LEDGERS` (minimum 1: the ledger bound is exclusive, so a zero
+  window would make every transaction unlandable before it starts).
 - `cargo run --example pool_snapshot` prints a live pool's reserves and its
   users' projected health factors through the real client.
 - Every chain test drives the real client through a scripted localhost
