@@ -144,14 +144,14 @@ pub struct Args {
     #[arg(long, env = "HIGH_FEE", default_value_t = 10_000)]
     pub high_fee: u32,
 
-    /// Ledgers a submitted transaction stays valid and is polled for. Must
-    /// be at least 1: the ledger bound is exclusive, so a zero window would
-    /// make every transaction unlandable before it starts.
+    /// Ledgers a submitted transaction stays valid and is polled for: at
+    /// least 1 (the upper bound is exclusive), at most 100 000 (about six
+    /// days), so the derived wait cap always fits a clock deadline.
     #[arg(
         long,
         env = "TX_POLL_LEDGERS",
         default_value_t = 3,
-        value_parser = clap::value_parser!(u32).range(1..),
+        value_parser = clap::value_parser!(u32).range(1..=100_000),
     )]
     pub tx_poll_ledgers: u32,
 }

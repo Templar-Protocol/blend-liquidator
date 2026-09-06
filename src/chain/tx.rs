@@ -625,7 +625,12 @@ impl Submitter<'_> {
         sequence: i64,
         window: LedgerWindow,
     ) -> Result<TxOutcome, ChainError> {
-        let deadline = Instant::now() + self.config.wait_cap;
+        // `wait_cap` is bounded by `TX_POLL_LEDGERS`'s ceiling, so the
+        // addition cannot overflow; a checked add keeps that a configuration
+        // fact rather than a panic if the ceiling ever moves.
+        let deadline = Instant::now()
+            .checked_add(self.config.wait_cap)
+            .unwrap_or_else(Instant::now);
         loop {
             match self.rpc.transaction(&hash).await {
                 Ok(status) => {
