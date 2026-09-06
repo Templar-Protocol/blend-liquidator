@@ -369,7 +369,12 @@ impl<'a> Submitter<'a> {
     }
 
     /// Restores the archived entries a simulation reported, consuming one
-    /// sequence number, and waits for the restore to land.
+    /// sequence number, and waits for the restore to land. A `send` failure
+    /// that does not prove the envelope was refused — a transport error, an
+    /// HTTP or JSON-RPC error, a hash the RPC echoed wrongly — is reported
+    /// as `RestoreUnknown` with the restore's handle, since the restore may
+    /// still land at that sequence; only `BadSequence` and `Rejected`, which
+    /// are refusals before the queue, propagate as themselves.
     async fn restore(
         &self,
         preamble: RestorePreamble,
@@ -396,7 +401,20 @@ impl<'a> Submitter<'a> {
             fee,
             resource_fee: preamble.min_resource_fee,
         };
-        self.send(&prepared).await?;
+        match self.send(&prepared).await {
+            Ok(()) => {}
+            Err(refused @ (ChainError::BadSequence | ChainError::Rejected(_))) => {
+                return Err(refused)
+            }
+            Err(error) => {
+                tracing::warn!(hash = %prepared.hash, %error, "restore send failed after the envelope may have been accepted");
+                return Err(ChainError::RestoreUnknown {
+                    hash: prepared.hash,
+                    sequence: prepared.sequence,
+                    window: prepared.window,
+                });
+            }
+        }
         match self.wait(&prepared).await? {
             TxOutcome::Succeeded { .. } => Ok(()),
             TxOutcome::Unknown {
@@ -776,6 +794,7 @@ mod tests {
         let (network, signer) = (Network::testnet(), signer());
         let submitter = Submitter::new(&client, &network, &signer, config());
 
+        let started = unix_now();
         let prepared = submitter
             .prepare(operation(), Priority::Normal)
             .await
@@ -804,9 +823,12 @@ mod tests {
         };
         let time = cond.time_bounds.as_ref().unwrap();
         assert_eq!(time.min_time.0, 0);
+        // One clock read taken before `prepare`, and a minute of slack above
+        // it, so a paused or slow run cannot fail this on timing.
         assert!(
-            (unix_now() + TIME_BOUND_SECS - 5..=unix_now() + TIME_BOUND_SECS)
-                .contains(&time.max_time.0)
+            (started + TIME_BOUND_SECS..=started + TIME_BOUND_SECS + 60).contains(&time.max_time.0),
+            "max_time {} is not within a minute above {started} + {TIME_BOUND_SECS}",
+            time.max_time.0
         );
         let ledgers = cond.ledger_bounds.as_ref().unwrap();
         assert_eq!(
@@ -936,6 +958,33 @@ mod tests {
                 .unwrap_err(),
             ChainError::Restore(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_restore_whose_send_fails_after_acceptance_returns_its_handle() {
+        // The RPC queues the restore (PENDING) but echoes a hash that is not
+        // the envelope's: `send` refuses, yet the restore may land at
+        // sequence 42, so the caller gets its handle, not a shape error.
+        let rpc = ScriptedRpc::start().await;
+        script_account(&rpc, 41, 100);
+        script_fees(&rpc, 200, 200);
+        script_simulation(&rpc, 10, 100, Some(77));
+        rpc.expect(
+            "sendTransaction",
+            json!({"status": "PENDING", "hash": "ab".repeat(32), "latestLedger": 100}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let (network, signer) = (Network::testnet(), signer());
+        let submitter = Submitter::new(&client, &network, &signer, config());
+        let error = submitter
+            .prepare(operation(), Priority::Normal)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ChainError::RestoreUnknown { sequence: 42, .. }),
+            "{error:?}"
+        );
+        assert!(rpc.calls("getTransaction").is_empty());
     }
 
     #[tokio::test]
