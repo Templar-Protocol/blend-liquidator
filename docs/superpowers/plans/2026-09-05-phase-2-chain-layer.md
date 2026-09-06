@@ -3137,7 +3137,7 @@ git commit -m "feat(chain): transaction preparation with restore, fee policy and
 - Modify: `src/chain/tx.rs`
 
 **Interfaces:**
-- Produces on `Submitter`: `pub async fn send(&self, prepared: &Prepared) -> Result<(), ChainError>` (one retry of `TRY_AGAIN_LATER`; `TxBadSeq` is `BadSequence`; any other rejection is `Rejected`), `pub async fn wait(&self, prepared: &Prepared) -> Result<TxOutcome, ChainError>`, `pub async fn wait_for(&self, hash: TxHash, sequence: i64, max_ledger: u32) -> Result<TxOutcome, ChainError>` (how a queue resumes an `Unknown` from the fields it recorded; `wait` delegates to it), `pub async fn submit(&self, operation: Operation, priority: Priority) -> Result<TxOutcome, ChainError>` (a convenience; a queue uses prepare/send/wait and keeps the `Prepared`); and the pure `pub fn classify(status: TransactionStatus, hash: TxHash, max_ledger: u32) -> Option<TxOutcome>` (`None` = keep polling).
+- Produces `pub struct LedgerWindow` (`try_new(min_ledger, max_ledger)`, min inclusive, max exclusive; `min_ledger()`, `max_ledger()`) and, on `Submitter`: `pub async fn send(&self, prepared: &Prepared) -> Result<(), ChainError>` (one retry of `TRY_AGAIN_LATER`; `TxBadSeq` is `BadSequence`; any other rejection is `Rejected`), `pub async fn wait(&self, prepared: &Prepared) -> Result<TxOutcome, ChainError>`, `pub async fn wait_for(&self, hash: TxHash, sequence: i64, window: LedgerWindow) -> Result<TxOutcome, ChainError>` (how a queue resumes an `Unknown` from the fields it recorded; `wait` delegates to it), `pub async fn submit(&self, operation: Operation, priority: Priority) -> Result<TxOutcome, ChainError>` (a convenience; a queue uses prepare/send/wait and keeps the `Prepared`); and the pure `pub fn classify(status: TransactionStatus, hash: TxHash, window: LedgerWindow) -> Option<TxOutcome>` (`None` = keep polling).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3438,7 +3438,7 @@ git commit -m "feat(chain): send with one retry, bounded polling and outcome cla
 - Produces:
   - `pub enum RequestType { Supply, Withdraw, SupplyCollateral, WithdrawCollateral, Borrow, Repay, FillUserLiquidationAuction, FillBadDebtAuction, FillInterestAuction, DeleteLiquidationAuction }` with `code(self) -> u32` (0 to 9 in that order).
   - `pub struct Request { pub request_type: RequestType, pub address: String, pub amount: i128 }` and `pub fn request(request: &Request) -> Result<ScVal, XdrError>` (a struct map with keys `address`, `amount`, `request_type`).
-  - `pub fn submit_op(pool, from, spender, to: &str, requests: &[Request]) -> Result<Operation, XdrError>`, `pub fn new_auction_op(pool: &str, auction_type: AuctionType, user: &str, bid: &[&str], lot: &[&str], percent: u32) -> Result<Operation, XdrError>` (`percent` is 1 to 100, the contract's range; anything else is `XdrError::Shape`), `pub fn bad_debt_op(pool: &str, user: &str) -> Result<Operation, XdrError>`.
+  - `pub fn submit_op(pool, from, spender, to: &str, requests: &[Request]) -> Result<Operation, XdrError>`, `pub fn new_auction_op(pool: &str, auction_type: AuctionType, user: &str, bid: &[&str], lot: &[&str], percent: FillPercent) -> Result<Operation, XdrError>` (`FillPercent` is a `TryFrom<u32>` newtype for 1 to 100, the contract's range, shared with `Request::fill`, so an out-of-range value is refused before a request is even built), `pub fn bad_debt_op(pool: &str, user: &str) -> Result<Operation, XdrError>`.
   - `pub struct PoolSnapshot { pub ledger: u32, pub pool: String, pub instance: PoolInstance, pub reserves: BTreeMap<u32, Reserve>, pub asset_index: BTreeMap<String, u32>, pub prices: OraclePrices, pub price_timestamps: BTreeMap<String, u64>, pub positions: BTreeMap<String, Positions> }` with `position_data(&self, user: &str, close_time: u64) -> Result<Option<PositionData>, ChainError>`.
   - `pub struct PoolReader<'a>` with `PoolReader::new(rpc: &'a RpcClient, pool: &str)`, `snapshot(&self, users: &[&str]) -> Result<PoolSnapshot, ChainError>` (retries a moved ledger up to `SNAPSHOT_ATTEMPTS = 3` times through a private `snapshot_once`; the last attempt's `LedgerMoved` propagates and the caller tries again on the next tick), `auction(&self, user: &str, auction_type: AuctionType) -> Result<Option<(u32, AuctionData)>, ChainError>`, `balance(&self, token: &str, account: &str) -> Result<(u32, i128), ChainError>`.
 
@@ -4302,5 +4302,20 @@ The whole-branch review (2026-09-05) returned four Important findings and a set 
 - `ledger_entries` drops entries whose key was not requested, with a warning (`aa5f10c`).
 - `new_auction_op` documents and bounds `percent` to 1..=100; `RpcClient`'s doc notes that the URL renders in `Debug`; proof comments on the two saturating additions in `tx.rs` (`0b07c52`, `0a9519c`).
 - The example reads the latest ledger after the snapshot (`28c03ef`); the Dockerfile builder no longer installs `pkg-config` and `libssl-dev`, since the crate links no OpenSSL (`8cc1fd4`); changelog entries (`6c3e2a7`).
+
+### Corrections after the pull-request review
+
+Review rounds 1 and 2 on the open pull request found further gaps, folded into the branch's history rather than the plan's original code blocks:
+
+- The retention-floor rule: `getTransaction`'s `oldestLedger` is decoded, and `classify` calls a `NOT_FOUND` `Expired` only when the RPC's retention still reaches back to the transaction's lower ledger bound — otherwise a `NOT_FOUND` proves nothing and the outcome stays `Unknown`.
+- `LedgerWindow`, a `try_new`-only newtype for the `[min_ledger, max_ledger)` pair, so a window can never be empty or inverted; `Prepared`, `TxOutcome::Expired`, `TxOutcome::Unknown`, `classify` and `wait_for` all carry it instead of two independent `u32`s.
+- `wait_for` reports a permanent `getTransaction` error as `Unknown` — carrying the hash, sequence and window — instead of propagating it as `Err`, since the transaction may already have been sent and only the chain can say what became of it.
+- `FillPercent`, a `TryFrom<u32>` newtype validating the contract's 1 to 100 fill-percent range once, shared by `new_auction_op`'s `percent` and the `amount` the three fill `Request`s carry through `Request::fill`.
+- The `getEvents` `limit` is validated against the RPC's 1 to 10 000 range before a request is ever sent.
+- An empty `RPC_API_KEY` counts as absent, the same as the variable being unset at all, and `Args::chain` validates the API key header name before building `ChainConfig`.
+- `TX_POLL_LEDGERS` is floored at 1 by the clap parser: the ledger bound is exclusive, so a zero window would make every transaction unlandable before it starts.
+- The runtime Docker image no longer installs `libssl3`: the binary links no OpenSSL, so the package bought nothing.
+- The configuration tests assert none of the network, RPC or logging environment variables are set before parsing, so a developer's shell exporting one cannot silently change what a test exercises.
+- The scripted server answers a request whose body is not valid JSON with HTTP 400 and the parse error, instead of decaying to "unscripted method".
 
 Parked for later phases, recorded in the execution ledger: `position_data` re-accrues per call (Phase 4 chooses the memo shape); `Submitter` and `PoolReader` are borrow-holding `Copy` types a queue rebuilds per call (Phase 4's queue design decides whether to own handles); a startup check of the RPC's protocol version (Phase 3's service owns startup).

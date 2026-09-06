@@ -52,7 +52,13 @@ struct Responder {
 
 impl Respond for Responder {
     fn respond(&self, request: &Request) -> ResponseTemplate {
-        let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+        let body: Value = match serde_json::from_slice(&request.body) {
+            Ok(body) => body,
+            Err(error) => {
+                return ResponseTemplate::new(400)
+                    .set_body_string(format!("request body is not JSON: {error}"))
+            }
+        };
         let method = body["method"].as_str().unwrap_or_default().to_string();
         let id = body["id"].clone();
         let mut state = self.state.lock().expect("script mutex");
@@ -265,4 +271,25 @@ pub(crate) fn meta_v3_b64(return_value: ScVal, diagnostics: Vec<DiagnosticEvent>
         }),
     });
     to_base64(&meta).expect("encodes")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A body that is not valid JSON at all cannot carry a `method`, so it
+    /// must not be answered as if it were merely an unscripted one: the
+    /// scripted server rejects it loudly at HTTP 400 with the parse error,
+    /// and records nothing, instead of decaying to "unscripted method".
+    #[tokio::test]
+    async fn a_non_json_body_is_answered_with_http_400() {
+        let rpc = ScriptedRpc::start().await;
+        let response = reqwest::Client::new()
+            .post(rpc.url())
+            .body("not json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+    }
 }

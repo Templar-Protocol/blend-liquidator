@@ -61,26 +61,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fill requests carry, built through `Request::fill`, so an out-of-range
   value is refused before a request is even built; the network id and an
   Ed25519 `Signer` that renders as its address only (`signer`); and the one
-  write path (`tx`): build with a five-minute time bound and a ledger bound
-  of `[latest_ledger, latest_ledger + TX_POLL_LEDGERS + 1)` — `Prepared`
-  carries both, since the lower bound is what lets `Expired` be trusted —
-  simulate, restore archived entries, assemble, fee from the p70/p90
-  inclusion percentiles floored at `BASE_FEE`/`HIGH_FEE`, sign, send with
-  one `TRY_AGAIN_LATER` retry, poll, and classify into succeeded, failed
-  with the pool's error code, expired, or unknown. A `NOT_FOUND` is only
-  `Expired` when the RPC's retention still reaches back to the transaction's
-  lower ledger bound; once retention has moved past it, a `NOT_FOUND`
-  proves nothing, so the outcome stays `Unknown` for reconciliation by other
-  means (the account's sequence number) instead of being called `Expired` on
-  a guess. A `TxBadSeq` at send is its own error, `BadSequence`, because the
-  plan behind such a transaction is stale and must be rebuilt. `wait_for`
-  polls to that same outcome from a bare hash, sequence and the two ledger
-  bounds — the fields an `Unknown` outcome carries — so a submission queue
-  can resume a transaction after a restart or a send that timed out without
-  resending it; `wait` is `wait_for` on the fields a `Prepared` already
-  holds. Only a transient failure (a transport error, or an HTTP 429/5xx) is
-  retried while polling; any other error propagates immediately, since
-  polling again cannot change what the RPC already said.
+  write path (`tx`): build with a five-minute time bound and a `LedgerWindow`
+  of `[latest_ledger, latest_ledger + TX_POLL_LEDGERS + 1)` — a `try_new`-only
+  newtype that can never be empty or inverted, which `Prepared` carries since
+  its lower bound is what lets `Expired` be trusted — simulate, restore
+  archived entries, assemble, fee from the p70/p90 inclusion percentiles
+  floored at `BASE_FEE`/`HIGH_FEE`, sign, send with one `TRY_AGAIN_LATER`
+  retry, poll, and classify into succeeded, failed with the pool's error
+  code, expired, or unknown. A `NOT_FOUND` is only `Expired` when the RPC's
+  retention still reaches back to the transaction's lower ledger bound; once
+  retention has moved past it, a `NOT_FOUND` proves nothing, so the outcome
+  stays `Unknown` for reconciliation by other means (the account's sequence
+  number) instead of being called `Expired` on a guess. A `TxBadSeq` at send
+  is its own error, `BadSequence`, because the plan behind such a
+  transaction is stale and must be rebuilt. `wait_for` polls to that same
+  outcome from a bare hash, sequence and window — the fields an `Unknown`
+  outcome carries — so a submission queue can resume a transaction after a
+  restart or a send that timed out without resending it; `wait` is
+  `wait_for` on the fields a `Prepared` already holds. Only a transient
+  failure (a transport error, or an HTTP 429/5xx) is retried while polling;
+  a permanent one — a JSON-RPC error object, a malformed response, or any
+  other HTTP status — stops polling and is reported as `Unknown` rather than
+  an `Err`, since the transaction may already have landed and only the chain
+  can say what happened: `wait_for` never loses the handle while the
+  transaction could still be in flight.
 - Configuration for the chain: `NETWORK` or `NETWORK_PASSPHRASE`,
   `RPC_URL`, `RPC_API_KEY_HEADER` with `RPC_API_KEY` read from the
   environment only (an empty value counts as absent), `BASE_FEE`,

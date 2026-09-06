@@ -26,8 +26,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .ok_or("usage: pool_snapshot <pool> [user...]")?;
     let users: Vec<&str> = arguments.iter().skip(2).map(String::as_str).collect();
     let url = std::env::var("RPC_URL").map_err(|_| "RPC_URL is required")?;
-    let header = std::env::var("RPC_API_KEY_HEADER").ok();
-    let key = std::env::var("RPC_API_KEY").ok();
+    let header = std::env::var("RPC_API_KEY_HEADER")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let key = std::env::var("RPC_API_KEY")
+        .ok()
+        .filter(|value| !value.is_empty());
     let api_key = match (&header, &key) {
         (Some(header), Some(key)) => Some((header.as_str(), key.as_str())),
         (None, None) => None,

@@ -260,7 +260,28 @@ mod tests {
         }
     }
 
+    /// `Args::try_parse_from` honours `#[arg(env = ..)]`, so a developer's
+    /// shell exporting any of these would silently change what the config
+    /// tests exercise. Asserted, never mutated: fail loudly instead of
+    /// passing for the wrong reason.
     fn parse(argv: &[&str]) -> Args {
+        for name in [
+            "RPC_URL",
+            "NETWORK",
+            "NETWORK_PASSPHRASE",
+            "RPC_API_KEY_HEADER",
+            "BASE_FEE",
+            "HIGH_FEE",
+            "TX_POLL_LEDGERS",
+            "DRY_RUN",
+            "LOG_FORMAT",
+        ] {
+            assert!(
+                std::env::var_os(name).is_none(),
+                "{name} is set in the environment; the config tests must run in a clean \
+                 environment or they exercise the shell's values instead of the argv given"
+            );
+        }
         Args::try_parse_from(argv).unwrap()
     }
 

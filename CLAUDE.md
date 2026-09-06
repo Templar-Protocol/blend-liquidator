@@ -137,9 +137,10 @@ filler and executor, unwind, and the operational surface.
   it copies in verbatim on every rebuild and needs no script. See
   `.devcontainer/git-signing.sh`.
 - The `stellar` CLI is deliberately **not** in the dev container yet: it is a
-  multi-minute source build on every rebuild, and nothing depends on it. Add
-  it — and a cgroup-aware build-job cap alongside it — when the first Soroban
-  dependency lands.
+  multi-minute source build on every rebuild, and nothing invokes it. It stays
+  out until Phase 7's sandbox integration tier (the spec's section 9) needs it
+  to deploy the pool contracts locally; add it — and a cgroup-aware build-job
+  cap alongside it — in that phase.
 - Money is `i128` in each asset's own decimals, but the scales differ by
   field: v2 rates (`b_rate`, `d_rate`) are 12 decimals, factors and
   utilisation are 7, prices are in the oracle's own decimals (7 on the

@@ -21,7 +21,7 @@ pub mod xdr;
 pub use pool::{PoolReader, PoolSnapshot};
 pub use rpc::RpcClient;
 pub use signer::{Network, Signer};
-pub use tx::{Prepared, Priority, Submitter, TxConfig, TxOutcome};
+pub use tx::{LedgerWindow, Prepared, Priority, Submitter, TxConfig, TxOutcome};
 
 /// A failure anywhere between the bot and the chain.
 ///
