@@ -118,6 +118,134 @@ pub fn from_base64<T: ReadXdr>(text: &str) -> Result<T, XdrError> {
     T::from_xdr_base64(text, XDR_LIMITS).map_err(XdrError::Xdr)
 }
 
+/// The pool's `Request.request_type` discriminants, in the contract's order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestType {
+    /// 0: supply to the pool (not as collateral).
+    Supply,
+    /// 1: withdraw supplied tokens.
+    Withdraw,
+    /// 2: supply as collateral.
+    SupplyCollateral,
+    /// 3: withdraw collateral.
+    WithdrawCollateral,
+    /// 4: borrow.
+    Borrow,
+    /// 5: repay.
+    Repay,
+    /// 6: fill a user liquidation auction; `address` is the liquidated
+    /// user, `amount` the percent to fill, 1 to 100.
+    FillUserLiquidationAuction,
+    /// 7: fill a bad-debt auction.
+    FillBadDebtAuction,
+    /// 8: fill an interest auction.
+    FillInterestAuction,
+    /// 9: delete a liquidation auction whose user is healthy again.
+    DeleteLiquidationAuction,
+}
+
+impl RequestType {
+    /// The contract's number for this request type.
+    #[must_use]
+    pub fn code(self) -> u32 {
+        match self {
+            Self::Supply => 0,
+            Self::Withdraw => 1,
+            Self::SupplyCollateral => 2,
+            Self::WithdrawCollateral => 3,
+            Self::Borrow => 4,
+            Self::Repay => 5,
+            Self::FillUserLiquidationAuction => 6,
+            Self::FillBadDebtAuction => 7,
+            Self::FillInterestAuction => 8,
+            Self::DeleteLiquidationAuction => 9,
+        }
+    }
+}
+
+/// One entry of a `submit` call's request list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Request {
+    /// What to do.
+    pub request_type: RequestType,
+    /// The asset for supply, withdraw, borrow and repay; the user for the
+    /// auction requests.
+    pub address: String,
+    /// The amount in the asset's decimals for supply, withdraw, borrow and
+    /// repay. The three fill request types instead carry a percent, 1 to
+    /// 100 — `Request::fill` is the way to build one of those, so this
+    /// field need not be set directly by a caller filling an auction.
+    pub amount: i128,
+}
+
+/// The contract's `Request` struct: a map keyed `address`, `amount`,
+/// `request_type`, which is the order Soroban sorts the symbols into.
+pub fn request(request: &Request) -> Result<ScVal, XdrError> {
+    map(vec![
+        (symbol("address")?, address(&request.address)?),
+        (symbol("amount")?, i128_val(request.amount)),
+        (
+            symbol("request_type")?,
+            ScVal::U32(request.request_type.code()),
+        ),
+    ])
+}
+
+/// A fill or auction percent, 1 to 100, the contract's range for
+/// `new_auction`'s `percent` and the `amount` of the three fill requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FillPercent(u32);
+
+impl FillPercent {
+    /// The value, known to be 1 to 100.
+    #[must_use]
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl TryFrom<u32> for FillPercent {
+    type Error = XdrError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        if (1..=100).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(XdrError::Shape {
+                expected: "percent 1..=100",
+                got: value.to_string(),
+            })
+        }
+    }
+}
+
+impl Request {
+    /// A fill request: `FillUserLiquidationAuction`, `FillBadDebtAuction` or
+    /// `FillInterestAuction`, the three request types that carry a user and
+    /// a fill percent rather than an asset and an amount. Any other
+    /// request type is refused here, before a request the contract would
+    /// reject is ever built.
+    pub fn fill(
+        request_type: RequestType,
+        user: &str,
+        percent: FillPercent,
+    ) -> Result<Self, XdrError> {
+        match request_type {
+            RequestType::FillUserLiquidationAuction
+            | RequestType::FillBadDebtAuction
+            | RequestType::FillInterestAuction => Ok(Self {
+                request_type,
+                address: user.to_string(),
+                amount: i128::from(percent.get()),
+            }),
+            other => Err(XdrError::Shape {
+                expected: "a fill request type",
+                got: format!("{other:?}"),
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +336,96 @@ mod tests {
         match symbol(text).expect("symbol") {
             ScVal::Symbol(name) => name,
             other => panic!("expected a symbol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_types_carry_the_contracts_numbers_in_order() {
+        let all = [
+            RequestType::Supply,
+            RequestType::Withdraw,
+            RequestType::SupplyCollateral,
+            RequestType::WithdrawCollateral,
+            RequestType::Borrow,
+            RequestType::Repay,
+            RequestType::FillUserLiquidationAuction,
+            RequestType::FillBadDebtAuction,
+            RequestType::FillInterestAuction,
+            RequestType::DeleteLiquidationAuction,
+        ];
+        for (expected, request_type) in (0_u32..).zip(all) {
+            assert_eq!(request_type.code(), expected);
+        }
+    }
+
+    #[test]
+    fn a_request_is_a_struct_map_with_sorted_keys() {
+        let user = "GDAWX4KV5EQLP5W44HE5AA5QN5QRBJOVQIAI5OXOH5FW2ENT5PXN33DE";
+        let value = request(&Request {
+            request_type: RequestType::FillUserLiquidationAuction,
+            address: user.to_string(),
+            amount: 60,
+        })
+        .expect("encodes");
+        let ScVal::Map(Some(entries)) = value else {
+            panic!("expected a map")
+        };
+        let keys: Vec<String> = entries
+            .iter()
+            .map(|entry| match &entry.key {
+                ScVal::Symbol(symbol) => symbol.to_utf8_string_lossy(),
+                other => panic!("non-symbol key {other:?}"),
+            })
+            .collect();
+        assert_eq!(keys, ["address", "amount", "request_type"]);
+        assert_eq!(entries[0].val, address(user).expect("address"));
+        assert_eq!(entries[1].val, i128_val(60));
+        assert_eq!(entries[2].val, ScVal::U32(6));
+    }
+
+    #[test]
+    fn a_fill_percent_outside_one_to_a_hundred_and_a_non_fill_request_type_are_refused() {
+        for percent in [0, 101] {
+            let error = FillPercent::try_from(percent).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    XdrError::Shape {
+                        expected: "percent 1..=100",
+                        ..
+                    }
+                ),
+                "{error:?}"
+            );
+        }
+        let user = "GDAWX4KV5EQLP5W44HE5AA5QN5QRBJOVQIAI5OXOH5FW2ENT5PXN33DE";
+        let percent = FillPercent::try_from(50).expect("50 is in range");
+        let error = Request::fill(RequestType::Supply, user, percent).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                XdrError::Shape {
+                    expected: "a fill request type",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn fill_builds_a_request_for_each_of_the_three_fill_types() {
+        let user = "GDAWX4KV5EQLP5W44HE5AA5QN5QRBJOVQIAI5OXOH5FW2ENT5PXN33DE";
+        let percent = FillPercent::try_from(60).expect("60 is in range");
+        for request_type in [
+            RequestType::FillUserLiquidationAuction,
+            RequestType::FillBadDebtAuction,
+            RequestType::FillInterestAuction,
+        ] {
+            let built = Request::fill(request_type, user, percent).expect("a fill type");
+            assert_eq!(built.request_type, request_type);
+            assert_eq!(built.address, user);
+            assert_eq!(built.amount, 60);
         }
     }
 }

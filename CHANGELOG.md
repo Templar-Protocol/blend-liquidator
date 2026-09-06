@@ -47,5 +47,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo run --example capture_fixture` refreshes that snapshot from a live
   RPC over `curl`, retrying until every entry and simulation describes one
   ledger.
+- The chain layer (`src/chain/`): a hand-written Soroban JSON-RPC client
+  (`rpc`) for the eight methods the bot uses, with every base64 XDR field
+  decoded at the boundary and every result carrying its ledger — `events`'s
+  `limit` is validated against the RPC's 1 to 10 000 range before a request
+  is ever sent; pool reads (`pool`) that assemble one ledger's instance,
+  reserves, oracle prices and positions into a `PoolSnapshot`, refuse a
+  ledger that moved between reads, and retry a moved ledger across up to
+  three attempts before giving up, since the pool is read in several round
+  trips and a ledger closing mid-read is expected, not exceptional; a
+  `FillPercent` newtype validates the contract's 1 to 100 fill-percent range
+  once, for both `new_auction_op`'s `percent` and the `amount` the three
+  fill requests carry, built through `Request::fill`, so an out-of-range
+  value is refused before a request is even built; the network id and an
+  Ed25519 `Signer` that renders as its address only (`signer`); and the one
+  write path (`tx`): build with a five-minute time bound and a `LedgerWindow`
+  of `[latest_ledger, latest_ledger + TX_POLL_LEDGERS + 1)` — a `try_new`-only
+  newtype that can never be empty or inverted, which `Prepared` carries since
+  its lower bound is what lets `Expired` be trusted — simulate, restore
+  archived entries, assemble, fee from the p70/p90 inclusion percentiles
+  floored at `BASE_FEE`/`HIGH_FEE`, sign, send with one `TRY_AGAIN_LATER`
+  retry, poll, and classify into succeeded, failed with the pool's error
+  code, expired, or unknown. A `NOT_FOUND` is only `Expired` when the RPC's
+  retention still reaches back to the transaction's lower ledger bound; once
+  retention has moved past it, a `NOT_FOUND` proves nothing, so the outcome
+  stays `Unknown` for reconciliation by other means (the account's sequence
+  number) instead of being called `Expired` on a guess. A `TxBadSeq` at send
+  is its own error, `BadSequence`, because the plan behind such a
+  transaction is stale and must be rebuilt. `send` also checks the hash a
+  `Pending`/`Duplicate` `sendTransaction` response carries against the
+  envelope it just sent, refusing a mismatch as `Shape` rather than trusting
+  the RPC's echo blindly. `wait_for` polls to that same outcome from a bare
+  hash, sequence and window — the fields an `Unknown` outcome carries — so a
+  submission queue can resume a transaction after a restart or a send that
+  timed out without resending it; `wait` is `wait_for` on the fields a
+  `Prepared` already holds. Only a transient failure (a transport error, or
+  an HTTP 429/5xx) is retried while polling; a permanent one — a JSON-RPC
+  error object, a malformed response, or any other HTTP status — stops
+  polling and is reported as `Unknown` rather than an `Err`, since the
+  transaction may already have landed and only the chain can say what
+  happened: `wait_for` never loses the handle while the transaction could
+  still be in flight. A restore transaction whose own outcome comes back
+  `Unknown` keeps its hash, sequence and window too, in
+  `ChainError::RestoreUnknown`, instead of losing them inside `Restore`'s
+  formatted string.
+- Configuration for the chain: `NETWORK` or `NETWORK_PASSPHRASE`,
+  `RPC_URL`, `RPC_API_KEY_HEADER` (an empty value counts as absent, the same
+  as an unset one) with `RPC_API_KEY` read from the environment only (an
+  empty value counts as absent here too), `BASE_FEE`, `HIGH_FEE`,
+  `TX_POLL_LEDGERS` (minimum 1: the ledger bound is exclusive, so a zero
+  window would make every transaction unlandable before it starts).
+- `cargo run --example pool_snapshot` prints a live pool's reserves and its
+  users' projected health factors through the real client.
+- Every chain test drives the real client through a scripted localhost
+  JSON-RPC server (`src/chain/script.rs`), covering the restore,
+  `TRY_AGAIN_LATER`, timeout and decoded-error paths without a network.
+- The runtime Docker image no longer installs `libssl3`: the binary is
+  built against `rustls-tls-native-roots` and links no OpenSSL, so the
+  package bought nothing.
 - The repository itself: a Rust service scaffold for a Blend Protocol liquidation bot, green on its first commit. CI gates `cargo fmt`/`clippy -D warnings`/`test`/`doc -D warnings`, `cargo-deny`, the Docker build, `shellcheck` and the three-way Rust version pin behind one aggregate `CI Summary` check — the single required status check, so adding or renaming a job never needs a ruleset edit. `clippy::pedantic` is warn-level with `unwrap_used = "deny"` from the first commit, which is the cheap moment: retrofitting that onto an existing codebase is not. The dev container pins its base image by digest and its features by exact version, with a lock file CI verifies.
 - `DRY_RUN` / `--dry-run`, defaulting to `true`, before there is anything to trade. The parser accepts only the literal strings `true` and `false`; `1`, `yes` and `on` are refused at startup. Every extra spelling is another way into live trading, and the dangerous direction is silent — a `DRY_RUN=yes` read as false would arm the bot while reading, to the operator, like it had been disarmed. This is the invariant most expensive to retrofit: a bot that defaults to live and is made safe-by-default later leaves every existing deployment silently changing behaviour on upgrade.

@@ -17,15 +17,12 @@
 # and update both the tag and the digest below together.
 FROM rust:1.97.0-bookworm@sha256:8fa55b2f3ddf97471ab6a767bfa3f37e6bad0986ba823e75fea57e2a2a5c3073 AS builder
 
-# pkg-config + libssl-dev are here for the TLS-using dependencies this crate
-# will grow, not for what it has today. Drop them if the tree stays pure-Rust
-# through to the first release; keeping an unused apt layer is cheaper than a
-# build that fails on the first HTTP client, but it is not free.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config \
-    libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
-
+# No apt-get layer here: the crate's only TLS-using dependency is `reqwest`,
+# built against `rustls-tls-native-roots` (see Cargo.toml), which is pure
+# Rust and never links OpenSSL. `pkg-config` and `libssl-dev` bought nothing
+# — confirmed by building with them removed — so they are gone rather than
+# kept "for later". If a future dependency needs native TLS, that build
+# failure is exactly the signal to bring them back.
 WORKDIR /app
 
 # Only what a release build of the `liquidator` binary needs.
@@ -51,13 +48,12 @@ RUN cargo build --locked --release --bin liquidator
 FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 
 # ca-certificates: TLS to the RPC / price / notification endpoints this bot
-#                  will talk to.
-# libssl3:         runtime counterpart of the builder's libssl-dev.
+#                  will talk to — verified through rustls's own root store,
+#                  not OpenSSL, but the roots themselves still come from here.
 # procps:          provides `pgrep`, used by HEALTHCHECK below — not installed
 #                  in bookworm-slim by default.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    libssl3 \
     procps \
     && rm -rf /var/lib/apt/lists/*
 

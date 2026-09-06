@@ -7,7 +7,7 @@ A liquidation bot for [Blend Protocol](https://blend.capital) lending pools on
 [Stellar](https://stellar.org).
 
 > **Status: skeleton.** The crate parses configuration, sets up logging and
-> exits. There is no pool client, no position scanner and no executor yet.
+> exits. There is no bot loop, no position scanner and no executor yet.
 > What *is* complete is the scaffolding around them — CI gates, lint posture,
 > dev container, release preflight — so the liquidation logic lands into a
 > repository that already fails loudly.
