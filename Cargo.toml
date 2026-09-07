@@ -38,7 +38,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Network id is sha256(passphrase). Already in the tree through stellar-xdr.
-sha2 = "0.10"
+sha2 = "0.11"
 # Decodes an S… secret. The version stellar-xdr already depends on, so no
 # second copy; public keys parse through stellar-xdr's own FromStr impls.
 stellar-strkey = "0.0.13"
