@@ -3169,3 +3169,24 @@ the same range. Re-reading costs nothing because applying an event is
 idempotent, while advancing past undelivered events is unrecoverable, and a
 broken RPC then stalls visibly rather than silently losing ledgers (landed in
 `d0cb566`).
+
+### Correction after the Task 7 review
+
+Two errors in this plan, both caught by the implementer.
+
+The shared harness snippet gave `USER_TWO` as `chain::pool`'s unrelated
+`FILLER` constant rather than the fixture's second borrower, so the
+golden-health test saw one user where it claimed two. The harness in
+`src/harness.rs` carries the fixture's real second account.
+
+`auctions.percent` is the filler's **planned** fill percent, nullable and
+absent until the filler plans one — not a record of the auction's creation.
+The spec's own table groups it with the nullable `fill_ledger` as "the
+filler's current plan" and records what was actually filled in `fills`. On
+creation the `new_auction` event's percent describes the share of the
+position that went into the auction, which the bid and lot amounts already
+embody; on a partial-fill remainder there is no percent on chain to read at
+all. So `TrackedAuction::percent` is `Option<FillPercent>`, the column is
+nullable (its `CHECK` still bounds a value when one is present), and the
+tracker writes `None` at both sites rather than inventing 100 (landed in
+`02b162b`).
