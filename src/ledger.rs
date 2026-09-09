@@ -4,9 +4,17 @@
 //!
 //! That order is the invariant: a crash between sending and storing
 //! re-reads a ledger, which the tracker handles because applying an event
-//! twice is idempotent, while storing first would skip one silently. The
-//! cursor never moves past what was sent, and an RPC failure moves it not
-//! at all.
+//! twice is idempotent, while storing first would skip one silently.
+//!
+//! The cursor never moves past what was **applied**. A tick carries an
+//! acknowledgement channel the tracker answers once it has written that
+//! ledger's effects, and only that answer commits the cursor: a kill
+//! between the send and the write — an aborted task, an eviction, a
+//! `SIGKILL` past the grace period — drops whatever the tracker had not
+//! yet consumed, and a cursor that had already moved past it would never
+//! read those ledgers again. A dropped acknowledgement means "not
+//! applied", so an RPC failure and a tracker that declines both leave the
+//! cursor exactly where it was.
 //!
 //! A cursor older than the RPC's retained window cannot be caught up: the
 //! events between are gone. The poller reports that as a `Gap` and restarts
@@ -20,7 +28,7 @@
 
 use std::time::Duration;
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::chain::rpc::{EventQuery, RpcClient};
 use crate::chain::xdr::{decode_pool_event, PoolEvent};
@@ -37,8 +45,11 @@ pub struct LedgerTick {
     pub close_time: u64,
 }
 
-/// What a poller sends downstream, in order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What a poller sends downstream, in order. Not `Clone` or `Eq`: a
+/// [`PollerMessage::Tick`] carries the one acknowledgement channel that
+/// commits its ledger, and a copy of that is a second answer to a
+/// question only the tracker may answer.
+#[derive(Debug)]
 pub enum PollerMessage {
     /// One decoded pool event.
     Event {
@@ -55,6 +66,11 @@ pub enum PollerMessage {
         pool: String,
         /// The ledger.
         tick: LedgerTick,
+        /// Answered once this ledger's effects are in the store. The
+        /// poller commits its cursor on this and nothing else, so
+        /// dropping the sender unanswered means "not applied" and leaves
+        /// the range to be read again.
+        ack: oneshot::Sender<()>,
     },
     /// The cursor fell out of the RPC's retained window: the events between
     /// `from` and `oldest` are gone and the user set must be reseeded.
@@ -106,6 +122,15 @@ pub enum LedgerError {
     /// The receiving end went away, which happens during shutdown.
     #[error("the tracker channel is closed")]
     Closed,
+    /// The tracker did not acknowledge a tick, so the ledger was not
+    /// applied and the cursor stays where it is. Reported as a failure so
+    /// the poller's own backoff slows the re-read rather than spinning on
+    /// a tracker that keeps declining.
+    #[error("the tracker did not apply ledger {ledger}")]
+    NotApplied {
+        /// The ledger that was sent and not applied.
+        ledger: u32,
+    },
 }
 
 /// A page count beyond which paging is presumed broken rather than merely
@@ -131,6 +156,12 @@ pub struct LedgerPoller<'a> {
     store: &'a Store,
     pool: &'a str,
     config: PollerConfig,
+    /// The cursor a `Gap` was last reported for. A gap makes the tracker
+    /// walk every seed source, and a pass that then fails leaves the same
+    /// stale cursor behind, so without this the next poll would compute
+    /// the very same gap and reseed again — once per poll interval, which
+    /// earns a rate limit rather than a recovery.
+    gap_reported_at: Option<u32>,
 }
 
 impl<'a> LedgerPoller<'a> {
@@ -142,13 +173,14 @@ impl<'a> LedgerPoller<'a> {
             store,
             pool,
             config,
+            gap_reported_at: None,
         }
     }
 
     /// Polls until `shutdown` flips, backing off on RPC failures. An RPC
     /// outage never advances the cursor, so nothing is skipped.
     pub async fn run(
-        &self,
+        &mut self,
         sender: mpsc::Sender<PollerMessage>,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<(), LedgerError> {
@@ -278,7 +310,7 @@ impl<'a> LedgerPoller<'a> {
     /// cursor. `None` when the chain has not moved, or when the pass could
     /// not prove it drained the range and left the cursor untouched.
     pub async fn poll_once(
-        &self,
+        &mut self,
         sender: &mpsc::Sender<PollerMessage>,
     ) -> Result<Option<LedgerTick>, LedgerError> {
         let health = self.rpc.health().await?;
@@ -293,21 +325,37 @@ impl<'a> LedgerPoller<'a> {
         };
         if let Some(cursor) = &stored {
             if start < health.oldest_ledger {
-                tracing::warn!(
-                    pool = self.pool,
-                    from = cursor.ledger,
-                    oldest = health.oldest_ledger,
-                    "the cursor fell out of the RPC's retained window; reseeding"
-                );
-                send(
-                    sender,
-                    PollerMessage::Gap {
-                        pool: self.pool.to_string(),
-                        from: cursor.ledger,
-                        oldest: health.oldest_ledger,
-                    },
-                )
-                .await?;
+                // At most one `Gap` per stale cursor: each one costs the
+                // tracker a walk of every seed source, and until the
+                // cursor actually moves every later pass computes exactly
+                // this gap again. Whether the reseed itself succeeded is
+                // the tracker's business — it retries an incomplete one on
+                // its own full-scan cadence.
+                if self.gap_reported_at == Some(cursor.ledger) {
+                    tracing::debug!(
+                        pool = self.pool,
+                        from = cursor.ledger,
+                        oldest = health.oldest_ledger,
+                        "the cursor is still outside the retained window; gap already reported"
+                    );
+                } else {
+                    tracing::warn!(
+                        pool = self.pool,
+                        from = cursor.ledger,
+                        oldest = health.oldest_ledger,
+                        "the cursor fell out of the RPC's retained window; reseeding"
+                    );
+                    send(
+                        sender,
+                        PollerMessage::Gap {
+                            pool: self.pool.to_string(),
+                            from: cursor.ledger,
+                            oldest: health.oldest_ledger,
+                        },
+                    )
+                    .await?;
+                    self.gap_reported_at = Some(cursor.ledger);
+                }
                 start = health.oldest_ledger;
             }
         }
@@ -334,14 +382,27 @@ impl<'a> LedgerPoller<'a> {
             sequence: head.sequence,
             close_time: head.close_time,
         };
+        let (ack, applied) = oneshot::channel();
         send(
             sender,
             PollerMessage::Tick {
                 pool: self.pool.to_string(),
                 tick,
+                ack,
             },
         )
         .await?;
+        // The cursor says "applied", not "sent". Writing it before the
+        // tracker has answered would let a kill drop everything still
+        // queued while the store claims those ledgers are done, and
+        // nothing re-reads them: `seed_pools_needing_it` reseeds only a
+        // store that is empty or has no cursor, so a populated one never
+        // recovers them.
+        if applied.await.is_err() {
+            return Err(LedgerError::NotApplied {
+                ledger: head.sequence,
+            });
+        }
         self.store
             .set_cursor(
                 &events_cursor(self.pool),
@@ -375,6 +436,73 @@ mod tests {
     const POOL: &str = "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD";
     const USER: &str = "GDAWX4KV5EQLP5W44HE5AA5QN5QRBJOVQIAI5OXOH5FW2ENT5PXN33DE";
     const USDC: &str = "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75";
+
+    /// One message a poll sent, without the acknowledgement channel a
+    /// `Tick` carries: enough to assert what was sent, and in what order.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Seen {
+        Event {
+            pool: String,
+            ledger: u32,
+            event: PoolEvent,
+        },
+        Tick(LedgerTick),
+        Gap {
+            pool: String,
+            from: u32,
+            oldest: u32,
+        },
+    }
+
+    /// Records one message, answering a tick's acknowledgement when
+    /// `acknowledge`, and dropping it unanswered otherwise — which is how
+    /// a tracker says "not applied".
+    fn record(message: PollerMessage, acknowledge: bool) -> Seen {
+        match message {
+            PollerMessage::Event {
+                pool,
+                ledger,
+                event,
+            } => Seen::Event {
+                pool,
+                ledger,
+                event,
+            },
+            PollerMessage::Tick { tick, ack, .. } => {
+                if acknowledge {
+                    let _ = ack.send(());
+                }
+                Seen::Tick(tick)
+            }
+            PollerMessage::Gap { pool, from, oldest } => Seen::Gap { pool, from, oldest },
+        }
+    }
+
+    /// Runs one pass while draining everything it sends. The poller waits
+    /// for a tick's acknowledgement before committing its cursor, so a
+    /// test that let the message sit in the channel would hang: every
+    /// caller drains concurrently, and chooses whether to answer.
+    async fn poll_draining(
+        poller: &mut LedgerPoller<'_>,
+        sender: &mpsc::Sender<PollerMessage>,
+        receiver: &mut mpsc::Receiver<PollerMessage>,
+        acknowledge: bool,
+    ) -> (Result<Option<LedgerTick>, LedgerError>, Vec<Seen>) {
+        let mut seen = Vec::new();
+        let poll = poller.poll_once(sender);
+        tokio::pin!(poll);
+        let result = loop {
+            tokio::select! {
+                result = &mut poll => break result,
+                Some(message) = receiver.recv() => seen.push(record(message, acknowledge)),
+            }
+        };
+        // Whatever the pass sent after the last time this loop looked.
+        while let Ok(message) = receiver.try_recv() {
+            seen.push(record(message, acknowledge));
+        }
+        (result, seen)
+    }
 
     fn config() -> PollerConfig {
         PollerConfig {
@@ -428,23 +556,17 @@ mod tests {
         );
         let client = RpcClient::new(&rpc.url(), None).unwrap();
         let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
-        let poller = LedgerPoller::new(&client, &store, POOL, config());
+        let mut poller = LedgerPoller::new(&client, &store, POOL, config());
 
-        let tick = poller
-            .poll_once(&sender)
-            .await
-            .expect("poll")
-            .expect("a tick");
+        let (result, seen) = poll_draining(&mut poller, &sender, &mut receiver, true).await;
+        let tick = result.expect("poll").expect("a tick");
         assert_eq!(
             (tick.sequence, tick.close_time),
             (64_291_297, 1_788_645_403)
         );
         // The stream starts at head, so the first getEvents asks for it.
         assert_eq!(rpc.calls("getEvents")[0]["startLedger"], 64_291_297);
-        assert!(matches!(
-            receiver.try_recv(),
-            Ok(PollerMessage::Tick { .. })
-        ));
+        assert_eq!(seen, vec![Seen::Tick(tick)]);
         assert_eq!(
             store.cursor(&events_cursor(POOL)).await.expect("cursor"),
             Some(Cursor {
@@ -479,29 +601,31 @@ mod tests {
         );
         let client = RpcClient::new(&rpc.url(), None).unwrap();
         let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
-        let poller = LedgerPoller::new(&client, &store, POOL, config());
+        let mut poller = LedgerPoller::new(&client, &store, POOL, config());
 
-        poller.poll_once(&sender).await.expect("poll");
+        let (result, seen) = poll_draining(&mut poller, &sender, &mut receiver, true).await;
+        result.expect("poll");
         // It asked for the ledger after the cursor, not the cursor itself.
         assert_eq!(rpc.calls("getEvents")[0]["startLedger"], 101);
-        for expected_ledger in [101, 103] {
-            match receiver.try_recv().expect("an event") {
-                PollerMessage::Event {
+        assert_eq!(seen.len(), 3, "two events, then the tick");
+        for (position, expected_ledger) in [101, 103].into_iter().enumerate() {
+            match &seen[position] {
+                Seen::Event {
                     pool,
                     ledger,
                     event,
                 } => {
                     assert_eq!(pool, POOL);
-                    assert_eq!(ledger, expected_ledger);
+                    assert_eq!(*ledger, expected_ledger);
                     assert!(matches!(event, PoolEvent::Borrow { .. }));
                 }
                 other => panic!("expected an event, got {other:?}"),
             }
         }
-        assert!(matches!(
-            receiver.try_recv(),
-            Ok(PollerMessage::Tick { .. })
-        ));
+        assert!(
+            matches!(seen[2], Seen::Tick(_)),
+            "the tick comes after every event it covers"
+        );
         assert_eq!(
             store
                 .cursor(&events_cursor(POOL))
@@ -538,12 +662,13 @@ mod tests {
         );
         let client = RpcClient::new(&rpc.url(), None).unwrap();
         let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
-        let poller = LedgerPoller::new(&client, &store, POOL, config());
+        let mut poller = LedgerPoller::new(&client, &store, POOL, config());
 
-        poller.poll_once(&sender).await.expect("poll");
-        match receiver.try_recv().expect("a gap") {
-            PollerMessage::Gap { pool, from, oldest } => {
-                assert_eq!((pool.as_str(), from, oldest), (POOL, 10, 400_000));
+        let (result, seen) = poll_draining(&mut poller, &sender, &mut receiver, true).await;
+        result.expect("poll");
+        match &seen[0] {
+            Seen::Gap { pool, from, oldest } => {
+                assert_eq!((pool.as_str(), *from, *oldest), (POOL, 10, 400_000));
             }
             other => panic!("expected a gap, got {other:?}"),
         }
@@ -580,12 +705,13 @@ mod tests {
         );
         let client = RpcClient::new(&rpc.url(), None).unwrap();
         let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
-        let poller = LedgerPoller::new(&client, &store, POOL, config());
+        let mut poller = LedgerPoller::new(&client, &store, POOL, config());
 
-        poller.poll_once(&sender).await.expect("poll");
+        let (result, seen) = poll_draining(&mut poller, &sender, &mut receiver, true).await;
+        result.expect("poll");
         assert!(
-            matches!(receiver.try_recv(), Ok(PollerMessage::Tick { .. })),
-            "only the tick"
+            matches!(seen.as_slice(), [Seen::Tick(_)]),
+            "only the tick: {seen:?}"
         );
         Ok(())
     }
@@ -605,7 +731,7 @@ mod tests {
         rpc.expect_http("getHealth", 503);
         let client = RpcClient::new(&rpc.url(), None).unwrap();
         let (sender, _receiver) = tokio::sync::mpsc::channel(16);
-        let poller = LedgerPoller::new(&client, &store, POOL, config());
+        let mut poller = LedgerPoller::new(&client, &store, POOL, config());
 
         assert!(matches!(
             poller.poll_once(&sender).await,
@@ -635,7 +761,7 @@ mod tests {
         rpc.expect("getLatestLedger", latest(103, 1_788_645_403));
         let client = RpcClient::new(&rpc.url(), None).unwrap();
         let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
-        let poller = LedgerPoller::new(&client, &store, POOL, config());
+        let mut poller = LedgerPoller::new(&client, &store, POOL, config());
 
         assert_eq!(poller.poll_once(&sender).await.expect("poll"), None);
         assert!(receiver.try_recv().is_err(), "no messages");
@@ -679,7 +805,7 @@ mod tests {
             page_limit: 2,
             ..config()
         };
-        let poller = LedgerPoller::new(&client, &store, POOL, config);
+        let mut poller = LedgerPoller::new(&client, &store, POOL, config);
 
         assert_eq!(poller.poll_once(&sender).await.expect("poll"), None);
         while let Ok(message) = receiver.try_recv() {
@@ -723,7 +849,7 @@ mod tests {
             page_limit: 2,
             ..config()
         };
-        let poller = LedgerPoller::new(&client, &store, POOL, config);
+        let mut poller = LedgerPoller::new(&client, &store, POOL, config);
 
         assert_eq!(poller.poll_once(&sender).await.expect("poll"), None);
         while let Ok(message) = receiver.try_recv() {
@@ -751,13 +877,124 @@ mod tests {
         let client = RpcClient::new(&rpc.url(), None).unwrap();
         let (sender, _receiver) = tokio::sync::mpsc::channel(16);
         let (flag, watch) = tokio::sync::watch::channel(false);
-        let poller = LedgerPoller::new(&client, &store, POOL, config());
+        let mut poller = LedgerPoller::new(&client, &store, POOL, config());
         let stopper = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(30)).await;
             flag.send(true).expect("flag");
         });
         poller.run(sender, watch).await.expect("run");
         stopper.await.expect("stopper");
+        Ok(())
+    }
+
+    /// The cursor means "applied": a tick the tracker never acknowledges
+    /// leaves it exactly where it was, so the next pass re-reads the same
+    /// range rather than resuming past ledgers nobody stored.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_tick_the_tracker_does_not_acknowledge_leaves_the_cursor_alone(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let before = Cursor {
+            ledger: 100,
+            paging_token: None,
+        };
+        store
+            .set_cursor(&events_cursor(POOL), &before)
+            .await
+            .expect("cursor");
+        let rpc = ScriptedRpc::start().await;
+        rpc.expect("getHealth", health(103, 1));
+        rpc.expect("getLatestLedger", latest(103, 1_788_645_403));
+        rpc.expect(
+            "getEvents",
+            json!({"latestLedger": 103, "cursor": "103-1", "events": [borrow_event(101, 1)]}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        let mut poller = LedgerPoller::new(&client, &store, POOL, config());
+
+        // The tick is drained and dropped unanswered, which is what the
+        // tracker does when it could not apply the ledger.
+        let (result, seen) = poll_draining(&mut poller, &sender, &mut receiver, false).await;
+        assert!(
+            matches!(result, Err(LedgerError::NotApplied { ledger: 103 })),
+            "an unacknowledged tick is a failure the poller backs off from"
+        );
+        assert!(
+            seen.iter().any(|message| matches!(message, Seen::Tick(_))),
+            "the tick was sent; only its acknowledgement was withheld"
+        );
+        assert_eq!(
+            store.cursor(&events_cursor(POOL)).await.expect("cursor"),
+            Some(before),
+            "an unapplied ledger never moves the cursor"
+        );
+        Ok(())
+    }
+
+    /// A gap is reported once per stale cursor. Each one costs the tracker
+    /// a walk of every seed source, and a pass that cannot drain leaves the
+    /// same cursor behind, so a repeat would reseed once per poll.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_gap_is_reported_once_until_the_cursor_moves(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        store
+            .set_cursor(
+                &events_cursor(POOL),
+                &Cursor {
+                    ledger: 10,
+                    paging_token: None,
+                },
+            )
+            .await
+            .expect("cursor");
+        let rpc = ScriptedRpc::start().await;
+        // Two passes, each of which fails to drain (a full page whose
+        // cursor never advances), so the stale cursor survives both.
+        for _ in 0..2 {
+            rpc.expect("getHealth", health(500_000, 400_000));
+            rpc.expect("getLatestLedger", latest(500_000, 1_788_645_403));
+            rpc.expect(
+                "getEvents",
+                json!({"latestLedger": 500_000, "cursor": "400000-1",
+                       "events": [borrow_event(400_001, 1), borrow_event(400_001, 2)]}),
+            );
+            rpc.expect(
+                "getEvents",
+                json!({"latestLedger": 500_000, "cursor": "400000-1",
+                       "events": [borrow_event(400_001, 3), borrow_event(400_001, 4)]}),
+            );
+        }
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+        let config = PollerConfig {
+            page_limit: 2,
+            ..config()
+        };
+        let mut poller = LedgerPoller::new(&client, &store, POOL, config);
+
+        let (first, seen_first) = poll_draining(&mut poller, &sender, &mut receiver, true).await;
+        assert_eq!(first.expect("first pass"), None, "the pass did not drain");
+        assert_eq!(
+            seen_first
+                .iter()
+                .filter(|message| matches!(message, Seen::Gap { .. }))
+                .count(),
+            1,
+            "the first pass reports the gap"
+        );
+
+        let (second, seen_second) = poll_draining(&mut poller, &sender, &mut receiver, true).await;
+        assert_eq!(second.expect("second pass"), None);
+        assert!(
+            !seen_second
+                .iter()
+                .any(|message| matches!(message, Seen::Gap { .. })),
+            "the same stale cursor does not report the gap twice: {seen_second:?}"
+        );
+        // It still restarts at the window edge, gap message or not.
+        assert_eq!(rpc.calls("getEvents")[2]["startLedger"], 400_000);
         Ok(())
     }
 }

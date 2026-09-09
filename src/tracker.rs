@@ -14,6 +14,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
+use tokio::sync::watch;
+
 use crate::chain::pool::PoolReader;
 use crate::chain::rpc::RpcClient;
 use crate::chain::xdr::PoolEvent;
@@ -45,6 +47,17 @@ pub struct RefreshOutcome {
     pub removed: usize,
 }
 
+/// What one seed did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SeedOutcome {
+    /// The refresh that valued every account the sources named.
+    pub refresh: RefreshOutcome,
+    /// How many sources failed to answer. Non-zero means this seed's
+    /// coverage is incomplete, which spec §4 makes a warning to be retried
+    /// on the next full scan rather than a failure.
+    pub failed_sources: usize,
+}
+
 /// Applies events and refreshes users for one store.
 #[derive(Debug, Clone, Copy)]
 pub struct Tracker<'a> {
@@ -57,6 +70,20 @@ impl<'a> Tracker<'a> {
     #[must_use]
     pub fn new(rpc: &'a RpcClient, store: &'a Store) -> Self {
         Self { rpc, store }
+    }
+
+    /// The chain client this tracker reads through, so a caller driving it
+    /// reads the same chain rather than opening a second client.
+    #[must_use]
+    pub fn rpc(&self) -> &'a RpcClient {
+        self.rpc
+    }
+
+    /// The store this tracker writes, so a caller reading back what it
+    /// wrote cannot read a different one.
+    #[must_use]
+    pub fn store(&self) -> &'a Store {
+        self.store
     }
 
     /// Applies one event's auction bookkeeping and returns the accounts it
@@ -223,12 +250,15 @@ impl<'a> Tracker<'a> {
         sources: &[SeedSource],
         tick: LedgerTick,
         batch: u32,
-    ) -> Result<RefreshOutcome, TrackerError> {
+        shutdown: &watch::Receiver<bool>,
+    ) -> Result<SeedOutcome, TrackerError> {
         let mut accounts: BTreeSet<String> = BTreeSet::new();
+        let mut outcome = SeedOutcome::default();
         for source in sources {
             match source.accounts(pool).await {
                 Ok(found) => accounts.extend(found),
                 Err(error) => {
+                    outcome.failed_sources += 1;
                     tracing::warn!(pool, %error, "a seed source failed; skipping it");
                 }
             }
@@ -237,11 +267,17 @@ impl<'a> Tracker<'a> {
         // `chunks` panics on a zero size; a batch this small is nonsensical
         // but must not crash the seed over it.
         let batch = usize::try_from(batch).unwrap_or(usize::MAX).max(1);
-        let mut outcome = RefreshOutcome::default();
         for chunk in accounts.chunks(batch) {
+            // A seed of a busy pool is many sequential round trips and
+            // runs before any poller does, so it is the longest stretch in
+            // which a shutdown request would otherwise go unheard.
+            if *shutdown.borrow() {
+                tracing::warn!(pool, "shutdown requested during a seed; stopping early");
+                break;
+            }
             let result = self.refresh(pool, chunk, tick).await?;
-            outcome.tracked += result.tracked;
-            outcome.removed += result.removed;
+            outcome.refresh.tracked += result.tracked;
+            outcome.refresh.removed += result.removed;
         }
         Ok(outcome)
     }
@@ -1182,19 +1218,24 @@ mod tests {
         );
 
         let tick = harness::fixture_tick();
+        let (_flag, shutdown) = tokio::sync::watch::channel(false);
         let outcome = tracker
-            .seed(POOL, &[analytics, file, failing], tick, 10)
+            .seed(POOL, &[analytics, file, failing], tick, 10, &shutdown)
             .await
             .expect("seed");
 
         assert_eq!(
-            outcome,
+            outcome.refresh,
             RefreshOutcome {
                 tracked: 2,
                 removed: 0
             },
             "USER_ONE and USER_TWO are each refreshed exactly once, deduplicated \
              across the analytics source and the file source"
+        );
+        assert_eq!(
+            outcome.failed_sources, 1,
+            "the source that could not answer is reported, so the next full scan retries the seed"
         );
         assert_eq!(store.count_users(POOL).await.expect("count"), 2);
         assert_eq!(
