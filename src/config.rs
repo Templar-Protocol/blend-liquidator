@@ -311,23 +311,28 @@ impl std::fmt::Debug for ChainConfig {
     }
 }
 
-/// A URL's scheme, host and port, without the path, query or fragment that
-/// could carry a key. Anything that does not parse as `scheme://host...`
-/// renders as `<unparsed url>` rather than falling back to the whole string,
-/// because the fallback is exactly the case where the shape is unexpected.
+/// A URL's scheme, host and port, without the userinfo, path, query or
+/// fragment that could carry a key. Anything that does not parse renders as
+/// `<unparsed url>` rather than falling back to the whole string, because
+/// the fallback is exactly the case where the shape is unexpected.
+///
+/// The parse is `reqwest`'s own, which is the parser the client itself uses,
+/// so this cannot disagree with it about where the authority ends. Splitting
+/// the text by hand did: it read everything before the first `/?#` as an
+/// authority, so a URL whose path is separated by backslashes — which the
+/// URL standard normalises to `/` for http and https, and which `reqwest`
+/// therefore accepts — rendered its path, and any key in it.
 fn endpoint_origin(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
         return "<unparsed url>".to_owned();
     };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    if authority.is_empty() {
+    let Some(host) = parsed.host_str() else {
         return "<unparsed url>".to_owned();
+    };
+    match parsed.port() {
+        Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
+        None => format!("{}://{host}", parsed.scheme()),
     }
-    // Userinfo is a credential too, and it is not a diagnostic.
-    let host = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    format!("{scheme}://{host}")
 }
 
 /// Everything the service needs, validated.
@@ -946,6 +951,20 @@ mod tests {
         assert_eq!(endpoint_origin("https://user:pw@host/v1"), "https://host");
         assert_eq!(endpoint_origin("not a url"), "<unparsed url>");
         assert_eq!(endpoint_origin("https://"), "<unparsed url>");
+        // A port that is not a port makes the whole URL unparseable, so
+        // none of it renders rather than the text before the first `/`.
+        assert_eq!(
+            endpoint_origin("https://rpc.example:token"),
+            "<unparsed url>"
+        );
+        // http and https normalise a backslash to a path separator, so a
+        // URL written this way still reaches the RPC — and must not carry
+        // its path into a log line.
+        let backslashed = endpoint_origin("https://rpc.example\\v1\\super-secret-key");
+        assert!(
+            !backslashed.contains("super-secret-key"),
+            "a backslash-separated path must not render: {backslashed}"
+        );
     }
 
     const POOLS: &str = r#"

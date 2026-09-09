@@ -482,7 +482,6 @@ async fn apply_tick(
         cadence.phase,
         cadence.full_scan_ledgers,
     ) {
-        state.last_scan.insert(pool.to_owned(), tick.sequence);
         full_scan(
             tracker,
             seed_sources,
@@ -492,6 +491,12 @@ async fn apply_tick(
             (pool, tick),
         )
         .await?;
+        // Only a scan that ran counts as this period's. `full_scan` carries
+        // the reseed retry, and a transient failure declines the tick, so
+        // recording the sequence first would let the redelivered tick skip
+        // that retry until the next period — and a flaky source is exactly
+        // when it must not.
+        state.last_scan.insert(pool.to_owned(), tick.sequence);
     }
     Ok(())
 }
