@@ -3190,3 +3190,71 @@ all. So `TrackedAuction::percent` is `Option<FillPercent>`, the column is
 nullable (its `CHECK` still bounds a value when one is present), and the
 tracker writes `None` at both sites rather than inventing 100 (landed in
 `02b162b`).
+
+### Correction after the final review
+
+Four things this plan left under-specified, each of which the whole-branch
+review found in the code.
+
+**`USER_REFRESH_LEDGERS` is a span, and `Store::users_stale` takes an
+absolute ledger.** Task 9 step 4 says only "then runs the stale-refresh
+pass", and nothing anywhere connects the knob to the cutoff. The service
+passed the span straight through, so the predicate was `updated_ledger <
+241_920` against mainnet sequences near 64 300 000: false for every row, and
+the pass never refreshed anything. On a fresh network with small sequence
+numbers it is true for every row, which is the opposite failure. The caller
+subtracts: `tick.sequence.saturating_sub(USER_REFRESH_LEDGERS)`. The store's
+interface is right as it stands and its own tests pin it; the tracker's
+parameter is now named `updated_before` and its doc says which of the two it
+is, because `older_than` is what invited the mistake. The row is written at
+`snapshot.ledger`, the ledger the positions were read at, which is what that
+cutoff then selects on.
+
+**Ruling 9 needs the clamp spelled out.** "A tick's close time is the
+timestamp the tracker accrues reserves to" is right for the ordinary case
+and impossible in the one the poller actually produces: `getEvents` carries
+no end ledger, so a pass delivers events from ledgers newer than the head it
+read, and the snapshot taken to value them is newer still. The Phase 2
+primitive this ruling calls — `Reserve::accrue` — returns `InvalidInput("now
+is before last_time")` rather than clamping, and that refusal is correct: a
+reserve entry is a stored state the contract only ever accrues forward from.
+So the clamp belongs in the tracker, not in `math` or `chain::pool`. The
+accrual target is the later of the tick's close time and the newest
+`last_time` in the snapshot — one timestamp for every reserve, so a position
+is still valued at a single instant.
+
+**Ruling 6 does not exclude the database.** Narrowing startup validation to
+"what a bot with no signer can check" was about the signer, and the ruling
+then enumerated only chain checks. Spec §10 puts the database in
+`check-config`'s job explicitly — it "validates configuration against chain
+and the database and exits, for use as a deploy smoke test before dry-run is
+turned off" — and a database is not signer-dependent. `check_config`
+connects and pings. It does not migrate: a check must not have DDL as a side
+effect, and `run` already migrates under the advisory lock. Failing to open
+the store is a `Config` error in both modes, because §10's exit-code
+contract calls a configuration problem a 2.
+
+**The cursor invariant is the spec's, and the ack enforces it.** The plan's
+checklist asks that "the poller's cursor never advances past what was sent";
+spec §8 says "never advance the cursor past what was applied", and the two
+are not the same guarantee. Everything queued between the send and the write
+was a ledger the store claimed to have applied, and nothing would ever
+re-read it: `seed_pools_needing_it` reseeds only an empty store or a missing
+cursor. The spec wins. `PollerMessage::Tick` carries a `oneshot` sender the
+tracker answers once that ledger's whole effect is in the store, and only
+that answer commits the cursor; a dropped sender means "not applied". A
+smaller channel narrows that window without closing it and is not an
+alternative.
+
+Two consequences follow from the ack rather than being separate decisions. A
+transient `TrackerError` no longer needs to end the process to be safe: §8's
+"a failed user refresh logs and leaves the row untouched; the next event or
+refresh pass retries" is now literally true, because the declined tick makes
+the poller deliver the same range again. `TrackerError::Store` stays fatal,
+per §8's "a store outage … pauses rather than trading on stale state". And a
+`Gap` is reported at most once per stale cursor: each one costs a walk of
+every seed source, and a pass that then fails leaves the same cursor behind,
+so repeating it would reseed once per poll interval. Spec §4's "a failed
+seed … is retried on the next full scan" — which this plan never ruled on at
+all — is what recovers an incomplete one, and it is now wired into the
+full-scan branch.

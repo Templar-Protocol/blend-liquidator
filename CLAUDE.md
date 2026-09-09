@@ -70,24 +70,33 @@ make help                           # Docker Compose lifecycle
   boundary as decimal text, never as a bound number.
 - `src/ledger.rs` — the clock: one `LedgerPoller` per pool, reading events
   since a stored cursor, sending each decoded event and then the ledger's
-  tick, and only advancing the cursor once both have been sent — so a crash
-  between sending and storing replays a ledger rather than skipping one. A
-  cursor fallen out of the RPC's retained window is reported as a `Gap`
-  rather than silently caught up on; a pass that cannot prove it drained the
-  range leaves the cursor untouched.
+  tick, and advancing the cursor only once the tracker has answered that
+  tick's acknowledgement — see the cursor invariant below. A cursor fallen
+  out of the RPC's retained window is reported as a `Gap` rather than
+  silently caught up on, and at most once per stale cursor, since each one
+  costs a full reseed; a pass that cannot prove it drained the range leaves
+  the cursor untouched.
 - `src/tracker.rs` — applies chain state to the store: `Tracker::apply`
   writes an event's auction bookkeeping and returns the accounts it named;
-  `Tracker::refresh` re-reads named accounts from chain in one snapshot and
-  upserts or deletes their `users` row; `Tracker::seed` collects accounts
+  `Tracker::refresh` re-reads named accounts from chain in one snapshot,
+  values them at the later of the tick's close time and the newest reserve
+  entry the snapshot holds, and upserts or deletes their `users` row at the
+  ledger the snapshot was read at; `Tracker::refresh_stale` takes an
+  *absolute* ledger cutoff, not a span; `Tracker::seed` collects accounts
   from every configured `SeedSource` — the public analytics API
-  (`AnalyticsSeed`) or a static file (`FileSeed`) — deduplicates them, and
-  refreshes them in batches.
+  (`AnalyticsSeed`) or a static file (`FileSeed`) — deduplicates them,
+  refreshes them in batches, and reports how many sources failed so an
+  incomplete seed is retried on the next full scan.
 - `src/service.rs` — wiring: `Service::check_config` validates the
-  configuration and reports without touching the store or following
-  anything; `Service::run` connects and migrates the store, seeds every pool
-  whose tracked-user count or events cursor is missing, then runs one
+  configuration against the chain *and* the database (connect and ping, per
+  the spec's deployment contract) and reports without following anything;
+  `Service::run` connects and migrates the store, seeds every pool whose
+  tracked-user count or events cursor is missing, then runs one
   `LedgerPoller` per pool and one tracker task consuming their shared
-  channel until a shutdown signal arrives and every task has returned.
+  channel until a shutdown signal arrives and every task has returned. The
+  tracker loop treats a `TrackerError::Store` as fatal and a `Chain` or
+  `Math` one as transient — it declines the tick, and the same range is read
+  again.
 - `src/harness.rs` (`cfg(test)`) — scripted-RPC and store scaffolding shared
   by the store, ledger and tracker tests: the fixture's pool, its two
   borrowers, and the golden health factors `chain::xdr::decode`'s test
@@ -124,6 +133,17 @@ and the rest of the operational surface.
   `docker inspect` and `docker compose config`.
 
 ## Safety invariants a change must not break
+
+- **The events cursor means "applied", never "sent".** A `PollerMessage::Tick`
+  carries a `oneshot` sender; the tracker answers it only once that ledger's
+  whole effect is in the store, and `LedgerPoller::poll_once` writes the
+  cursor only on that answer. Committing earlier is not a narrow race to be
+  shrunk with a smaller channel: everything still queued would be a ledger
+  the store claims to have applied, a kill would drop it, and nothing would
+  ever re-read it — `seed_pools_needing_it` reseeds only an empty store or a
+  missing cursor. The failure is loud and the loss is silent. A dropped
+  acknowledgement therefore means "not applied": do not commit, and let the
+  poller's backoff slow the re-read.
 
 - **Dry-run is the default.** `DRY_RUN` (env) / `--dry-run` (flag) defaults to
   `true`. Live trading requires explicitly setting it to `false` — there is no

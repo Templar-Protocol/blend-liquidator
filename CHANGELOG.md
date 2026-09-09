@@ -20,12 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `StoreError`, never a silently truncated zero.
 - The per-pool ledger poller (`src/ledger.rs`, `LedgerPoller`): asks the RPC
   for chain head, pages every pool event since its stored cursor, sends each
-  decoded event followed by the ledger's tick, and only then advances the
-  cursor — so a crash between sending and storing replays a ledger rather
-  than skipping one, which the tracker tolerates because applying an event
-  twice is idempotent. A cursor that has fallen out of the RPC's retained
-  window is reported as a `Gap` and restarted at the window's edge, for the
-  tracker to reseed; a pass that cannot prove it drained its range — paging
+  decoded event followed by the ledger's tick, and advances the cursor only
+  once the tracker acknowledges that tick — the cursor means "applied", so a
+  kill anywhere before that replays a ledger rather than skipping one, which
+  the tracker tolerates because applying an event twice is idempotent. A
+  cursor that has fallen out of the RPC's retained window is reported as a
+  `Gap` and restarted at the window's edge, for the tracker to reseed, and
+  at most once per stale cursor since each `Gap` costs a full reseed; a pass
+  that cannot prove it drained its range — paging
   stalled, repeated, or hit a hard cap — leaves the cursor untouched instead
   of guessing.
 - The tracker (`src/tracker.rs`, `Tracker`): `apply` writes an event's
@@ -33,12 +35,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than subtracting the filled side, since the contract owns that
   arithmetic) and returns the accounts it named; `refresh` re-reads named
   accounts from chain in one batched snapshot per tick and upserts or
-  deletes their `users` row, valuing them at the tick's own close time;
-  `refresh_stale` walks the oldest-updated rows first so a long-idle
-  borrower's accrued interest is never missed; `seed` collects accounts from
+  deletes their `users` row at the ledger it read them at, valuing them at
+  the tick's own close time — or, when the chain has already moved past it,
+  at the newest reserve entry the snapshot holds, since the contract only
+  ever accrues forward from a stored entry; `refresh_stale` walks the
+  oldest-updated rows first, below an absolute ledger cutoff the caller
+  derives from `USER_REFRESH_LEDGERS`, so a long-idle borrower's accrued
+  interest is never missed; `seed` collects accounts from
   every configured source, deduplicates them, and refreshes them in
   batches — a source that fails is a warning, not a startup failure, because
-  every account is re-verified from chain before the bot ever acts on it.
+  every account is re-verified from chain before the bot ever acts on it,
+  and an incomplete seed is retried on the next full scan.
   Seeding draws from the public Blend analytics API (`AnalyticsSeed`,
   walking its cursor-paginated positions endpoint) and/or a static TOML file
   of pool-to-account lists (`FileSeed`), both behind the uniform
@@ -54,9 +61,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `POLL_INTERVAL_MS`. `pools.example.toml` and `seed.example.toml` document
   both file formats and are referenced from `.env.example`.
 - `RUN_MODE`/`--run-mode` (`src/service.rs`, `Service`): `check-config`
-  validates the configuration and reports the resolved (redacted) form, the
-  per-pool validation and every warning, without touching the store or
-  following anything; `loop` (the default) additionally connects and
+  validates the configuration against the chain and the database — it
+  connects and pings, never migrates — and reports the resolved (redacted)
+  form, the per-pool validation and every warning, without following
+  anything; `loop` (the default) additionally connects and
   migrates the store, seeds every pool that needs it, then runs one
   `LedgerPoller` per pool and one tracker task consuming their shared
   channel until `SIGTERM`/`SIGINT` and every task has returned — a second

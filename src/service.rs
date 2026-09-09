@@ -2,12 +2,12 @@
 //! configured pools and shut down cleanly.
 //!
 //! `Service` has two entry points, matching [`crate::config::RunMode`]:
-//! [`Service::check_config`] validates and reports without touching the
-//! store or the chain beyond a read, and [`Service::run`] additionally
-//! connects the store, seeds it, and follows every configured pool until a
-//! shutdown signal arrives. Both share `validate`, because a bot that
-//! never checked its own configuration would happily submit against a pool
-//! it misread.
+//! [`Service::check_config`] reads the chain and pings the store and
+//! reports, writing nothing and following nothing, and [`Service::run`]
+//! additionally migrates the store, seeds it, and follows every configured
+//! pool until a shutdown signal arrives. Both share `validate`, because a
+//! bot that never checked its own configuration would happily submit
+//! against a pool it misread.
 
 use std::collections::{BTreeMap, BTreeSet};
 
