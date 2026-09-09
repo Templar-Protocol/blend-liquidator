@@ -731,8 +731,9 @@ mod tests {
         address, i128_val, map, sc_address, symbol, to_base64, vec as sc_vec,
     };
     use crate::chain::xdr::keys;
-    use crate::chain::xdr::PoolEvent;
+    use crate::chain::xdr::{AuctionType, PoolEvent};
     use crate::harness;
+    use crate::math::AuctionData;
     use crate::store::TrackedUser;
     use std::collections::BTreeMap;
     use tokio::sync::oneshot;
@@ -1605,6 +1606,119 @@ mod tests {
             state.pending[harness::POOL],
             BTreeSet::from([harness::USER_ONE.to_string()]),
             "the accounts this tick took are back for the next pass"
+        );
+        Ok(())
+    }
+
+    /// `state.unapplied` is the poison `handle_message`'s `Event` arm sets
+    /// when `Tracker::apply` fails, and the `Tick` arm's whole reason to
+    /// exist: a failed event's pool declines its very next tick's
+    /// acknowledgement so the poller does not commit a cursor past a
+    /// ledger the store never recorded. Three things must all be true, or
+    /// the pool's cursor either commits over a gap or stalls forever:
+    /// setting the mark, clearing it once spent, and never touching a
+    /// pool that did not fail.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_failed_event_poisons_only_its_own_pools_next_tick(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        // The only non-fatal failure inside `Tracker::apply`: a partial
+        // fill re-reads the auction's remainder from chain, and that read
+        // fails here.
+        rpc.expect_http("getLedgerEntries", 503);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let tracker = Tracker::new(&client, &store);
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = LoopState::default();
+
+        let failing_fill = PollerMessage::Event {
+            pool: harness::POOL.to_string(),
+            ledger: harness::fixture_tick().sequence,
+            event: PoolEvent::FillAuction {
+                auction_type: AuctionType::UserLiquidation,
+                user: harness::USER_ONE.to_string(),
+                filler: harness::USER_TWO.to_string(),
+                fill_percent: 60,
+                filled: AuctionData::default(),
+            },
+        };
+        let error = handle_message(
+            &tracker,
+            &[],
+            quiet_cadence(),
+            &mut state,
+            &shutdown,
+            failing_fill,
+        )
+        .await
+        .expect_err("the partial-fill re-read could not reach chain");
+        assert!(matches!(error, TrackerError::Chain(_)));
+        assert!(
+            state.unapplied.contains(harness::POOL),
+            "the pool whose event failed is marked"
+        );
+
+        // A second pool's tick is not poisoned by the first pool's failed
+        // event: they share one channel and must not see each other's
+        // state.
+        let (other_message, other_applied) = tick_message(POOL_B, harness::fixture_tick());
+        handle_message(
+            &tracker,
+            &[],
+            quiet_cadence(),
+            &mut state,
+            &shutdown,
+            other_message,
+        )
+        .await
+        .expect("the other pool's tick applies");
+        assert!(
+            other_applied.await.is_ok(),
+            "a failure on one pool must not poison another pool's tick"
+        );
+
+        // This pool's own next tick declines its acknowledgement, so the
+        // poller leaves the cursor where it is and re-reads the range —
+        // and the mark is spent by that decline, not left latched.
+        let (message, applied) = tick_message(harness::POOL, harness::fixture_tick());
+        handle_message(
+            &tracker,
+            &[],
+            quiet_cadence(),
+            &mut state,
+            &shutdown,
+            message,
+        )
+        .await
+        .expect("the tick itself has nothing to refresh and applies cleanly");
+        assert!(
+            applied.await.is_err(),
+            "the tick right after a failed event is not acknowledged"
+        );
+        assert!(
+            !state.unapplied.contains(harness::POOL),
+            "the mark is cleared once it has declined a tick"
+        );
+
+        // A second tick, with no failure in between, is acknowledged
+        // normally. A flag that latched instead of clearing would stall
+        // this pool's cursor forever, and only this assertion catches it.
+        let (message, applied) = tick_message(harness::POOL, harness::fixture_tick());
+        handle_message(
+            &tracker,
+            &[],
+            quiet_cadence(),
+            &mut state,
+            &shutdown,
+            message,
+        )
+        .await
+        .expect("a clean tick applies");
+        assert!(
+            applied.await.is_ok(),
+            "with the mark cleared, a tick with no failure ahead of it is acknowledged"
         );
         Ok(())
     }
