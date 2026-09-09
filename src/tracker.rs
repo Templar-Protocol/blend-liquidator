@@ -342,7 +342,10 @@ impl AnalyticsSeed {
     /// positions), both end the walk without error. Caps at `SEED_PAGE_CAP`
     /// pages, logging a warning rather than looping forever when a cursor
     /// never comes back null.
-    pub async fn accounts(&self, pool: &str) -> Result<Vec<String>, SeedError> {
+    ///
+    /// Private: [`SeedSource::accounts`] is the uniform entry point across
+    /// sources, matching [`FileSeed::accounts`]'s visibility.
+    async fn accounts(&self, pool: &str) -> Result<Vec<String>, SeedError> {
         let url = format!("{}/v1/analytics/state/positions", self.base_url);
         let mut accounts = Vec::new();
         let mut cursor: Option<String> = None;
