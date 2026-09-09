@@ -240,30 +240,40 @@ async fn seed_pools_needing_it(
                 continue;
             }
         };
-        if outcome.failed_sources != 0 {
+        if !outcome.is_complete() {
             incomplete.insert(pool.address.clone());
         }
-        // The events cursor starts where the seed's own ledger ends.
-        // Without this the poller would start from the head *it* reads,
-        // and every event between the two — the whole time seeding takes,
-        // pool by pool — would never be read by anything. That loss is
-        // permanent: this pool is not seeded again once it has users and a
-        // cursor, so a borrower who opens their first position in that
-        // window is tracked only if some later event happens to name them.
-        store
-            .set_cursor(
-                &events_cursor(&pool.address),
-                &Cursor {
-                    ledger: head.sequence,
-                    paging_token: None,
-                },
-            )
-            .await?;
+        // The events cursor starts where the seed's own ledger ends, so the
+        // poller resumes there rather than from the head *it* reads: every
+        // event between the two — the whole time seeding takes, pool by
+        // pool — would otherwise be read by nothing, permanently, because a
+        // pool with users and a cursor is never seeded again.
+        //
+        // Which is exactly why only a *complete* seed may write it. A
+        // partial seed that recorded its position would make its own gap
+        // durable: the pool would have users and a cursor, so the next
+        // start would skip it, and the accounts it never valued would be
+        // tracked only if some later event happened to name them. Leaving
+        // the cursor unset trades this pool's seed-to-first-poll window for
+        // a seed the next start finishes, which is the side the skip test
+        // is on.
+        if outcome.is_complete() {
+            store
+                .set_cursor(
+                    &events_cursor(&pool.address),
+                    &Cursor {
+                        ledger: head.sequence,
+                        paging_token: None,
+                    },
+                )
+                .await?;
+        }
         tracing::info!(
             pool = pool.address,
             tracked = outcome.refresh.tracked,
             failed_sources = outcome.failed_sources,
-            cursor = head.sequence,
+            stopped_early = outcome.stopped_early,
+            complete = outcome.is_complete(),
             "seeded pool"
         );
     }
@@ -1894,6 +1904,72 @@ mod tests {
         );
         assert_eq!(cursor.paging_token, None);
         assert_eq!(store.count_users(harness::POOL).await.expect("count"), 1);
+        Ok(())
+    }
+
+    /// A seed that ran only partly commits no cursor. Committing one would
+    /// make the gap durable: the pool would have users *and* a cursor, so
+    /// the next start's skip test would pass it by for good, and the
+    /// accounts the seed never valued would be tracked only if some later
+    /// event happened to name them.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_incomplete_seed_commits_no_cursor_so_the_next_start_finishes_it(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let tick = harness::fixture_tick();
+        rpc.expect(
+            "getLatestLedger",
+            json!({"id": "aa", "protocolVersion": 27, "sequence": tick.sequence,
+                   "closeTime": tick.close_time.to_string()}),
+        );
+        harness::script_snapshot(&rpc, &[harness::USER_ONE]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let (_flag, shutdown) = watch::channel(false);
+
+        // One source answers and one does not: the accounts the first named
+        // are written, so the pool ends up with users but an incomplete set.
+        let file = write_temp_seed_file(&format!(
+            "[accounts]\n\"{}\" = [\"{}\"]\n",
+            harness::POOL,
+            harness::USER_ONE
+        ));
+        let unreachable = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&unreachable)
+            .await;
+        let sources = vec![
+            SeedSource::File(FileSeed::load(&file).expect("loads")),
+            SeedSource::Analytics(AnalyticsSeed::new(&unreachable.uri(), 100_000_000).unwrap()),
+        ];
+
+        let incomplete = seed_pools_needing_it(
+            &client,
+            &store,
+            &[pool_config(harness::POOL, USDC, &["*"], &["*"])],
+            &sources,
+            20,
+            &shutdown,
+        )
+        .await
+        .expect("a source that does not answer is not fatal");
+
+        assert!(incomplete.contains(harness::POOL), "marked for retry");
+        assert_eq!(
+            store.count_users(harness::POOL).await.expect("count"),
+            1,
+            "what the answering source named is written"
+        );
+        assert!(
+            store
+                .cursor(&events_cursor(harness::POOL))
+                .await
+                .expect("cursor read")
+                .is_none(),
+            "an incomplete seed records no position, so the next start seeds this pool again"
+        );
         Ok(())
     }
 

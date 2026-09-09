@@ -56,6 +56,22 @@ pub struct SeedOutcome {
     /// coverage is incomplete, which spec §4 makes a warning to be retried
     /// on the next full scan rather than a failure.
     pub failed_sources: usize,
+    /// Whether the seed stopped before valuing every account it collected,
+    /// which today means a shutdown arrived mid-seed. It is not an error —
+    /// the accounts already written are written — but the seed is not
+    /// finished, and a caller that records progress must not record it as
+    /// though it were.
+    pub stopped_early: bool,
+}
+
+impl SeedOutcome {
+    /// Whether this seed reached every source and valued every account it
+    /// collected. Only a complete seed may be recorded as one: a caller
+    /// that commits progress for an incomplete seed makes the gap durable.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.failed_sources == 0 && !self.stopped_early
+    }
 }
 
 /// Applies events and refreshes users for one store.
@@ -306,6 +322,7 @@ impl<'a> Tracker<'a> {
             // which a shutdown request would otherwise go unheard.
             if *shutdown.borrow() {
                 tracing::warn!(pool, "shutdown requested during a seed; stopping early");
+                outcome.stopped_early = true;
                 break;
             }
             let result = self.refresh(pool, chunk, tick).await?;
@@ -1349,6 +1366,39 @@ mod tests {
     }
 
     /// Every source's accounts are refreshed once, deduplicated, and a
+    /// A shutdown arriving mid-seed is not an error and not a completed
+    /// seed either: the accounts already valued stay written, and the
+    /// outcome says it stopped early so a caller cannot record the seed's
+    /// position as though it had finished.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_shutdown_mid_seed_reports_that_it_stopped_early(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        // No snapshot is scripted: the loop must break before it reads.
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let tracker = Tracker::new(&client, &store);
+        let file_path =
+            write_temp_seed_file(&format!("[accounts]\n\"{POOL}\" = [\"{USER_ONE}\"]\n"));
+        let file = SeedSource::File(FileSeed::load(&file_path).expect("loads"));
+        let (_flag, shutdown) = watch::channel(true);
+
+        let outcome = tracker
+            .seed(POOL, &[file], harness::fixture_tick(), 20, &shutdown)
+            .await
+            .expect("a shutdown is not a seed failure");
+
+        assert!(outcome.stopped_early, "the seed stopped before it finished");
+        assert_eq!(outcome.failed_sources, 0, "the source itself answered");
+        assert!(
+            !outcome.is_complete(),
+            "a seed that stopped early is not complete, whatever its sources did"
+        );
+        assert_eq!(outcome.refresh.tracked, 0);
+        Ok(())
+    }
+
     /// failing source is skipped rather than failing the seed.
     #[sqlx::test(migrations = "./migrations")]
     async fn seeding_refreshes_every_account_once_and_survives_a_failing_source(
