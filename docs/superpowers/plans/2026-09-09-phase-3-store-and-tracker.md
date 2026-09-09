@@ -1608,7 +1608,7 @@ supported_lot = ["*"]
     }
 ```
 
-Extend `assert_clean_environment`'s list with the new variables: `DATABASE_URL`, `DATABASE_MAX_CONNECTIONS`, `POOLS_FILE`, `POOLS_TOML`, `RUN_MODE`, `POLL_INTERVAL_MS`, `USER_REFRESH_LEDGERS`, `REFRESH_BATCH`, `FULL_SCAN_LEDGERS`, `SCAN_HF_THRESHOLD`, `SEED_URL`, `SEED_HF_MAX`, `SEED_FILE`.
+Extend `assert_clean_environment`'s list with the new variables — but **not** `DATABASE_URL`: like `RPC_API_KEY` it is never a clap argument, and `make check` and CI both export it job-wide so the query macros can reach the schema, so asserting it absent would fail every run. The list gains `DATABASE_MAX_CONNECTIONS`, `POOLS_FILE`, `POOLS_TOML`, `RUN_MODE`, `POLL_INTERVAL_MS`, `USER_REFRESH_LEDGERS`, `REFRESH_BATCH`, `FULL_SCAN_LEDGERS`, `SCAN_HF_THRESHOLD`, `SEED_URL`, `SEED_HF_MAX`, `SEED_FILE`.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -1759,7 +1759,7 @@ pub fn parse_pools(text: &str) -> Result<Vec<PoolConfig>, LiquidatorError> {
         .map_err(|error| LiquidatorError::Config(format!("pools file: {error}")))?;
     if raw.pools.is_empty() {
         return Err(LiquidatorError::Config(
-            "pools file: at least one [[pools]] table is required".to_string(),
+            "pools file: at least one pool (a [[pools]] table) is required".to_string(),
         ));
     }
     let mut pools = Vec::with_capacity(raw.pools.len());
