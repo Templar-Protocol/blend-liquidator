@@ -25,6 +25,7 @@
 
 pub mod chain;
 pub mod config;
+pub mod ledger;
 pub mod math;
 pub mod store;
 
@@ -49,4 +50,7 @@ pub enum LiquidatorError {
     /// The store failed: connection, query, migration or a value it held.
     #[error("store: {0}")]
     Store(#[from] store::StoreError),
+    /// The ledger poller failed.
+    #[error("ledger: {0}")]
+    Ledger(#[from] ledger::LedgerError),
 }

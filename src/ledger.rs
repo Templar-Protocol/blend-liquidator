@@ -1,0 +1,590 @@
+//! The clock. One poller per pool: it asks the RPC for chain head, reads
+//! every pool event since its cursor, sends each decoded event followed by
+//! the ledger's tick, and only then writes the cursor forward.
+//!
+//! That order is the invariant: a crash between sending and storing
+//! re-reads a ledger, which the tracker handles because applying an event
+//! twice is idempotent, while storing first would skip one silently. The
+//! cursor never moves past what was sent, and an RPC failure moves it not
+//! at all.
+//!
+//! A cursor older than the RPC's retained window cannot be caught up: the
+//! events between are gone. The poller reports that as a `Gap` and restarts
+//! at the window's edge, leaving the tracker to reseed rather than pretend
+//! the missing ledgers held nothing.
+
+use std::time::Duration;
+
+use tokio::sync::{mpsc, watch};
+
+use crate::chain::rpc::{EventQuery, RpcClient};
+use crate::chain::xdr::{decode_pool_event, PoolEvent};
+use crate::chain::ChainError;
+use crate::store::{events_cursor, Cursor, Store, StoreError};
+
+/// A ledger the poller has caught up to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LedgerTick {
+    /// The ledger sequence.
+    pub sequence: u32,
+    /// Its close time, the timestamp reserves are accrued to when a user is
+    /// valued at this ledger.
+    pub close_time: u64,
+}
+
+/// What a poller sends downstream, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PollerMessage {
+    /// One decoded pool event.
+    Event {
+        /// The pool that emitted it.
+        pool: String,
+        /// The ledger it was emitted in.
+        ledger: u32,
+        /// The event.
+        event: PoolEvent,
+    },
+    /// Every event up to and including this ledger has been sent.
+    Tick {
+        /// The pool.
+        pool: String,
+        /// The ledger.
+        tick: LedgerTick,
+    },
+    /// The cursor fell out of the RPC's retained window: the events between
+    /// `from` and `oldest` are gone and the user set must be reseeded.
+    Gap {
+        /// The pool.
+        pool: String,
+        /// The last ledger that was applied.
+        from: u32,
+        /// The oldest ledger the RPC still holds.
+        oldest: u32,
+    },
+}
+
+/// Polling and backoff timings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PollerConfig {
+    /// How often to ask for chain head.
+    pub poll_interval: Duration,
+    /// Events per `getEvents` page.
+    pub page_limit: u32,
+    /// First backoff after an RPC failure.
+    pub min_backoff: Duration,
+    /// Longest backoff after repeated failures.
+    pub max_backoff: Duration,
+}
+
+impl PollerConfig {
+    /// The spec's timings: pages of 200, backoff from one to thirty seconds.
+    #[must_use]
+    pub fn new(poll_interval: Duration) -> Self {
+        Self {
+            poll_interval,
+            page_limit: 200,
+            min_backoff: Duration::from_secs(1),
+            max_backoff: Duration::from_secs(30),
+        }
+    }
+}
+
+/// A failure in the poller.
+#[derive(Debug, thiserror::Error)]
+pub enum LedgerError {
+    /// The RPC could not be read.
+    #[error("chain: {0}")]
+    Chain(#[from] ChainError),
+    /// The cursor could not be read or written.
+    #[error("store: {0}")]
+    Store(#[from] StoreError),
+    /// The receiving end went away, which happens during shutdown.
+    #[error("the tracker channel is closed")]
+    Closed,
+}
+
+/// Follows one pool's events.
+#[derive(Debug)]
+pub struct LedgerPoller<'a> {
+    rpc: &'a RpcClient,
+    store: &'a Store,
+    pool: &'a str,
+    config: PollerConfig,
+}
+
+impl<'a> LedgerPoller<'a> {
+    /// A poller for `pool`.
+    #[must_use]
+    pub fn new(rpc: &'a RpcClient, store: &'a Store, pool: &'a str, config: PollerConfig) -> Self {
+        Self {
+            rpc,
+            store,
+            pool,
+            config,
+        }
+    }
+
+    /// Polls until `shutdown` flips, backing off on RPC failures. An RPC
+    /// outage never advances the cursor, so nothing is skipped.
+    pub async fn run(
+        &self,
+        sender: mpsc::Sender<PollerMessage>,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<(), LedgerError> {
+        let mut backoff = self.config.min_backoff;
+        loop {
+            if *shutdown.borrow_and_update() {
+                return Ok(());
+            }
+            let wait = match self.poll_once(&sender).await {
+                Ok(_) => {
+                    backoff = self.config.min_backoff;
+                    self.config.poll_interval
+                }
+                Err(LedgerError::Closed) => return Ok(()),
+                Err(error) => {
+                    tracing::warn!(pool = self.pool, %error, "poll failed; backing off");
+                    let wait = backoff;
+                    backoff = (backoff * 2).min(self.config.max_backoff);
+                    wait
+                }
+            };
+            tokio::select! {
+                () = tokio::time::sleep(wait) => {}
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
+    /// One pass: head, events since the cursor, then the tick and the
+    /// cursor. `None` when the chain has not moved.
+    pub async fn poll_once(
+        &self,
+        sender: &mpsc::Sender<PollerMessage>,
+    ) -> Result<Option<LedgerTick>, LedgerError> {
+        let health = self.rpc.health().await?;
+        let head = self.rpc.latest_ledger().await?;
+        let stored = self.store.cursor(&events_cursor(self.pool)).await?;
+
+        // With no cursor the bot follows from now: history comes from
+        // seeding, not from replaying every ledger the RPC still holds.
+        let mut start = match &stored {
+            None => head.sequence,
+            Some(cursor) => cursor.ledger.saturating_add(1),
+        };
+        if let Some(cursor) = &stored {
+            if start < health.oldest_ledger {
+                tracing::warn!(
+                    pool = self.pool,
+                    from = cursor.ledger,
+                    oldest = health.oldest_ledger,
+                    "the cursor fell out of the RPC's retained window; reseeding"
+                );
+                send(
+                    sender,
+                    PollerMessage::Gap {
+                        pool: self.pool.to_string(),
+                        from: cursor.ledger,
+                        oldest: health.oldest_ledger,
+                    },
+                )
+                .await?;
+                start = health.oldest_ledger;
+            }
+        }
+        if start > head.sequence {
+            return Ok(None);
+        }
+
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = self
+                .rpc
+                .events(&EventQuery {
+                    start_ledger: cursor.is_none().then_some(start),
+                    cursor: cursor.as_deref(),
+                    contract_ids: &[self.pool],
+                    limit: self.config.page_limit,
+                })
+                .await?;
+            let count = page.events.len();
+            for event in &page.events {
+                if event.contract_id != self.pool || !event.in_successful_contract_call {
+                    continue;
+                }
+                match decode_pool_event(&event.topics, &event.value) {
+                    Ok(Some(decoded)) => {
+                        send(
+                            sender,
+                            PollerMessage::Event {
+                                pool: self.pool.to_string(),
+                                ledger: event.ledger,
+                                event: decoded,
+                            },
+                        )
+                        .await?;
+                    }
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(
+                        pool = self.pool,
+                        ledger = event.ledger,
+                        id = %event.id,
+                        %error,
+                        "an event this bot models did not decode; skipping it"
+                    ),
+                }
+            }
+            // A short page is the last one; the next poll starts from the
+            // ledger after the tick.
+            if count < usize::try_from(self.config.page_limit).unwrap_or(usize::MAX) {
+                break;
+            }
+            match page.cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        let tick = LedgerTick {
+            sequence: head.sequence,
+            close_time: head.close_time,
+        };
+        send(
+            sender,
+            PollerMessage::Tick {
+                pool: self.pool.to_string(),
+                tick,
+            },
+        )
+        .await?;
+        self.store
+            .set_cursor(
+                &events_cursor(self.pool),
+                &Cursor {
+                    ledger: head.sequence,
+                    paging_token: None,
+                },
+            )
+            .await?;
+        Ok(Some(tick))
+    }
+}
+
+/// Sends downstream, turning a closed channel into `Closed` rather than an
+/// error the caller would retry.
+async fn send(
+    sender: &mpsc::Sender<PollerMessage>,
+    message: PollerMessage,
+) -> Result<(), LedgerError> {
+    sender.send(message).await.map_err(|_| LedgerError::Closed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chain::script::ScriptedRpc;
+    use crate::chain::xdr::encode::{address, i128_val, symbol, to_base64, vec as sc_vec};
+    use serde_json::json;
+    use std::time::Duration;
+
+    const POOL: &str = "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD";
+    const USER: &str = "GDAWX4KV5EQLP5W44HE5AA5QN5QRBJOVQIAI5OXOH5FW2ENT5PXN33DE";
+    const USDC: &str = "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75";
+
+    fn config() -> PollerConfig {
+        PollerConfig {
+            poll_interval: Duration::from_millis(5),
+            page_limit: 200,
+            min_backoff: Duration::from_millis(5),
+            max_backoff: Duration::from_millis(20),
+        }
+    }
+
+    fn health(latest: u32, oldest: u32) -> serde_json::Value {
+        json!({
+            "status": "healthy", "latestLedger": latest,
+            "latestLedgerCloseTime": "1788635204", "oldestLedger": oldest,
+            "oldestLedgerCloseTime": "1787949229", "ledgerRetentionWindow": 120_960
+        })
+    }
+
+    fn latest(sequence: u32, close_time: u64) -> serde_json::Value {
+        json!({"id": "aa", "protocolVersion": 27, "sequence": sequence, "closeTime": close_time.to_string()})
+    }
+
+    /// A `borrow` event as the pool emits it, at `ledger`.
+    fn borrow_event(ledger: u32, index: u32) -> serde_json::Value {
+        let topics = [
+            symbol("borrow").unwrap(),
+            address(USDC).unwrap(),
+            address(USER).unwrap(),
+        ];
+        let value = sc_vec(vec![i128_val(1_000), i128_val(900)]).unwrap();
+        json!({
+            "type": "contract", "ledger": ledger, "ledgerClosedAt": "2026-09-05T14:28:07Z",
+            "contractId": POOL, "id": format!("{ledger}-{index}"), "operationIndex": 0,
+            "transactionIndex": 1, "txHash": "ab".repeat(32), "inSuccessfulContractCall": true,
+            "topic": topics.iter().map(|t| to_base64(t).unwrap()).collect::<Vec<_>>(),
+            "value": to_base64(&value).unwrap()
+        })
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_first_poll_with_no_cursor_starts_at_chain_head(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        rpc.expect("getHealth", health(64_291_297, 64_150_000));
+        rpc.expect("getLatestLedger", latest(64_291_297, 1_788_645_403));
+        rpc.expect(
+            "getEvents",
+            json!({"latestLedger": 64_291_297, "cursor": null, "events": []}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        let poller = LedgerPoller::new(&client, &store, POOL, config());
+
+        let tick = poller
+            .poll_once(&sender)
+            .await
+            .expect("poll")
+            .expect("a tick");
+        assert_eq!(
+            (tick.sequence, tick.close_time),
+            (64_291_297, 1_788_645_403)
+        );
+        // The stream starts at head, so the first getEvents asks for it.
+        assert_eq!(rpc.calls("getEvents")[0]["startLedger"], 64_291_297);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(PollerMessage::Tick { .. })
+        ));
+        assert_eq!(
+            store.cursor(&events_cursor(POOL)).await.expect("cursor"),
+            Some(Cursor {
+                ledger: 64_291_297,
+                paging_token: None
+            })
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn events_arrive_before_the_tick_and_the_cursor_follows(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        store
+            .set_cursor(
+                &events_cursor(POOL),
+                &Cursor {
+                    ledger: 100,
+                    paging_token: None,
+                },
+            )
+            .await
+            .expect("cursor");
+        let rpc = ScriptedRpc::start().await;
+        rpc.expect("getHealth", health(103, 1));
+        rpc.expect("getLatestLedger", latest(103, 1_788_645_403));
+        rpc.expect(
+            "getEvents",
+            json!({"latestLedger": 103, "cursor": "0103-2", "events": [borrow_event(101, 1), borrow_event(103, 2)]}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        let poller = LedgerPoller::new(&client, &store, POOL, config());
+
+        poller.poll_once(&sender).await.expect("poll");
+        // It asked for the ledger after the cursor, not the cursor itself.
+        assert_eq!(rpc.calls("getEvents")[0]["startLedger"], 101);
+        for expected_ledger in [101, 103] {
+            match receiver.try_recv().expect("an event") {
+                PollerMessage::Event {
+                    pool,
+                    ledger,
+                    event,
+                } => {
+                    assert_eq!(pool, POOL);
+                    assert_eq!(ledger, expected_ledger);
+                    assert!(matches!(event, PoolEvent::Borrow { .. }));
+                }
+                other => panic!("expected an event, got {other:?}"),
+            }
+        }
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(PollerMessage::Tick { .. })
+        ));
+        assert_eq!(
+            store
+                .cursor(&events_cursor(POOL))
+                .await
+                .expect("cursor")
+                .expect("set")
+                .ledger,
+            103
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_cursor_older_than_the_retained_window_is_a_gap(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        store
+            .set_cursor(
+                &events_cursor(POOL),
+                &Cursor {
+                    ledger: 10,
+                    paging_token: None,
+                },
+            )
+            .await
+            .expect("cursor");
+        let rpc = ScriptedRpc::start().await;
+        rpc.expect("getHealth", health(500_000, 400_000));
+        rpc.expect("getLatestLedger", latest(500_000, 1_788_645_403));
+        rpc.expect(
+            "getEvents",
+            json!({"latestLedger": 500_000, "cursor": null, "events": []}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        let poller = LedgerPoller::new(&client, &store, POOL, config());
+
+        poller.poll_once(&sender).await.expect("poll");
+        match receiver.try_recv().expect("a gap") {
+            PollerMessage::Gap { pool, from, oldest } => {
+                assert_eq!((pool.as_str(), from, oldest), (POOL, 10, 400_000));
+            }
+            other => panic!("expected a gap, got {other:?}"),
+        }
+        // It restarts at the window's edge rather than skipping to head.
+        assert_eq!(rpc.calls("getEvents")[0]["startLedger"], 400_000);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_unmodelled_event_and_a_foreign_contract_are_both_ignored(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        store
+            .set_cursor(
+                &events_cursor(POOL),
+                &Cursor {
+                    ledger: 100,
+                    paging_token: None,
+                },
+            )
+            .await
+            .expect("cursor");
+        let mut unmodelled = borrow_event(101, 1);
+        unmodelled["topic"] = json!([to_base64(&symbol("gulp").unwrap()).unwrap()]);
+        let mut foreign = borrow_event(101, 2);
+        foreign["contractId"] = json!(USDC);
+        let rpc = ScriptedRpc::start().await;
+        rpc.expect("getHealth", health(101, 1));
+        rpc.expect("getLatestLedger", latest(101, 1_788_645_403));
+        rpc.expect(
+            "getEvents",
+            json!({"latestLedger": 101, "cursor": null, "events": [unmodelled, foreign]}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        let poller = LedgerPoller::new(&client, &store, POOL, config());
+
+        poller.poll_once(&sender).await.expect("poll");
+        assert!(
+            matches!(receiver.try_recv(), Ok(PollerMessage::Tick { .. })),
+            "only the tick"
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_rpc_failure_leaves_the_cursor_alone(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let before = Cursor {
+            ledger: 100,
+            paging_token: None,
+        };
+        store
+            .set_cursor(&events_cursor(POOL), &before)
+            .await
+            .expect("cursor");
+        let rpc = ScriptedRpc::start().await;
+        rpc.expect_http("getHealth", 503);
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(16);
+        let poller = LedgerPoller::new(&client, &store, POOL, config());
+
+        assert!(matches!(
+            poller.poll_once(&sender).await,
+            Err(LedgerError::Chain(_))
+        ));
+        assert_eq!(
+            store.cursor(&events_cursor(POOL)).await.expect("cursor"),
+            Some(before)
+        );
+        Ok(())
+    }
+
+    /// Nothing new closed, so there is nothing to do and no cursor write.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_ledger_that_has_not_moved_is_a_no_op(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let at_head = Cursor {
+            ledger: 103,
+            paging_token: None,
+        };
+        store
+            .set_cursor(&events_cursor(POOL), &at_head)
+            .await
+            .expect("cursor");
+        let rpc = ScriptedRpc::start().await;
+        rpc.expect("getHealth", health(103, 1));
+        rpc.expect("getLatestLedger", latest(103, 1_788_645_403));
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        let poller = LedgerPoller::new(&client, &store, POOL, config());
+
+        assert_eq!(poller.poll_once(&sender).await.expect("poll"), None);
+        assert!(receiver.try_recv().is_err(), "no messages");
+        assert!(rpc.calls("getEvents").is_empty());
+        assert_eq!(
+            store.cursor(&events_cursor(POOL)).await.expect("cursor"),
+            Some(at_head)
+        );
+        Ok(())
+    }
+
+    /// `run` polls until the shutdown flag flips, then returns.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_stops_on_the_shutdown_flag(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        for _ in 0..40 {
+            rpc.expect("getHealth", health(103, 1));
+            rpc.expect("getLatestLedger", latest(103, 1_788_645_403));
+        }
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(16);
+        let (flag, watch) = tokio::sync::watch::channel(false);
+        let poller = LedgerPoller::new(&client, &store, POOL, config());
+        let stopper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            flag.send(true).expect("flag");
+        });
+        poller.run(sender, watch).await.expect("run");
+        stopper.await.expect("stopper");
+        Ok(())
+    }
+}
