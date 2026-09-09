@@ -538,36 +538,30 @@ impl Store {
 
     /// One auction.
     ///
-    /// Filters by pool and account only, then matches `auction_type` after
-    /// decoding: a SQL-level `auction_type = $3` filter built from the
-    /// caller's (always valid) `AuctionType` could never match a row a
-    /// corrupted write left with an out-of-range discriminant, so a
-    /// corrupted row would silently read back as "no such auction" instead
-    /// of surfacing the decode error.
+    /// A discriminant this crate never writes cannot match a typed lookup,
+    /// so a corrupted row is reported by [`Store::open_auctions`], which
+    /// reads every row, rather than here.
     pub async fn auction(
         &self,
         pool: &str,
         account: &str,
         auction_type: AuctionType,
     ) -> Result<Option<TrackedAuction>, StoreError> {
-        let rows = sqlx::query!(
+        let row = sqlx::query!(
             "SELECT pool, account, auction_type, start_ledger, fill_ledger, percent,
                     bid, lot, updated_ledger
-             FROM auctions WHERE pool = $1 AND account = $2",
+             FROM auctions WHERE pool = $1 AND account = $2 AND auction_type = $3",
             pool,
             account,
+            auction_type_code(auction_type),
         )
-        .fetch_all(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        for row in rows {
-            let decoded_type = auction_type_from_code(row.auction_type)?;
-            if decoded_type != auction_type {
-                continue;
-            }
-            return Ok(Some(TrackedAuction {
+        row.map(|row| {
+            Ok(TrackedAuction {
                 pool: row.pool,
                 account: row.account,
-                auction_type: decoded_type,
+                auction_type: auction_type_from_code(row.auction_type)?,
                 start_ledger: ledger(row.start_ledger, "start_ledger")?,
                 fill_ledger: row
                     .fill_ledger
@@ -577,9 +571,9 @@ impl Store {
                 bid: asset_amounts_from_json(&row.bid, "bid")?,
                 lot: asset_amounts_from_json(&row.lot, "lot")?,
                 updated_ledger: ledger(row.updated_ledger, "updated_ledger")?,
-            }));
-        }
-        Ok(None)
+            })
+        })
+        .transpose()
     }
 
     /// Every auction the bot has open in a pool, oldest first: the filler
@@ -984,7 +978,9 @@ mod tests {
     }
 
     /// A discriminant the contract never emits cannot be read back as an
-    /// auction type.
+    /// auction type. It surfaces through `open_auctions`, which reads every
+    /// row of a pool: a typed lookup cannot match a code this crate never
+    /// writes, so that is where corruption has to be caught.
     #[sqlx::test(migrations = "./migrations")]
     async fn an_unknown_auction_type_in_the_row_is_an_error(
         pool: sqlx::PgPool,
@@ -998,14 +994,21 @@ mod tests {
         .await?;
         let store = Store::from_pool(pool);
         assert!(matches!(
-            store
-                .auction(POOL, USER, AuctionType::UserLiquidation)
-                .await,
+            store.open_auctions(POOL).await,
             Err(StoreError::Decimal {
                 column: "auction_type",
                 ..
             })
         ));
+        // A typed read is not the place this shows up: there is no
+        // user-liquidation auction for this account, and that is the answer.
+        assert_eq!(
+            store
+                .auction(POOL, USER, AuctionType::UserLiquidation)
+                .await
+                .expect("typed read"),
+            None
+        );
         Ok(())
     }
 }
