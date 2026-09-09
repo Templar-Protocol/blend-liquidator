@@ -6,13 +6,16 @@ A liquidation bot for [Blend Protocol](https://blend.capital) lending pools on
 Stellar. It is intended to repay the debt of underwater positions and receive
 their collateral at a discount.
 
-**Status: skeleton.** Phase 1 landed the pure fixed-point math (`math`) and
+**Status: Phase 3.** Phase 1 landed the pure fixed-point math (`math`) and
 the ScVal/ledger-entry codecs (`chain::xdr`); Phase 2 landed the chain layer
-(`chain::rpc`, `chain::pool`, `chain::signer`, `chain::tx`), which can read a
-pool and sign and submit a transaction but is not yet driven by anything.
-The binary itself still just parses configuration, sets up logging and
-exits: there is no bot loop or executor yet. The repository scaffolding is
-complete and enforced.
+(`chain::rpc`, `chain::pool`, `chain::signer`, `chain::tx`); Phase 3 landed
+the Postgres store, a per-pool ledger poller and a tracker (`store`,
+`ledger`, `tracker`, `service`), so the binary now validates its
+configuration, seeds its tracked-user set from the analytics API or a static
+file, and follows every configured pool — applying events and refreshing
+borrowers' health factors from chain — until it is shut down. It still
+creates no auctions and fills nothing: no signer is wired into `service`
+yet. The repository scaffolding is complete and enforced.
 
 **This bot is NOT non-custodial.** It is designed to hold a signing key and
 submit transactions itself — that is the point of a liquidation bot. Treat
@@ -22,10 +25,12 @@ reason (see Safety invariants below).
 ## Orientation commands
 
 ```bash
+make db-up                          # start Postgres; make check needs it running
 make check                          # everything CI runs
 cargo test --lib --bins             # unit tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all
+make sqlx-prepare                   # after changing a query in src/store.rs
 make help                           # Docker Compose lifecycle
 ```
 
@@ -57,6 +62,39 @@ make help                           # Docker Compose lifecycle
   classify into `TxOutcome`.
 - `src/chain/script.rs` (`cfg(test)`) — a scripted JSON-RPC server the chain
   tests drive the real client through.
+- `src/store.rs` — the bot's durable state: cursors per polling task,
+  tracked borrowers (`users` — a row exists only while the account owes
+  something) and open auctions (`auctions`), migrated by the embedded
+  `migrations/` and read and written through compile-time-checked
+  `sqlx::query!`. `i128` amounts and health factors cross the Postgres
+  boundary as decimal text, never as a bound number.
+- `src/ledger.rs` — the clock: one `LedgerPoller` per pool, reading events
+  since a stored cursor, sending each decoded event and then the ledger's
+  tick, and only advancing the cursor once both have been sent — so a crash
+  between sending and storing replays a ledger rather than skipping one. A
+  cursor fallen out of the RPC's retained window is reported as a `Gap`
+  rather than silently caught up on; a pass that cannot prove it drained the
+  range leaves the cursor untouched.
+- `src/tracker.rs` — applies chain state to the store: `Tracker::apply`
+  writes an event's auction bookkeeping and returns the accounts it named;
+  `Tracker::refresh` re-reads named accounts from chain in one snapshot and
+  upserts or deletes their `users` row; `Tracker::seed` collects accounts
+  from every configured `SeedSource` — the public analytics API
+  (`AnalyticsSeed`) or a static file (`FileSeed`) — deduplicates them, and
+  refreshes them in batches.
+- `src/service.rs` — wiring: `Service::check_config` validates the
+  configuration and reports without touching the store or following
+  anything; `Service::run` connects and migrates the store, seeds every pool
+  whose tracked-user count or events cursor is missing, then runs one
+  `LedgerPoller` per pool and one tracker task consuming their shared
+  channel until a shutdown signal arrives and every task has returned.
+- `src/harness.rs` (`cfg(test)`) — scripted-RPC and store scaffolding shared
+  by the store, ledger and tracker tests: the fixture's pool, its two
+  borrowers, and the golden health factors `chain::xdr::decode`'s test
+  derives from the same contract-attested inputs.
+- `migrations/` — the store's schema, embedded in the binary and applied by
+  `Store::migrate`. The `sqlx::query!` macros in `src/store.rs` are checked
+  against it at compile time; see the query-macro gotcha below.
 - `examples/pool_snapshot.rs` — prints a live pool's reserves and users'
   health factors.
 - `examples/capture_fixture.rs` — refreshes `tests/fixtures/` from a live
@@ -64,8 +102,8 @@ make help                           # Docker Compose lifecycle
 
 The module layout beyond this follows
 `docs/superpowers/specs/2026-09-04-blend-liquidator-bot-design.md`; the
-phases still to land are the store and ledger poller, the auctioneer, the
-filler and executor, unwind, and the operational surface.
+phases still to land are the auctioneer, the filler and executor, unwind,
+and the rest of the operational surface.
 
 ## Conventions
 
@@ -159,6 +197,26 @@ filler and executor, unwind, and the operational surface.
 - `getLedgerEntries` omits absent keys rather than returning nulls, so a
   lookup must go by key, never by position, and "the RPC returned fewer
   entries than keys" is the normal shape of "some of these do not exist".
+- The `sqlx::query!` macros in `src/store.rs` are checked at compile time,
+  so a build needs either a live database (`make db-up && sqlx migrate run`)
+  or the committed offline metadata in `.sqlx/` (`SQLX_OFFLINE=true`, which
+  the Dockerfile sets). Change a query and run `make sqlx-prepare`, or the
+  Docker build fails on stale metadata while the local build — which still
+  has a database to check against — passes.
+- `i128` fits no Postgres integer type. Amounts and health factors cross the
+  boundary as decimal text: bound as `$n::text::numeric` going in, read back
+  through `::text` coming out. A query that binds one as a number instead is
+  a rounding bug waiting to happen.
+- Store tests need a live Postgres and are not skipped without one:
+  `#[sqlx::test]` creates a database per test. `make db-up` first.
+- A `users` row exists only while the account owes something — the tracker
+  deletes it the moment its liabilities empty — so `count(*)` on `users` is
+  the number of positions that could be liquidated, not the number of
+  accounts ever seen.
+- The migration in `migrations/` was amended twice during Phase 3, so a
+  stale local database (one migrated before those amendments) fails loudly
+  on a checksum mismatch rather than applying quietly. `make db-reset &&
+  make db-up && sqlx migrate run` clears it.
 
 ## Workflow
 

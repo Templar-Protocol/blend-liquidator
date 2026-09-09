@@ -9,6 +9,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The Postgres store (`src/store.rs`): cursors per polling task, tracked
+  borrowers (`users`, one row while an account owes something, deleted the
+  moment it does not) and open auctions (`auctions`), migrated by embedded,
+  compile-time-checked `migrations/` and queried through `sqlx::query!` so a
+  schema drift is a build failure, not a runtime surprise. `i128` amounts and
+  health factors cross the Postgres boundary as decimal text — bound
+  `$n::text::numeric`, read back `::text` — since no Postgres integer holds
+  one exactly; a `numeric` column that does not parse back to an `i128` is a
+  `StoreError`, never a silently truncated zero.
+- The per-pool ledger poller (`src/ledger.rs`, `LedgerPoller`): asks the RPC
+  for chain head, pages every pool event since its stored cursor, sends each
+  decoded event followed by the ledger's tick, and only then advances the
+  cursor — so a crash between sending and storing replays a ledger rather
+  than skipping one, which the tracker tolerates because applying an event
+  twice is idempotent. A cursor that has fallen out of the RPC's retained
+  window is reported as a `Gap` and restarted at the window's edge, for the
+  tracker to reseed; a pass that cannot prove it drained its range — paging
+  stalled, repeated, or hit a hard cap — leaves the cursor untouched instead
+  of guessing.
+- The tracker (`src/tracker.rs`, `Tracker`): `apply` writes an event's
+  auction bookkeeping (a partial fill re-reads the remainder from chain
+  rather than subtracting the filled side, since the contract owns that
+  arithmetic) and returns the accounts it named; `refresh` re-reads named
+  accounts from chain in one batched snapshot per tick and upserts or
+  deletes their `users` row, valuing them at the tick's own close time;
+  `refresh_stale` walks the oldest-updated rows first so a long-idle
+  borrower's accrued interest is never missed; `seed` collects accounts from
+  every configured source, deduplicates them, and refreshes them in
+  batches — a source that fails is a warning, not a startup failure, because
+  every account is re-verified from chain before the bot ever acts on it.
+  Seeding draws from the public Blend analytics API (`AnalyticsSeed`,
+  walking its cursor-paginated positions endpoint) and/or a static TOML file
+  of pool-to-account lists (`FileSeed`), both behind the uniform
+  `SeedSource`.
+- The pools file (`POOLS_FILE`/`POOLS_TOML`, parsed in `src/config.rs`): one
+  `[[pools]]` table per pool naming its primary asset, supported bid/lot
+  assets and profit rules, validated at startup — every pool must agree on
+  one backstop (a filler's position is shared across every pool it follows),
+  and every named asset must be one of the pool's own reserves. New knobs:
+  `USER_REFRESH_LEDGERS`, `REFRESH_BATCH`, `FULL_SCAN_LEDGERS`,
+  `SCAN_HF_THRESHOLD`, `SEED_URL` (empty disables the analytics source),
+  `SEED_HF_MAX`, `SEED_FILE`, `DATABASE_URL`, `DATABASE_MAX_CONNECTIONS`,
+  `POLL_INTERVAL_MS`. `pools.example.toml` and `seed.example.toml` document
+  both file formats and are referenced from `.env.example`.
+- `RUN_MODE`/`--run-mode` (`src/service.rs`, `Service`): `check-config`
+  validates the configuration and reports the resolved (redacted) form, the
+  per-pool validation and every warning, without touching the store or
+  following anything; `loop` (the default) additionally connects and
+  migrates the store, seeds every pool that needs it, then runs one
+  `LedgerPoller` per pool and one tracker task consuming their shared
+  channel until `SIGTERM`/`SIGINT` and every task has returned — a second
+  signal exits immediately with code 130 rather than wait further. Once a
+  tick, the full scan reports the pool's tracked-user count and its least
+  healthy borrowers, staggered across instances by a per-process random
+  phase so several bots following the same pool do not scan in lockstep.
+- A `postgres` service in `docker-compose.yml` and `Makefile` targets
+  (`db-up`, `db-down`, `db-reset`, `db-migrate`, `sqlx-prepare`) for the
+  local database `make check` and the store's tests now need.
 - The pool contract's arithmetic, ported to checked `i128` (`src/math/`):
   reserve interest accrual, b/d-token conversions, effective position values
   and the health factor, and Dutch-auction scaling. Every rounding direction
