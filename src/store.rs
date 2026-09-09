@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
-use crate::chain::xdr::AuctionType;
+use crate::chain::xdr::{AuctionType, FillPercent};
 
 /// A failure talking to the store, or reading a value it returned.
 #[derive(Debug, thiserror::Error)]
@@ -445,8 +445,8 @@ pub struct TrackedAuction {
     pub start_ledger: u32,
     /// The ledger the filler intends to fill at, once it has planned one.
     pub fill_ledger: Option<u32>,
-    /// The share of the position auctioned, 1 to 100.
-    pub percent: u32,
+    /// The share of the position auctioned, validated 1 to 100 by the type.
+    pub percent: FillPercent,
     /// Asset address to amount the filler pays.
     pub bid: BTreeMap<String, i128>,
     /// Asset address to amount the filler receives.
@@ -476,9 +476,14 @@ fn auction_type_from_code(code: i16) -> Result<AuctionType, StoreError> {
     })
 }
 
-/// A `smallint` percent back into the 1-to-100 range the contract uses.
-fn percent_from_code(code: i16) -> Result<u32, StoreError> {
-    u32::try_from(code).map_err(|_| StoreError::Decimal {
+/// A `smallint` percent back into the 1-to-100 range the contract uses,
+/// rejecting anything `FillPercent` would reject.
+fn percent_from_code(code: i16) -> Result<FillPercent, StoreError> {
+    let value = u32::try_from(code).map_err(|_| StoreError::Decimal {
+        column: "percent",
+        value: code.to_string(),
+    })?;
+    FillPercent::try_from(value).map_err(|_| StoreError::Decimal {
         column: "percent",
         value: code.to_string(),
     })
@@ -488,9 +493,9 @@ impl Store {
     /// Writes an auction, replacing any previous row for the same pool,
     /// account and type.
     pub async fn upsert_auction(&self, auction: &TrackedAuction) -> Result<(), StoreError> {
-        let percent = i16::try_from(auction.percent).map_err(|_| StoreError::Decimal {
+        let percent = i16::try_from(auction.percent.get()).map_err(|_| StoreError::Decimal {
             column: "percent",
-            value: auction.percent.to_string(),
+            value: auction.percent.get().to_string(),
         })?;
         sqlx::query!(
             "INSERT INTO auctions (pool, account, auction_type, start_ledger, fill_ledger,
@@ -900,7 +905,7 @@ mod tests {
             auction_type: AuctionType::UserLiquidation,
             start_ledger,
             fill_ledger: None,
-            percent: 100,
+            percent: FillPercent::try_from(100).expect("100 is in range"),
             bid,
             lot,
             updated_ledger: start_ledger,
@@ -922,7 +927,7 @@ mod tests {
 
         // The filler plans a fill ledger and a partial percent.
         open.fill_ledger = Some(64_291_400);
-        open.percent = 60;
+        open.percent = FillPercent::try_from(60).expect("60 is in range");
         open.updated_ledger = 64_291_350;
         store.upsert_auction(&open).await.expect("update");
         assert_eq!(
@@ -977,38 +982,40 @@ mod tests {
         Ok(())
     }
 
-    /// A discriminant the contract never emits cannot be read back as an
-    /// auction type. It surfaces through `open_auctions`, which reads every
-    /// row of a pool: a typed lookup cannot match a code this crate never
-    /// writes, so that is where corruption has to be caught.
-    #[sqlx::test(migrations = "./migrations")]
-    async fn an_unknown_auction_type_in_the_row_is_an_error(
-        pool: sqlx::PgPool,
-    ) -> sqlx::Result<()> {
-        sqlx::query!(
-            "INSERT INTO auctions (pool, account, auction_type, start_ledger, percent, bid, lot, updated_ledger)
-             VALUES ($1, $2, $3, $4, $5, '{}'::jsonb, '{}'::jsonb, $4)",
-            POOL, USER, 7_i16, 10_i64, 100_i16,
-        )
-        .execute(&pool)
-        .await?;
-        let store = Store::from_pool(pool);
+    // The `auctions` table now has `CHECK` constraints mirroring both
+    // guards below, so neither a raw `INSERT` nor `Store::upsert_auction`
+    // (which only ever writes a valid `AuctionType`/`FillPercent`) can put a
+    // corrupted row in the database for an integration test to read back.
+    // These two tests exercise the guards directly instead.
+
+    /// A discriminant the contract never emits cannot decode. `auction_type`
+    /// is also the store's lookup key, so a row this corrupted is filtered
+    /// out of a typed `Store::auction` lookup by SQL before decoding ever
+    /// runs: only `Store::open_auctions`, which decodes every row of a
+    /// pool, ever calls this on such a row.
+    #[test]
+    fn auction_type_from_code_rejects_a_discriminant_the_contract_never_emits() {
         assert!(matches!(
-            store.open_auctions(POOL).await,
+            auction_type_from_code(7),
             Err(StoreError::Decimal {
                 column: "auction_type",
                 ..
             })
         ));
-        // A typed read is not the place this shows up: there is no
-        // user-liquidation auction for this account, and that is the answer.
-        assert_eq!(
-            store
-                .auction(POOL, USER, AuctionType::UserLiquidation)
-                .await
-                .expect("typed read"),
-            None
-        );
-        Ok(())
+    }
+
+    /// A percent outside 1 to 100 cannot decode. Unlike `auction_type`,
+    /// `percent` is not part of the lookup key, so a corrupted percent
+    /// would be decoded by both `Store::auction` and `Store::open_auctions`
+    /// alike.
+    #[test]
+    fn percent_from_code_rejects_a_value_outside_one_to_a_hundred() {
+        assert!(matches!(
+            percent_from_code(200),
+            Err(StoreError::Decimal {
+                column: "percent",
+                ..
+            })
+        ));
     }
 }

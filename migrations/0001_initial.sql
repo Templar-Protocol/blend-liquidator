@@ -38,13 +38,18 @@ CREATE INDEX users_by_health ON users (pool, health_factor);
 -- fill at. `auction_type` is the contract's discriminant (0 user
 -- liquidation, 1 bad debt, 2 interest) and `percent` its 1-to-100 fill
 -- percent, both small enough for smallint.
+--
+-- Both ranges are the contract's, and the Rust `AuctionType`/`FillPercent`
+-- types already enforce the same thing on every value this crate writes;
+-- these `CHECK`s are defence in depth, not the primary guard, so a row that
+-- violates one did not come from this crate.
 CREATE TABLE auctions (
     pool            text     NOT NULL,
     account         text     NOT NULL,
-    auction_type    smallint NOT NULL,
+    auction_type    smallint NOT NULL CHECK (auction_type BETWEEN 0 AND 2),
     start_ledger    bigint   NOT NULL,
     fill_ledger     bigint,
-    percent         smallint NOT NULL,
+    percent         smallint NOT NULL CHECK (percent BETWEEN 1 AND 100),
     bid             jsonb    NOT NULL,
     lot             jsonb    NOT NULL,
     updated_ledger  bigint   NOT NULL,
