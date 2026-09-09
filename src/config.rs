@@ -230,6 +230,14 @@ pub fn parse_pools(text: &str) -> Result<Vec<PoolConfig>, LiquidatorError> {
         let min_primary_collateral =
             amount_from_str(&pool.min_primary_collateral, "min_primary_collateral")
                 .map_err(LiquidatorError::Config)?;
+        // The floor a position must clear to be worth acting on. A negative
+        // floor is not a permissive one, it is a nonsense the filler would
+        // read as "any position qualifies".
+        if min_primary_collateral < 0 {
+            return Err(LiquidatorError::Config(
+                "pools file: min_primary_collateral must not be negative".to_owned(),
+            ));
+        }
         pools.push(PoolConfig {
             address: pool.address,
             primary_asset: pool.primary_asset,
@@ -949,6 +957,10 @@ supported_lot = ["*"]
             (
                 &POOLS.replace("min_health_factor = 1.5", "min_health_factor = 1.00000001"),
                 "min_health_factor",
+            ),
+            (
+                &POOLS.replace("\"1000000000000\"", "\"-1\""),
+                "must not be negative",
             ),
             (
                 &POOLS.replace("[[pools]]", "[[pools]]\naddress = \"CDUP\""),

@@ -386,6 +386,31 @@ struct AnalyticsPosition {
     account_id: String,
 }
 
+/// The most of an unparseable response that reaches an error message, and so
+/// a log line: [`Tracker::seed`] logs a source's failure with `%error`. The
+/// body belongs to a third party and is bounded by nothing, so a diagnostic
+/// takes its shape and its size, never all of it.
+const BODY_SNIPPET: usize = 200;
+
+/// Truncates `text` to [`BODY_SNIPPET`] bytes on a character boundary,
+/// naming the full length so a truncated diagnostic still says how much was
+/// left out.
+///
+/// This bounds the *whole* composed message rather than the body alone:
+/// `serde_json` renders the offending value into its own error, so a body
+/// truncated on its way into `{text}` would still arrive in full through
+/// `{error}`.
+fn snippet(text: &str) -> String {
+    if text.len() <= BODY_SNIPPET {
+        return text.to_owned();
+    }
+    let mut end = BODY_SNIPPET;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... ({} bytes total)", &text[..end], text.len())
+}
+
 impl AnalyticsSeed {
     /// A client for the analytics API at `base_url`, sending
     /// `healthFactorMax` rendered from `health_factor_max`'s 7-decimal
@@ -438,7 +463,7 @@ impl AnalyticsSeed {
             }
             let text = response.text().await?;
             let body: AnalyticsPage = serde_json::from_str(&text)
-                .map_err(|error| SeedError::Shape(format!("{error}: {text}")))?;
+                .map_err(|error| SeedError::Shape(snippet(&format!("{error}: {text}"))))?;
             accounts.extend(
                 body.positions
                     .into_iter()
@@ -1199,6 +1224,39 @@ mod tests {
                 SeedError::Shape(_)
             ),
             "a 200 with an undocumented body shape is a Shape error"
+        );
+    }
+
+    /// The body of an unparseable response reaches a log line through
+    /// `SeedError::Shape`, so it is truncated: a third party's response is
+    /// bounded by nothing, and a diagnostic needs the body's shape and its
+    /// size, not all of it.
+    #[tokio::test]
+    async fn an_unparseable_body_is_truncated_in_the_error() {
+        let server = MockServer::start().await;
+        let huge = format!("{{\"positions\": \"{}\"}}", "x".repeat(50_000));
+        Mock::given(method("GET"))
+            .and(path("/v1/analytics/state/positions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(huge.clone()))
+            .mount(&server)
+            .await;
+
+        let seed = AnalyticsSeed::new(&server.uri(), 100_000_000).expect("client");
+        let SeedError::Shape(message) = seed.accounts("pool").await.unwrap_err() else {
+            panic!("an unparseable body is a Shape error");
+        };
+        assert!(
+            message.len() < 400,
+            "the whole body must not reach the message: {} bytes",
+            message.len()
+        );
+        assert!(
+            message.ends_with(" bytes total)"),
+            "the message names how much it left out: {message}"
+        );
+        assert!(
+            !message.contains(&"x".repeat(300)),
+            "no run of the body survives past the snippet"
         );
     }
 

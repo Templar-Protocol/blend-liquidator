@@ -180,6 +180,13 @@ fn build_seed_sources(seed: &SeedConfig) -> Result<Vec<SeedSource>, LiquidatorEr
             .map_err(|error| LiquidatorError::Config(format!("seed file: {error}")))?;
         sources.push(SeedSource::File(file));
     }
+    if sources.is_empty() {
+        tracing::warn!(
+            "no seed source is configured; a pool with no stored users starts \
+             empty and the tracker follows only accounts that later appear in \
+             events"
+        );
+    }
     Ok(sources)
 }
 

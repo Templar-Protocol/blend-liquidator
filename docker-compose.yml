@@ -12,7 +12,10 @@ services:
       - POSTGRES_DB=${POSTGRES_DB:-liquidator}
 
     ports:
-      - "${POSTGRES_PORT:-55432}:5432"
+      # Loopback only: the default credentials are development ones, and a
+      # port published on every interface would expose the bot's state
+      # database on any host with a routable address.
+      - "127.0.0.1:${POSTGRES_PORT:-55432}:5432"
 
     volumes:
       - postgres-data:/var/lib/postgresql/data

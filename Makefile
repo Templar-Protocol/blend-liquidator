@@ -19,15 +19,20 @@ help: ## Show available commands
 
 db-up: ## Start Postgres and wait for it
 	$(COMPOSE) up -d postgres
-	@until $(COMPOSE) exec -T postgres pg_isready -U liquidator >/dev/null 2>&1; do sleep 1; done
-	@echo "postgres ready on 127.0.0.1:55432"
+	@user=$${POSTGRES_USER:-liquidator}; port=$${POSTGRES_PORT:-55432}; \
+	for _ in $$(seq 1 60); do \
+		if $(COMPOSE) exec -T postgres pg_isready -U "$$user" >/dev/null 2>&1; then \
+			echo "postgres ready on 127.0.0.1:$$port"; exit 0; \
+		fi; \
+		sleep 1; \
+	done; \
+	echo "postgres did not become ready in 60s"; $(COMPOSE) logs postgres; exit 1
 
 db-down: ## Stop Postgres, keeping its data
 	$(COMPOSE) stop postgres
 
-db-reset: ## Delete the database and its volume
-	$(COMPOSE) rm -sf postgres
-	docker volume rm -f blend-liquidator_postgres-data
+db-reset: ## Take the stack down and delete the database volume
+	$(COMPOSE) down -v --remove-orphans
 
 db-migrate: ## Apply migrations to the local database
 	sqlx migrate run
