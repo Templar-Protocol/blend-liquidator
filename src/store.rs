@@ -217,9 +217,137 @@ fn asset_amounts_from_json(
         .collect()
 }
 
+/// How far a named task has applied. The poller keeps one per pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cursor {
+    /// The last ledger whose events were applied in full.
+    pub ledger: u32,
+    /// The RPC's paging token for the next `getEvents` page, when the
+    /// poller stopped mid-ledger. `None` means the ledger is complete.
+    pub paging_token: Option<String>,
+}
+
+/// The cursor name a pool's event stream uses.
+#[must_use]
+pub fn events_cursor(pool: &str) -> String {
+    format!("events:{pool}")
+}
+
+/// A `bigint` ledger back into the `u32` the chain uses. Out of range means
+/// the row did not come from this crate.
+fn ledger(value: i64, column: &'static str) -> Result<u32, StoreError> {
+    u32::try_from(value).map_err(|_| StoreError::Decimal {
+        column,
+        value: value.to_string(),
+    })
+}
+
+impl Store {
+    /// The named cursor, or `None` when the task has never run.
+    pub async fn cursor(&self, name: &str) -> Result<Option<Cursor>, StoreError> {
+        let row = sqlx::query!(
+            "SELECT ledger, paging_token FROM cursors WHERE name = $1",
+            name
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            Ok(Cursor {
+                ledger: ledger(row.ledger, "ledger")?,
+                paging_token: row.paging_token,
+            })
+        })
+        .transpose()
+    }
+
+    /// Writes the named cursor, replacing any previous value.
+    pub async fn set_cursor(&self, name: &str, cursor: &Cursor) -> Result<(), StoreError> {
+        sqlx::query!(
+            "INSERT INTO cursors (name, ledger, paging_token, updated_at)
+             VALUES ($1, $2, $3, now())
+             ON CONFLICT (name) DO UPDATE
+               SET ledger = EXCLUDED.ledger,
+                   paging_token = EXCLUDED.paging_token,
+                   updated_at = EXCLUDED.updated_at",
+            name,
+            i64::from(cursor.ledger),
+            cursor.paging_token.as_deref(),
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const POOL: &str = "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD";
+    /// No caller until Task 3's tests exercise `Store::user`/`upsert_user`/
+    /// `delete_user`; `#[allow(dead_code)]` until then, removed when that
+    /// task lands.
+    #[allow(dead_code)]
+    const USER: &str = "GDAWX4KV5EQLP5W44HE5AA5QN5QRBJOVQIAI5OXOH5FW2ENT5PXN33DE";
+    /// No caller until Task 3's tests exercise the same methods for a
+    /// second account; `#[allow(dead_code)]` until then, removed when that
+    /// task lands.
+    #[allow(dead_code)]
+    const FILLER: &str = "GCIH7OYRDHJ3IOPFEM7DMUX3SXTVHOO2XSWLGBMSVQ3EIHPHYUTNJID3";
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_cursor_is_absent_until_it_is_set_and_then_it_is_the_last_write(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(pool);
+        let name = events_cursor(POOL);
+        assert_eq!(name, format!("events:{POOL}"));
+        assert_eq!(store.cursor(&name).await.expect("read"), None);
+
+        let first = Cursor {
+            ledger: 64_291_297,
+            paging_token: Some("0276-0000".to_string()),
+        };
+        store.set_cursor(&name, &first).await.expect("write");
+        assert_eq!(store.cursor(&name).await.expect("read"), Some(first));
+
+        // Setting it again overwrites rather than failing on the primary key.
+        let second = Cursor {
+            ledger: 64_291_400,
+            paging_token: None,
+        };
+        store.set_cursor(&name, &second).await.expect("overwrite");
+        assert_eq!(store.cursor(&name).await.expect("read"), Some(second));
+
+        // Cursors are per name: another pool's is untouched.
+        assert_eq!(
+            store.cursor(&events_cursor("COTHER")).await.expect("read"),
+            None
+        );
+        Ok(())
+    }
+
+    /// A ledger that does not fit `u32` cannot have come from this crate;
+    /// reading it is an error, not a truncation.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_ledger_outside_u32_is_an_error(pool: sqlx::PgPool) -> sqlx::Result<()> {
+        sqlx::query!(
+            "INSERT INTO cursors (name, ledger) VALUES ($1, $2)",
+            "events:bad",
+            i64::from(u32::MAX) + 1,
+        )
+        .execute(&pool)
+        .await?;
+        let store = Store::from_pool(pool);
+        assert!(matches!(
+            store.cursor("events:bad").await,
+            Err(StoreError::Decimal {
+                column: "ledger",
+                ..
+            })
+        ));
+        Ok(())
+    }
 
     /// Migrations apply to an empty database and the three tables exist.
     #[sqlx::test(migrations = "./migrations")]

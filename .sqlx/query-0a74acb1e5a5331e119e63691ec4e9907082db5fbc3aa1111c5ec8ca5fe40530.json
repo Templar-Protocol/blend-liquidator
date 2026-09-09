@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO cursors (name, ledger, paging_token, updated_at)\n             VALUES ($1, $2, $3, now())\n             ON CONFLICT (name) DO UPDATE\n               SET ledger = EXCLUDED.ledger,\n                   paging_token = EXCLUDED.paging_token,\n                   updated_at = EXCLUDED.updated_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0a74acb1e5a5331e119e63691ec4e9907082db5fbc3aa1111c5ec8ca5fe40530"
+}
