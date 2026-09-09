@@ -8,25 +8,27 @@
 //!
 //! # Status
 //!
-//! Skeleton. Phase 1 landed the pure fixed-point math and the ScVal/ledger-
-//! entry codecs (`math`, `chain::xdr`); Phase 2 landed the chain layer
-//! (`chain::rpc`, `chain::pool`, `chain::signer`, `chain::tx`), which can
-//! read a pool and sign and submit a transaction, but is driven by nothing
-//! yet. The binary itself still just parses configuration, sets up logging
-//! and exits. The repository scaffolding around it — CI gates, lint
+//! Phase 1 landed the pure fixed-point math and the ScVal/ledger-entry
+//! codecs (`math`, `chain::xdr`); Phase 2 landed the chain layer
+//! (`chain::rpc`, `chain::pool`, `chain::signer`, `chain::tx`); Phase 3
+//! lands the store, the ledger poller, the tracker and `service`, which
+//! wires them into a bot that validates its configuration, seeds its
+//! tracked-user set and follows every configured pool until shut down. No
+//! signer is wired in yet, so the bot only ever reads: the auctioneer, the
+//! filler and executor, unwind, and the rest of the operational surface are
+//! still to land. The repository scaffolding around it — CI gates, lint
 //! posture, dev container, release preflight — is complete and enforced
 //! from the first commit, so the liquidation logic lands into a repo that
 //! already fails loudly.
 //!
 //! The module layout follows the design spec at
-//! `docs/superpowers/specs/2026-09-04-blend-liquidator-bot-design.md`. The
-//! phases still to land are the store and ledger poller, the auctioneer,
-//! the filler and executor, unwind, and the operational surface.
+//! `docs/superpowers/specs/2026-09-04-blend-liquidator-bot-design.md`.
 
 pub mod chain;
 pub mod config;
 pub mod ledger;
 pub mod math;
+pub mod service;
 pub mod store;
 pub mod tracker;
 
