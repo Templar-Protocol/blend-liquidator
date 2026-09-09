@@ -3147,3 +3147,25 @@ adding a migration is deliberate: nothing is deployed, and sqlx's per-migration
 checksum makes an already-migrated local database fail loudly — run
 `make db-reset && make db-up && sqlx migrate run` if you hold one (landed in
 `d3a8e37`).
+
+### Correction after the Task 6 review
+
+The plan's paging loop had two defects the review caught, both of which could
+lose ledgers. A full page whose cursor never advanced looped forever, and a
+full page carrying no cursor broke out of pagination after which the stored
+cursor was written to chain head regardless — skipping every event after that
+page. A probe of the live mainnet RPC settled the contract: `getEvents` always
+returns a cursor (an empty page returns the range-end sentinel `…-4294967295`,
+never null) and the cursor advances between pages, so the plan's `cursor: null`
+empty-page fixtures did not match reality.
+
+The rule is now that a pass either drains or it does not commit. The paging
+loop lives in `LedgerPoller::drain_events`, bounded by `MAX_PAGES` and by a
+check that the cursor advanced, and it reports whether the final page was
+short — the RPC's way of saying the range is exhausted. Only a drained pass
+sends its tick and advances the stored cursor; a pass that ends any other way
+warns with the reason and returns without either, so the next poll re-reads
+the same range. Re-reading costs nothing because applying an event is
+idempotent, while advancing past undelivered events is unrecoverable, and a
+broken RPC then stalls visibly rather than silently losing ledgers (landed in
+`d0cb566`).
