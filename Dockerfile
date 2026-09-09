@@ -34,6 +34,13 @@ WORKDIR /app
 #   - clippy.toml: lint configuration, irrelevant to `cargo build`.
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+# The query metadata `cargo sqlx prepare` wrote, and the migrations the
+# binary embeds. With SQLX_OFFLINE the compile-time query checks read the
+# metadata instead of a database, which is the only way this stage can
+# build: there is no Postgres in an image build.
+COPY .sqlx ./.sqlx
+COPY migrations ./migrations
+ENV SQLX_OFFLINE=true
 
 # --locked, so a stale Cargo.lock fails here rather than silently resolving
 # different versions than the ones that were tested.

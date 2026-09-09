@@ -1,4 +1,31 @@
 services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: blend-liquidator-db
+
+    # The bot's durable state: cursors, tracked borrowers, open auctions.
+    # Losing it costs a reseed and a replay, not correctness, but a restart
+    # that finds an empty database re-reads every borrower from chain.
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-liquidator}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-liquidator}
+      - POSTGRES_DB=${POSTGRES_DB:-liquidator}
+
+    ports:
+      - "${POSTGRES_PORT:-55432}:5432"
+
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-liquidator}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+    restart: unless-stopped
+
   liquidator:
     build:
       context: .
@@ -11,6 +38,10 @@ services:
     # the settle.
     stop_grace_period: 60s
     restart: unless-stopped
+
+    depends_on:
+      postgres:
+        condition: service_healthy
 
     env_file:
       - .env
@@ -47,3 +78,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
+
+volumes:
+  postgres-data:

@@ -1,6 +1,7 @@
 # blend-liquidator
 
-.PHONY: help build build-clean start stop restart logs logs-tail clean shell ps stats check
+.PHONY: help build build-clean start stop restart logs logs-tail clean shell ps stats check \
+	db-up db-down db-reset db-migrate sqlx-prepare
 
 .DEFAULT_GOAL := help
 
@@ -9,11 +10,32 @@ TAG := latest
 COMPOSE := docker compose
 ENV_FILE := .env
 
+DATABASE_URL ?= postgres://liquidator:liquidator@127.0.0.1:55432/liquidator
+export DATABASE_URL
+
 help: ## Show available commands
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
 
-check: ## Run everything CI runs (fmt, clippy, test, doc, invariants, shellcheck)
+db-up: ## Start Postgres and wait for it
+	$(COMPOSE) up -d postgres
+	@until $(COMPOSE) exec -T postgres pg_isready -U liquidator >/dev/null 2>&1; do sleep 1; done
+	@echo "postgres ready on 127.0.0.1:55432"
+
+db-down: ## Stop Postgres, keeping its data
+	$(COMPOSE) stop postgres
+
+db-reset: ## Delete the database and its volume
+	$(COMPOSE) rm -sf postgres
+	docker volume rm -f blend-liquidator_postgres-data
+
+db-migrate: ## Apply migrations to the local database
+	sqlx migrate run
+
+sqlx-prepare: ## Regenerate the committed offline query metadata (.sqlx)
+	cargo sqlx prepare -- --lib --bins
+
+check: ## Run everything CI runs (needs `make db-up` first)
 	cargo fmt --all --check
 	cargo clippy --all-targets -- -D warnings
 	cargo test --lib --bins

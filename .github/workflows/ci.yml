@@ -11,9 +11,31 @@ env:
 jobs:
   lint-test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: liquidator
+          POSTGRES_PASSWORD: liquidator
+          POSTGRES_DB: liquidator
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U liquidator"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://liquidator:liquidator@127.0.0.1:5432/liquidator
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1, reads rust-toolchain.toml
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --version 0.9.0 --no-default-features --features postgres,rustls --locked
+      - name: Apply migrations
+        run: sqlx migrate run
+      - name: Offline query metadata is current
+        run: cargo sqlx prepare --check -- --lib --bins
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --lib --bins

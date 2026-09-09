@@ -26,6 +26,7 @@
 pub mod chain;
 pub mod config;
 pub mod math;
+pub mod store;
 
 /// The committed mainnet snapshot the `chain::xdr` codec tests read.
 #[cfg(test)]
@@ -45,4 +46,7 @@ pub enum LiquidatorError {
     /// The chain layer failed: transport, RPC, decoding, signing or submission.
     #[error("chain: {0}")]
     Chain(#[from] chain::ChainError),
+    /// The store failed: connection, query, migration or a value it held.
+    #[error("store: {0}")]
+    Store(#[from] store::StoreError),
 }
