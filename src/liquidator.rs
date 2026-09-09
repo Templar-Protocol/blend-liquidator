@@ -28,10 +28,16 @@ pub mod config;
 pub mod ledger;
 pub mod math;
 pub mod store;
+pub mod tracker;
 
 /// The committed mainnet snapshot the `chain::xdr` codec tests read.
 #[cfg(test)]
 pub(crate) mod fixture;
+
+/// Scripted-RPC and store scaffolding shared by the store, ledger and
+/// tracker tests.
+#[cfg(test)]
+pub(crate) mod harness;
 
 /// Errors this crate reports to its caller.
 ///
@@ -53,4 +59,7 @@ pub enum LiquidatorError {
     /// The ledger poller failed.
     #[error("ledger: {0}")]
     Ledger(#[from] ledger::LedgerError),
+    /// The tracker failed to apply an event or refresh a borrower.
+    #[error("tracker: {0}")]
+    Tracker(#[from] tracker::TrackerError),
 }
