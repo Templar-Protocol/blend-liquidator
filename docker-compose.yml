@@ -1,4 +1,34 @@
 services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: blend-liquidator-db
+
+    # The bot's durable state: cursors, tracked borrowers, open auctions.
+    # Losing it costs a reseed and a replay, not correctness, but a restart
+    # that finds an empty database re-reads every borrower from chain.
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-liquidator}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-liquidator}
+      - POSTGRES_DB=${POSTGRES_DB:-liquidator}
+
+    ports:
+      # Loopback only: the default credentials are development ones, and a
+      # port published on every interface would expose the bot's state
+      # database on any host with a routable address.
+      - "127.0.0.1:${POSTGRES_PORT:-55432}:5432"
+
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-liquidator}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+    restart: unless-stopped
+
   liquidator:
     build:
       context: .
@@ -12,10 +42,21 @@ services:
     stop_grace_period: 60s
     restart: unless-stopped
 
+    depends_on:
+      postgres:
+        condition: service_healthy
+
     env_file:
       - .env
 
     environment:
+      # `environment:` wins over `env_file:`, which is the point. The
+      # DATABASE_URL in .env is the host-side one — 127.0.0.1 and the
+      # published port — because that is what cargo, sqlx and a `cargo run`
+      # on the host need. Inside this container 127.0.0.1 is this container,
+      # so the bot would restart-loop against a perfectly healthy Postgres;
+      # on the compose network it is reached by service name instead.
+      - DATABASE_URL=postgres://${POSTGRES_USER:-liquidator}:${POSTGRES_PASSWORD:-liquidator}@postgres:5432/${POSTGRES_DB:-liquidator}
       - RUST_LOG=${RUST_LOG:-info,blend_liquidator=debug}
       - RUST_BACKTRACE=${RUST_BACKTRACE:-1}
 
@@ -47,3 +88,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
+
+volumes:
+  postgres-data:

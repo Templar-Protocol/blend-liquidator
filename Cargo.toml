@@ -29,6 +29,9 @@ ed25519-dalek = "3.0"
 # 256-bit integers for the fixed-point widening path. Already in the tree
 # through stellar-xdr, so this adds no new code to audit.
 ethnum = "1.5"
+# Cadence phase offsets, so several bots on one pool do not fire on the
+# same ledger.
+rand = "0.10"
 # JSON-RPC over HTTPS to the Soroban RPC. rustls with the system root store:
 # the runtime image ships ca-certificates, and this is the feature set whose
 # licence tree cargo-deny accepts — `rustls-tls` would pull webpki-roots
@@ -39,6 +42,18 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Network id is sha256(passphrase). Already in the tree through stellar-xdr.
 sha2 = "0.11"
+# Postgres with compile-time checked queries. rustls with the system root
+# store and the ring backend: the same TLS posture as `reqwest` above, and
+# the feature set whose licence tree `cargo deny` accepts — the aws-lc-rs
+# backends are OpenSSL-licensed and `deny.toml` does not allow that.
+sqlx = { version = "0.9", default-features = false, features = [
+    "postgres",
+    "runtime-tokio",
+    "tls-rustls-ring-native-roots",
+    "macros",
+    "migrate",
+    "json",
+] }
 # Decodes an S… secret. The version stellar-xdr already depends on, so no
 # second copy; public keys parse through stellar-xdr's own FromStr impls.
 stellar-strkey = "0.0.13"
@@ -48,6 +63,8 @@ stellar-strkey = "0.0.13"
 stellar-xdr = { version = "28.0.0", features = ["base64"] }
 thiserror = "2.0.18"
 tokio = { version = "1.51.0", features = ["full"] }
+# The pools file.
+toml = "1.1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 

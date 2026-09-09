@@ -1,0 +1,51 @@
+# Pools this bot follows.
+#
+# One [[pools]] table per pool. Give this file's path as POOLS_FILE, or its
+# contents inline as POOLS_TOML for an environment with no volume to mount
+# (see .env.example) — never both.
+#
+# This example follows one real mainnet pool with XLM as the primary asset:
+# the collateral the bot accumulates from fills and keeps a floor of.
+
+[[pools]]
+# The pool contract.
+address = "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD"
+
+# The asset the bot keeps as collateral in this pool. Startup validation
+# requires it to be a reserve with a positive collateral factor.
+primary_asset = "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA" # XLM
+
+# The least of the primary asset to hold, in its own decimals as a decimal
+# string (XLM has 7: this is 100,000 XLM). In live mode, the filler holding
+# less than this in a configured pool is a startup warning, not a failure.
+min_primary_collateral = "1000000000000"
+
+# The health factor the filler keeps its own position above after a fill.
+# Decimal text, parsed into 7-decimal fixed point at startup.
+min_health_factor = 1.5
+
+# Profit required when none of the [[pools.profits]] rules below match, in
+# basis points.
+default_profit_bps = 1000
+
+# Fill regardless of profit. For exercising a pool's wiring end to end, not
+# for production: it disables the one check that keeps a fill economical.
+force_fill = false
+
+# Assets the bot will pay as the auction's bid, or ["*"] for any reserve.
+# Every entry here must be a reserve of the pool.
+supported_bid = [
+  "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA", # XLM
+  "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75", # USDC
+]
+
+# Assets the bot will take as the auction's lot, or ["*"] for any reserve.
+supported_lot = ["*"]
+
+# Ordered profit rules; the first whose bid and lot lists both match a
+# candidate auction wins over default_profit_bps above. Optional, and may
+# be repeated.
+[[pools.profits]]
+profit_bps = 500
+supported_bid = ["CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75"] # USDC
+supported_lot = ["*"]

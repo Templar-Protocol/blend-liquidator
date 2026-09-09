@@ -1,0 +1,13 @@
+# A static seed of tracked accounts, for a pool or network the analytics API
+# (SEED_URL) does not cover, or as a supplement to it.
+#
+# One [accounts] table, keyed by pool address, each holding the list of
+# accounts to seed for that pool. Give this file's path as SEED_FILE (see
+# .env.example). Every account here is re-read and re-valued from chain
+# before the bot trusts it, so a stale or wrong entry costs nothing beyond
+# one extra chain read — it can never cause an incorrect submission.
+
+[accounts]
+"CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD" = [
+  "GDAWX4KV5EQLP5W44HE5AA5QN5QRBJOVQIAI5OXOH5FW2ENT5PXN33DE",
+]

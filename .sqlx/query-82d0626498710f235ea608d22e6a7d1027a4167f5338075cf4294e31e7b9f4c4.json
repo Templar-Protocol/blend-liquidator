@@ -1,0 +1,124 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT pool, account, auction_type, start_ledger, fill_ledger, percent,\n                    bid, lot, updated_ledger\n             FROM auctions WHERE pool = $1\n             ORDER BY start_ledger ASC, account ASC, auction_type ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "pool",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "auctions",
+            "name": "pool"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "account",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "auctions",
+            "name": "account"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "auction_type",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "auctions",
+            "name": "auction_type"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "start_ledger",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "auctions",
+            "name": "start_ledger"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "fill_ledger",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "auctions",
+            "name": "fill_ledger"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "percent",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "auctions",
+            "name": "percent"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "bid",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "auctions",
+            "name": "bid"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "lot",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "auctions",
+            "name": "lot"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "updated_ledger",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "auctions",
+            "name": "updated_ledger"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "82d0626498710f235ea608d22e6a7d1027a4167f5338075cf4294e31e7b9f4c4"
+}

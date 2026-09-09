@@ -6,9 +6,12 @@
 A liquidation bot for [Blend Protocol](https://blend.capital) lending pools on
 [Stellar](https://stellar.org).
 
-> **Status: skeleton.** The crate parses configuration, sets up logging and
-> exits. There is no bot loop, no position scanner and no executor yet.
-> What *is* complete is the scaffolding around them — CI gates, lint posture,
+> **Status: Phase 3.** The bot validates its configuration, seeds its
+> tracked-user set from the [Blend analytics API](https://api.blend.templarfi.org)
+> or a static file, and follows every configured pool — applying pool events
+> and refreshing borrowers' health factors from chain into a Postgres store.
+> It still creates no auctions and fills nothing: no signer is wired in yet.
+> What *is* complete is the scaffolding around it — CI gates, lint posture,
 > dev container, release preflight — so the liquidation logic lands into a
 > repository that already fails loudly.
 
@@ -48,6 +51,7 @@ repository is private, so the package is too — pulling it needs a token with
 ## Development
 
 ```bash
+make db-up     # start Postgres; make check needs it running
 make check     # everything CI runs: fmt, clippy, test, doc, invariants, shellcheck
 make help      # Docker Compose lifecycle
 ```
