@@ -44,6 +44,7 @@ check: ## Run everything CI runs (needs `make db-up` first)
 	cargo fmt --all --check
 	cargo clippy --all-targets -- -D warnings
 	cargo test --lib --bins
+	cargo sqlx prepare --check -- --lib --bins
 	RUSTDOCFLAGS='-D warnings' cargo doc --no-deps
 	./scripts/check-repo-invariants.sh
 	shellcheck --severity=error scripts/*.sh .devcontainer/*.sh

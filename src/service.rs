@@ -20,7 +20,7 @@ use crate::chain::rpc::RpcClient;
 use crate::chain::xdr::PoolStatus;
 use crate::config::{PoolConfig, SeedConfig, ServiceConfig};
 use crate::ledger::{LedgerPoller, LedgerTick, PollerConfig, PollerMessage};
-use crate::store::{events_cursor, Store};
+use crate::store::{events_cursor, Cursor, Store};
 use crate::tracker::{AnalyticsSeed, FileSeed, SeedSource, Tracker, TrackerError};
 use crate::LiquidatorError;
 
@@ -221,16 +221,49 @@ async fn seed_pools_needing_it(
             sequence: head.sequence,
             close_time: head.close_time,
         };
-        let outcome = tracker
+        let outcome = match tracker
             .seed(&pool.address, sources, tick, batch, shutdown)
-            .await?;
+            .await
+        {
+            Ok(outcome) => outcome,
+            // The same split the tracker loop makes: a store failure is
+            // fatal because the bot would be trading on state it cannot
+            // write, while a chain or math failure costs coverage of this
+            // pool and is retried. Propagating the latter would let a
+            // single unpriced reserve — which `validate` deliberately
+            // records as a warning that does not stop the bot — keep the
+            // bot from ever starting.
+            Err(error @ TrackerError::Store(_)) => return Err(error.into()),
+            Err(error) => {
+                tracing::warn!(pool = pool.address, %error, "seeding this pool failed; it will be retried");
+                incomplete.insert(pool.address.clone());
+                continue;
+            }
+        };
         if outcome.failed_sources != 0 {
             incomplete.insert(pool.address.clone());
         }
+        // The events cursor starts where the seed's own ledger ends.
+        // Without this the poller would start from the head *it* reads,
+        // and every event between the two — the whole time seeding takes,
+        // pool by pool — would never be read by anything. That loss is
+        // permanent: this pool is not seeded again once it has users and a
+        // cursor, so a borrower who opens their first position in that
+        // window is tracked only if some later event happens to name them.
+        store
+            .set_cursor(
+                &events_cursor(&pool.address),
+                &Cursor {
+                    ledger: head.sequence,
+                    paging_token: None,
+                },
+            )
+            .await?;
         tracing::info!(
             pool = pool.address,
             tracked = outcome.refresh.tracked,
             failed_sources = outcome.failed_sources,
+            cursor = head.sequence,
             "seeded pool"
         );
     }
@@ -286,8 +319,22 @@ fn scan_phase(period: u32) -> u32 {
 /// Whether the full scan fires at `ledger`: once every `period` ledgers, at
 /// this instance's `phase`, so several bots following the same pool do not
 /// all scan on the same ledger.
-fn scan_due(ledger: u32, phase: u32, period: u32) -> bool {
-    period != 0 && ledger.wrapping_add(phase).is_multiple_of(period)
+///
+/// `last` is the ledger this pool's scan last fired at. The test is whether
+/// `ledger` has entered a new phased period since then, never whether it
+/// lands exactly on a multiple: ticks are not consecutive — a pass slower
+/// than a ledger close skips sequences, and a declined tick skips them too —
+/// so an exact test silently drops a whole period, taking that period's
+/// reseed retry with it.
+fn scan_due(ledger: u32, last: Option<u32>, phase: u32, period: u32) -> bool {
+    if period == 0 {
+        return false;
+    }
+    let bucket = |ledger: u32| ledger.wrapping_add(phase) / period;
+    match last {
+        None => true,
+        Some(last) => bucket(ledger) > bucket(last),
+    }
 }
 
 /// What the tracker loop carries between messages, all of it keyed by
@@ -306,6 +353,10 @@ struct LoopState {
     /// such a seed on the next full scan, which is slow on purpose: the
     /// alternative is walking a third-party API once per poll interval.
     needs_reseed: BTreeSet<String>,
+    /// The ledger each pool's full scan last fired at, so the cadence fires
+    /// once per period rather than only on a tick that lands exactly on a
+    /// multiple of it.
+    last_scan: BTreeMap<String, u32>,
 }
 
 /// Applies one message from the shared poller channel: an event accumulates
@@ -415,7 +466,13 @@ async fn apply_tick(
     tracker
         .refresh_stale(pool, tick, updated_before, cadence.refresh_batch)
         .await?;
-    if scan_due(tick.sequence, cadence.phase, cadence.full_scan_ledgers) {
+    if scan_due(
+        tick.sequence,
+        state.last_scan.get(pool).copied(),
+        cadence.phase,
+        cadence.full_scan_ledgers,
+    ) {
+        state.last_scan.insert(pool.to_owned(), tick.sequence);
         full_scan(
             tracker,
             seed_sources,
@@ -1786,41 +1843,169 @@ mod tests {
         Ok(())
     }
 
-    /// The scan cadence fires once per period and its phase depends on the
-    /// instance, so two bots do not fire on the same ledger.
+    /// Seeding commits the events cursor at the ledger it seeded from.
+    /// Without it the poller starts from the head *it* reads, and every
+    /// event between the two — the whole time seeding every pool takes — is
+    /// read by nothing. The loss is permanent: a pool that has users and a
+    /// cursor is never seeded again, so a borrower who opens their first
+    /// position in that window is tracked only if a later event names them.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn seeding_commits_the_cursor_at_the_ledger_it_seeded_from(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let tick = harness::fixture_tick();
+        rpc.expect(
+            "getLatestLedger",
+            json!({"id": "aa", "protocolVersion": 27, "sequence": tick.sequence,
+                   "closeTime": tick.close_time.to_string()}),
+        );
+        harness::script_snapshot(&rpc, &[harness::USER_ONE]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let (_flag, shutdown) = watch::channel(false);
+        let file = write_temp_seed_file(&format!(
+            "[accounts]\n\"{}\" = [\"{}\"]\n",
+            harness::POOL,
+            harness::USER_ONE
+        ));
+        let sources = vec![SeedSource::File(FileSeed::load(&file).expect("loads"))];
+
+        let incomplete = seed_pools_needing_it(
+            &client,
+            &store,
+            &[pool_config(harness::POOL, USDC, &["*"], &["*"])],
+            &sources,
+            20,
+            &shutdown,
+        )
+        .await
+        .expect("seeding succeeds");
+
+        assert!(incomplete.is_empty(), "the one source answered");
+        let cursor = store
+            .cursor(&events_cursor(harness::POOL))
+            .await
+            .expect("cursor read")
+            .expect("seeding commits a cursor");
+        assert_eq!(
+            cursor.ledger, tick.sequence,
+            "the cursor is the ledger the seed valued positions at, so the poller resumes there"
+        );
+        assert_eq!(cursor.paging_token, None);
+        assert_eq!(store.count_users(harness::POOL).await.expect("count"), 1);
+        Ok(())
+    }
+
+    /// A seed that fails against the chain costs this pool's coverage and is
+    /// retried; it is not fatal. The tracker loop treats the same error
+    /// class as transient, and `validate` deliberately records an unpriced
+    /// reserve as a warning — but any seeded borrower holding that asset
+    /// makes the seed's refresh fail, so propagating it would keep the bot
+    /// from ever starting on a pool it is allowed to follow.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_chain_failure_while_seeding_is_not_fatal(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let tick = harness::fixture_tick();
+        // The head is answered; the snapshot the refresh needs is not.
+        rpc.expect(
+            "getLatestLedger",
+            json!({"id": "aa", "protocolVersion": 27, "sequence": tick.sequence,
+                   "closeTime": tick.close_time.to_string()}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let (_flag, shutdown) = watch::channel(false);
+        let file = write_temp_seed_file(&format!(
+            "[accounts]\n\"{}\" = [\"{}\"]\n",
+            harness::POOL,
+            harness::USER_ONE
+        ));
+        let sources = vec![SeedSource::File(FileSeed::load(&file).expect("loads"))];
+
+        let incomplete = seed_pools_needing_it(
+            &client,
+            &store,
+            &[pool_config(harness::POOL, USDC, &["*"], &["*"])],
+            &sources,
+            20,
+            &shutdown,
+        )
+        .await
+        .expect("a chain failure while seeding is not fatal");
+
+        assert!(
+            incomplete.contains(harness::POOL),
+            "the pool is marked for retry"
+        );
+        assert!(
+            store
+                .cursor(&events_cursor(harness::POOL))
+                .await
+                .expect("cursor read")
+                .is_none(),
+            "no cursor is committed for a pool the seed could not read, so the next start seeds it again"
+        );
+        Ok(())
+    }
+
+    /// The scan cadence fires once per period, cannot skip one, and its
+    /// phase depends on the instance so two bots do not fire on the same
+    /// ledger.
     #[test]
     fn the_scan_cadence_fires_once_per_period_at_an_instance_specific_phase() {
         let period = 10;
 
-        // Whatever the phase, exactly one ledger in each period fires.
+        // The ledgers a walk fires at, given what it last fired at.
+        let fired = |phase: u32, from: u32, count: u32, mut last: Option<u32>| -> Vec<u32> {
+            let mut out = Vec::new();
+            for ledger in from..from + count {
+                if scan_due(ledger, last, phase, period) {
+                    last = Some(ledger);
+                    out.push(ledger);
+                }
+            }
+            out
+        };
+
+        // The first tick for a pool scans: the tracked set is worth logging
+        // at startup rather than a period later.
+        assert_eq!(fired(0, 2_000, 1, None), vec![2_000]);
+
+        // Whatever the phase, two periods after that fire exactly twice.
         for phase in 0..period {
-            let fires = (2_000..2_000 + period)
-                .filter(|&ledger| scan_due(ledger, phase, period))
-                .count();
+            let ledgers = fired(phase, 2_001, 2 * period, Some(2_000));
             assert_eq!(
-                fires, 1,
-                "phase {phase} should fire exactly once per period"
+                ledgers.len(),
+                2,
+                "phase {phase} should fire twice over two periods, fired at {ledgers:?}"
+            );
+        }
+
+        // A tick that never lands on an exact multiple still fires. Ticks
+        // are not consecutive — a pass slower than a ledger close skips
+        // sequences — and the exact test this replaced dropped the whole
+        // period, and that period's reseed retry with it.
+        for phase in 0..period {
+            assert!(
+                scan_due(2_000 + period + 3, Some(2_000), phase, period),
+                "phase {phase} must fire after a period even on a skipped sequence"
             );
         }
 
         // Two instances with different phases fire on different ledgers:
         // the phase is what keeps them from scanning in lockstep.
-        let ledgers_at = |phase: u32| -> Vec<u32> {
-            (0..period)
-                .filter(|&ledger| scan_due(ledger, phase, period))
-                .collect()
-        };
         assert_ne!(
-            ledgers_at(2),
-            ledgers_at(7),
+            fired(2, 1, 3 * period, Some(0)),
+            fired(7, 1, 3 * period, Some(0)),
             "different phases must fire on different ledgers"
         );
 
         // A zero period never fires: `full_scan_ledgers` is validated to be
         // at least 1, but `scan_due` must not divide by zero if it is ever
         // built by hand, e.g. in a test.
-        assert!(!scan_due(0, 0, 0));
-        assert!(!scan_due(100, 3, 0));
+        assert!(!scan_due(0, None, 0, 0));
+        assert!(!scan_due(100, Some(50), 3, 0));
 
         // The phase generator stays within the period it was asked for.
         for _ in 0..50 {

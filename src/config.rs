@@ -274,7 +274,13 @@ pub struct SeedConfig {
 }
 
 /// Everything the chain layer needs, validated. Built by [`Args::chain`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` renders `rpc_url` as its origin alone. Some Soroban providers key
+/// access by a path segment (`https://host/v1/<key>`), and this type is
+/// rendered into a log line at startup, so the path and query are dropped
+/// the way [`Secret`] drops its value: the endpoint is the diagnostic, the
+/// rest can be a credential.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ChainConfig {
     /// The network passphrase transactions are hashed with.
     pub network_passphrase: String,
@@ -290,6 +296,38 @@ pub struct ChainConfig {
     pub high_fee: u32,
     /// How many ledgers a submitted transaction stays valid and is polled for.
     pub tx_poll_ledgers: u32,
+}
+
+impl std::fmt::Debug for ChainConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChainConfig")
+            .field("network_passphrase", &self.network_passphrase)
+            .field("rpc_url", &endpoint_origin(&self.rpc_url))
+            .field("rpc_api_key", &self.rpc_api_key)
+            .field("base_fee", &self.base_fee)
+            .field("high_fee", &self.high_fee)
+            .field("tx_poll_ledgers", &self.tx_poll_ledgers)
+            .finish()
+    }
+}
+
+/// A URL's scheme, host and port, without the path, query or fragment that
+/// could carry a key. Anything that does not parse as `scheme://host...`
+/// renders as `<unparsed url>` rather than falling back to the whole string,
+/// because the fallback is exactly the case where the shape is unexpected.
+fn endpoint_origin(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return "<unparsed url>".to_owned();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() {
+        return "<unparsed url>".to_owned();
+    }
+    // Userinfo is a credential too, and it is not a diagnostic.
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    format!("{scheme}://{host}")
 }
 
 /// Everything the service needs, validated.
@@ -873,6 +911,41 @@ mod tests {
         assert!(rendered.contains("Secret(<redacted>)"));
         assert!(!rendered.contains("secret-123"));
         assert_eq!(Secret::new("secret-123").expose(), "secret-123");
+    }
+
+    /// Some Soroban providers key access by a path segment rather than a
+    /// header, and this config is rendered into a log line on every start,
+    /// so `Debug` keeps the endpoint and drops everything after it.
+    #[test]
+    fn the_rpc_url_renders_as_its_origin_only() {
+        assert_clean_environment();
+        let args = parse(&[
+            "liquidator",
+            "--network",
+            "mainnet",
+            "--rpc-url",
+            "https://soroban.example.org/v1/super-secret-key",
+        ]);
+        let rendered = format!("{:?}", args.chain().expect("chain config"));
+        assert!(
+            !rendered.contains("super-secret-key"),
+            "a path-embedded key must not reach a log line: {rendered}"
+        );
+        assert!(
+            rendered.contains("https://soroban.example.org"),
+            "the endpoint itself is the diagnostic: {rendered}"
+        );
+
+        // The shapes the origin helper has to get right: a port is part of
+        // the endpoint, userinfo is a credential, and anything that is not a
+        // URL renders as nothing rather than as itself.
+        assert_eq!(
+            endpoint_origin("https://host:8000/v1/key?token=t"),
+            "https://host:8000"
+        );
+        assert_eq!(endpoint_origin("https://user:pw@host/v1"), "https://host");
+        assert_eq!(endpoint_origin("not a url"), "<unparsed url>");
+        assert_eq!(endpoint_origin("https://"), "<unparsed url>");
     }
 
     const POOLS: &str = r#"
