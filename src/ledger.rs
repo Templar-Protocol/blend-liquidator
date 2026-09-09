@@ -995,6 +995,49 @@ mod tests {
         );
         // It still restarts at the window edge, gap message or not.
         assert_eq!(rpc.calls("getEvents")[2]["startLedger"], 400_000);
+
+        // The cursor then moves — a recovery, or an operator's fix — to a
+        // ledger that is still outside the retained window. This is a
+        // genuine second gap, not a repeat of the first, and must be
+        // reported: `gap_reported_at` is keyed on the cursor it last fired
+        // for, not a bare "has a gap fired yet" flag, so a *different*
+        // stale cursor fires again rather than being swallowed for the
+        // rest of the process.
+        store
+            .set_cursor(
+                &events_cursor(POOL),
+                &Cursor {
+                    ledger: 250_000,
+                    paging_token: None,
+                },
+            )
+            .await
+            .expect("the cursor moves");
+        rpc.expect("getHealth", health(500_000, 400_000));
+        rpc.expect("getLatestLedger", latest(500_000, 1_788_645_403));
+        rpc.expect(
+            "getEvents",
+            json!({"latestLedger": 500_000, "cursor": "400000-1",
+                   "events": [borrow_event(400_001, 1), borrow_event(400_001, 2)]}),
+        );
+        rpc.expect(
+            "getEvents",
+            json!({"latestLedger": 500_000, "cursor": "400000-1",
+                   "events": [borrow_event(400_001, 3), borrow_event(400_001, 4)]}),
+        );
+
+        let (third, seen_third) = poll_draining(&mut poller, &sender, &mut receiver, true).await;
+        assert_eq!(third.expect("third pass"), None, "the pass did not drain");
+        assert_eq!(
+            seen_third
+                .iter()
+                .filter(|message| matches!(message, Seen::Gap { .. }))
+                .count(),
+            1,
+            "a cursor that moved and then fell stale again reports a fresh \
+             gap rather than staying silent for the rest of the process: \
+             {seen_third:?}"
+        );
         Ok(())
     }
 }
