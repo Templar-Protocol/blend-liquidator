@@ -230,6 +230,21 @@ async fn seed_pools_needing_it(
     Ok(incomplete)
 }
 
+/// Opens the store, reporting a failure to open it as a *configuration*
+/// problem rather than a store failure. An unreachable instance, a wrong
+/// password or a malformed `DATABASE_URL` is something an operator fixes in
+/// configuration, and spec §10's exit-code contract calls that a 2; a store
+/// that answered and then failed is a 1. The message never carries the DSN:
+/// [`crate::store::StoreError::Connect`] renders fixed text.
+async fn connect_store(config: &ServiceConfig) -> Result<Store, LiquidatorError> {
+    Store::connect(
+        config.database_url.expose(),
+        config.database_max_connections,
+    )
+    .await
+    .map_err(|error| LiquidatorError::Config(format!("database: {error}")))
+}
+
 /// Timings the tracker loop reads every message, bundled so its functions
 /// do not grow a parameter per knob. Copy: every field is a plain number.
 #[derive(Debug, Clone, Copy)]
@@ -581,6 +596,19 @@ impl Service {
     /// the warnings for a caller that wants them without re-reading logs;
     /// an `Err` is a failed validation, never a warning.
     pub async fn check_config(config: &ServiceConfig) -> Result<Vec<String>, LiquidatorError> {
+        // Spec §10 makes this a deploy smoke test "against chain **and the
+        // database**": a check that passes against an unreachable instance
+        // or a wrong password is precisely the failure it exists to catch,
+        // and it is run before dry-run is turned off. It connects and
+        // pings rather than migrating, because a check must not have DDL
+        // as a side effect — `run` migrates, under the advisory lock.
+        let store = connect_store(config).await?;
+        store.ping().await?;
+        tracing::info!(
+            max_connections = config.database_max_connections,
+            "database reachable"
+        );
+
         let rpc = RpcClient::from_config(&config.chain)?;
         let (validations, warnings) = validate(&rpc, &config.pools).await?;
         log_validation(config, &validations, &warnings);
@@ -600,11 +628,7 @@ impl Service {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         spawn_shutdown_listener(shutdown_tx);
 
-        let store = Store::connect(
-            config.database_url.expose(),
-            config.database_max_connections,
-        )
-        .await?;
+        let store = connect_store(&config).await?;
         store.migrate().await?;
 
         let rpc = RpcClient::from_config(&config.chain)?;

@@ -47,6 +47,13 @@ services:
       - .env
 
     environment:
+      # `environment:` wins over `env_file:`, which is the point. The
+      # DATABASE_URL in .env is the host-side one — 127.0.0.1 and the
+      # published port — because that is what cargo, sqlx and a `cargo run`
+      # on the host need. Inside this container 127.0.0.1 is this container,
+      # so the bot would restart-loop against a perfectly healthy Postgres;
+      # on the compose network it is reached by service name instead.
+      - DATABASE_URL=postgres://${POSTGRES_USER:-liquidator}:${POSTGRES_PASSWORD:-liquidator}@postgres:5432/${POSTGRES_DB:-liquidator}
       - RUST_LOG=${RUST_LOG:-info,blend_liquidator=debug}
       - RUST_BACKTRACE=${RUST_BACKTRACE:-1}
 
