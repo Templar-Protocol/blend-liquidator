@@ -249,14 +249,20 @@ async fn seed_pools_needing_it(
         // pool — would otherwise be read by nothing, permanently, because a
         // pool with users and a cursor is never seeded again.
         //
-        // Which is exactly why only a *complete* seed may write it. A
-        // partial seed that recorded its position would make its own gap
-        // durable: the pool would have users and a cursor, so the next
-        // start would skip it, and the accounts it never valued would be
-        // tracked only if some later event happened to name them. Leaving
-        // the cursor unset trades this pool's seed-to-first-poll window for
-        // a seed the next start finishes, which is the side the skip test
-        // is on.
+        // Which is exactly why only a *complete* seed may write it: a
+        // partial seed that recorded its position would be claiming to have
+        // read a ledger it did not finish reading.
+        //
+        // Withholding it does not, on its own, make the reseed durable. The
+        // poller starts from the head it reads when no cursor is stored and
+        // writes one on its first acknowledged tick, so within about a poll
+        // interval this pool has a cursor and users again, and a restart
+        // after that skips it just the same. What the gap buys is the
+        // current run's retry — `needs_reseed` carries it to the next full
+        // scan — and a restart inside that first interval. A reseed that
+        // survives any restart needs a durable marker, which is Phase 4's:
+        // the skip test cannot ask "was this seed complete?" of a store
+        // that does not record the answer.
         if outcome.is_complete() {
             store
                 .set_cursor(
@@ -482,7 +488,16 @@ async fn apply_tick(
         cadence.phase,
         cadence.full_scan_ledgers,
     ) {
-        full_scan(
+        // A failed scan does not fail the tick. The acknowledgement means
+        // "this ledger's effects are in the store", and neither the
+        // least-healthy report nor a best-effort reseed retry is one of
+        // them. Declining the tick over one would stall the pool's cursor
+        // for good when the failure is deterministic rather than transient
+        // — a borrower the seed names who holds a reserve the oracle does
+        // not price is exactly that, and `validate` deliberately lets the
+        // bot follow such a pool. A store failure still propagates: it is
+        // the one class that means the bot cannot trust what it reads.
+        if let Err(error) = full_scan(
             tracker,
             seed_sources,
             cadence,
@@ -490,12 +505,17 @@ async fn apply_tick(
             shutdown,
             (pool, tick),
         )
-        .await?;
-        // Only a scan that ran counts as this period's. `full_scan` carries
-        // the reseed retry, and a transient failure declines the tick, so
-        // recording the sequence first would let the redelivered tick skip
-        // that retry until the next period — and a flaky source is exactly
-        // when it must not.
+        .await
+        {
+            if matches!(error, TrackerError::Store(_)) {
+                return Err(error);
+            }
+            tracing::warn!(pool, ledger = tick.sequence, %error, "the full scan failed; it runs again next period");
+        }
+        // The period is recorded either way: by a scan that ran, or by one
+        // that tried and failed. `needs_reseed` still holds the pool, so
+        // the retry recurs next period rather than being lost — but the
+        // cadence cannot spin on the same failure.
         state.last_scan.insert(pool.to_owned(), tick.sequence);
     }
     Ok(())
@@ -1909,6 +1929,71 @@ mod tests {
         );
         assert_eq!(cursor.paging_token, None);
         assert_eq!(store.count_users(harness::POOL).await.expect("count"), 1);
+        Ok(())
+    }
+
+    /// A full scan that fails does not fail the tick, and the period is
+    /// recorded anyway. The acknowledgement means this ledger's effects are
+    /// in the store, and a best-effort reseed retry is not one of them —
+    /// so a scan that fails the same way every time (a borrower the seed
+    /// names holding a reserve the oracle does not price, which `validate`
+    /// deliberately permits) would otherwise stall this pool's cursor for
+    /// good, because the redelivered tick would find the scan still due.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_failing_full_scan_neither_fails_the_tick_nor_repeats_forever(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let tick = harness::fixture_tick();
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let tracker = Tracker::new(&client, &store);
+        let (_flag, shutdown) = watch::channel(false);
+
+        // The pool is due a reseed, and the reseed will fail against the
+        // chain every time: no snapshot is ever scripted.
+        let mut state = LoopState::default();
+        state.needs_reseed.insert(harness::POOL.to_string());
+        let file = write_temp_seed_file(&format!(
+            "[accounts]\n\"{}\" = [\"{}\"]\n",
+            harness::POOL,
+            harness::USER_ONE
+        ));
+        let sources = vec![SeedSource::File(FileSeed::load(&file).expect("loads"))];
+        let cadence = Cadence {
+            full_scan_ledgers: 100,
+            ..quiet_cadence()
+        };
+
+        let (message, applied) = tick_message(harness::POOL, tick);
+        handle_message(&tracker, &sources, cadence, &mut state, &shutdown, message)
+            .await
+            .expect("a failing scan is not a failing tick");
+        assert!(
+            applied.await.is_ok(),
+            "the tick is acknowledged, so the poller commits the cursor"
+        );
+        assert!(
+            state.needs_reseed.contains(harness::POOL),
+            "the reseed is still owed, to be retried next period"
+        );
+        assert_eq!(
+            state.last_scan.get(harness::POOL),
+            Some(&tick.sequence),
+            "the period is recorded by a scan that tried, so the cadence cannot spin on it"
+        );
+
+        // The next tick inside the same period does not scan again, so a
+        // deterministic failure costs one warning per period, not a stall.
+        let next = LedgerTick {
+            sequence: tick.sequence + 1,
+            close_time: tick.close_time,
+        };
+        let (message, applied) = tick_message(harness::POOL, next);
+        handle_message(&tracker, &sources, cadence, &mut state, &shutdown, message)
+            .await
+            .expect("the following tick");
+        assert!(applied.await.is_ok());
         Ok(())
     }
 

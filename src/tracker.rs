@@ -1365,7 +1365,6 @@ mod tests {
         ));
     }
 
-    /// Every source's accounts are refreshed once, deduplicated, and a
     /// A shutdown arriving mid-seed is not an error and not a completed
     /// seed either: the accounts already valued stay written, and the
     /// outcome says it stopped early so a caller cannot record the seed's
@@ -1399,6 +1398,7 @@ mod tests {
         Ok(())
     }
 
+    /// Every source's accounts are refreshed once, deduplicated, and a
     /// failing source is skipped rather than failing the seed.
     #[sqlx::test(migrations = "./migrations")]
     async fn seeding_refreshes_every_account_once_and_survives_a_failing_source(
