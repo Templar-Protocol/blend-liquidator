@@ -237,6 +237,16 @@ and the rest of the operational surface.
   stale local database (one migrated before those amendments) fails loudly
   on a checksum mismatch rather than applying quietly. `make db-reset &&
   make db-up && sqlx migrate run` clears it.
+- `docker-compose.yml`'s `DATABASE_URL` — set in the `liquidator` service's
+  `environment:` block, which overrides `env_file:` on purpose, so the
+  bot reaches Postgres by its compose service name rather than the
+  host-side `127.0.0.1` in `.env` — is a local development credential, not
+  a deployment one: `docker compose config` renders `environment:` in
+  full, which is exactly what this file's own secrets convention above
+  means by naming that command. A real deployment passes `DATABASE_URL`
+  through the environment, never through a committed file. Nothing there
+  percent-encodes `POSTGRES_PASSWORD` either, so a password containing
+  `@`, `:` or `/` produces a malformed URL.
 
 ## Workflow
 

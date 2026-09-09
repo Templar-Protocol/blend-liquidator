@@ -3258,3 +3258,56 @@ so repeating it would reseed once per poll interval. Spec §4's "a failed
 seed … is retried on the next full scan" — which this plan never ruled on at
 all — is what recovers an incomplete one, and it is now wired into the
 full-scan branch.
+
+**The event-failure poison has a bounded worst case, and it is worth
+stating.** `handle_message`'s `Event` arm marks a pool in `state.unapplied`
+when `Tracker::apply` fails it (`src/service.rs:330`); the `Tick` arm reads
+and clears that mark unconditionally and, when it was set, declines the
+tick's acknowledgement instead of sending it (`:336`, `:354`–`:363`), so the
+cursor cannot commit past the ledger the failed event came from and the next
+poll re-reads the same range. That is correct as far as it goes, but an
+event that can never apply — an undecodable shape, not a transient RPC blip
+— stalls that pool's cursor for as long as the process runs: every poll
+re-reads a range that only grows, at the poller's own backoff ceiling
+(`PollerConfig::max_backoff`, 30 s), until the cursor falls far enough behind
+to fall out of the RPC's retention window. At that point the poller reports
+a `Gap` and restarts at the window's edge, past the ledger that was stuck —
+which recovers the pool, but by discarding the events between, exactly as a
+`Gap` always does. A permanently poisoning event is therefore self-limiting,
+not silent forever, but the recovery is a gap, not a fix.
+
+**`needs_reseed` is in-memory only, and a restart can lose it.** A `Gap`
+whose reseed does not reach every source leaves the pool marked in
+`state.needs_reseed` so the next full scan retries it (spec §4). That mark
+lives in `LoopState`, which is rebuilt empty on every process start, while
+`seed_pools_needing_it` only seeds a pool whose tracked-user count is zero or
+whose cursor is missing (`src/service.rs:192`–`:209`) — exactly the store a
+successful partial reseed leaves behind: rows and a cursor both present. A
+restart between the failed reseed and the full scan that would have retried
+it is therefore not "retried later", it is dropped: the pool keeps whatever
+partial coverage the failed reseed left it with, silently, until another gap
+happens to occur. A durable recheck flag is Phase 4's to add; until then
+this is a limitation Phase 4 inherits, not one this phase closes. One more
+edge shares the same root: a seed cut short by shutdown
+(`src/tracker.rs:307`–`:309`) reports `failed_sources: 0` — no *source*
+failed, the loop just stopped early — so the `outcome.failed_sources == 0`
+check clears the mark on the way out, in both places that make it
+(`src/service.rs:380` in the `Gap` arm, `:471` in the full-scan retry). That
+is harmless today, because the process is exiting anyway and the mark is
+only ever in memory to begin with — but it stops being harmless the day
+`needs_reseed` becomes durable, where the same sequence would persist a
+false "this pool is fully seeded".
+
+**The compose `DATABASE_URL` is a local development credential.**
+`docker-compose.yml:56` sets it in the `liquidator` service's `environment:`
+block (which is what overrides `env_file:`'s host-side value with the
+compose-network one, by design). `docker compose config` renders
+`environment:` in full, unlike `env_file:` contents — which is exactly the
+distinction `CLAUDE.md`'s secrets convention names that command for. So say
+it plainly: the compose default (`liquidator:liquidator`) is fine for a
+laptop, and a real deployment passes `DATABASE_URL` through the environment
+itself, never through a file committed anywhere near the repository. Nothing
+in the compose file percent-encodes `POSTGRES_PASSWORD` either, so an
+operator who sets a password containing `@`, `:` or `/` gets a `DATABASE_URL`
+that does not parse as the URL it is meant to be, not a working one with an
+odd password.
