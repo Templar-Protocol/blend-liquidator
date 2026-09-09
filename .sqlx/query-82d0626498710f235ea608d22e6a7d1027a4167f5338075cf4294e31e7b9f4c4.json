@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT pool, account, auction_type, start_ledger, fill_ledger, percent,\n                    bid, lot, updated_ledger\n             FROM auctions WHERE pool = $1 ORDER BY start_ledger ASC, account ASC",
+  "query": "SELECT pool, account, auction_type, start_ledger, fill_ledger, percent,\n                    bid, lot, updated_ledger\n             FROM auctions WHERE pool = $1\n             ORDER BY start_ledger ASC, account ASC, auction_type ASC",
   "describe": {
     "columns": [
       {
@@ -120,5 +120,5 @@
       false
     ]
   },
-  "hash": "e76c1fb154185a88fc7fb5b4813c7da497bc9ff2a6e76656a8b6575f3bfed1d2"
+  "hash": "82d0626498710f235ea608d22e6a7d1027a4167f5338075cf4294e31e7b9f4c4"
 }

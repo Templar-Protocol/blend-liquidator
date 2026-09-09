@@ -172,9 +172,24 @@ impl<'a> Tracker<'a> {
     }
 
     /// Re-reads `accounts` from chain in one snapshot and writes each row,
-    /// deleting the ones that no longer owe anything. Reserves are accrued
-    /// to `tick.close_time`, so an account refreshed at ledger *N* is valued
-    /// as the contract would value it in ledger *N*.
+    /// deleting the ones that no longer owe anything.
+    ///
+    /// Reserves are accrued to `tick.close_time`, so an account refreshed
+    /// at ledger *N* is valued as the contract would value it in ledger
+    /// *N* — **unless the chain has already moved past that tick**, which
+    /// is the ordinary case rather than a rare race: `getEvents` has no
+    /// end ledger, so a pass delivers events from ledgers newer than the
+    /// head it read, and the snapshot taken to refresh them is newer
+    /// still. The accrual target is therefore the later of the tick's
+    /// close time and the newest `last_time` the snapshot holds. It never
+    /// runs backwards, because a reserve entry is a stored state the
+    /// contract only ever accrues *forward* from — `Reserve::accrue`
+    /// rightly refuses the other direction, and clamping here keeps that
+    /// refusal from turning "the chain moved" into a failed refresh.
+    ///
+    /// The row records `snapshot.ledger`, the ledger the positions were
+    /// actually read at, not the tick: that is what the stale-refresh pass
+    /// then measures staleness against.
     pub async fn refresh(
         &self,
         pool: &str,
@@ -186,13 +201,24 @@ impl<'a> Tracker<'a> {
         }
         let borrowed: Vec<&str> = accounts.iter().map(String::as_str).collect();
         let snapshot = PoolReader::new(self.rpc, pool).snapshot(&borrowed).await?;
+        // One timestamp for every reserve, so the position is valued at a
+        // single instant: the earliest one at which every entry read is
+        // valid. Per-reserve clamping would value one asset later than
+        // another and quietly mix two ledgers into one health factor.
+        let valued_at = snapshot
+            .reserves
+            .values()
+            .map(|reserve| reserve.data.last_time)
+            .max()
+            .unwrap_or(0)
+            .max(tick.close_time);
         let mut outcome = RefreshOutcome::default();
         for account in accounts {
             let positions = snapshot.positions.get(account);
             let owes = positions.is_some_and(|positions| !positions.liabilities.is_empty());
             let health = if owes {
                 snapshot
-                    .position_data(account, tick.close_time)?
+                    .position_data(account, valued_at)?
                     .and_then(|data| data.health_factor().transpose())
                     .transpose()?
             } else {
@@ -207,7 +233,7 @@ impl<'a> Tracker<'a> {
                             health_factor: mul_floor(health, SCALAR_7, snapshot.prices.scalar())?,
                             collateral: positions.collateral.clone(),
                             liabilities: positions.liabilities.clone(),
-                            updated_ledger: tick.sequence,
+                            updated_ledger: snapshot.ledger,
                         })
                         .await?;
                     outcome.tracked += 1;
@@ -222,17 +248,24 @@ impl<'a> Tracker<'a> {
         Ok(outcome)
     }
 
-    /// Refreshes up to `batch` users whose row predates `older_than`, oldest
-    /// first, so a long-idle borrower's accrued interest is never missed.
+    /// Refreshes up to `batch` users whose row was written before
+    /// `updated_before`, oldest first, so a long-idle borrower's accrued
+    /// interest is never missed.
+    ///
+    /// `updated_before` is an **absolute ledger**, not a span: a caller
+    /// working from a knob like `USER_REFRESH_LEDGERS` subtracts it from
+    /// the tick first. Handing the span over instead compares a count of
+    /// ledgers against a ledger sequence, which selects every row on a
+    /// fresh network and no row at all on a live one.
     pub async fn refresh_stale(
         &self,
         pool: &str,
         tick: LedgerTick,
-        older_than: u32,
+        updated_before: u32,
         batch: u32,
     ) -> Result<RefreshOutcome, TrackerError> {
         let limit = i64::from(batch);
-        let stale = self.store.users_stale(pool, older_than, limit).await?;
+        let stale = self.store.users_stale(pool, updated_before, limit).await?;
         let accounts: Vec<String> = stale.into_iter().map(|user| user.account).collect();
         self.refresh(pool, &accounts, tick).await
     }
@@ -604,9 +637,92 @@ mod tests {
                 .unwrap_or_else(|| panic!("{account} should be tracked"));
             assert_eq!(row.health_factor, golden);
             assert_eq!(row.pool, POOL);
+            // The snapshot is the fixture's own ledger, which is also this
+            // tick's, so this pins both: the row records the ledger it was
+            // read at, and here that is the ledger it was valued at.
             assert_eq!(row.updated_ledger, tick.sequence);
         }
         assert_eq!(store.count_users(POOL).await.expect("count"), 2);
+        Ok(())
+    }
+
+    /// A snapshot newer than the tick is the ordinary case, not a race:
+    /// `getEvents` carries no end ledger, so a pass delivers events from
+    /// ledgers newer than the head it read, and the snapshot taken to
+    /// value them is newer still. Accruing must clamp forward to the
+    /// newest reserve entry rather than refuse to run backwards, and the
+    /// row must record the ledger the positions were read at.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_snapshot_newer_than_the_tick_is_valued_at_its_newest_reserve(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        for _ in 0..3 {
+            harness::script_snapshot(&rpc, &[USER_ONE]);
+        }
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let tracker = Tracker::new(&client, &store);
+        let fixture = harness::fixture_tick();
+
+        // What the fixture's own entries say: every reserve was last
+        // touched before the ledger closed, so a tick between the two is
+        // exactly the case this clamp exists for.
+        let snapshot = PoolReader::new(&client, POOL)
+            .snapshot(&[USER_ONE])
+            .await
+            .expect("snapshot");
+        let newest = snapshot
+            .reserves
+            .values()
+            .map(|reserve| reserve.data.last_time)
+            .max()
+            .expect("the fixture pool has reserves");
+        assert!(
+            newest < fixture.close_time,
+            "the fixture's newest reserve entry ({newest}) precedes its close time"
+        );
+
+        // A tick four ledgers behind the snapshot, whose close time is
+        // older than that newest entry: `Reserve::accrue` refuses to run
+        // backwards, so without the clamp this refresh is a hard error.
+        let stale = LedgerTick {
+            sequence: fixture.sequence - 4,
+            close_time: newest - 1,
+        };
+        tracker
+            .refresh(POOL, &[USER_ONE.to_string()], stale)
+            .await
+            .expect("a tick behind the chain still values the position");
+        let after_stale = store
+            .user(POOL, USER_ONE)
+            .await
+            .expect("read")
+            .expect("a row");
+        assert_eq!(
+            after_stale.updated_ledger, snapshot.ledger,
+            "the row records the ledger it was read at, not the older tick"
+        );
+
+        // Valuing at that newest entry directly is the same number, which
+        // is what clamping forward to it means.
+        let at_newest = LedgerTick {
+            sequence: stale.sequence,
+            close_time: newest,
+        };
+        tracker
+            .refresh(POOL, &[USER_ONE.to_string()], at_newest)
+            .await
+            .expect("refresh");
+        let after_newest = store
+            .user(POOL, USER_ONE)
+            .await
+            .expect("read")
+            .expect("a row");
+        assert_eq!(
+            after_stale.health_factor, after_newest.health_factor,
+            "a stale tick values at the newest reserve entry, not at itself"
+        );
         Ok(())
     }
 

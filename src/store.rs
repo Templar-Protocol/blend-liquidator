@@ -21,8 +21,13 @@ use crate::chain::xdr::{AuctionType, FillPercent};
 /// A failure talking to the store, or reading a value it returned.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    /// The connection pool could not be opened.
-    #[error("connecting to the database: {0}")]
+    /// The connection pool could not be opened. The message is fixed on
+    /// purpose: sqlx builds its own connection errors from the DSN, this
+    /// one reaches a log line through `main`, and this repository's
+    /// standing invariant is that a password never does. The cause is kept
+    /// as a source for a caller that deliberately walks the chain, and is
+    /// never rendered by `Display`.
+    #[error("connecting to the database failed")]
     Connect(#[source] sqlx::Error),
     /// A query failed.
     #[error("database query: {0}")]
@@ -202,8 +207,11 @@ fn asset_amounts_from_json(
 pub struct Cursor {
     /// The last ledger whose events were applied in full.
     pub ledger: u32,
-    /// The RPC's paging token for the next `getEvents` page, when the
-    /// poller stopped mid-ledger. `None` means the ledger is complete.
+    /// The RPC's paging token this task stopped at, `None` when it stopped
+    /// on a range boundary. The event poller only ever commits a pass it
+    /// proved drained a whole range, so it always writes `None`; the
+    /// column stays because it is the `cursors` table's contract for any
+    /// task that does resume mid-range, and the schema is the spec's.
     pub paging_token: Option<String>,
 }
 
@@ -380,13 +388,17 @@ impl Store {
             .collect()
     }
 
-    /// The pool's borrowers whose row predates `older_than`, oldest first:
-    /// the refresh pass walks these so a long-idle borrower's accrued
-    /// interest is not missed.
+    /// The pool's borrowers whose row was written before `updated_before`,
+    /// oldest first: the refresh pass walks these so a long-idle
+    /// borrower's accrued interest is not missed.
+    ///
+    /// `updated_before` is an absolute ledger, compared against the row's
+    /// own `updated_ledger`. A caller holding a span of ledgers subtracts
+    /// it from the current one first.
     pub async fn users_stale(
         &self,
         pool: &str,
-        older_than: u32,
+        updated_before: u32,
         limit: i64,
     ) -> Result<Vec<TrackedUser>, StoreError> {
         let rows = sqlx::query!(
@@ -397,7 +409,7 @@ impl Store {
              ORDER BY updated_ledger ASC
              LIMIT $3",
             pool,
-            i64::from(older_than),
+            i64::from(updated_before),
             limit,
         )
         .fetch_all(&self.pool)
@@ -590,12 +602,16 @@ impl Store {
     }
 
     /// Every auction the bot has open in a pool, oldest first: the filler
-    /// walks them in the order they became fillable.
+    /// walks them in the order they became fillable. The order is total —
+    /// the three sort keys are the primary key plus the start ledger — so
+    /// two auction types opened for one account in one ledger do not tie,
+    /// and a caller that pages or compares runs sees one stable order.
     pub async fn open_auctions(&self, pool: &str) -> Result<Vec<TrackedAuction>, StoreError> {
         let rows = sqlx::query!(
             "SELECT pool, account, auction_type, start_ledger, fill_ledger, percent,
                     bid, lot, updated_ledger
-             FROM auctions WHERE pool = $1 ORDER BY start_ledger ASC, account ASC",
+             FROM auctions WHERE pool = $1
+             ORDER BY start_ledger ASC, account ASC, auction_type ASC",
             pool
         )
         .fetch_all(&self.pool)
@@ -969,6 +985,43 @@ mod tests {
             .delete_auction(POOL, USER, AuctionType::BadDebt)
             .await
             .expect("again"));
+        Ok(())
+    }
+
+    /// Two auction types for one account in one ledger tie on the first
+    /// two sort keys; the type breaks the tie, so the order is total.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn two_auction_types_in_one_ledger_come_back_in_type_order(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(pool);
+        for kind in [AuctionType::Interest, AuctionType::UserLiquidation] {
+            let mut row = auction(USER, 500);
+            row.auction_type = kind;
+            store.upsert_auction(&row).await.expect("insert");
+        }
+        let open = store.open_auctions(POOL).await.expect("list");
+        let types: Vec<AuctionType> = open.iter().map(|a| a.auction_type).collect();
+        assert_eq!(
+            types,
+            [AuctionType::UserLiquidation, AuctionType::Interest],
+            "the type breaks a tie on start ledger and account"
+        );
+
+        // A typed read answers for the type asked for and `None` for the
+        // one that is absent, even while another type's row exists.
+        assert!(store
+            .auction(POOL, USER, AuctionType::Interest)
+            .await
+            .expect("read")
+            .is_some());
+        assert_eq!(
+            store
+                .auction(POOL, USER, AuctionType::BadDebt)
+                .await
+                .expect("read"),
+            None
+        );
         Ok(())
     }
 
