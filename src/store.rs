@@ -101,10 +101,6 @@ impl Store {
 /// A `NULL`, a fractional value or anything else is an error, never a zero:
 /// a health factor that silently became zero would make a healthy account
 /// look liquidatable.
-///
-/// No caller until the tracker (Task 3) reads `users.health_factor` back;
-/// `#[allow(dead_code)]` until then, removed when that task lands.
-#[allow(dead_code)]
 fn decimal(text: Option<&str>, column: &'static str) -> Result<i128, StoreError> {
     let text = text.ok_or_else(|| StoreError::Decimal {
         column,
@@ -119,11 +115,6 @@ fn decimal(text: Option<&str>, column: &'static str) -> Result<i128, StoreError>
 /// A reserve-index-to-amount map as `jsonb`: keys are the index in decimal,
 /// values the amount as a decimal string, because an `i128` amount exceeds
 /// what a JSON number holds exactly.
-///
-/// No caller until the tracker (Task 3) writes `users.collateral` and
-/// `users.liabilities`; `#[allow(dead_code)]` until then, removed when that
-/// task lands.
-#[allow(dead_code)]
 fn index_amounts_to_json(amounts: &BTreeMap<u32, i128>) -> Value {
     Value::Object(
         amounts
@@ -135,11 +126,6 @@ fn index_amounts_to_json(amounts: &BTreeMap<u32, i128>) -> Value {
 
 /// The inverse. Anything that is not an object of decimal strings keyed by
 /// decimal indexes is a `Json` error.
-///
-/// No caller until the tracker (Task 3) reads `users.collateral` and
-/// `users.liabilities` back; `#[allow(dead_code)]` until then, removed when
-/// that task lands.
-#[allow(dead_code)]
 fn index_amounts_from_json(
     value: &Value,
     column: &'static str,
@@ -279,20 +265,181 @@ impl Store {
     }
 }
 
+/// A borrower the bot tracks. A row exists only while the account owes
+/// something: the tracker deletes it the moment its liabilities empty, so
+/// the table's size is the number of positions that could be liquidated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackedUser {
+    /// The pool contract.
+    pub pool: String,
+    /// The borrower.
+    pub account: String,
+    /// Health factor normalised to 7 decimals (`hf * 10^7 / oracle_scalar`),
+    /// so pools whose oracles differ in decimals order alike.
+    pub health_factor: i128,
+    /// Reserve index to b-token amount.
+    pub collateral: BTreeMap<u32, i128>,
+    /// Reserve index to d-token amount.
+    pub liabilities: BTreeMap<u32, i128>,
+    /// The ledger this row was computed at.
+    pub updated_ledger: u32,
+}
+
+impl Store {
+    /// Writes a borrower, replacing any previous row for the same pool and
+    /// account.
+    pub async fn upsert_user(&self, user: &TrackedUser) -> Result<(), StoreError> {
+        sqlx::query!(
+            "INSERT INTO users (pool, account, health_factor, collateral, liabilities, updated_ledger)
+             VALUES ($1, $2, $3::text::numeric, $4, $5, $6)
+             ON CONFLICT (pool, account) DO UPDATE
+               SET health_factor = EXCLUDED.health_factor,
+                   collateral = EXCLUDED.collateral,
+                   liabilities = EXCLUDED.liabilities,
+                   updated_ledger = EXCLUDED.updated_ledger",
+            user.pool,
+            user.account,
+            user.health_factor.to_string(),
+            index_amounts_to_json(&user.collateral),
+            index_amounts_to_json(&user.liabilities),
+            i64::from(user.updated_ledger),
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Removes a borrower. `true` when a row went away, which is what the
+    /// tracker reports when a position closes.
+    pub async fn delete_user(&self, pool: &str, account: &str) -> Result<bool, StoreError> {
+        let done = sqlx::query!(
+            "DELETE FROM users WHERE pool = $1 AND account = $2",
+            pool,
+            account
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// One borrower.
+    pub async fn user(&self, pool: &str, account: &str) -> Result<Option<TrackedUser>, StoreError> {
+        let row = sqlx::query!(
+            "SELECT pool, account, health_factor::text AS health_factor, collateral,
+                    liabilities, updated_ledger
+             FROM users WHERE pool = $1 AND account = $2",
+            pool,
+            account
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            Ok(TrackedUser {
+                pool: row.pool,
+                account: row.account,
+                health_factor: decimal(row.health_factor.as_deref(), "health_factor")?,
+                collateral: index_amounts_from_json(&row.collateral, "collateral")?,
+                liabilities: index_amounts_from_json(&row.liabilities, "liabilities")?,
+                updated_ledger: ledger(row.updated_ledger, "updated_ledger")?,
+            })
+        })
+        .transpose()
+    }
+
+    /// The pool's borrowers below `threshold`, least healthy first. The
+    /// threshold is exclusive, so a user exactly at a scan threshold is not
+    /// rechecked by it.
+    pub async fn users_below_health(
+        &self,
+        pool: &str,
+        threshold: i128,
+        limit: i64,
+    ) -> Result<Vec<TrackedUser>, StoreError> {
+        let rows = sqlx::query!(
+            "SELECT pool, account, health_factor::text AS health_factor, collateral,
+                    liabilities, updated_ledger
+             FROM users
+             WHERE pool = $1 AND health_factor < $2::text::numeric
+             ORDER BY health_factor ASC
+             LIMIT $3",
+            pool,
+            threshold.to_string(),
+            limit,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        // The three row-to-`TrackedUser` conversions below cannot share a
+        // helper: each `sqlx::query!` call produces its own anonymous row
+        // type, so there is no common type a `fn` or trait could take. The
+        // duplication is the honest cost of compile-time-checked queries.
+        rows.into_iter()
+            .map(|row| {
+                Ok(TrackedUser {
+                    pool: row.pool,
+                    account: row.account,
+                    health_factor: decimal(row.health_factor.as_deref(), "health_factor")?,
+                    collateral: index_amounts_from_json(&row.collateral, "collateral")?,
+                    liabilities: index_amounts_from_json(&row.liabilities, "liabilities")?,
+                    updated_ledger: ledger(row.updated_ledger, "updated_ledger")?,
+                })
+            })
+            .collect()
+    }
+
+    /// The pool's borrowers whose row predates `older_than`, oldest first:
+    /// the refresh pass walks these so a long-idle borrower's accrued
+    /// interest is not missed.
+    pub async fn users_stale(
+        &self,
+        pool: &str,
+        older_than: u32,
+        limit: i64,
+    ) -> Result<Vec<TrackedUser>, StoreError> {
+        let rows = sqlx::query!(
+            "SELECT pool, account, health_factor::text AS health_factor, collateral,
+                    liabilities, updated_ledger
+             FROM users
+             WHERE pool = $1 AND updated_ledger < $2
+             ORDER BY updated_ledger ASC
+             LIMIT $3",
+            pool,
+            i64::from(older_than),
+            limit,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(TrackedUser {
+                    pool: row.pool,
+                    account: row.account,
+                    health_factor: decimal(row.health_factor.as_deref(), "health_factor")?,
+                    collateral: index_amounts_from_json(&row.collateral, "collateral")?,
+                    liabilities: index_amounts_from_json(&row.liabilities, "liabilities")?,
+                    updated_ledger: ledger(row.updated_ledger, "updated_ledger")?,
+                })
+            })
+            .collect()
+    }
+
+    /// How many borrowers the bot tracks in a pool.
+    pub async fn count_users(&self, pool: &str) -> Result<i64, StoreError> {
+        let row = sqlx::query!(
+            "SELECT count(*) AS \"count!\" FROM users WHERE pool = $1",
+            pool
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.count)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const POOL: &str = "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD";
-    /// No caller until Task 3's tests exercise `Store::user`/`upsert_user`/
-    /// `delete_user`; `#[allow(dead_code)]` until then, removed when that
-    /// task lands.
-    #[allow(dead_code)]
     const USER: &str = "GDAWX4KV5EQLP5W44HE5AA5QN5QRBJOVQIAI5OXOH5FW2ENT5PXN33DE";
-    /// No caller until Task 3's tests exercise the same methods for a
-    /// second account; `#[allow(dead_code)]` until then, removed when that
-    /// task lands.
-    #[allow(dead_code)]
     const FILLER: &str = "GCIH7OYRDHJ3IOPFEM7DMUX3SXTVHOO2XSWLGBMSVQ3EIHPHYUTNJID3";
 
     #[sqlx::test(migrations = "./migrations")]
@@ -443,5 +590,128 @@ mod tests {
             decimal(Some("1.5"), "health_factor"),
             Err(StoreError::Decimal { .. })
         ));
+    }
+
+    fn user(account: &str, health_factor: i128, updated_ledger: u32) -> TrackedUser {
+        let mut collateral = BTreeMap::new();
+        collateral.insert(0_u32, 1_000_000_i128);
+        let mut liabilities = BTreeMap::new();
+        liabilities.insert(1_u32, 500_000_i128);
+        TrackedUser {
+            pool: POOL.to_string(),
+            account: account.to_string(),
+            health_factor,
+            collateral,
+            liabilities,
+            updated_ledger,
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_user_round_trips_and_upsert_replaces(pool: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(pool);
+        assert_eq!(store.user(POOL, USER).await.expect("read"), None);
+
+        let mut tracked = user(USER, 10_070_767, 64_291_297);
+        store.upsert_user(&tracked).await.expect("insert");
+        assert_eq!(
+            store.user(POOL, USER).await.expect("read"),
+            Some(tracked.clone())
+        );
+        assert_eq!(store.count_users(POOL).await.expect("count"), 1);
+
+        tracked.health_factor = 9_500_000;
+        tracked.updated_ledger = 64_291_400;
+        tracked.liabilities.insert(2_u32, 7_i128);
+        store.upsert_user(&tracked).await.expect("update");
+        assert_eq!(store.user(POOL, USER).await.expect("read"), Some(tracked));
+        assert_eq!(store.count_users(POOL).await.expect("count"), 1);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn deleting_reports_whether_a_row_went_away(pool: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(pool);
+        store
+            .upsert_user(&user(USER, 10_070_767, 1))
+            .await
+            .expect("insert");
+        assert!(store.delete_user(POOL, USER).await.expect("delete"));
+        assert!(!store.delete_user(POOL, USER).await.expect("delete again"));
+        assert_eq!(store.count_users(POOL).await.expect("count"), 0);
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_unhealthiest_users_come_back_first_and_the_threshold_excludes(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(pool);
+        store
+            .upsert_user(&user(USER, 9_000_000, 1))
+            .await
+            .expect("a");
+        store
+            .upsert_user(&user(FILLER, 8_000_000, 1))
+            .await
+            .expect("b");
+        store
+            .upsert_user(&user("GHEALTHY", 30_000_000, 1))
+            .await
+            .expect("c");
+
+        let scanned = store
+            .users_below_health(POOL, 12_000_000, 10)
+            .await
+            .expect("scan");
+        let accounts: Vec<&str> = scanned.iter().map(|u| u.account.as_str()).collect();
+        assert_eq!(accounts, [FILLER, USER], "ascending by health factor");
+
+        assert_eq!(
+            store
+                .users_below_health(POOL, 12_000_000, 1)
+                .await
+                .expect("limit")
+                .len(),
+            1
+        );
+        assert!(store
+            .users_below_health("COTHER", 12_000_000, 10)
+            .await
+            .expect("other")
+            .is_empty());
+        // The threshold is exclusive: a user exactly at it is healthy enough.
+        assert!(store
+            .users_below_health(POOL, 8_000_000, 10)
+            .await
+            .expect("exact")
+            .is_empty());
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn stale_users_come_back_oldest_first(pool: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(pool);
+        store
+            .upsert_user(&user(USER, 10_000_000, 100))
+            .await
+            .expect("a");
+        store
+            .upsert_user(&user(FILLER, 10_000_000, 50))
+            .await
+            .expect("b");
+        store
+            .upsert_user(&user("GFRESH", 10_000_000, 900))
+            .await
+            .expect("c");
+
+        let stale = store.users_stale(POOL, 500, 10).await.expect("stale");
+        let accounts: Vec<&str> = stale.iter().map(|u| u.account.as_str()).collect();
+        assert_eq!(accounts, [FILLER, USER]);
+        assert_eq!(
+            store.users_stale(POOL, 500, 1).await.expect("limit").len(),
+            1
+        );
+        Ok(())
     }
 }
