@@ -489,6 +489,16 @@ async fn tracker_loop(
     mut receiver: mpsc::Receiver<PollerMessage>,
 ) -> Result<(), TrackerError> {
     while let Some(message) = receiver.recv().await {
+        // `handle_message` consumes `message`, so the pool (and, for the
+        // variants that name a single one, the ledger) must be read out
+        // before the call — otherwise a warn logged after it returns has
+        // no way to say which pool or ledger failed. `Gap` is about a
+        // range rather than one ledger, so it names no `ledger` here.
+        let (pool, ledger) = match &message {
+            PollerMessage::Event { pool, ledger, .. } => (pool.clone(), Some(*ledger)),
+            PollerMessage::Tick { pool, tick, .. } => (pool.clone(), Some(tick.sequence)),
+            PollerMessage::Gap { pool, .. } => (pool.clone(), None),
+        };
         match handle_message(
             tracker,
             seed_sources,
@@ -514,6 +524,8 @@ async fn tracker_loop(
             // upsert or a delete keyed by what the chain says.
             Err(error @ TrackerError::Store(_)) => return Err(error),
             Err(error) => tracing::warn!(
+                pool,
+                ledger,
                 %error,
                 "applying a poller message failed; the range will be read again"
             ),
