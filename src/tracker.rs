@@ -12,7 +12,7 @@
 
 use crate::chain::pool::PoolReader;
 use crate::chain::rpc::RpcClient;
-use crate::chain::xdr::{FillPercent, PoolEvent};
+use crate::chain::xdr::PoolEvent;
 use crate::chain::ChainError;
 use crate::ledger::LedgerTick;
 use crate::math::{mul_floor, MathError, SCALAR_7};
@@ -21,9 +21,7 @@ use crate::store::{Store, StoreError, TrackedAuction, TrackedUser};
 /// A failure applying chain state to the store.
 #[derive(Debug, thiserror::Error)]
 pub enum TrackerError {
-    /// Reading the chain failed, including a percent the contract would
-    /// never emit outside 1 to 100 — that is a chain shape this bot did not
-    /// expect, not a value to clamp.
+    /// Reading the chain failed.
     #[error("chain: {0}")]
     Chain(#[from] ChainError),
     /// Writing the store failed.
@@ -43,13 +41,6 @@ pub struct RefreshOutcome {
     pub removed: usize,
 }
 
-/// The remainder of a partial fill is re-read from chain rather than
-/// derived, so its share of the position is recorded as fully open: the
-/// contract does not persist the original `percent` on the auction entry
-/// itself, only its bid and lot, and a freshly re-read auction is eligible
-/// for a fill up to what remains.
-const REMAINDER_PERCENT: u32 = 100;
-
 /// Applies events and refreshes users for one store.
 #[derive(Debug, Clone, Copy)]
 pub struct Tracker<'a> {
@@ -66,7 +57,10 @@ impl<'a> Tracker<'a> {
 
     /// Applies one event's auction bookkeeping and returns the accounts it
     /// names, for the caller to refresh at the tick. Writes no row in the
-    /// `users` table: refreshing is the tick's job, not the event's.
+    /// `users` table: refreshing is the tick's job, not the event's. The
+    /// tracker only ever records what the chain says an auction *is* — its
+    /// bid, lot and start ledger; what to fill of it is the filler's own
+    /// decision, planned later and written into the same row by Phase 5.
     pub async fn apply(
         &self,
         pool: &str,
@@ -77,10 +71,9 @@ impl<'a> Tracker<'a> {
             PoolEvent::NewAuction {
                 auction_type,
                 user,
-                percent,
                 auction,
+                ..
             } => {
-                let percent = FillPercent::try_from(*percent).map_err(ChainError::from)?;
                 self.store
                     .upsert_auction(&TrackedAuction {
                         pool: pool.to_string(),
@@ -88,7 +81,7 @@ impl<'a> Tracker<'a> {
                         auction_type: *auction_type,
                         start_ledger: auction.block,
                         fill_ledger: None,
-                        percent,
+                        percent: None,
                         bid: auction.bid.clone(),
                         lot: auction.lot.clone(),
                         updated_ledger: ledger,
@@ -107,12 +100,12 @@ impl<'a> Tracker<'a> {
                     // A partial fill leaves a remainder the contract
                     // computed; read it rather than subtracting the filled
                     // side ourselves — the contract owns that arithmetic
-                    // and the entry is authoritative.
+                    // and the entry is authoritative. The remainder carries
+                    // no fill plan of its own, so `percent` starts absent
+                    // again.
                     let reader = PoolReader::new(self.rpc, pool);
                     match reader.auction(user, *auction_type).await? {
                         Some((at, remaining)) => {
-                            let percent = FillPercent::try_from(REMAINDER_PERCENT)
-                                .map_err(ChainError::from)?;
                             self.store
                                 .upsert_auction(&TrackedAuction {
                                     pool: pool.to_string(),
@@ -120,7 +113,7 @@ impl<'a> Tracker<'a> {
                                     auction_type: *auction_type,
                                     start_ledger: remaining.block,
                                     fill_ledger: None,
-                                    percent,
+                                    percent: None,
                                     bid: remaining.bid,
                                     lot: remaining.lot,
                                     updated_ledger: at,
@@ -454,13 +447,14 @@ mod tests {
             .expect("read")
             .expect("a row");
         assert_eq!(opened.start_ledger, 64_271_300);
-        assert_eq!(opened.percent.get(), 40);
+        assert_eq!(opened.percent, None, "no fill has been planned for it yet");
         assert_eq!(opened.bid, bid);
         assert_eq!(opened.lot, lot);
         assert_eq!(opened.updated_ledger, 64_271_301);
 
         // A partial fill re-reads the remainder from chain rather than
-        // subtracting the filled side, and the remainder is fully open.
+        // subtracting the filled side, and the remainder carries no fill
+        // plan of its own either.
         let key = keys::auction(POOL, USER_ONE, kind).expect("key");
         rpc.expect(
             "getLedgerEntries",
@@ -491,7 +485,10 @@ mod tests {
             .expect("still a row");
         assert_eq!(reduced.bid[USDC], 400);
         assert_eq!(reduced.lot[USDC], 800);
-        assert_eq!(reduced.percent.get(), 100, "the remainder is fully open");
+        assert_eq!(
+            reduced.percent, None,
+            "the remainder starts with no fill planned either"
+        );
         assert_eq!(reduced.start_ledger, 64_271_300, "the chain's own block");
         assert_eq!(
             reduced.updated_ledger, 64_271_320,

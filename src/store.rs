@@ -445,8 +445,11 @@ pub struct TrackedAuction {
     pub start_ledger: u32,
     /// The ledger the filler intends to fill at, once it has planned one.
     pub fill_ledger: Option<u32>,
-    /// The share of the position auctioned, validated 1 to 100 by the type.
-    pub percent: FillPercent,
+    /// The filler's planned fill percent, `None` until it plans one. This
+    /// is not a record of the auction's creation — the event's own percent
+    /// at creation time is already embodied in `bid` and `lot` — and what
+    /// was actually filled is recorded separately in `fills`.
+    pub percent: Option<FillPercent>,
     /// Asset address to amount the filler pays.
     pub bid: BTreeMap<String, i128>,
     /// Asset address to amount the filler receives.
@@ -493,10 +496,15 @@ impl Store {
     /// Writes an auction, replacing any previous row for the same pool,
     /// account and type.
     pub async fn upsert_auction(&self, auction: &TrackedAuction) -> Result<(), StoreError> {
-        let percent = i16::try_from(auction.percent.get()).map_err(|_| StoreError::Decimal {
-            column: "percent",
-            value: auction.percent.get().to_string(),
-        })?;
+        let percent = auction
+            .percent
+            .map(|percent| {
+                i16::try_from(percent.get()).map_err(|_| StoreError::Decimal {
+                    column: "percent",
+                    value: percent.get().to_string(),
+                })
+            })
+            .transpose()?;
         sqlx::query!(
             "INSERT INTO auctions (pool, account, auction_type, start_ledger, fill_ledger,
                                    percent, bid, lot, updated_ledger)
@@ -572,7 +580,7 @@ impl Store {
                     .fill_ledger
                     .map(|value| ledger(value, "fill_ledger"))
                     .transpose()?,
-                percent: percent_from_code(row.percent)?,
+                percent: row.percent.map(percent_from_code).transpose()?,
                 bid: asset_amounts_from_json(&row.bid, "bid")?,
                 lot: asset_amounts_from_json(&row.lot, "lot")?,
                 updated_ledger: ledger(row.updated_ledger, "updated_ledger")?,
@@ -603,7 +611,7 @@ impl Store {
                         .fill_ledger
                         .map(|value| ledger(value, "fill_ledger"))
                         .transpose()?,
-                    percent: percent_from_code(row.percent)?,
+                    percent: row.percent.map(percent_from_code).transpose()?,
                     bid: asset_amounts_from_json(&row.bid, "bid")?,
                     lot: asset_amounts_from_json(&row.lot, "lot")?,
                     updated_ledger: ledger(row.updated_ledger, "updated_ledger")?,
@@ -905,7 +913,7 @@ mod tests {
             auction_type: AuctionType::UserLiquidation,
             start_ledger,
             fill_ledger: None,
-            percent: FillPercent::try_from(100).expect("100 is in range"),
+            percent: None,
             bid,
             lot,
             updated_ledger: start_ledger,
@@ -918,6 +926,7 @@ mod tests {
         let kind = AuctionType::UserLiquidation;
         assert_eq!(store.auction(POOL, USER, kind).await.expect("read"), None);
 
+        // Freshly opened: no fill plan yet, so `percent` is absent.
         let mut open = auction(USER, 64_291_297);
         store.upsert_auction(&open).await.expect("insert");
         assert_eq!(
@@ -925,9 +934,9 @@ mod tests {
             Some(open.clone())
         );
 
-        // The filler plans a fill ledger and a partial percent.
+        // The filler plans a fill ledger and a percent to fill.
         open.fill_ledger = Some(64_291_400);
-        open.percent = FillPercent::try_from(60).expect("60 is in range");
+        open.percent = Some(FillPercent::try_from(60).expect("60 is in range"));
         open.updated_ledger = 64_291_350;
         store.upsert_auction(&open).await.expect("update");
         assert_eq!(

@@ -34,22 +34,28 @@ CREATE TABLE users (
 -- The scan that matters: the least healthy borrowers in a pool, first.
 CREATE INDEX users_by_health ON users (pool, health_factor);
 
--- Open auctions and, once the filler plans one, the ledger it intends to
--- fill at. `auction_type` is the contract's discriminant (0 user
--- liquidation, 1 bad debt, 2 interest) and `percent` its 1-to-100 fill
--- percent, both small enough for smallint.
+-- Open auctions and the filler's current plan for each: the ledger it
+-- intends to fill at and the percent it intends to fill. `auction_type` is
+-- the contract's discriminant (0 user liquidation, 1 bad debt, 2 interest),
+-- small enough for smallint alongside it.
+--
+-- `percent` is the filler's *planned* fill percent, not a record of the
+-- auction's creation: it is NULL until the filler plans a fill, just like
+-- `fill_ledger` beside it. What was actually filled is recorded separately
+-- in `fills`, once that table exists.
 --
 -- Both ranges are the contract's, and the Rust `AuctionType`/`FillPercent`
 -- types already enforce the same thing on every value this crate writes;
 -- these `CHECK`s are defence in depth, not the primary guard, so a row that
--- violates one did not come from this crate.
+-- violates one did not come from this crate. A `CHECK` passes on `NULL`,
+-- which is exactly what an unplanned percent is.
 CREATE TABLE auctions (
     pool            text     NOT NULL,
     account         text     NOT NULL,
     auction_type    smallint NOT NULL CHECK (auction_type BETWEEN 0 AND 2),
     start_ledger    bigint   NOT NULL,
     fill_ledger     bigint,
-    percent         smallint NOT NULL CHECK (percent BETWEEN 1 AND 100),
+    percent         smallint CHECK (percent BETWEEN 1 AND 100),
     bid             jsonb    NOT NULL,
     lot             jsonb    NOT NULL,
     updated_ledger  bigint   NOT NULL,
