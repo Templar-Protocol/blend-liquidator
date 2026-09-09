@@ -1222,7 +1222,9 @@ Append to `src/store.rs`'s test module:
     }
 
     /// A discriminant the contract never emits cannot be read back as an
-    /// auction type.
+    /// auction type. It surfaces through `open_auctions`, which reads every
+    /// row of a pool: a typed lookup cannot match a code this crate never
+    /// writes, so that is where corruption has to be caught.
     #[sqlx::test(migrations = "./migrations")]
     async fn an_unknown_auction_type_in_the_row_is_an_error(pool: sqlx::PgPool) -> sqlx::Result<()> {
         sqlx::query!(
@@ -1234,9 +1236,15 @@ Append to `src/store.rs`'s test module:
         .await?;
         let store = Store::from_pool(pool);
         assert!(matches!(
-            store.auction(POOL, USER, AuctionType::UserLiquidation).await,
+            store.open_auctions(POOL).await,
             Err(StoreError::Decimal { column: "auction_type", .. })
         ));
+        // A typed read is not the place this shows up: there is no
+        // user-liquidation auction for this account, and that is the answer.
+        assert_eq!(
+            store.auction(POOL, USER, AuctionType::UserLiquidation).await.expect("typed read"),
+            None
+        );
         Ok(())
     }
 ```
@@ -1361,7 +1369,9 @@ impl Store {
         Ok(done.rows_affected() > 0)
     }
 
-    /// One auction.
+    /// One auction, by its primary key. A discriminant this crate never
+    /// writes cannot match a typed lookup, so a corrupted row is reported
+    /// by `open_auctions`, which reads every row, rather than here.
     pub async fn auction(
         &self,
         pool: &str,
