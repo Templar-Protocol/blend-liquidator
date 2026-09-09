@@ -459,9 +459,15 @@ async fn handle_message(
 }
 
 /// A tick's whole effect: refresh the accounts this ledger's events named,
-/// then the stale-refresh pass, then the full scan when it is due. Every
-/// step must succeed before the tick is acknowledged, so this is one
-/// fallible unit rather than three.
+/// then the stale-refresh pass, then the full scan when it is due.
+///
+/// The first two must succeed for the tick to be acknowledged: they are
+/// what "this ledger's effects are in the store" means, and the poller must
+/// not commit a cursor past a ledger whose accounts were never re-valued.
+/// The full scan is not one of those effects — it reports the least healthy
+/// borrowers and retries an owed reseed — so it may fail without failing the
+/// tick, and only a store error, which means the bot cannot trust what it
+/// reads at all, still propagates.
 ///
 /// `subject` is the pool, the accounts its events named, and the tick.
 async fn apply_tick(
@@ -1994,6 +2000,15 @@ mod tests {
             .await
             .expect("the following tick");
         assert!(applied.await.is_ok());
+        // The acknowledgement alone cannot show the scan was skipped — a
+        // scan that ran and failed is acknowledged too, by this very fix.
+        // The recorded period is what distinguishes them: it would have
+        // moved to this tick had the scan run again.
+        assert_eq!(
+            state.last_scan.get(harness::POOL),
+            Some(&tick.sequence),
+            "the second tick in the period did not scan"
+        );
         Ok(())
     }
 
