@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO auctions (pool, account, auction_type, start_ledger, fill_ledger,\n                                   percent, bid, lot, updated_ledger)\n             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)\n             ON CONFLICT (pool, account, auction_type) DO UPDATE\n               SET start_ledger = EXCLUDED.start_ledger,\n                   fill_ledger = EXCLUDED.fill_ledger,\n                   percent = EXCLUDED.percent,\n                   bid = EXCLUDED.bid,\n                   lot = EXCLUDED.lot,\n                   updated_ledger = EXCLUDED.updated_ledger",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int2",
+        "Int8",
+        "Int8",
+        "Int2",
+        "Jsonb",
+        "Jsonb",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "43b3f9a63c71276b54e7043697e45026526329ca49b1426122c9cf64433274ca"
+}

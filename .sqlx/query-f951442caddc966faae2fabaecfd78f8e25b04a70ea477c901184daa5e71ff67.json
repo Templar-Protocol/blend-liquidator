@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM auctions WHERE pool = $1 AND account = $2 AND auction_type = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int2"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f951442caddc966faae2fabaecfd78f8e25b04a70ea477c901184daa5e71ff67"
+}

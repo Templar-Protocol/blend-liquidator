@@ -16,6 +16,8 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
+use crate::chain::xdr::AuctionType;
+
 /// A failure talking to the store, or reading a value it returned.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -158,10 +160,6 @@ fn index_amounts_from_json(
 }
 
 /// The same pair for a map keyed by asset address, as the auction sides are.
-///
-/// No caller until Task 4 wires the auction queries; `#[allow(dead_code)]`
-/// until then, removed when that task lands.
-#[allow(dead_code)]
 fn asset_amounts_to_json(amounts: &BTreeMap<String, i128>) -> Value {
     Value::Object(
         amounts
@@ -172,10 +170,6 @@ fn asset_amounts_to_json(amounts: &BTreeMap<String, i128>) -> Value {
 }
 
 /// The inverse of `asset_amounts_to_json`.
-///
-/// No caller until Task 4 wires the auction queries; `#[allow(dead_code)]`
-/// until then, removed when that task lands.
-#[allow(dead_code)]
 fn asset_amounts_from_json(
     value: &Value,
     column: &'static str,
@@ -431,6 +425,192 @@ impl Store {
         .fetch_one(&self.pool)
         .await?;
         Ok(row.count)
+    }
+}
+
+/// An auction the bot knows about: opened by a `new_auction` event, reduced
+/// by a partial `fill_auction`, removed by a full fill or a
+/// `delete_auction`. `fill_ledger` is the filler's current plan, not
+/// anything the chain says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackedAuction {
+    /// The pool contract.
+    pub pool: String,
+    /// The account being auctioned.
+    pub account: String,
+    /// Which auction: user liquidation, bad debt or interest.
+    pub auction_type: AuctionType,
+    /// The ledger the auction was created in, from which its Dutch ramp is
+    /// measured.
+    pub start_ledger: u32,
+    /// The ledger the filler intends to fill at, once it has planned one.
+    pub fill_ledger: Option<u32>,
+    /// The share of the position auctioned, 1 to 100.
+    pub percent: u32,
+    /// Asset address to amount the filler pays.
+    pub bid: BTreeMap<String, i128>,
+    /// Asset address to amount the filler receives.
+    pub lot: BTreeMap<String, i128>,
+    /// The ledger this row was last written at.
+    pub updated_ledger: u32,
+}
+
+/// The `smallint` an auction type is stored as.
+fn auction_type_code(auction_type: AuctionType) -> i16 {
+    match auction_type {
+        AuctionType::UserLiquidation => 0,
+        AuctionType::BadDebt => 1,
+        AuctionType::Interest => 2,
+    }
+}
+
+/// The inverse, rejecting a discriminant the contract never emits.
+fn auction_type_from_code(code: i16) -> Result<AuctionType, StoreError> {
+    let value = u32::try_from(code).map_err(|_| StoreError::Decimal {
+        column: "auction_type",
+        value: code.to_string(),
+    })?;
+    AuctionType::try_from(value).map_err(|_| StoreError::Decimal {
+        column: "auction_type",
+        value: code.to_string(),
+    })
+}
+
+/// A `smallint` percent back into the 1-to-100 range the contract uses.
+fn percent_from_code(code: i16) -> Result<u32, StoreError> {
+    u32::try_from(code).map_err(|_| StoreError::Decimal {
+        column: "percent",
+        value: code.to_string(),
+    })
+}
+
+impl Store {
+    /// Writes an auction, replacing any previous row for the same pool,
+    /// account and type.
+    pub async fn upsert_auction(&self, auction: &TrackedAuction) -> Result<(), StoreError> {
+        let percent = i16::try_from(auction.percent).map_err(|_| StoreError::Decimal {
+            column: "percent",
+            value: auction.percent.to_string(),
+        })?;
+        sqlx::query!(
+            "INSERT INTO auctions (pool, account, auction_type, start_ledger, fill_ledger,
+                                   percent, bid, lot, updated_ledger)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             ON CONFLICT (pool, account, auction_type) DO UPDATE
+               SET start_ledger = EXCLUDED.start_ledger,
+                   fill_ledger = EXCLUDED.fill_ledger,
+                   percent = EXCLUDED.percent,
+                   bid = EXCLUDED.bid,
+                   lot = EXCLUDED.lot,
+                   updated_ledger = EXCLUDED.updated_ledger",
+            auction.pool,
+            auction.account,
+            auction_type_code(auction.auction_type),
+            i64::from(auction.start_ledger),
+            auction.fill_ledger.map(i64::from),
+            percent,
+            asset_amounts_to_json(&auction.bid),
+            asset_amounts_to_json(&auction.lot),
+            i64::from(auction.updated_ledger),
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Removes an auction. `true` when a row went away.
+    pub async fn delete_auction(
+        &self,
+        pool: &str,
+        account: &str,
+        auction_type: AuctionType,
+    ) -> Result<bool, StoreError> {
+        let done = sqlx::query!(
+            "DELETE FROM auctions WHERE pool = $1 AND account = $2 AND auction_type = $3",
+            pool,
+            account,
+            auction_type_code(auction_type),
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// One auction.
+    ///
+    /// Filters by pool and account only, then matches `auction_type` after
+    /// decoding: a SQL-level `auction_type = $3` filter built from the
+    /// caller's (always valid) `AuctionType` could never match a row a
+    /// corrupted write left with an out-of-range discriminant, so a
+    /// corrupted row would silently read back as "no such auction" instead
+    /// of surfacing the decode error.
+    pub async fn auction(
+        &self,
+        pool: &str,
+        account: &str,
+        auction_type: AuctionType,
+    ) -> Result<Option<TrackedAuction>, StoreError> {
+        let rows = sqlx::query!(
+            "SELECT pool, account, auction_type, start_ledger, fill_ledger, percent,
+                    bid, lot, updated_ledger
+             FROM auctions WHERE pool = $1 AND account = $2",
+            pool,
+            account,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for row in rows {
+            let decoded_type = auction_type_from_code(row.auction_type)?;
+            if decoded_type != auction_type {
+                continue;
+            }
+            return Ok(Some(TrackedAuction {
+                pool: row.pool,
+                account: row.account,
+                auction_type: decoded_type,
+                start_ledger: ledger(row.start_ledger, "start_ledger")?,
+                fill_ledger: row
+                    .fill_ledger
+                    .map(|value| ledger(value, "fill_ledger"))
+                    .transpose()?,
+                percent: percent_from_code(row.percent)?,
+                bid: asset_amounts_from_json(&row.bid, "bid")?,
+                lot: asset_amounts_from_json(&row.lot, "lot")?,
+                updated_ledger: ledger(row.updated_ledger, "updated_ledger")?,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Every auction the bot has open in a pool, oldest first: the filler
+    /// walks them in the order they became fillable.
+    pub async fn open_auctions(&self, pool: &str) -> Result<Vec<TrackedAuction>, StoreError> {
+        let rows = sqlx::query!(
+            "SELECT pool, account, auction_type, start_ledger, fill_ledger, percent,
+                    bid, lot, updated_ledger
+             FROM auctions WHERE pool = $1 ORDER BY start_ledger ASC, account ASC",
+            pool
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(TrackedAuction {
+                    pool: row.pool,
+                    account: row.account,
+                    auction_type: auction_type_from_code(row.auction_type)?,
+                    start_ledger: ledger(row.start_ledger, "start_ledger")?,
+                    fill_ledger: row
+                        .fill_ledger
+                        .map(|value| ledger(value, "fill_ledger"))
+                        .transpose()?,
+                    percent: percent_from_code(row.percent)?,
+                    bid: asset_amounts_from_json(&row.bid, "bid")?,
+                    lot: asset_amounts_from_json(&row.lot, "lot")?,
+                    updated_ledger: ledger(row.updated_ledger, "updated_ledger")?,
+                })
+            })
+            .collect()
     }
 }
 
@@ -712,6 +892,120 @@ mod tests {
             store.users_stale(POOL, 500, 1).await.expect("limit").len(),
             1
         );
+        Ok(())
+    }
+
+    fn auction(account: &str, start_ledger: u32) -> TrackedAuction {
+        let mut bid = BTreeMap::new();
+        bid.insert("CUSDC".to_string(), 1_000_i128);
+        let mut lot = BTreeMap::new();
+        lot.insert("CXLM".to_string(), 2_000_i128);
+        TrackedAuction {
+            pool: POOL.to_string(),
+            account: account.to_string(),
+            auction_type: AuctionType::UserLiquidation,
+            start_ledger,
+            fill_ledger: None,
+            percent: 100,
+            bid,
+            lot,
+            updated_ledger: start_ledger,
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_auction_round_trips_and_upsert_replaces(pool: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(pool);
+        let kind = AuctionType::UserLiquidation;
+        assert_eq!(store.auction(POOL, USER, kind).await.expect("read"), None);
+
+        let mut open = auction(USER, 64_291_297);
+        store.upsert_auction(&open).await.expect("insert");
+        assert_eq!(
+            store.auction(POOL, USER, kind).await.expect("read"),
+            Some(open.clone())
+        );
+
+        // The filler plans a fill ledger and a partial percent.
+        open.fill_ledger = Some(64_291_400);
+        open.percent = 60;
+        open.updated_ledger = 64_291_350;
+        store.upsert_auction(&open).await.expect("update");
+        assert_eq!(
+            store.auction(POOL, USER, kind).await.expect("read"),
+            Some(open)
+        );
+        Ok(())
+    }
+
+    /// The three auction types are separate rows for one account.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn auction_types_do_not_collide(pool: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(pool);
+        for kind in [
+            AuctionType::UserLiquidation,
+            AuctionType::BadDebt,
+            AuctionType::Interest,
+        ] {
+            let mut row = auction(USER, 10);
+            row.auction_type = kind;
+            store.upsert_auction(&row).await.expect("insert");
+        }
+        assert_eq!(store.open_auctions(POOL).await.expect("list").len(), 3);
+        assert!(store
+            .delete_auction(POOL, USER, AuctionType::BadDebt)
+            .await
+            .expect("delete"));
+        assert_eq!(store.open_auctions(POOL).await.expect("list").len(), 2);
+        assert!(!store
+            .delete_auction(POOL, USER, AuctionType::BadDebt)
+            .await
+            .expect("again"));
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn open_auctions_come_back_in_start_order(pool: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(pool);
+        store.upsert_auction(&auction(USER, 300)).await.expect("a");
+        store
+            .upsert_auction(&auction(FILLER, 100))
+            .await
+            .expect("b");
+        let open = store.open_auctions(POOL).await.expect("list");
+        let accounts: Vec<&str> = open.iter().map(|a| a.account.as_str()).collect();
+        assert_eq!(accounts, [FILLER, USER]);
+        assert!(store
+            .open_auctions("COTHER")
+            .await
+            .expect("other")
+            .is_empty());
+        Ok(())
+    }
+
+    /// A discriminant the contract never emits cannot be read back as an
+    /// auction type.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_unknown_auction_type_in_the_row_is_an_error(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        sqlx::query!(
+            "INSERT INTO auctions (pool, account, auction_type, start_ledger, percent, bid, lot, updated_ledger)
+             VALUES ($1, $2, $3, $4, $5, '{}'::jsonb, '{}'::jsonb, $4)",
+            POOL, USER, 7_i16, 10_i64, 100_i16,
+        )
+        .execute(&pool)
+        .await?;
+        let store = Store::from_pool(pool);
+        assert!(matches!(
+            store
+                .auction(POOL, USER, AuctionType::UserLiquidation)
+                .await,
+            Err(StoreError::Decimal {
+                column: "auction_type",
+                ..
+            })
+        ));
         Ok(())
     }
 }
