@@ -12,6 +12,11 @@
 //! events between are gone. The poller reports that as a `Gap` and restarts
 //! at the window's edge, leaving the tracker to reseed rather than pretend
 //! the missing ledgers held nothing.
+//!
+//! A pass that cannot prove it drained the range — paging stalled,
+//! repeated, or ran past a hard cap — leaves the cursor untouched, for the
+//! same reason: the bot re-reads rather than skips, and a persistently
+//! broken RPC stalls visibly instead of silently losing ledgers.
 
 use std::time::Duration;
 
@@ -103,6 +108,22 @@ pub enum LedgerError {
     Closed,
 }
 
+/// A page count beyond which paging is presumed broken rather than merely
+/// long: at the default 200-event page this is two million events in one
+/// pass, far beyond any legitimate backlog. It exists to bound a
+/// misbehaving RPC, not a busy one.
+pub const MAX_PAGES: usize = 10_000;
+
+/// The result of paging through one `getEvents` range.
+struct DrainOutcome {
+    /// Whether a short page proved the range was fully read.
+    drained: bool,
+    /// How many pages were fetched.
+    pages: usize,
+    /// Why paging stopped without draining; `None` when `drained` is `true`.
+    stall_reason: Option<&'static str>,
+}
+
 /// Follows one pool's events.
 #[derive(Debug)]
 pub struct LedgerPoller<'a> {
@@ -160,8 +181,102 @@ impl<'a> LedgerPoller<'a> {
         }
     }
 
+    /// Pages `getEvents` from `start`, decoding and sending every pool
+    /// event along the way, until a short page proves the range is
+    /// drained. Stops early — without claiming the range drained — when
+    /// paging looks broken: the page count reaches [`MAX_PAGES`], the
+    /// returned cursor equals the one just used, or a full page carries no
+    /// cursor at all.
+    async fn drain_events(
+        &self,
+        start: u32,
+        sender: &mpsc::Sender<PollerMessage>,
+    ) -> Result<DrainOutcome, LedgerError> {
+        // The cursor used for the request just sent, or `None` on the first
+        // page when `start` drives it instead; it doubles as "the cursor
+        // just used" for the repeat check below.
+        let mut request_cursor: Option<String> = None;
+        let mut pages: usize = 0;
+        loop {
+            pages += 1;
+            let page = self
+                .rpc
+                .events(&EventQuery {
+                    start_ledger: request_cursor.is_none().then_some(start),
+                    cursor: request_cursor.as_deref(),
+                    contract_ids: &[self.pool],
+                    limit: self.config.page_limit,
+                })
+                .await?;
+            let count = page.events.len();
+            for event in &page.events {
+                if event.contract_id != self.pool || !event.in_successful_contract_call {
+                    continue;
+                }
+                match decode_pool_event(&event.topics, &event.value) {
+                    Ok(Some(decoded)) => {
+                        send(
+                            sender,
+                            PollerMessage::Event {
+                                pool: self.pool.to_string(),
+                                ledger: event.ledger,
+                                event: decoded,
+                            },
+                        )
+                        .await?;
+                    }
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(
+                        pool = self.pool,
+                        ledger = event.ledger,
+                        id = %event.id,
+                        %error,
+                        "an event this bot models did not decode; skipping it"
+                    ),
+                }
+            }
+            // A short page is the last one; the range is drained.
+            if count < usize::try_from(self.config.page_limit).unwrap_or(usize::MAX) {
+                return Ok(DrainOutcome {
+                    drained: true,
+                    pages,
+                    stall_reason: None,
+                });
+            }
+            // A full page means there is more to read. Bound how long that
+            // can go on, and refuse to trust a cursor that did not move or
+            // never came back — either would page forever or skip on the
+            // next poll, and both are worse than pausing here.
+            if pages >= MAX_PAGES {
+                return Ok(DrainOutcome {
+                    drained: false,
+                    pages,
+                    stall_reason: Some("page cap reached"),
+                });
+            }
+            match page.cursor {
+                Some(next) if Some(next.as_str()) == request_cursor.as_deref() => {
+                    return Ok(DrainOutcome {
+                        drained: false,
+                        pages,
+                        stall_reason: Some("cursor did not advance"),
+                    });
+                }
+                Some(next) => request_cursor = Some(next),
+                None => {
+                    return Ok(DrainOutcome {
+                        drained: false,
+                        pages,
+                        stall_reason: Some("full page returned no cursor"),
+                    });
+                }
+            }
+        }
+    }
+
     /// One pass: head, events since the cursor, then the tick and the
-    /// cursor. `None` when the chain has not moved.
+    /// cursor. `None` when the chain has not moved, or when the pass could
+    /// not prove it drained the range and left the cursor untouched.
     pub async fn poll_once(
         &self,
         sender: &mpsc::Sender<PollerMessage>,
@@ -200,53 +315,19 @@ impl<'a> LedgerPoller<'a> {
             return Ok(None);
         }
 
-        let mut cursor: Option<String> = None;
-        loop {
-            let page = self
-                .rpc
-                .events(&EventQuery {
-                    start_ledger: cursor.is_none().then_some(start),
-                    cursor: cursor.as_deref(),
-                    contract_ids: &[self.pool],
-                    limit: self.config.page_limit,
-                })
-                .await?;
-            let count = page.events.len();
-            for event in &page.events {
-                if event.contract_id != self.pool || !event.in_successful_contract_call {
-                    continue;
-                }
-                match decode_pool_event(&event.topics, &event.value) {
-                    Ok(Some(decoded)) => {
-                        send(
-                            sender,
-                            PollerMessage::Event {
-                                pool: self.pool.to_string(),
-                                ledger: event.ledger,
-                                event: decoded,
-                            },
-                        )
-                        .await?;
-                    }
-                    Ok(None) => {}
-                    Err(error) => tracing::warn!(
-                        pool = self.pool,
-                        ledger = event.ledger,
-                        id = %event.id,
-                        %error,
-                        "an event this bot models did not decode; skipping it"
-                    ),
-                }
-            }
-            // A short page is the last one; the next poll starts from the
-            // ledger after the tick.
-            if count < usize::try_from(self.config.page_limit).unwrap_or(usize::MAX) {
-                break;
-            }
-            match page.cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
+        let outcome = self.drain_events(start, sender).await?;
+
+        // Only a drained pass may advance the cursor: events already sent
+        // stay sent (applying one twice is idempotent), but a pass that
+        // cannot prove it read everything must not tell the store it did.
+        if !outcome.drained {
+            tracing::warn!(
+                pool = self.pool,
+                reason = outcome.stall_reason.unwrap_or("unknown"),
+                pages = outcome.pages,
+                "the event stream did not drain; not advancing the cursor"
+            );
+            return Ok(None);
         }
 
         let tick = LedgerTick {
@@ -343,7 +424,7 @@ mod tests {
         rpc.expect("getLatestLedger", latest(64_291_297, 1_788_645_403));
         rpc.expect(
             "getEvents",
-            json!({"latestLedger": 64_291_297, "cursor": null, "events": []}),
+            json!({"latestLedger": 64_291_297, "cursor": "64291297-4294967295", "events": []}),
         );
         let client = RpcClient::new(&rpc.url(), None).unwrap();
         let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
@@ -453,7 +534,7 @@ mod tests {
         rpc.expect("getLatestLedger", latest(500_000, 1_788_645_403));
         rpc.expect(
             "getEvents",
-            json!({"latestLedger": 500_000, "cursor": null, "events": []}),
+            json!({"latestLedger": 500_000, "cursor": "500000-4294967295", "events": []}),
         );
         let client = RpcClient::new(&rpc.url(), None).unwrap();
         let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
@@ -495,7 +576,7 @@ mod tests {
         rpc.expect("getLatestLedger", latest(101, 1_788_645_403));
         rpc.expect(
             "getEvents",
-            json!({"latestLedger": 101, "cursor": null, "events": [unmodelled, foreign]}),
+            json!({"latestLedger": 101, "cursor": "101-4294967295", "events": [unmodelled, foreign]}),
         );
         let client = RpcClient::new(&rpc.url(), None).unwrap();
         let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
@@ -562,6 +643,98 @@ mod tests {
         assert_eq!(
             store.cursor(&events_cursor(POOL)).await.expect("cursor"),
             Some(at_head)
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_pass_that_does_not_drain_leaves_the_cursor_alone(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let before = Cursor {
+            ledger: 100,
+            paging_token: None,
+        };
+        store
+            .set_cursor(&events_cursor(POOL), &before)
+            .await
+            .expect("cursor");
+        let rpc = ScriptedRpc::start().await;
+        rpc.expect("getHealth", health(103, 1));
+        rpc.expect("getLatestLedger", latest(103, 1_788_645_403));
+        // A full page (exactly `page_limit` events) whose cursor comes back
+        // unchanged on the next request: the range never advances.
+        rpc.expect(
+            "getEvents",
+            json!({"latestLedger": 103, "cursor": "101-1", "events": [borrow_event(101, 1), borrow_event(101, 2)]}),
+        );
+        rpc.expect(
+            "getEvents",
+            json!({"latestLedger": 103, "cursor": "101-1", "events": [borrow_event(101, 3), borrow_event(101, 4)]}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        let config = PollerConfig {
+            page_limit: 2,
+            ..config()
+        };
+        let poller = LedgerPoller::new(&client, &store, POOL, config);
+
+        assert_eq!(poller.poll_once(&sender).await.expect("poll"), None);
+        while let Ok(message) = receiver.try_recv() {
+            assert!(
+                !matches!(message, PollerMessage::Tick { .. }),
+                "a pass that did not drain must not tick"
+            );
+        }
+        assert_eq!(
+            store.cursor(&events_cursor(POOL)).await.expect("cursor"),
+            Some(before)
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_full_page_without_a_cursor_does_not_advance_the_cursor(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let before = Cursor {
+            ledger: 100,
+            paging_token: None,
+        };
+        store
+            .set_cursor(&events_cursor(POOL), &before)
+            .await
+            .expect("cursor");
+        let rpc = ScriptedRpc::start().await;
+        rpc.expect("getHealth", health(103, 1));
+        rpc.expect("getLatestLedger", latest(103, 1_788_645_403));
+        // A full page with no cursor at all: real RPCs never do this, but
+        // if one ever did the bot must not skip past it.
+        rpc.expect(
+            "getEvents",
+            json!({"latestLedger": 103, "cursor": null, "events": [borrow_event(101, 1), borrow_event(101, 2)]}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        let config = PollerConfig {
+            page_limit: 2,
+            ..config()
+        };
+        let poller = LedgerPoller::new(&client, &store, POOL, config);
+
+        assert_eq!(poller.poll_once(&sender).await.expect("poll"), None);
+        while let Ok(message) = receiver.try_recv() {
+            assert!(
+                !matches!(message, PollerMessage::Tick { .. }),
+                "a pass that did not drain must not tick"
+            );
+        }
+        assert_eq!(
+            store.cursor(&events_cursor(POOL)).await.expect("cursor"),
+            Some(before)
         );
         Ok(())
     }
