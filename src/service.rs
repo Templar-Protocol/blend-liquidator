@@ -732,6 +732,18 @@ mod tests {
         }
     }
 
+    /// A second, usable-but-unpriced reserve: neither the primary asset nor
+    /// a listed supported asset in any test that uses it, so it exercises
+    /// only the oracle-warning branch, not `validate_primary_asset`'s or
+    /// `validate_supported_assets`'s already-covered `Err` paths.
+    fn unpriced_reserve() -> SyntheticReserve {
+        SyntheticReserve {
+            asset: BLND,
+            price: None,
+            ..usable_reserve()
+        }
+    }
+
     /// Validation accepts the fixture pool and reports its reserves.
     #[sqlx::test(migrations = "./migrations")]
     async fn validation_accepts_a_pool_that_loads_from_chain(db: sqlx::PgPool) -> sqlx::Result<()> {
@@ -760,6 +772,81 @@ mod tests {
         assert!(
             warnings.is_empty(),
             "an active, fully priced pool has no warnings: {warnings:?}"
+        );
+        Ok(())
+    }
+
+    /// A non-active pool status is a warning that still lets validation
+    /// succeed, not an error: a frozen or on-ice pool must let the bot
+    /// start and warn, not refuse to start.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_non_active_pool_status_is_a_warning_not_an_error(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let _store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        script_pool(
+            &rpc,
+            POOL_A,
+            BACKSTOP_A,
+            PoolStatus::Frozen.code(),
+            &[usable_reserve()],
+            LEDGER,
+        );
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let pool = pool_config(POOL_A, USDC, &[USDC], &["*"]);
+
+        let (validations, warnings) = validate(&client, &[pool])
+            .await
+            .expect("a non-active pool status is a warning, not an error");
+        assert_eq!(
+            validations.len(),
+            1,
+            "validation still succeeded and reported the pool"
+        );
+        assert_eq!(validations[0].pool, POOL_A);
+        assert_eq!(
+            warnings,
+            vec![format!(
+                "pool {POOL_A}: status is {:?}, not active",
+                PoolStatus::Frozen
+            )],
+            "the warning must name the pool and its actual status"
+        );
+        Ok(())
+    }
+
+    /// An asset the oracle does not price is a warning that still lets
+    /// validation succeed, not an error: an oracle that has stopped
+    /// pricing one reserve must let the bot start and warn, not refuse to
+    /// start.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_unpriced_reserve_is_a_warning_not_an_error(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let _store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        script_pool(
+            &rpc,
+            POOL_A,
+            BACKSTOP_A,
+            PoolStatus::Active.code(),
+            &[usable_reserve(), unpriced_reserve()],
+            LEDGER,
+        );
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let pool = pool_config(POOL_A, USDC, &[USDC], &["*"]);
+
+        let (validations, warnings) = validate(&client, &[pool])
+            .await
+            .expect("an unpriced reserve is a warning, not an error");
+        assert_eq!(validations.len(), 1);
+        assert_eq!(
+            validations[0].reserves, 2,
+            "both reserves are reported, priced or not"
+        );
+        assert_eq!(
+            warnings,
+            vec![format!("pool {POOL_A}: the oracle has no price for {BLND}")],
+            "the warning must name the unpriced asset"
         );
         Ok(())
     }
