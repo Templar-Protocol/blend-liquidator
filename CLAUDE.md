@@ -171,6 +171,9 @@ filler and executor, unwind, and the operational surface.
 ## Where things live
 
 - `src/` — the crate (binary `liquidator`, lib root `src/liquidator.rs`).
+- `pools.example.toml`, `seed.example.toml` — annotated examples of the
+  `POOLS_FILE`/`POOLS_TOML` and `SEED_FILE` formats, referenced from
+  `.env.example`.
 - `scripts/` — repo-invariant and release preflight checks, review tooling.
 - `docs/` — design specs.
 - `.github/workflows/` — CI and release automation.

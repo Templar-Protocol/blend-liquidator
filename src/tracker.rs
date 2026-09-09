@@ -10,6 +10,10 @@
 //! adjusted, so an event applied twice cannot drift a balance. The chain,
 //! not the event, is the source of every number the store holds.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+use std::time::Duration;
+
 use crate::chain::pool::PoolReader;
 use crate::chain::rpc::RpcClient;
 use crate::chain::xdr::PoolEvent;
@@ -205,6 +209,237 @@ impl<'a> Tracker<'a> {
         let accounts: Vec<String> = stale.into_iter().map(|user| user.account).collect();
         self.refresh(pool, &accounts, tick).await
     }
+
+    /// Seeds `pool`'s tracked-user set: collects accounts from every
+    /// source, deduplicates them, and refreshes them from chain in batches
+    /// of `batch`. A source that fails is logged and skipped rather than
+    /// failing the whole seed — the spec makes a failed seed a warning, not
+    /// a startup failure, because every submission still acts only on an
+    /// account [`Tracker::refresh`] has itself verified from chain: an
+    /// incomplete seed costs coverage, never correctness.
+    pub async fn seed(
+        &self,
+        pool: &str,
+        sources: &[SeedSource],
+        tick: LedgerTick,
+        batch: u32,
+    ) -> Result<RefreshOutcome, TrackerError> {
+        let mut accounts: BTreeSet<String> = BTreeSet::new();
+        for source in sources {
+            match source.accounts(pool).await {
+                Ok(found) => accounts.extend(found),
+                Err(error) => {
+                    tracing::warn!(pool, %error, "a seed source failed; skipping it");
+                }
+            }
+        }
+        let accounts: Vec<String> = accounts.into_iter().collect();
+        // `chunks` panics on a zero size; a batch this small is nonsensical
+        // but must not crash the seed over it.
+        let batch = usize::try_from(batch).unwrap_or(usize::MAX).max(1);
+        let mut outcome = RefreshOutcome::default();
+        for chunk in accounts.chunks(batch) {
+            let result = self.refresh(pool, chunk, tick).await?;
+            outcome.tracked += result.tracked;
+            outcome.removed += result.removed;
+        }
+        Ok(outcome)
+    }
+}
+
+/// A failure seeding the tracker's initial user set.
+#[derive(Debug, thiserror::Error)]
+pub enum SeedError {
+    /// The request never produced a response, or the client could not be
+    /// built.
+    #[error("seed request: {0}")]
+    Http(#[from] reqwest::Error),
+    /// The seed source answered with a non-2xx status.
+    #[error("seed source status {status}")]
+    Status {
+        /// The HTTP status.
+        status: u16,
+    },
+    /// A 200 whose body was not the documented shape.
+    #[error("seed response shape: {0}")]
+    Shape(String),
+    /// The seed file could not be read or parsed.
+    #[error("seed file: {0}")]
+    File(String),
+}
+
+/// Renders a 7-decimal fixed-point value as its shortest decimal text,
+/// without ever going through a float: `whole = value / SCALAR_7`,
+/// `fraction = value % SCALAR_7`, trailing zeros trimmed. Assumes `value`
+/// is non-negative, which every parsed `Decimal7` knob is.
+fn render_decimal7(value: i128) -> String {
+    let whole = value / SCALAR_7;
+    let fraction = value % SCALAR_7;
+    if fraction == 0 {
+        return whole.to_string();
+    }
+    let digits = format!("{fraction:07}");
+    let trimmed = digits.trim_end_matches('0');
+    format!("{whole}.{trimmed}")
+}
+
+/// Page size the analytics API is asked for.
+const SEED_PAGE_LIMIT: u32 = 500;
+/// Stop paging after this many pages even if the cursor keeps coming back,
+/// so a misbehaving endpoint stalls visibly instead of paging forever.
+const SEED_PAGE_CAP: usize = 200;
+/// Pause between pages, to stay under the endpoint's anonymous rate limit.
+const SEED_PAGE_PAUSE: Duration = Duration::from_millis(200);
+
+/// The public Blend analytics API's positions endpoint, walked by cursor.
+///
+/// Only `accountId` is read from each position: the API's own health
+/// factor is a third party's float, and every seeded account is re-valued
+/// from chain — by [`Tracker::refresh`] — before the bot trusts it.
+#[derive(Debug, Clone)]
+pub struct AnalyticsSeed {
+    http: reqwest::Client,
+    base_url: String,
+    health_factor_max: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AnalyticsPage {
+    positions: Vec<AnalyticsPosition>,
+    #[serde(default)]
+    next_cursor: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AnalyticsPosition {
+    account_id: String,
+}
+
+impl AnalyticsSeed {
+    /// A client for the analytics API at `base_url`, sending
+    /// `healthFactorMax` rendered from `health_factor_max`'s 7-decimal
+    /// fixed point. Built the way [`crate::chain::rpc::RpcClient::new`]
+    /// builds its client — a bounded timeout and connect timeout, and the
+    /// crate's own user agent — rather than `reqwest::Client::new()`.
+    pub fn new(base_url: &str, health_factor_max: i128) -> Result<Self, SeedError> {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .user_agent(concat!("blend-liquidator/", env!("CARGO_PKG_VERSION")))
+            .build()?;
+        Ok(Self {
+            http,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            health_factor_max: render_decimal7(health_factor_max),
+        })
+    }
+
+    /// Walks every page of `pool`'s positions, returning every `accountId`
+    /// in the order the API gave them. A null `nextCursor`, or one the API
+    /// omits entirely (an unknown pool answers this way, with no
+    /// positions), both end the walk without error. Caps at `SEED_PAGE_CAP`
+    /// pages, logging a warning rather than looping forever when a cursor
+    /// never comes back null.
+    pub async fn accounts(&self, pool: &str) -> Result<Vec<String>, SeedError> {
+        let url = format!("{}/v1/analytics/state/positions", self.base_url);
+        let mut accounts = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages: usize = 0;
+        loop {
+            pages += 1;
+            let mut query = vec![
+                ("healthFactorMax", self.health_factor_max.clone()),
+                ("poolId", pool.to_string()),
+                ("limit", SEED_PAGE_LIMIT.to_string()),
+            ];
+            if let Some(cursor) = &cursor {
+                query.push(("cursor", cursor.clone()));
+            }
+            let response = self.http.get(&url).query(&query).send().await?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(SeedError::Status {
+                    status: status.as_u16(),
+                });
+            }
+            let text = response.text().await?;
+            let body: AnalyticsPage = serde_json::from_str(&text)
+                .map_err(|error| SeedError::Shape(format!("{error}: {text}")))?;
+            accounts.extend(
+                body.positions
+                    .into_iter()
+                    .map(|position| position.account_id),
+            );
+            let Some(next) = body.next_cursor else {
+                break;
+            };
+            if pages >= SEED_PAGE_CAP {
+                tracing::warn!(
+                    pool,
+                    pages,
+                    "seed pagination hit the page cap without a null cursor; stopping"
+                );
+                break;
+            }
+            cursor = Some(next);
+            tokio::time::sleep(SEED_PAGE_PAUSE).await;
+        }
+        Ok(accounts)
+    }
+}
+
+/// A static file of pool address to tracked-account list, for a network the
+/// analytics API does not cover, or as a supplement to it.
+#[derive(Debug, Clone)]
+pub struct FileSeed {
+    accounts: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSeedFile {
+    accounts: BTreeMap<String, Vec<String>>,
+}
+
+impl FileSeed {
+    /// Reads and parses the seed file: one `[accounts]` table mapping pool
+    /// address to account list.
+    pub fn load(path: &Path) -> Result<Self, SeedError> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| SeedError::File(format!("{}: {error}", path.display())))?;
+        let raw: RawSeedFile = toml::from_str(&text)
+            .map_err(|error| SeedError::File(format!("{}: {error}", path.display())))?;
+        Ok(Self {
+            accounts: raw.accounts,
+        })
+    }
+
+    /// The accounts the file lists for `pool`, or empty when it does not
+    /// mention that pool at all.
+    fn accounts(&self, pool: &str) -> Vec<String> {
+        self.accounts.get(pool).cloned().unwrap_or_default()
+    }
+}
+
+/// Where the tracker's initial user set comes from.
+#[derive(Debug, Clone)]
+pub enum SeedSource {
+    /// The public Blend analytics API.
+    Analytics(AnalyticsSeed),
+    /// A static file.
+    File(FileSeed),
+}
+
+impl SeedSource {
+    /// `pool`'s accounts from this source.
+    pub async fn accounts(&self, pool: &str) -> Result<Vec<String>, SeedError> {
+        match self {
+            Self::Analytics(analytics) => analytics.accounts(pool).await,
+            Self::File(file) => Ok(file.accounts(pool)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -213,6 +448,9 @@ mod tests {
 
     use serde_json::json;
     use stellar_xdr::{ContractDataDurability, ContractDataEntry, ExtensionPoint, LedgerEntryData};
+
+    use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
     use crate::chain::script::ScriptedRpc;
@@ -230,6 +468,22 @@ mod tests {
     const USDC: &str = "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75";
     const REPAID: &str = "GCC4A2FN5BIXW6I57LKMP4XK7WVNZJWDCD5JZGGQKAI45PNTPC5NU6U4";
     const NEVER_TRACKED: &str = "GAX2VVWVHU5YQY5J3NJBXKHI3FFKZN54BE6GRJCWSIKSBZTQWJJNJMPC";
+
+    /// Writes `contents` to a fresh temporary file and returns its path, for
+    /// the seed-file tests: a real path `FileSeed::load` reads, rather than
+    /// a string it never gets to parse from disk. Every caller removes the
+    /// file itself once done with it.
+    fn write_temp_seed_file(contents: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "blend-liquidator-seed-test-{}-{id}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, contents).expect("write temp seed file");
+        path
+    }
 
     fn stale_user(account: &str, updated_ledger: u32) -> TrackedUser {
         let mut collateral = BTreeMap::new();
@@ -669,6 +923,283 @@ mod tests {
             !requested(NEVER_TRACKED),
             "the newest row was excluded by the batch"
         );
+        Ok(())
+    }
+
+    /// Two pages, then a null cursor: every accountId, in order, once.
+    #[tokio::test]
+    async fn the_analytics_source_follows_the_cursor_to_the_end() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/analytics/state/positions"))
+            .and(query_param("poolId", POOL))
+            .and(query_param_is_missing("cursor"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "positions": [
+                    {"accountId": USER_ONE, "healthFactor": 0.4},
+                    {"accountId": USER_TWO, "healthFactor": 0.5},
+                ],
+                "nextCursor": "page-2",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/analytics/state/positions"))
+            .and(query_param("poolId", POOL))
+            .and(query_param("cursor", "page-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "positions": [{"accountId": USDC, "healthFactor": 0.9}],
+                "nextCursor": null,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let seed = AnalyticsSeed::new(&server.uri(), 100_000_000).expect("client");
+        let accounts = seed.accounts(POOL).await.expect("accounts");
+        assert_eq!(
+            accounts,
+            vec![USER_ONE.to_string(), USER_TWO.to_string(), USDC.to_string()],
+            "every accountId, in the order the pages gave them, exactly once"
+        );
+    }
+
+    /// A null `nextCursor` and an absent one both end the walk, and an
+    /// unknown pool's empty `positions` is not an error.
+    #[tokio::test]
+    async fn an_unknown_pool_seeds_nothing_without_failing() {
+        const UNKNOWN_POOL: &str = "unknown-pool";
+        let server = MockServer::start().await;
+        // A null `nextCursor` ends the walk after one page even though the
+        // page carries data.
+        Mock::given(method("GET"))
+            .and(path("/v1/analytics/state/positions"))
+            .and(query_param("poolId", POOL))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "positions": [{"accountId": USER_ONE, "healthFactor": 0.4}],
+                "nextCursor": null,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // An unknown pool's real response: no `nextCursor` field at all,
+        // and an empty `positions` array — not an error, just nothing.
+        Mock::given(method("GET"))
+            .and(path("/v1/analytics/state/positions"))
+            .and(query_param("poolId", UNKNOWN_POOL))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "positions": [],
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let seed = AnalyticsSeed::new(&server.uri(), 100_000_000).expect("client");
+        assert_eq!(
+            seed.accounts(POOL)
+                .await
+                .expect("a null cursor ends the walk"),
+            vec![USER_ONE.to_string()]
+        );
+        assert_eq!(
+            seed.accounts(UNKNOWN_POOL)
+                .await
+                .expect("an absent cursor and empty positions are not an error"),
+            Vec::<String>::new()
+        );
+    }
+
+    /// A non-200, and a 200 whose body is not the documented shape, are
+    /// errors that name what happened rather than seeding silently.
+    #[tokio::test]
+    async fn a_bad_status_or_shape_is_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/analytics/state/positions"))
+            .and(query_param("poolId", "bad-status"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/analytics/state/positions"))
+            .and(query_param("poolId", "bad-shape"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"{"positions": "not-an-array"}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let seed = AnalyticsSeed::new(&server.uri(), 100_000_000).expect("client");
+        assert!(
+            matches!(
+                seed.accounts("bad-status").await.unwrap_err(),
+                SeedError::Status { status: 503 }
+            ),
+            "a non-200 status is a Status error"
+        );
+        assert!(
+            matches!(
+                seed.accounts("bad-shape").await.unwrap_err(),
+                SeedError::Shape(_)
+            ),
+            "a 200 with an undocumented body shape is a Shape error"
+        );
+    }
+
+    /// The query carries the pool, the limit and the health factor rendered
+    /// from 7-decimal fixed point, and the cursor only on later pages.
+    #[tokio::test]
+    async fn the_query_carries_the_pool_and_the_rendered_health_factor() {
+        let server = MockServer::start().await;
+        // The first page, matched only while unconsumed: no cursor.
+        Mock::given(method("GET"))
+            .and(path("/v1/analytics/state/positions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "positions": [],
+                "nextCursor": "next-page",
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Falls through to this one on the second request.
+        Mock::given(method("GET"))
+            .and(path("/v1/analytics/state/positions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "positions": [],
+                "nextCursor": null,
+            })))
+            .mount(&server)
+            .await;
+
+        // 1.5 in 7-decimal fixed point, the same mapping config.rs's
+        // Decimal7 test pins the other direction.
+        let seed = AnalyticsSeed::new(&server.uri(), 15_000_000).expect("client");
+        seed.accounts(POOL).await.expect("accounts");
+
+        let requests = server.received_requests().await.expect("recorded");
+        assert_eq!(requests.len(), 2, "one request per page");
+        let query = |index: usize| -> std::collections::HashMap<String, String> {
+            requests[index].url.query_pairs().into_owned().collect()
+        };
+        let first = query(0);
+        assert_eq!(first.get("poolId").map(String::as_str), Some(POOL));
+        assert_eq!(first.get("limit").map(String::as_str), Some("500"));
+        assert_eq!(
+            first.get("healthFactorMax").map(String::as_str),
+            Some("1.5")
+        );
+        assert!(
+            !first.contains_key("cursor"),
+            "the first page carries no cursor"
+        );
+        let second = query(1);
+        assert_eq!(
+            second.get("cursor").map(String::as_str),
+            Some("next-page"),
+            "the second page carries the cursor the first page returned"
+        );
+    }
+
+    #[test]
+    fn the_seed_file_reads_a_pools_account_list() {
+        let path = write_temp_seed_file(&format!("[accounts]\n\"{POOL}\" = [\"{USER_ONE}\"]\n"));
+        let seed = FileSeed::load(&path).expect("loads");
+        assert_eq!(seed.accounts(POOL), vec![USER_ONE.to_string()]);
+        assert!(
+            seed.accounts("some-other-pool").is_empty(),
+            "a pool the file does not mention has no accounts"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_seed_file_that_is_not_the_documented_shape_is_an_error() {
+        for contents in [
+            "not valid toml {{{",
+            "[wrong-table]\nkey = 1\n",
+            "[accounts]\n\"C...\" = \"not-a-list\"\n",
+        ] {
+            let path = write_temp_seed_file(contents);
+            assert!(
+                matches!(FileSeed::load(&path).unwrap_err(), SeedError::File(_)),
+                "{contents:?} should be a File error"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+        // A path that does not exist is also a File error, not a panic.
+        let missing = std::env::temp_dir().join("blend-liquidator-seed-test-missing.toml");
+        assert!(matches!(
+            FileSeed::load(&missing).unwrap_err(),
+            SeedError::File(_)
+        ));
+    }
+
+    /// Every source's accounts are refreshed once, deduplicated, and a
+    /// failing source is skipped rather than failing the seed.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn seeding_refreshes_every_account_once_and_survives_a_failing_source(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        // Scripted exactly once: if the two sources' overlapping accounts
+        // were not deduplicated first, a second refresh would need a
+        // second scripted snapshot that is not here, and fail loudly.
+        harness::script_snapshot(&rpc, &[USER_ONE, USER_TWO]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let tracker = Tracker::new(&client, &store);
+
+        let analytics_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "positions": [
+                    {"accountId": USER_ONE, "healthFactor": 0.4},
+                    {"accountId": USER_TWO, "healthFactor": 0.5},
+                ],
+                "nextCursor": null,
+            })))
+            .mount(&analytics_server)
+            .await;
+        let analytics = SeedSource::Analytics(
+            AnalyticsSeed::new(&analytics_server.uri(), 100_000_000).expect("client"),
+        );
+
+        let file_path =
+            write_temp_seed_file(&format!("[accounts]\n\"{POOL}\" = [\"{USER_TWO}\"]\n"));
+        let file = SeedSource::File(FileSeed::load(&file_path).expect("loads"));
+
+        let failing_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&failing_server)
+            .await;
+        let failing = SeedSource::Analytics(
+            AnalyticsSeed::new(&failing_server.uri(), 100_000_000).expect("client"),
+        );
+
+        let tick = harness::fixture_tick();
+        let outcome = tracker
+            .seed(POOL, &[analytics, file, failing], tick, 10)
+            .await
+            .expect("seed");
+
+        assert_eq!(
+            outcome,
+            RefreshOutcome {
+                tracked: 2,
+                removed: 0
+            },
+            "USER_ONE and USER_TWO are each refreshed exactly once, deduplicated \
+             across the analytics source and the file source"
+        );
+        assert_eq!(store.count_users(POOL).await.expect("count"), 2);
+        assert_eq!(
+            rpc.calls("getLedgerEntries").len(),
+            2,
+            "one batched snapshot (two getLedgerEntries calls), not one per source"
+        );
+        let _ = std::fs::remove_file(&file_path);
         Ok(())
     }
 }
