@@ -192,10 +192,10 @@ CREATE INDEX users_by_health ON users (pool, health_factor);
 CREATE TABLE auctions (
     pool            text     NOT NULL,
     account         text     NOT NULL,
-    auction_type    smallint NOT NULL,
+    auction_type    smallint NOT NULL CHECK (auction_type BETWEEN 0 AND 2),
     start_ledger    bigint   NOT NULL,
     fill_ledger     bigint,
-    percent         smallint NOT NULL,
+    percent         smallint NOT NULL CHECK (percent BETWEEN 1 AND 100),
     bid             jsonb    NOT NULL,
     lot             jsonb    NOT NULL,
     updated_ledger  bigint   NOT NULL,
@@ -1145,7 +1145,7 @@ git commit -m "feat(store): tracked borrowers, health scans and refresh batches"
 **Interfaces:**
 - Consumes: `Store`, `StoreError`, `ledger`, `asset_amounts_to_json`, `asset_amounts_from_json`; `chain::xdr::AuctionType`.
 - Produces:
-  - `pub struct store::TrackedAuction { pub pool: String, pub account: String, pub auction_type: AuctionType, pub start_ledger: u32, pub fill_ledger: Option<u32>, pub percent: u32, pub bid: BTreeMap<String, i128>, pub lot: BTreeMap<String, i128>, pub updated_ledger: u32 }`.
+  - `pub struct store::TrackedAuction { pub pool: String, pub account: String, pub auction_type: AuctionType, pub start_ledger: u32, pub fill_ledger: Option<u32>, pub percent: FillPercent, pub bid: BTreeMap<String, i128>, pub lot: BTreeMap<String, i128>, pub updated_ledger: u32 }`.
   - `Store::upsert_auction(&self, auction: &TrackedAuction) -> Result<(), StoreError>`.
   - `Store::delete_auction(&self, pool: &str, account: &str, auction_type: AuctionType) -> Result<bool, StoreError>`.
   - `Store::auction(&self, pool: &str, account: &str, auction_type: AuctionType) -> Result<Option<TrackedAuction>, StoreError>`.
@@ -1278,8 +1278,9 @@ pub struct TrackedAuction {
     pub start_ledger: u32,
     /// The ledger the filler intends to fill at, once it has planned one.
     pub fill_ledger: Option<u32>,
-    /// The share of the position auctioned, 1 to 100.
-    pub percent: u32,
+    /// The share of the position auctioned, validated 1 to 100 by the
+    /// type Phase 2 built for the contract's own range.
+    pub percent: FillPercent,
     /// Asset address to amount the filler pays.
     pub bid: BTreeMap<String, i128>,
     /// Asset address to amount the filler receives.
@@ -3130,3 +3131,19 @@ git commit -m "docs: the store, the poller and the tracker in the module map and
 - [ ] The poller's cursor never advances past what was sent, proven by a test.
 - [ ] `check-config` and a live loop run against mainnet are in the pull request.
 - [ ] The pull request is opened against `main` with a summary of the rulings above.
+
+### Correction after the Task 3+4 review
+
+`TrackedAuction::percent` is `chain::xdr::encode::FillPercent`, not a bare
+`u32`: the plan's own doc comment claimed the contract's 1-to-100 range while
+nothing enforced it, and Phase 2 already built the validated newtype for
+exactly that range. `percent_from_code` returns a `FillPercent`, and
+`migrations/0001_initial.sql` carries `CHECK` constraints on `percent` and
+`auction_type` as an independent second line against a row this crate did not
+write. Because those constraints make a corrupt row unconstructible through
+SQL, the two corruption tests are direct unit tests of `auction_type_from_code`
+and `percent_from_code` rather than round trips. Amending `0001` rather than
+adding a migration is deliberate: nothing is deployed, and sqlx's per-migration
+checksum makes an already-migrated local database fail loudly — run
+`make db-reset && make db-up && sqlx migrate run` if you hold one (landed in
+`d3a8e37`).
