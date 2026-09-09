@@ -76,6 +76,195 @@ impl std::fmt::Debug for Secret {
     }
 }
 
+/// A decimal knob in 7-decimal fixed point, the scale the pool contract
+/// uses for factors and the scale the store normalises health factors to.
+///
+/// Parsed from decimal text, never from float arithmetic: a TOML float
+/// reaches this through its own shortest round-tripping rendering, so
+/// `1.5` is exactly `15_000_000` and a value needing more than seven
+/// fractional digits is a startup error rather than a quietly rounded
+/// threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Decimal7(i128);
+
+impl Decimal7 {
+    /// The value in 7-decimal fixed point.
+    #[must_use]
+    pub fn get(self) -> i128 {
+        self.0
+    }
+}
+
+impl std::str::FromStr for Decimal7 {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let (whole, fraction) = match text.split_once('.') {
+            Some((whole, fraction)) => (whole, fraction),
+            None => (text, ""),
+        };
+        if whole.is_empty() || !whole.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(format!("`{text}` is not a non-negative decimal number"));
+        }
+        if !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(format!("`{text}` is not a non-negative decimal number"));
+        }
+        if fraction.len() > 7 {
+            return Err(format!("`{text}` has more than 7 decimal places"));
+        }
+        let scaled = format!("{whole}{fraction:0<7}");
+        scaled
+            .parse::<i128>()
+            .map(Self)
+            .map_err(|_| format!("`{text}` does not fit a 128-bit fixed-point value"))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Decimal7 {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // A TOML value reaches us as a string, an integer or a float; each
+        // is converted through its decimal text, so no float arithmetic
+        // ever touches a threshold.
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Text(String),
+            Integer(i64),
+            Float(f64),
+        }
+        let text = match Raw::deserialize(deserializer)? {
+            Raw::Text(text) => text,
+            Raw::Integer(value) => value.to_string(),
+            Raw::Float(value) => value.to_string(),
+        };
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// An amount in an asset's own decimals, written as a decimal string
+/// because it exceeds what TOML integers and JSON numbers hold.
+fn amount_from_str(text: &str, field: &'static str) -> Result<i128, String> {
+    text.parse()
+        .map_err(|_| format!("{field}: `{text}` is not an integer amount"))
+}
+
+/// One profit rule: the first whose asset lists match a candidate wins.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfitRule {
+    /// Required profit in basis points.
+    pub profit_bps: u32,
+    /// Bid assets this rule covers, or `["*"]`.
+    pub supported_bid: Vec<String>,
+    /// Lot assets this rule covers, or `["*"]`.
+    pub supported_lot: Vec<String>,
+}
+
+/// One pool the bot follows. Phase 3 uses `address`, `primary_asset` and
+/// the supported-asset lists; the profit and collateral fields are the
+/// filler's, parsed here so the file's schema is settled once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolConfig {
+    /// The pool contract.
+    pub address: String,
+    /// The asset the bot keeps as collateral in this pool.
+    pub primary_asset: String,
+    /// The least of it to hold, in the asset's own decimals.
+    pub min_primary_collateral: i128,
+    /// The health factor the filler keeps its own position above, 7 decimals.
+    pub min_health_factor: i128,
+    /// Profit required when no rule matches, in basis points.
+    pub default_profit_bps: u32,
+    /// Fill regardless of profit. For testing a pool, not for production.
+    pub force_fill: bool,
+    /// Bid assets the bot will pay, or `["*"]`.
+    pub supported_bid: Vec<String>,
+    /// Lot assets the bot will take, or `["*"]`.
+    pub supported_lot: Vec<String>,
+    /// Ordered profit rules; the first match wins.
+    pub profits: Vec<ProfitRule>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPool {
+    address: String,
+    primary_asset: String,
+    min_primary_collateral: String,
+    min_health_factor: Decimal7,
+    default_profit_bps: u32,
+    #[serde(default)]
+    force_fill: bool,
+    supported_bid: Vec<String>,
+    supported_lot: Vec<String>,
+    #[serde(default)]
+    profits: Vec<ProfitRule>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPools {
+    #[serde(default)]
+    pools: Vec<RawPool>,
+}
+
+/// Parses the pools file. Every failure names the field that caused it,
+/// because this runs at startup where the operator is watching.
+pub fn parse_pools(text: &str) -> Result<Vec<PoolConfig>, LiquidatorError> {
+    let raw: RawPools = toml::from_str(text)
+        .map_err(|error| LiquidatorError::Config(format!("pools file: {error}")))?;
+    if raw.pools.is_empty() {
+        return Err(LiquidatorError::Config(
+            "pools file: at least one pool (a [[pools]] table) is required".to_string(),
+        ));
+    }
+    let mut pools = Vec::with_capacity(raw.pools.len());
+    let mut seen = std::collections::BTreeSet::new();
+    for pool in raw.pools {
+        if !seen.insert(pool.address.clone()) {
+            return Err(LiquidatorError::Config(format!(
+                "pools file: duplicate pool {}",
+                pool.address
+            )));
+        }
+        let min_primary_collateral =
+            amount_from_str(&pool.min_primary_collateral, "min_primary_collateral")
+                .map_err(LiquidatorError::Config)?;
+        pools.push(PoolConfig {
+            address: pool.address,
+            primary_asset: pool.primary_asset,
+            min_primary_collateral,
+            min_health_factor: pool.min_health_factor.get(),
+            default_profit_bps: pool.default_profit_bps,
+            force_fill: pool.force_fill,
+            supported_bid: pool.supported_bid,
+            supported_lot: pool.supported_lot,
+            profits: pool.profits,
+        });
+    }
+    Ok(pools)
+}
+
+/// What the binary does when it starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum RunMode {
+    /// Follow the configured pools until shut down.
+    Loop,
+    /// Validate the configuration, print it redacted, and exit.
+    CheckConfig,
+}
+
+/// Where the tracker gets its initial user set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedConfig {
+    /// The analytics API's base URL; `None` when `SEED_URL` is empty.
+    pub url: Option<String>,
+    /// Only accounts at or below this health factor are seeded, 7 decimals.
+    pub health_factor_max: i128,
+    /// An optional static file of pool-to-account lists.
+    pub file: Option<std::path::PathBuf>,
+}
+
 /// Everything the chain layer needs, validated. Built by [`Args::chain`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainConfig {
@@ -93,6 +282,35 @@ pub struct ChainConfig {
     pub high_fee: u32,
     /// How many ledgers a submitted transaction stays valid and is polled for.
     pub tx_poll_ledgers: u32,
+}
+
+/// Everything the service needs, validated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceConfig {
+    /// Network, RPC and fee configuration.
+    pub chain: ChainConfig,
+    /// Postgres. May carry a password, so it never renders.
+    pub database_url: Secret,
+    /// Connections in the pool.
+    pub database_max_connections: u32,
+    /// The pools to follow.
+    pub pools: Vec<PoolConfig>,
+    /// Loop or validate.
+    pub run_mode: RunMode,
+    /// Whether submissions are suppressed. Still true by default.
+    pub dry_run: bool,
+    /// How often the poller asks for chain head.
+    pub poll_interval: std::time::Duration,
+    /// A user's row older than this many ledgers is refreshed.
+    pub user_refresh_ledgers: u32,
+    /// How many stale users to refresh per tick.
+    pub refresh_batch: u32,
+    /// How often the full scan reports the least healthy borrowers.
+    pub full_scan_ledgers: u32,
+    /// The health factor the full scan reports below, 7 decimals.
+    pub scan_health_factor: i128,
+    /// Seeding.
+    pub seed: SeedConfig,
 }
 
 #[derive(Debug, Parser)]
@@ -154,6 +372,79 @@ pub struct Args {
         value_parser = clap::value_parser!(u32).range(1..=100_000),
     )]
     pub tx_poll_ledgers: u32,
+
+    /// Path to the pools file. Give this or `--pools-toml`, not both.
+    #[arg(long, env = "POOLS_FILE", conflicts_with = "pools_toml")]
+    pub pools_file: Option<std::path::PathBuf>,
+
+    /// The pools file's contents inline, for environments with no volume.
+    #[arg(long, env = "POOLS_TOML")]
+    pub pools_toml: Option<String>,
+
+    /// What to do at startup.
+    #[arg(long, env = "RUN_MODE", value_enum, default_value = "loop")]
+    pub run_mode: RunMode,
+
+    /// Connections in the database pool.
+    #[arg(
+        long,
+        env = "DATABASE_MAX_CONNECTIONS",
+        default_value_t = 5,
+        value_parser = clap::value_parser!(u32).range(1..=100),
+    )]
+    pub database_max_connections: u32,
+
+    /// How often to ask the RPC for chain head, in milliseconds.
+    #[arg(
+        long,
+        env = "POLL_INTERVAL_MS",
+        default_value_t = 1_000,
+        value_parser = clap::value_parser!(u64).range(100..=60_000),
+    )]
+    pub poll_interval_ms: u64,
+
+    /// A tracked user whose row is older than this many ledgers is
+    /// refreshed, so accrued interest is never missed.
+    #[arg(long, env = "USER_REFRESH_LEDGERS", default_value_t = 241_920)]
+    pub user_refresh_ledgers: u32,
+
+    /// How many stale users to refresh per tick.
+    #[arg(
+        long,
+        env = "REFRESH_BATCH",
+        default_value_t = 20,
+        value_parser = clap::value_parser!(u32).range(1..=1_000),
+    )]
+    pub refresh_batch: u32,
+
+    /// How often to report the least healthy borrowers, in ledgers.
+    #[arg(
+        long,
+        env = "FULL_SCAN_LEDGERS",
+        default_value_t = 1_200,
+        value_parser = clap::value_parser!(u32).range(1..),
+    )]
+    pub full_scan_ledgers: u32,
+
+    /// The health factor that scan reports below.
+    #[arg(long, env = "SCAN_HF_THRESHOLD", default_value = "1.2")]
+    pub scan_hf_threshold: Decimal7,
+
+    /// The analytics API the tracker seeds from. Empty disables it.
+    #[arg(
+        long,
+        env = "SEED_URL",
+        default_value = "https://api.blend.templarfi.org"
+    )]
+    pub seed_url: String,
+
+    /// Only accounts at or below this health factor are seeded.
+    #[arg(long, env = "SEED_HF_MAX", default_value = "10")]
+    pub seed_hf_max: Decimal7,
+
+    /// An optional static file of pool-to-account lists.
+    #[arg(long, env = "SEED_FILE")]
+    pub seed_file: Option<std::path::PathBuf>,
 }
 
 impl Args {
@@ -226,6 +517,62 @@ impl Args {
             tx_poll_ledgers: self.tx_poll_ledgers,
         })
     }
+
+    /// The service configuration, reading both secrets from the environment.
+    pub fn service(&self) -> Result<ServiceConfig, LiquidatorError> {
+        self.service_with_secrets(
+            std::env::var("DATABASE_URL")
+                .ok()
+                .filter(|url| !url.is_empty()),
+            std::env::var("RPC_API_KEY")
+                .ok()
+                .filter(|key| !key.is_empty()),
+        )
+    }
+
+    /// What `service` does after reading the environment, separated so
+    /// tests never touch process-global state.
+    pub fn service_with_secrets(
+        &self,
+        database_url: Option<String>,
+        rpc_api_key: Option<String>,
+    ) -> Result<ServiceConfig, LiquidatorError> {
+        let chain = self.chain_with_secret(rpc_api_key)?;
+        let database_url = database_url
+            .ok_or_else(|| LiquidatorError::Config("DATABASE_URL is required".to_string()))?;
+        let pools = match (&self.pools_file, &self.pools_toml) {
+            (Some(path), None) => {
+                let text = std::fs::read_to_string(path).map_err(|error| {
+                    LiquidatorError::Config(format!("pools file {}: {error}", path.display()))
+                })?;
+                parse_pools(&text)?
+            }
+            (None, Some(text)) => parse_pools(text)?,
+            _ => {
+                return Err(LiquidatorError::Config(
+                    "one of POOLS_FILE or POOLS_TOML is required".to_string(),
+                ))
+            }
+        };
+        Ok(ServiceConfig {
+            chain,
+            database_url: Secret::new(database_url),
+            database_max_connections: self.database_max_connections,
+            pools,
+            run_mode: self.run_mode,
+            dry_run: self.dry_run,
+            poll_interval: std::time::Duration::from_millis(self.poll_interval_ms),
+            user_refresh_ledgers: self.user_refresh_ledgers,
+            refresh_batch: self.refresh_batch,
+            full_scan_ledgers: self.full_scan_ledgers,
+            scan_health_factor: self.scan_hf_threshold.get(),
+            seed: SeedConfig {
+                url: Some(self.seed_url.clone()).filter(|url| !url.is_empty()),
+                health_factor_max: self.seed_hf_max.get(),
+                file: self.seed_file.clone(),
+            },
+        })
+    }
 }
 
 #[cfg(test)]
@@ -273,6 +620,15 @@ mod tests {
     /// shell exporting any of these would silently change what the config
     /// tests exercise. Asserted, never mutated: fail loudly instead of
     /// passing for the wrong reason.
+    ///
+    /// `DATABASE_URL` is deliberately not in this list, for the same reason
+    /// `RPC_API_KEY` is not: neither is a clap argument (both are secrets,
+    /// read straight from the environment by `service`/`chain`, never by
+    /// parsing), so a value set in the shell cannot change what
+    /// `Args::try_parse_from` produces here — and both `make check` and CI's
+    /// `lint-test` job export `DATABASE_URL` for the whole run so the sqlx
+    /// query macros can check themselves, which would make this assertion
+    /// fail on every sanctioned way of running these tests.
     fn assert_clean_environment() {
         for name in [
             "RPC_URL",
@@ -284,6 +640,18 @@ mod tests {
             "TX_POLL_LEDGERS",
             "DRY_RUN",
             "LOG_FORMAT",
+            "DATABASE_MAX_CONNECTIONS",
+            "POOLS_FILE",
+            "POOLS_TOML",
+            "RUN_MODE",
+            "POLL_INTERVAL_MS",
+            "USER_REFRESH_LEDGERS",
+            "REFRESH_BATCH",
+            "FULL_SCAN_LEDGERS",
+            "SCAN_HF_THRESHOLD",
+            "SEED_URL",
+            "SEED_HF_MAX",
+            "SEED_FILE",
         ] {
             assert!(
                 std::env::var_os(name).is_none(),
@@ -497,5 +865,201 @@ mod tests {
         assert!(rendered.contains("Secret(<redacted>)"));
         assert!(!rendered.contains("secret-123"));
         assert_eq!(Secret::new("secret-123").expose(), "secret-123");
+    }
+
+    const POOLS: &str = r#"
+[[pools]]
+address = "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD"
+primary_asset = "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75"
+min_primary_collateral = "1000000000000"
+min_health_factor = 1.5
+default_profit_bps = 1000
+force_fill = false
+supported_bid = ["CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75"]
+supported_lot = ["*"]
+
+[[pools.profits]]
+profit_bps = 500
+supported_bid = ["CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75"]
+supported_lot = ["*"]
+"#;
+
+    #[test]
+    fn a_decimal_knob_becomes_seven_decimal_fixed_point() {
+        for (text, expected) in [
+            ("1.5", 15_000_000_i128),
+            ("1", 10_000_000),
+            ("0.998", 9_980_000),
+            ("1.0000001", 10_000_001),
+            ("10", 100_000_000),
+            ("0", 0),
+        ] {
+            assert_eq!(
+                text.parse::<Decimal7>().expect(text).get(),
+                expected,
+                "{text}"
+            );
+        }
+    }
+
+    /// More precision than the fixed point holds is a startup error, not a
+    /// silent rounding of a threshold that decides whether to liquidate.
+    #[test]
+    fn a_decimal_knob_refuses_what_it_cannot_hold() {
+        for text in [
+            "1.00000001",
+            "",
+            "1.2.3",
+            "abc",
+            "-1",
+            "1e9",
+            "170141183460469231731687303715884105728",
+        ] {
+            assert!(text.parse::<Decimal7>().is_err(), "{text} should not parse");
+        }
+    }
+
+    #[test]
+    fn the_pools_file_parses_with_its_profit_rules() {
+        let pools = parse_pools(POOLS).expect("parses");
+        assert_eq!(pools.len(), 1);
+        let pool = &pools[0];
+        assert_eq!(
+            pool.address,
+            "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD"
+        );
+        assert_eq!(pool.min_primary_collateral, 1_000_000_000_000);
+        assert_eq!(pool.min_health_factor, 15_000_000, "1.5 in 7 decimals");
+        assert_eq!(pool.default_profit_bps, 1_000);
+        assert!(!pool.force_fill);
+        assert_eq!(pool.supported_lot, ["*"]);
+        assert_eq!(pool.profits.len(), 1);
+        assert_eq!(pool.profits[0].profit_bps, 500);
+    }
+
+    #[test]
+    fn a_pools_file_that_is_wrong_is_a_config_error_naming_the_problem() {
+        for (bad, expected) in [
+            ("", "at least one pool"),
+            ("[[pools]]\naddress = \"C\"\n", "missing"),
+            (
+                &POOLS.replace("1000000000000", "not a number"),
+                "min_primary_collateral",
+            ),
+            (
+                &POOLS.replace("min_health_factor = 1.5", "min_health_factor = 1.00000001"),
+                "min_health_factor",
+            ),
+            (
+                &POOLS.replace("[[pools]]", "[[pools]]\naddress = \"CDUP\""),
+                "duplicate",
+            ),
+        ] {
+            let error = parse_pools(bad).expect_err(bad).to_string();
+            assert!(
+                error.contains(expected),
+                "{error} should mention {expected}"
+            );
+        }
+    }
+
+    /// Two pools naming the same address is a configuration mistake the bot
+    /// must refuse: it would track one pool twice and race itself.
+    #[test]
+    fn duplicate_pool_addresses_are_refused() {
+        let doubled = format!("{POOLS}{POOLS}");
+        assert!(parse_pools(&doubled)
+            .expect_err("duplicate")
+            .to_string()
+            .contains("duplicate"));
+    }
+
+    #[test]
+    fn the_service_configuration_needs_a_database_url_and_one_pools_source() {
+        assert_clean_environment();
+        let base = [
+            "liquidator",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "http://rpc",
+        ];
+        let args = parse(&[&base[..], &["--pools-toml", POOLS]].concat());
+        assert!(matches!(
+            args.service_with_secrets(None, None),
+            Err(LiquidatorError::Config(_))
+        ));
+        let config = args
+            .service_with_secrets(Some("postgres://u:p@localhost/db".to_string()), None)
+            .expect("configuration");
+        assert_eq!(config.pools.len(), 1);
+        assert_eq!(config.database_url.expose(), "postgres://u:p@localhost/db");
+        assert_eq!(config.run_mode, RunMode::Loop);
+        assert!(config.dry_run, "dry-run is still the default");
+        assert_eq!(config.poll_interval, std::time::Duration::from_secs(1));
+        assert_eq!(config.scan_health_factor, 12_000_000);
+        assert_eq!(config.seed.health_factor_max, 100_000_000);
+        assert_eq!(
+            config.seed.url.as_deref(),
+            Some("https://api.blend.templarfi.org")
+        );
+
+        // Neither pools source, and both at once, are both errors.
+        let neither = parse(&base);
+        assert!(matches!(
+            neither.service_with_secrets(Some("postgres://x".to_string()), None),
+            Err(LiquidatorError::Config(_))
+        ));
+        assert!(Args::try_parse_from(
+            [&base[..], &["--pools-toml", POOLS, "--pools-file", "/x"]].concat()
+        )
+        .is_err());
+    }
+
+    /// The database URL may carry a password, so it must never be an
+    /// argument and never render.
+    #[test]
+    fn the_database_url_is_not_an_argument_and_never_renders() {
+        assert_clean_environment();
+        assert!(Args::try_parse_from(["liquidator", "--database-url", "postgres://x"]).is_err());
+        let args = parse(&[
+            "liquidator",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "http://rpc",
+            "--pools-toml",
+            POOLS,
+        ]);
+        let config = args
+            .service_with_secrets(
+                Some("postgres://user:hunter2@localhost/db".to_string()),
+                None,
+            )
+            .expect("configuration");
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(rendered.contains("Secret(<redacted>)"));
+    }
+
+    /// An empty SEED_URL disables the analytics source, as the spec says.
+    #[test]
+    fn an_empty_seed_url_disables_the_analytics_source() {
+        assert_clean_environment();
+        let args = parse(&[
+            "liquidator",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "http://rpc",
+            "--pools-toml",
+            POOLS,
+            "--seed-url",
+            "",
+        ]);
+        let config = args
+            .service_with_secrets(Some("postgres://x".to_string()), None)
+            .expect("configuration");
+        assert_eq!(config.seed.url, None);
     }
 }
