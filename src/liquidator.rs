@@ -24,6 +24,7 @@
 //! The module layout follows the design spec at
 //! `docs/superpowers/specs/2026-09-04-blend-liquidator-bot-design.md`.
 
+pub mod auctioneer;
 pub mod chain;
 pub mod config;
 pub mod ledger;
@@ -65,4 +66,7 @@ pub enum LiquidatorError {
     /// The tracker failed to apply an event or refresh a borrower.
     #[error("tracker: {0}")]
     Tracker(#[from] tracker::TrackerError),
+    /// The auctioneer failed to decide who is liquidatable.
+    #[error("auctioneer: {0}")]
+    Plan(#[from] auctioneer::AuctioneerError),
 }
