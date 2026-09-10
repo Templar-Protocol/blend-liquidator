@@ -56,6 +56,27 @@ async fn main() {
         }
     };
 
+    // Both arrive from the environment, never argv: a signing key on the
+    // command line is readable from `/proc/<pid>/cmdline` and shows up in
+    // `ps` and `docker inspect`. Neither is a clap argument for exactly
+    // that reason — see `Args::auctioneer_signer`'s own doc. An empty
+    // value counts as absent, the same treatment `Args::chain` and
+    // `Args::service` give `RPC_API_KEY` and `DATABASE_URL`.
+    let signer = match args.auctioneer_signer(
+        std::env::var("FILLER_SECRET_KEY")
+            .ok()
+            .filter(|key| !key.is_empty()),
+        std::env::var("AUCTIONEER_SECRET_KEY")
+            .ok()
+            .filter(|key| !key.is_empty()),
+    ) {
+        Ok(signer) => signer,
+        Err(error) => {
+            tracing::error!(%error, "configuration error");
+            std::process::exit(EXIT_CONFIG);
+        }
+    };
+
     let exit_code = match config.run_mode {
         RunMode::CheckConfig => match Service::check_config(&config).await {
             Ok(_warnings) => 0,
@@ -64,7 +85,7 @@ async fn main() {
                 EXIT_CONFIG
             }
         },
-        RunMode::Loop => match Service::run(config).await {
+        RunMode::Loop => match Service::run(config, signer).await {
             Ok(()) => 0,
             Err(error @ LiquidatorError::Config(_)) => {
                 tracing::error!(%error, "configuration error");

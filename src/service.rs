@@ -1,5 +1,6 @@
 //! Wiring: validate the configuration, seed the store, follow the
-//! configured pools and shut down cleanly.
+//! configured pools, decide and act on what the tracker finds, and shut
+//! down cleanly.
 //!
 //! `Service` has two entry points, matching [`crate::config::RunMode`]:
 //! [`Service::check_config`] reads the chain and pings the store and
@@ -8,19 +9,53 @@
 //! pool until a shutdown signal arrives. Both share `validate`, because a
 //! bot that never checked its own configuration would happily submit
 //! against a pool it misread.
+//!
+//! # The tracker and the auctioneer are separate tasks, joined by a tick
+//!
+//! `tracker_loop` is the one consumer of the poller channel every pool's
+//! events and ticks arrive on, and its cursor rests on a strict rule:
+//! `handle_message`'s `Tick` arm acknowledges a ledger — which is what
+//! lets the poller commit its cursor — only once that ledger's accounts
+//! are refreshed and flagged in the store. A creation decision is not one
+//! of those effects, so the auctioneer never sits inside that path: it is
+//! `auctioneer_loop`, a second task fed by a `tokio::sync::watch` that
+//! `handle_message` publishes to *after* it acknowledges, never a second
+//! reader of the poller channel itself (which would break the per-sender
+//! ordering the cursor rests on). The watch carries a value forward, never
+//! an acknowledgement backward, so nothing the auctioneer does can reach
+//! back to delay or fail a tick already committed — a slow pass simply
+//! falls behind the newest ledger, and a failed one logs and moves on to
+//! the next pool or borrower (see `recheck_batch`'s and
+//! `auctioneer_tick`'s own docs for exactly which failures are isolated
+//! that way). The one failure that ends the auctioneer's *own* task is a
+//! [`crate::store::StoreError`], for the same reason it ends the
+//! tracker's: the bot cannot trust what it reads.
+//!
+//! The durable link between the two tasks is
+//! [`crate::store::Store::flag_recheck`]: `apply_tick` flags every account
+//! its events named and every stale row its refresh pass touched, and the
+//! auctioneer's own oracle-scan and full-scan cadences flag more on their
+//! own schedules. The auctioneer reads that flagged set, decides, acts,
+//! and clears each flag with the ledger it was read at — never the tick's
+//! own ledger — so a flag raised again mid-decision survives the decision
+//! that never saw it.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use rand::RngExt as _;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 
+use crate::auctioneer::{Auctioneer, AuctioneerConfig, AuctioneerError, PriceWatch};
 use crate::chain::pool::{PoolReader, PoolSnapshot};
 use crate::chain::rpc::RpcClient;
 use crate::chain::xdr::PoolStatus;
+use crate::chain::{Network, Signer, Submitter, TxConfig};
 use crate::config::{PoolConfig, SeedConfig, ServiceConfig};
 use crate::ledger::{LedgerPoller, LedgerTick, PollerConfig, PollerMessage};
-use crate::store::{events_cursor, Cursor, Store};
+use crate::queue::{run_queue, SubmissionQueue};
+use crate::store::{events_cursor, Cursor, Store, StoreError, TrackedUser};
 use crate::tracker::{AnalyticsSeed, FileSeed, SeedSource, Tracker, TrackerError};
 use crate::LiquidatorError;
 
@@ -388,6 +423,7 @@ async fn handle_message(
     cadence: Cadence,
     state: &mut LoopState,
     shutdown: &watch::Receiver<bool>,
+    tick_tx: &watch::Sender<LedgerTick>,
     message: PollerMessage,
 ) -> Result<(), TrackerError> {
     match message {
@@ -434,6 +470,12 @@ async fn handle_message(
             } else {
                 // Answering is the only thing that lets the cursor move.
                 let _ = ack.send(());
+                // Published only now: the auctioneer's whole input is
+                // downstream of "this ledger's effects are in the store",
+                // never upstream of it. A dropped receiver (no auctioneer
+                // configured, or it has already exited) is not an error —
+                // the tracker does not care whether anyone is listening.
+                let _ = tick_tx.send(tick);
             }
         }
         PollerMessage::Gap { pool, from, oldest } => {
@@ -480,14 +522,40 @@ async fn apply_tick(
 ) -> Result<(), TrackerError> {
     let (pool, accounts, tick) = subject;
     tracker.refresh(pool, accounts, tick).await?;
+    // Flags every account this ledger's events named, for the auctioneer
+    // task to pick up on its own cadence. This is the durable replacement
+    // for `pending` as the auctioneer's input: `pending` itself stays
+    // exactly what it was above — this tick's own batch, consumed by the
+    // refresh it just fed — but a flag outlives this tick, which is the
+    // whole point. Flagging an account the refresh just deleted (a closed
+    // position) is harmless: `flag_recheck` is an `UPDATE` keyed by
+    // `(pool, account)`, so it silently matches no row.
+    for account in accounts {
+        tracker
+            .store()
+            .flag_recheck(pool, account, tick.sequence)
+            .await?;
+    }
     // `USER_REFRESH_LEDGERS` is a *span*; `Store::users_stale` selects on
     // an absolute ledger. Subtracting here is what turns one into the
     // other: handing the span over as-is compares a ledger count against a
     // ledger sequence, which on any real network is false for every row.
     let updated_before = tick.sequence.saturating_sub(cadence.user_refresh_ledgers);
-    tracker
-        .refresh_stale(pool, tick, updated_before, cadence.refresh_batch)
+    // Inlines what `Tracker::refresh_stale` does — read the stale rows,
+    // then refresh them — because this call site also needs the account
+    // list to flag, and `RefreshOutcome` reports only counts.
+    let stale_rows = tracker
+        .store()
+        .users_stale(pool, updated_before, i64::from(cadence.refresh_batch))
         .await?;
+    let stale_accounts: Vec<String> = stale_rows.into_iter().map(|user| user.account).collect();
+    tracker.refresh(pool, &stale_accounts, tick).await?;
+    for account in &stale_accounts {
+        tracker
+            .store()
+            .flag_recheck(pool, account, tick.sequence)
+            .await?;
+    }
     if scan_due(
         tick.sequence,
         state.last_scan.get(pool).copied(),
@@ -590,12 +658,20 @@ async fn full_scan(
 /// own `run` returns, and by then everything it sent is already in the
 /// channel, so letting `recv` return `None` naturally applies a ledger that
 /// was already read before this task returns.
+///
+/// `tick_tx` is owned, not borrowed: this is the one place that publishes
+/// on it, always after `handle_message` has acknowledged the ledger it
+/// carries (see that function's `Tick` arm), and dropping it when this
+/// function returns is what lets the auctioneer task's own `changed()`
+/// end rather than wait forever once this loop has nothing further to
+/// send.
 async fn tracker_loop(
     tracker: &Tracker<'_>,
     seed_sources: &[SeedSource],
     cadence: Cadence,
     mut state: LoopState,
     shutdown: &watch::Receiver<bool>,
+    tick_tx: watch::Sender<LedgerTick>,
     mut receiver: mpsc::Receiver<PollerMessage>,
 ) -> Result<(), TrackerError> {
     while let Some(message) = receiver.recv().await {
@@ -615,6 +691,7 @@ async fn tracker_loop(
             cadence,
             &mut state,
             shutdown,
+            &tick_tx,
             message,
         )
         .await
@@ -640,6 +717,387 @@ async fn tracker_loop(
                 "applying a poller message failed; the range will be read again"
             ),
         }
+    }
+    Ok(())
+}
+
+/// How long a price reference may stand with no significant move before
+/// the oracle scan refreshes it anyway (spec §4's cadence table: "refresh
+/// the reference price after a day without a significant move").
+const PRICE_REFERENCE_STALE_AFTER_SECS: u64 = 86_400;
+
+/// The submission queue's backlog bound. `run_queue` still sends one
+/// submission at a time regardless of this: it only bounds how many
+/// decided creations may wait for their turn before `enqueue` applies
+/// backpressure to the auctioneer loop that calls it — comfortably above
+/// one full recheck batch, so an ordinary pass never blocks on it.
+const SUBMISSION_QUEUE_CAPACITY: usize = 64;
+
+/// Timings and thresholds the auctioneer task reads every tick, bundled
+/// the same way [`Cadence`] bundles the tracker's. `oracle_phase` and
+/// `full_phase` are each drawn once at startup via [`scan_phase`],
+/// independently of the tracker's own full-scan phase: the two full-scan
+/// cadences serve different jobs on the same knobs — the tracker's reports
+/// the least healthy borrowers and retries an owed reseed, this one flags
+/// every borrower below the threshold for a decision — so each reuses
+/// [`scan_phase`]'s randomisation rather than sharing one draw.
+#[derive(Debug, Clone, Copy)]
+struct AuctioneerCadence {
+    /// How many flagged users to decide and act on per pool per tick, and
+    /// the page size the full scan flags with.
+    refresh_batch: u32,
+    /// How often, in ledgers, prices are re-read for a significant move.
+    oracle_scan_ledgers: u32,
+    /// This instance's phase in the oracle-scan cadence.
+    oracle_phase: u32,
+    /// How often every user below `scan_health_factor` is (re)flagged.
+    full_scan_ledgers: u32,
+    /// This instance's phase in the full-scan cadence.
+    full_phase: u32,
+    /// The health factor the full scan flags below, 7 decimals.
+    scan_health_factor: i128,
+    /// Basis points a price must move before the oracle scan reports it.
+    price_delta_bps: u32,
+    /// Ticks the auctioneer task has observed before any submission is
+    /// attempted, even when armed.
+    startup_delay_ledgers: u32,
+}
+
+/// Reads [`AuctioneerCadence`] out of the resolved configuration, drawing
+/// this instance's oracle-scan and full-scan phases once, independently of
+/// each other and of the tracker's own full-scan phase — see the struct's
+/// own doc for why the two full-scan cadences on the same knobs never
+/// share a draw.
+fn auctioneer_cadence_from(config: &ServiceConfig) -> AuctioneerCadence {
+    AuctioneerCadence {
+        refresh_batch: config.refresh_batch,
+        oracle_scan_ledgers: config.oracle_scan_ledgers,
+        oracle_phase: scan_phase(config.oracle_scan_ledgers),
+        full_scan_ledgers: config.full_scan_ledgers,
+        full_phase: scan_phase(config.full_scan_ledgers),
+        scan_health_factor: config.scan_health_factor,
+        price_delta_bps: config.price_delta_bps,
+        startup_delay_ledgers: config.startup_delay_ledgers,
+    }
+}
+
+/// Pages every one of `pool`'s borrowers below `threshold` and flags each
+/// for an auctioneer decision. This is the full scan's whole job — making
+/// sure nothing below the threshold stays un-flagged — never to decide
+/// inline: [`Auctioneer::decide`] still does that, on the ordinary recheck
+/// path this feeds.
+///
+/// Pages by the keyset [`Store::users_below_health`] returns rather than
+/// reading one page: a borrower who only shows up on the second page is
+/// exactly the one a single-page scan would miss, and it is the one this
+/// scan exists to catch.
+async fn full_scan_and_flag(
+    store: &Store,
+    pool: &str,
+    threshold: i128,
+    ledger: u32,
+    page_limit: i64,
+) -> Result<usize, StoreError> {
+    let mut flagged = 0_usize;
+    let mut after: Option<(i128, String)> = None;
+    loop {
+        let page = store
+            .users_below_health(
+                pool,
+                threshold,
+                page_limit,
+                after
+                    .as_ref()
+                    .map(|(health, account)| (*health, account.as_str())),
+            )
+            .await?;
+        let Some(last) = page.last() else {
+            break;
+        };
+        after = Some((last.health_factor, last.account.clone()));
+        for user in &page {
+            store.flag_recheck(pool, &user.account, ledger).await?;
+        }
+        flagged += page.len();
+    }
+    Ok(flagged)
+}
+
+/// Decides and acts on one already-read batch of flagged users, clearing
+/// each flag with the ledger the batch read it at — **never** `tick`'s own
+/// ledger, which is not the same thing: [`Store::clear_recheck`] is
+/// conditional on the exact value [`Store::users_needing_recheck`] read,
+/// so a flag raised again while this batch was deciding is left standing
+/// for the next pass rather than cleared by a decision that never saw it.
+///
+/// A per-borrower failure — from [`Auctioneer::decide`] or
+/// [`Auctioneer::act`] alike — is logged with the account and leaves that
+/// account's flag exactly where it was: still set, so the next tick's
+/// batch picks it up again. Isolating a per-borrower failure is this
+/// function's job, per `act`'s own doc. Only [`AuctioneerError::Store`]
+/// ends the pass early and propagates, for the reason it is fatal
+/// everywhere else in this module: the bot cannot trust what it reads.
+async fn recheck_batch(
+    auctioneer: &Auctioneer<'_>,
+    store: &Store,
+    pool: &str,
+    batch: &[TrackedUser],
+    tick: LedgerTick,
+    submit: Option<&SubmissionQueue>,
+    shutdown: &watch::Receiver<bool>,
+) -> Result<(), LiquidatorError> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let flagged_at: BTreeMap<&str, u32> = batch
+        .iter()
+        .filter_map(|user| {
+            user.recheck_ledger
+                .map(|ledger| (user.account.as_str(), ledger))
+        })
+        .collect();
+    let decisions = match auctioneer.decide(pool, batch, tick).await {
+        Ok(decisions) => decisions,
+        Err(AuctioneerError::Store(error)) => return Err(LiquidatorError::Store(error)),
+        Err(error) => {
+            tracing::warn!(
+                pool,
+                %error,
+                "deciding this pool's recheck batch failed; every flag in it stays set for the next pass"
+            );
+            return Ok(());
+        }
+    };
+    for (account, decision) in decisions {
+        // Checked between users, never inside a submission: a submission
+        // already in flight is waited for, because abandoning it would
+        // leave a signing key's sequence number consumed by something
+        // this bot never saw the outcome of.
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        match auctioneer
+            .act(pool, &account, &decision, tick, submit)
+            .await
+        {
+            Ok(_outcome) => {
+                if let Some(&flagged_at) = flagged_at.get(account.as_str()) {
+                    match store.clear_recheck(pool, &account, flagged_at).await {
+                        Ok(true) => {}
+                        Ok(false) => tracing::debug!(
+                            pool,
+                            account,
+                            "the flag was raised again while this was deciding; leaving it \
+                             for the next pass"
+                        ),
+                        Err(error) => return Err(LiquidatorError::Store(error)),
+                    }
+                }
+            }
+            Err(AuctioneerError::Store(error)) => return Err(LiquidatorError::Store(error)),
+            Err(error) => tracing::warn!(
+                pool,
+                account,
+                %error,
+                "acting on this borrower failed; it stays flagged for the next pass"
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Mutable state the auctioneer task carries from one tick to the next:
+/// how many it has seen, whether the startup delay has elapsed enough to
+/// allow a submission, and each pool's oracle-scan and full-scan cadence
+/// state. Bundled into one struct, rather than five `&mut` parameters on
+/// [`auctioneer_tick`], for the same reason [`LoopState`] exists for the
+/// tracker.
+#[derive(Debug, Default)]
+struct AuctioneerState {
+    /// Each pool's oracle-scan reference prices.
+    price_watches: BTreeMap<String, PriceWatch>,
+    /// The ledger each pool's oracle scan last fired at.
+    last_oracle_scan: BTreeMap<String, u32>,
+    /// The ledger each pool's full scan last fired at.
+    last_full_scan: BTreeMap<String, u32>,
+    /// How many ticks this task has observed since it started.
+    ticks_seen: u32,
+    /// Whether `ticks_seen` has passed `startup_delay_ledgers`. Latches
+    /// `true` and stays there — the delay is measured from startup, never
+    /// re-armed — so the "first tick submissions become possible" log line
+    /// fires at most once.
+    submissions_unlocked: bool,
+}
+
+/// What one auctioneer task holds for its whole life: the pieces
+/// `auctioneer_tick` needs but never mutates, bundled so that function
+/// takes a context and the two things that actually change tick to tick
+/// (`tick` itself and `&mut AuctioneerState`) rather than seven-plus
+/// parameters.
+struct AuctioneerContext<'a> {
+    store: &'a Store,
+    pools: &'a [String],
+    auctioneer: &'a Auctioneer<'a>,
+    cadence: AuctioneerCadence,
+    submission_queue: Option<&'a SubmissionQueue>,
+    shutdown: &'a watch::Receiver<bool>,
+}
+
+/// One tick's whole effect for every configured pool: decide and act on
+/// each pool's currently flagged users, and fire the oracle-scan and
+/// full-scan-and-flag cadences when due.
+///
+/// `state.ticks_seen` and `state.submissions_unlocked` gate whether
+/// `ctx.submission_queue` is actually handed to [`recheck_batch`] (`None`
+/// before the startup delay has elapsed, regardless of whether the queue
+/// itself exists — i.e. regardless of dry-run or armed) or passed through
+/// unchanged after it has. Saturating the counter is deliberate: a startup
+/// delay near `u32::MAX` must never wrap it past zero and unlock
+/// submissions immediately, which is exactly backwards for a knob whose
+/// whole purpose is to delay them.
+///
+/// A [`StoreError`] is fatal, exactly as it is in [`tracker_loop`]:
+/// without a trustworthy store there is no way to know who is flagged or
+/// to record a decision, so nothing downstream is safe to act on. Every
+/// other failure — deciding or acting on one borrower, a failed oracle or
+/// full scan — is logged with the pool or account and this pass carries
+/// on to the next pool; see [`recheck_batch`] and this function's own
+/// match arms for where each is isolated.
+async fn auctioneer_tick(
+    ctx: &AuctioneerContext<'_>,
+    tick: LedgerTick,
+    state: &mut AuctioneerState,
+) -> Result<(), LiquidatorError> {
+    state.ticks_seen = state.ticks_seen.saturating_add(1);
+    if !state.submissions_unlocked && state.ticks_seen > ctx.cadence.startup_delay_ledgers {
+        state.submissions_unlocked = true;
+        tracing::info!(
+            tick = state.ticks_seen,
+            ledger = tick.sequence,
+            "the startup delay has elapsed; submissions are now possible"
+        );
+    }
+    let submit = if state.submissions_unlocked {
+        ctx.submission_queue
+    } else {
+        None
+    };
+
+    for pool in ctx.pools {
+        if *ctx.shutdown.borrow() {
+            return Ok(());
+        }
+
+        if scan_due(
+            tick.sequence,
+            state.last_oracle_scan.get(pool).copied(),
+            ctx.cadence.oracle_phase,
+            ctx.cadence.oracle_scan_ledgers,
+        ) {
+            let watch = state.price_watches.entry(pool.clone()).or_insert_with(|| {
+                PriceWatch::new(
+                    ctx.cadence.price_delta_bps,
+                    PRICE_REFERENCE_STALE_AFTER_SECS,
+                )
+            });
+            match ctx
+                .auctioneer
+                .scan_oracle(pool, watch, tick, i64::from(ctx.cadence.refresh_batch))
+                .await
+            {
+                Ok(flagged) => tracing::info!(pool, flagged, "oracle scan"),
+                Err(AuctioneerError::Store(error)) => return Err(LiquidatorError::Store(error)),
+                Err(error) => tracing::warn!(
+                    pool,
+                    %error,
+                    "the oracle scan failed; it runs again next period"
+                ),
+            }
+            state.last_oracle_scan.insert(pool.clone(), tick.sequence);
+        }
+
+        if scan_due(
+            tick.sequence,
+            state.last_full_scan.get(pool).copied(),
+            ctx.cadence.full_phase,
+            ctx.cadence.full_scan_ledgers,
+        ) {
+            match full_scan_and_flag(
+                ctx.store,
+                pool,
+                ctx.cadence.scan_health_factor,
+                tick.sequence,
+                i64::from(ctx.cadence.refresh_batch),
+            )
+            .await
+            {
+                Ok(flagged) => tracing::info!(
+                    pool,
+                    flagged,
+                    "full scan flagged every user below the threshold"
+                ),
+                Err(error) => return Err(LiquidatorError::Store(error)),
+            }
+            state.last_full_scan.insert(pool.clone(), tick.sequence);
+        }
+
+        let batch = match ctx
+            .store
+            .users_needing_recheck(pool, i64::from(ctx.cadence.refresh_batch))
+            .await
+        {
+            Ok(batch) => batch,
+            Err(error) => return Err(LiquidatorError::Store(error)),
+        };
+        recheck_batch(
+            ctx.auctioneer,
+            ctx.store,
+            pool,
+            &batch,
+            tick,
+            submit,
+            ctx.shutdown,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Runs [`auctioneer_tick`] off the tick the tracker publishes after it
+/// has acknowledged one.
+///
+/// Fed by a `watch`, never the poller channel the cursor rests on (see the
+/// module doc's wiring note): nothing in this function is upstream of a
+/// tick's acknowledgement, so a slow or failing pass here falls behind the
+/// newest ledger and never blocks, delays or fails it. `changed()`
+/// returning an error means every sender has dropped — the tracker task is
+/// gone — and this loop then has nothing further to do. A decision is not
+/// a stored effect of a ledger, so nothing this loop does ever reaches
+/// back to poison a tick already acknowledged.
+async fn auctioneer_loop(
+    store: &Store,
+    pools: &[String],
+    auctioneer: &Auctioneer<'_>,
+    cadence: AuctioneerCadence,
+    submission_queue: Option<&SubmissionQueue>,
+    mut tick_rx: watch::Receiver<LedgerTick>,
+    shutdown: &watch::Receiver<bool>,
+) -> Result<(), LiquidatorError> {
+    let ctx = AuctioneerContext {
+        store,
+        pools,
+        auctioneer,
+        cadence,
+        submission_queue,
+        shutdown,
+    };
+    let mut state = AuctioneerState::default();
+    while tick_rx.changed().await.is_ok() {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        let tick = *tick_rx.borrow_and_update();
+        auctioneer_tick(&ctx, tick, &mut state).await?;
     }
     Ok(())
 }
@@ -705,6 +1163,136 @@ fn spawn_shutdown_listener(shutdown: watch::Sender<bool>) {
     });
 }
 
+/// What signs a transaction, shared by the submission queue's own task and
+/// the auctioneer's — whenever a key is configured at all, dry-run
+/// included, since `Auctioneer` still simulates with no intent to submit
+/// (see its own doc). `Signer` is deliberately not `Clone` — it holds key
+/// material — so an `Arc` is what lets both tasks borrow the one key
+/// without duplicating it in memory.
+struct SigningContext {
+    network: Network,
+    tx_config: TxConfig,
+    signer: Option<Arc<Signer>>,
+}
+
+impl SigningContext {
+    fn from_config(config: &ServiceConfig, signer: Option<Signer>) -> Self {
+        Self {
+            network: Network::from_config(&config.chain),
+            tx_config: TxConfig::from_config(&config.chain),
+            signer: signer.map(Arc::new),
+        }
+    }
+
+    /// The bot's own accounts, filler included — empty when no key is
+    /// configured at all, which excludes nothing rather than everything.
+    fn own_addresses(&self) -> BTreeSet<String> {
+        self.signer
+            .as_deref()
+            .map(|signer: &Signer| signer.address().to_string())
+            .into_iter()
+            .collect()
+    }
+}
+
+/// Spawns one [`LedgerPoller`] per pool, all sending into `sender`, and
+/// drops the caller's own clone once every one holds its own — which is
+/// what lets the tracker task's channel close, and its `recv` return
+/// `None`, once (and only once) every poller has stopped.
+fn spawn_pollers(
+    tasks: &mut JoinSet<Result<(), LiquidatorError>>,
+    rpc: &RpcClient,
+    store: &Store,
+    pools: &[PoolConfig],
+    poller_config: PollerConfig,
+    sender: &mpsc::Sender<PollerMessage>,
+    shutdown: &watch::Receiver<bool>,
+) {
+    for pool in pools {
+        let rpc = rpc.clone();
+        let store = store.clone();
+        let pool = pool.address.clone();
+        let sender = sender.clone();
+        let shutdown = shutdown.clone();
+        tasks.spawn(async move {
+            LedgerPoller::new(&rpc, &store, &pool, poller_config)
+                .run(sender, shutdown)
+                .await
+                .map_err(LiquidatorError::from)
+        });
+    }
+}
+
+/// Builds and spawns the submission queue's worker when armed — `!dry_run`
+/// and a signer configured, the one gate into live trading `DRY_RUN`'s
+/// default makes safe — and returns the queue handle for the auctioneer to
+/// submit through. `None` otherwise: the ordinary dry-run deployment, or a
+/// live one with no key to sign with.
+fn spawn_submission_queue(
+    tasks: &mut JoinSet<Result<(), LiquidatorError>>,
+    rpc: &RpcClient,
+    signing: &SigningContext,
+    dry_run: bool,
+    shutdown: &watch::Receiver<bool>,
+) -> Option<SubmissionQueue> {
+    let (false, Some(signer)) = (dry_run, signing.signer.as_ref()) else {
+        return None;
+    };
+    let signer = Arc::clone(signer);
+    let rpc = rpc.clone();
+    let network = signing.network.clone();
+    let tx_config = signing.tx_config;
+    let shutdown = shutdown.clone();
+    let (queue, queue_rx) = SubmissionQueue::new(SUBMISSION_QUEUE_CAPACITY);
+    tasks.spawn(async move {
+        let submitter = Submitter::new(&rpc, &network, &signer, tx_config);
+        run_queue(&submitter, queue_rx, &shutdown).await;
+        Ok(())
+    });
+    Some(queue)
+}
+
+/// Spawns the auctioneer task: builds its own [`Auctioneer`] — with a
+/// [`Submitter`] whenever a key is configured at all, dry-run included —
+/// and runs [`auctioneer_loop`] off `tick_rx` until the tracker task's
+/// sender drops.
+#[allow(clippy::too_many_arguments)]
+fn spawn_auctioneer(
+    tasks: &mut JoinSet<Result<(), LiquidatorError>>,
+    rpc: &RpcClient,
+    store: &Store,
+    signing: &SigningContext,
+    config: AuctioneerConfig,
+    cadence: AuctioneerCadence,
+    pools: Vec<String>,
+    submission_queue: Option<SubmissionQueue>,
+    tick_rx: watch::Receiver<LedgerTick>,
+    shutdown: &watch::Receiver<bool>,
+) {
+    let rpc = rpc.clone();
+    let store = store.clone();
+    let network = signing.network.clone();
+    let tx_config = signing.tx_config;
+    let signer = signing.signer.clone();
+    let shutdown = shutdown.clone();
+    tasks.spawn(async move {
+        let submitter = signer
+            .as_deref()
+            .map(|signer| Submitter::new(&rpc, &network, signer, tx_config));
+        let auctioneer = Auctioneer::new(&rpc, &store, config, submitter);
+        auctioneer_loop(
+            &store,
+            &pools,
+            &auctioneer,
+            cadence,
+            submission_queue.as_ref(),
+            tick_rx,
+            &shutdown,
+        )
+        .await
+    });
+}
+
 /// The bot's two entry points: [`run`](Service::run) follows the configured
 /// pools until shut down, and [`check_config`](Service::check_config)
 /// validates and reports without following anything. Both are associated
@@ -740,9 +1328,18 @@ impl Service {
     /// Connects and migrates the store, validates the configuration, seeds
     /// every pool that needs it, then follows every configured pool — one
     /// [`LedgerPoller`] per pool, one tracker task consuming their shared
-    /// channel — until a shutdown signal arrives and every task has
-    /// returned.
-    pub async fn run(config: ServiceConfig) -> Result<(), LiquidatorError> {
+    /// channel, one auctioneer task fed by the tick the tracker publishes
+    /// after it acknowledges, and — only when armed and a signer is given —
+    /// one submission-queue worker for that signer's key — until a
+    /// shutdown signal arrives and every task has returned.
+    ///
+    /// `signer` is `None` for the ordinary dry-run deployment with no
+    /// `AUCTIONEER_SECRET_KEY`/`FILLER_SECRET_KEY` configured; see
+    /// [`crate::config::Args::auctioneer_signer`]. Whether a submission is
+    /// ever actually sent is `!config.dry_run && signer.is_some()` — the
+    /// one gate this crate has into live trading, per the safety invariant
+    /// that `DRY_RUN` defaults `true`.
+    pub async fn run(config: ServiceConfig, signer: Option<Signer>) -> Result<(), LiquidatorError> {
         // Installed before anything that takes time. Seeding a busy pool
         // is tens of seconds of sequential round trips, and until this is
         // in place a `SIGTERM` in that window reaches the default handler
@@ -769,26 +1366,60 @@ impl Service {
         .await?;
 
         let (message_tx, message_rx) = mpsc::channel(1_024);
-
         let poller_config = PollerConfig::new(config.poll_interval);
         let mut tasks = JoinSet::new();
-        for pool in &config.pools {
-            let rpc = rpc.clone();
-            let store = store.clone();
-            let pool = pool.address.clone();
-            let sender = message_tx.clone();
-            let shutdown = shutdown_rx.clone();
-            tasks.spawn(async move {
-                LedgerPoller::new(&rpc, &store, &pool, poller_config)
-                    .run(sender, shutdown)
-                    .await
-                    .map_err(LiquidatorError::from)
-            });
-        }
+        spawn_pollers(
+            &mut tasks,
+            &rpc,
+            &store,
+            &config.pools,
+            poller_config,
+            &message_tx,
+            &shutdown_rx,
+        );
         // Every poller now holds its own sender clone; dropping this one
         // lets the tracker task's channel close, and its `recv` return
         // `None`, once (and only once) every poller has stopped.
         drop(message_tx);
+
+        let signing = SigningContext::from_config(&config, signer);
+        let submission_queue =
+            spawn_submission_queue(&mut tasks, &rpc, &signing, config.dry_run, &shutdown_rx);
+
+        let auctioneer_config = AuctioneerConfig {
+            liquidation_health_factor: config.liquidation_health_factor,
+            target_health_factor: config.target_health_factor,
+            plan_iterations: config.plan_iterations,
+            own_addresses: signing.own_addresses(),
+        };
+        let auctioneer_cadence = auctioneer_cadence_from(&config);
+        let pool_addresses: Vec<String> = config
+            .pools
+            .iter()
+            .map(|pool| pool.address.clone())
+            .collect();
+
+        // The auctioneer's own view of the tick, published by the tracker
+        // task only after it has acknowledged one (see `handle_message`'s
+        // `Tick` arm). The initial value is never observed as real: a
+        // `watch::Receiver` only wakes a waiter on a *change*, and this
+        // loop's first `changed()` is what it actually reads.
+        let (tick_tx, tick_rx) = watch::channel(LedgerTick {
+            sequence: 0,
+            close_time: 0,
+        });
+        spawn_auctioneer(
+            &mut tasks,
+            &rpc,
+            &store,
+            &signing,
+            auctioneer_config,
+            auctioneer_cadence,
+            pool_addresses,
+            submission_queue,
+            tick_rx,
+            &shutdown_rx,
+        );
 
         let cadence = Cadence {
             user_refresh_ledgers: config.user_refresh_ledgers,
@@ -810,6 +1441,7 @@ impl Service {
                 cadence,
                 state,
                 &shutdown,
+                tick_tx,
                 message_rx,
             )
             .await
@@ -842,9 +1474,10 @@ mod tests {
     };
     use crate::chain::xdr::keys;
     use crate::chain::xdr::{AuctionType, PoolEvent};
+    use crate::chain::{TxHash, TxOutcome};
+    use crate::fixture::{mainnet_fixed_v2, text};
     use crate::harness;
     use crate::math::AuctionData;
-    use crate::store::TrackedUser;
     use std::collections::BTreeMap;
     use tokio::sync::oneshot;
     use wiremock::matchers::method;
@@ -1392,6 +2025,16 @@ mod tests {
         )
     }
 
+    /// A throwaway tick watch for a test that does not care what the
+    /// auctioneer sees, only that `handle_message`/`tracker_loop` have
+    /// somewhere to publish to.
+    fn tick_watch() -> (watch::Sender<LedgerTick>, watch::Receiver<LedgerTick>) {
+        watch::channel(LedgerTick {
+            sequence: 0,
+            close_time: 0,
+        })
+    }
+
     /// A stored borrower row, for the passes that select on `updated_ledger`.
     fn tracked_user(account: &str, updated_ledger: u32) -> TrackedUser {
         let mut collateral = BTreeMap::new();
@@ -1438,6 +2081,7 @@ mod tests {
         let client = RpcClient::new(&rpc.url(), None).expect("client");
         let tracker = Tracker::new(&client, &store);
         let (_flag, shutdown) = watch::channel(false);
+        let (tick_tx, tick_rx) = tick_watch();
         let mut state = LoopState::default();
 
         handle_message(
@@ -1446,6 +2090,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &tick_tx,
             borrow(harness::POOL, harness::USER_ONE),
         )
         .await
@@ -1460,13 +2105,15 @@ mod tests {
             "an event writes no user row: valuing is the tick's job"
         );
 
-        let (message, applied) = tick_message(harness::POOL, harness::fixture_tick());
+        let tick = harness::fixture_tick();
+        let (message, applied) = tick_message(harness::POOL, tick);
         handle_message(
             &tracker,
             &[],
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &tick_tx,
             message,
         )
         .await
@@ -1484,6 +2131,20 @@ mod tests {
             .await
             .expect("read")
             .is_some());
+        assert_eq!(
+            *tick_rx.borrow(),
+            tick,
+            "the auctioneer's watch carries the acknowledged tick"
+        );
+        assert_eq!(
+            store
+                .user(harness::POOL, harness::USER_ONE)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            Some(tick.sequence),
+            "the account this tick's event named is flagged for an auctioneer decision"
+        );
         Ok(())
     }
 
@@ -1499,6 +2160,7 @@ mod tests {
         let client = RpcClient::new(&rpc.url(), None).expect("client");
         let tracker = Tracker::new(&client, &store);
         let (_flag, shutdown) = watch::channel(false);
+        let (tick_tx, _tick_rx) = tick_watch();
         let mut state = LoopState::default();
 
         for message in [
@@ -1511,6 +2173,7 @@ mod tests {
                 quiet_cadence(),
                 &mut state,
                 &shutdown,
+                &tick_tx,
                 message,
             )
             .await
@@ -1524,6 +2187,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &tick_tx,
             message,
         )
         .await
@@ -1570,6 +2234,7 @@ mod tests {
         let client = RpcClient::new(&rpc.url(), None).expect("client");
         let tracker = Tracker::new(&client, &store);
         let (_flag, shutdown) = watch::channel(false);
+        let (tick_tx, _tick_rx) = tick_watch();
         let mut state = LoopState::default();
         let cadence = Cadence {
             user_refresh_ledgers: 241_920,
@@ -1577,9 +2242,17 @@ mod tests {
         };
 
         let (message, applied) = tick_message(harness::POOL, tick);
-        handle_message(&tracker, &[], cadence, &mut state, &shutdown, message)
-            .await
-            .expect("the tick");
+        handle_message(
+            &tracker,
+            &[],
+            cadence,
+            &mut state,
+            &shutdown,
+            &tick_tx,
+            message,
+        )
+        .await
+        .expect("the tick");
         assert!(applied.await.is_ok());
 
         assert!(
@@ -1589,6 +2262,24 @@ mod tests {
         assert!(
             !read_from_chain(&rpc, harness::USER_TWO),
             "the fresh row was left alone"
+        );
+        assert_eq!(
+            store
+                .user(harness::POOL, harness::USER_ONE)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            Some(tick.sequence),
+            "the stale row the refresh pass touched is flagged for an auctioneer decision"
+        );
+        assert_eq!(
+            store
+                .user(harness::POOL, harness::USER_TWO)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            None,
+            "the fresh row the refresh pass left alone is not flagged"
         );
         Ok(())
     }
@@ -1614,6 +2305,7 @@ mod tests {
         let client = RpcClient::new(&rpc.url(), None).expect("client");
         let tracker = Tracker::new(&client, &store);
         let (_flag, shutdown) = watch::channel(false);
+        let (tick_tx, _tick_rx) = tick_watch();
         let mut state = LoopState::default();
 
         let file = write_temp_seed_file(&format!(
@@ -1637,6 +2329,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &tick_tx,
             PollerMessage::Gap {
                 pool: harness::POOL.to_string(),
                 from: 10,
@@ -1666,9 +2359,11 @@ mod tests {
             ..quiet_cadence()
         };
         let (message, applied) = tick_message(harness::POOL, tick);
-        handle_message(&tracker, &sources, cadence, &mut state, &shutdown, message)
-            .await
-            .expect("the scanning tick");
+        handle_message(
+            &tracker, &sources, cadence, &mut state, &shutdown, &tick_tx, message,
+        )
+        .await
+        .expect("the scanning tick");
         assert!(applied.await.is_ok());
         assert!(
             !state.needs_reseed.contains(harness::POOL),
@@ -1691,6 +2386,7 @@ mod tests {
         let client = RpcClient::new(&rpc.url(), None).expect("client");
         let tracker = Tracker::new(&client, &store);
         let (_flag, shutdown) = watch::channel(false);
+        let (tick_tx, tick_rx) = tick_watch();
         let mut state = LoopState::default();
         state.pending.insert(
             harness::POOL.to_string(),
@@ -1704,6 +2400,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &tick_tx,
             message,
         )
         .await
@@ -1717,6 +2414,14 @@ mod tests {
             state.pending[harness::POOL],
             BTreeSet::from([harness::USER_ONE.to_string()]),
             "the accounts this tick took are back for the next pass"
+        );
+        assert_eq!(
+            *tick_rx.borrow(),
+            LedgerTick {
+                sequence: 0,
+                close_time: 0
+            },
+            "a tick that never acknowledged is never published to the auctioneer either"
         );
         Ok(())
     }
@@ -1742,6 +2447,7 @@ mod tests {
         let client = RpcClient::new(&rpc.url(), None).expect("client");
         let tracker = Tracker::new(&client, &store);
         let (_flag, shutdown) = watch::channel(false);
+        let (tick_tx, _tick_rx) = tick_watch();
         let mut state = LoopState::default();
 
         let failing_fill = PollerMessage::Event {
@@ -1761,6 +2467,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &tick_tx,
             failing_fill,
         )
         .await
@@ -1781,6 +2488,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &tick_tx,
             other_message,
         )
         .await
@@ -1800,6 +2508,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &tick_tx,
             message,
         )
         .await
@@ -1823,6 +2532,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &tick_tx,
             message,
         )
         .await
@@ -1848,6 +2558,7 @@ mod tests {
         let client = RpcClient::new(&rpc.url(), None).expect("client");
         let tracker = Tracker::new(&client, &store);
         let (_flag, shutdown) = watch::channel(false);
+        let (tick_tx, tick_rx) = tick_watch();
         let (sender, receiver) = mpsc::channel(8);
 
         sender
@@ -1866,6 +2577,7 @@ mod tests {
             quiet_cadence(),
             LoopState::default(),
             &shutdown,
+            tick_tx,
             receiver,
         )
         .await
@@ -1886,6 +2598,11 @@ mod tests {
                 .expect("read")
                 .is_some(),
             "the account the failed tick held on to was refreshed by the retry"
+        );
+        assert_eq!(
+            *tick_rx.borrow(),
+            harness::fixture_tick(),
+            "only the acknowledged retry was published to the auctioneer's watch"
         );
         Ok(())
     }
@@ -1961,6 +2678,7 @@ mod tests {
         let client = RpcClient::new(&rpc.url(), None).expect("client");
         let tracker = Tracker::new(&client, &store);
         let (_flag, shutdown) = watch::channel(false);
+        let (tick_tx, _tick_rx) = tick_watch();
 
         // The pool is due a reseed, and the reseed will fail against the
         // chain every time: no snapshot is ever scripted.
@@ -1978,9 +2696,11 @@ mod tests {
         };
 
         let (message, applied) = tick_message(harness::POOL, tick);
-        handle_message(&tracker, &sources, cadence, &mut state, &shutdown, message)
-            .await
-            .expect("a failing scan is not a failing tick");
+        handle_message(
+            &tracker, &sources, cadence, &mut state, &shutdown, &tick_tx, message,
+        )
+        .await
+        .expect("a failing scan is not a failing tick");
         assert!(
             applied.await.is_ok(),
             "the tick is acknowledged, so the poller commits the cursor"
@@ -2002,9 +2722,11 @@ mod tests {
             close_time: tick.close_time,
         };
         let (message, applied) = tick_message(harness::POOL, next);
-        handle_message(&tracker, &sources, cadence, &mut state, &shutdown, message)
-            .await
-            .expect("the following tick");
+        handle_message(
+            &tracker, &sources, cadence, &mut state, &shutdown, &tick_tx, message,
+        )
+        .await
+        .expect("the following tick");
         assert!(applied.await.is_ok());
         // The acknowledgement alone cannot show the scan was skipped — a
         // scan that ran and failed is acknowledged too, by this very fix.
@@ -2132,6 +2854,602 @@ mod tests {
                 .expect("cursor read")
                 .is_none(),
             "no cursor is committed for a pool the seed could not read, so the next start seeds it again"
+        );
+        Ok(())
+    }
+
+    /// The design spec's default thresholds (`LIQ_HF_THRESHOLD=0.998`,
+    /// `TARGET_HF=1.06`, `PLAN_ITERATIONS=5`), with no own addresses: none
+    /// of these tests needs to exclude an account.
+    fn auctioneer_config() -> AuctioneerConfig {
+        AuctioneerConfig {
+            liquidation_health_factor: 9_980_000,
+            target_health_factor: 10_600_000,
+            plan_iterations: 5,
+            own_addresses: BTreeSet::new(),
+        }
+    }
+
+    /// A valid, distinct account strkey with no real key behind it — every
+    /// test that uses one only ever reads chain state through the
+    /// scripted RPC, never signs anything.
+    fn synthetic_debtor() -> String {
+        stellar_strkey::ed25519::PublicKey([42_u8; 32]).to_string()
+    }
+
+    /// A `Positions` ledger entry naming only a liability, on reserve
+    /// index 1, and no collateral at all — the one shape `decide_one`
+    /// calls bad debt outright, with no health-factor arithmetic and no
+    /// percent walk to script around: `liability_base > 0 &&
+    /// collateral_base == 0`.
+    fn bad_debt_positions_entry_xdr(account: &str) -> String {
+        let side = |amounts: &[(u32, i128)]| {
+            map(amounts
+                .iter()
+                .map(|(index, amount)| (ScVal::U32(*index), i128_val(*amount)))
+                .collect())
+            .unwrap()
+        };
+        let value = map(vec![
+            (symbol("collateral").unwrap(), side(&[])),
+            (symbol("liabilities").unwrap(), side(&[(1, 10_000_000_000)])),
+            (symbol("supply").unwrap(), side(&[])),
+        ])
+        .unwrap();
+        let entry = LedgerEntryData::ContractData(ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: sc_address(harness::POOL).unwrap(),
+            key: sc_vec(vec![
+                symbol("Positions").unwrap(),
+                address(account).unwrap(),
+            ])
+            .unwrap(),
+            durability: ContractDataDurability::Persistent,
+            val: value,
+        });
+        to_base64(&entry).unwrap()
+    }
+
+    /// Scripts one snapshot exactly as `harness::script_snapshot` does —
+    /// same reserves, same oracle prices, all from the fixture — except
+    /// `account` gets a hand-built, liability-only positions entry instead
+    /// of whatever (if anything) the fixture holds for it. Stands in for
+    /// `harness::script_snapshot` in the one test here that needs a
+    /// decision other than `Skip`.
+    fn script_snapshot_bad_debt(rpc: &ScriptedRpc, account: &str) {
+        let fixture = mainnet_fixed_v2();
+        let ledger = fixture["ledger"].as_u64().unwrap();
+        rpc.expect(
+            "getLedgerEntries",
+            json!({"latestLedger": ledger, "entries": [
+                entry(&keys::instance(harness::POOL).unwrap(), text(&fixture, &["instance_entry_xdr"])),
+                entry(&keys::reserve_list(harness::POOL).unwrap(), text(&fixture, &["res_list_entry_xdr"])),
+            ]}),
+        );
+        let mut entries = Vec::new();
+        for reserve in fixture["reserves"].as_array().unwrap() {
+            let asset = reserve["asset"].as_str().unwrap();
+            entries.push(entry(
+                &keys::reserve_config(harness::POOL, asset).unwrap(),
+                reserve["config_entry_xdr"].as_str().unwrap(),
+            ));
+            entries.push(entry(
+                &keys::reserve_data(harness::POOL, asset).unwrap(),
+                reserve["data_entry_xdr"].as_str().unwrap(),
+            ));
+        }
+        entries.push(entry(
+            &keys::positions(harness::POOL, account).unwrap(),
+            &bad_debt_positions_entry_xdr(account),
+        ));
+        rpc.expect(
+            "getLedgerEntries",
+            json!({"latestLedger": ledger, "entries": entries}),
+        );
+        let ledger = u32::try_from(ledger).unwrap();
+        rpc.expect(
+            "simulateTransaction",
+            simulation(text(&fixture, &["oracle_decimals_return_xdr"]), ledger),
+        );
+        for reserve in fixture["reserves"].as_array().unwrap() {
+            rpc.expect(
+                "simulateTransaction",
+                simulation(reserve["lastprice_return_xdr"].as_str().unwrap(), ledger),
+            );
+        }
+    }
+
+    /// A tick flags the accounts its events named, durably: the
+    /// auctioneer's input survives a restart, which the in-memory
+    /// `pending` set it replaces did not.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_tick_flags_the_accounts_its_events_named(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        harness::script_snapshot(&rpc, &[harness::USER_ONE]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let tracker = Tracker::new(&client, &store);
+        let (_flag, shutdown) = watch::channel(false);
+        let (tick_tx, _tick_rx) = tick_watch();
+        let mut state = LoopState::default();
+
+        handle_message(
+            &tracker,
+            &[],
+            quiet_cadence(),
+            &mut state,
+            &shutdown,
+            &tick_tx,
+            borrow(harness::POOL, harness::USER_ONE),
+        )
+        .await
+        .expect("apply the event");
+        assert_eq!(
+            store
+                .user(harness::POOL, harness::USER_ONE)
+                .await
+                .expect("read"),
+            None,
+            "an event writes no row yet: there is nothing to flag until the tick values it"
+        );
+
+        let tick = harness::fixture_tick();
+        let (message, applied) = tick_message(harness::POOL, tick);
+        handle_message(
+            &tracker,
+            &[],
+            quiet_cadence(),
+            &mut state,
+            &shutdown,
+            &tick_tx,
+            message,
+        )
+        .await
+        .expect("apply the tick");
+        assert!(applied.await.is_ok());
+
+        // Read back from the store, not from anything the tick left in
+        // memory: this is the durability the in-memory `pending` set this
+        // flag replaces as the auctioneer's input never had.
+        let flagged = store
+            .users_needing_recheck(harness::POOL, 10)
+            .await
+            .expect("read the recheck queue");
+        assert_eq!(
+            flagged
+                .iter()
+                .map(|user| user.account.clone())
+                .collect::<Vec<_>>(),
+            vec![harness::USER_ONE.to_string()],
+            "the account this tick's event named is flagged for an auctioneer decision"
+        );
+        assert_eq!(flagged[0].recheck_ledger, Some(tick.sequence));
+        Ok(())
+    }
+
+    /// The auctioneer's pass clears only the flag it saw, so a flag raised
+    /// while it was deciding survives the decision that did not account
+    /// for it. `Store::clear_recheck`'s own conditional-clear semantics
+    /// are `store.rs`'s to prove; this test pins the service layer's half:
+    /// that it always passes the ledger the *batch read* saw, never
+    /// `tick`'s own ledger — the two are deliberately different values
+    /// here, so a service that clears with the wrong one fails this test.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_pass_clears_only_the_flag_it_decided_on(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        // One `decide` call per `recheck_batch` call below.
+        harness::script_snapshot(&rpc, &[harness::USER_TWO]);
+        harness::script_snapshot(&rpc, &[harness::USER_TWO]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let auctioneer = Auctioneer::new(&client, &store, auctioneer_config(), None);
+        let (_flag, shutdown) = watch::channel(false);
+        // Deliberately not the ledger any batch was flagged at, so a
+        // service that clears with `tick.sequence` instead of the batch's
+        // own value would clear a flag this test never raised at that
+        // ledger — and the assertions below would catch it either way.
+        let tick = harness::fixture_tick();
+
+        // `flag_recheck` is an `UPDATE`, not an upsert: the row must
+        // already exist, exactly as the tracker's own refresh would have
+        // written it.
+        store
+            .upsert_user(&tracked_user(harness::USER_TWO, tick.sequence))
+            .await
+            .expect("seed the row");
+        store
+            .flag_recheck(harness::POOL, harness::USER_TWO, 100)
+            .await
+            .expect("flag");
+        let stale_batch = store
+            .users_needing_recheck(harness::POOL, 10)
+            .await
+            .expect("read");
+        assert_eq!(stale_batch[0].recheck_ledger, Some(100));
+
+        // A newer flag arrives — a fresh event, say — while this batch is
+        // still the one being decided on.
+        store
+            .flag_recheck(harness::POOL, harness::USER_TWO, 200)
+            .await
+            .expect("reflag");
+
+        recheck_batch(
+            &auctioneer,
+            &store,
+            harness::POOL,
+            &stale_batch,
+            tick,
+            None,
+            &shutdown,
+        )
+        .await
+        .expect("a healthy borrower's pass never fails");
+        assert_eq!(
+            store
+                .users_needing_recheck(harness::POOL, 10)
+                .await
+                .expect("read")[0]
+                .recheck_ledger,
+            Some(200),
+            "clearing the flag this pass saw (100) must not clear the newer one (200)"
+        );
+
+        // A pass that reads the *current* flag clears it normally: the
+        // conditional clear is about a stale value, not about refusing to
+        // clear at all.
+        let fresh_batch = store
+            .users_needing_recheck(harness::POOL, 10)
+            .await
+            .expect("read");
+        recheck_batch(
+            &auctioneer,
+            &store,
+            harness::POOL,
+            &fresh_batch,
+            tick,
+            None,
+            &shutdown,
+        )
+        .await
+        .expect("a second pass");
+        assert!(
+            store
+                .users_needing_recheck(harness::POOL, 10)
+                .await
+                .expect("read")
+                .is_empty(),
+            "a pass that decided on the current flag clears it"
+        );
+        Ok(())
+    }
+
+    /// The full scan flags every user below the threshold, across pages: a
+    /// borrower on the second page is exactly the one a single-page scan
+    /// would have missed.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_full_scan_flags_every_user_below_the_threshold(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        for (account, health) in [
+            ("A", 1_000_000_i128),
+            ("B", 2_000_000),
+            ("C", 2_000_000),
+            ("D", 3_000_000),
+        ] {
+            store
+                .upsert_user(&TrackedUser {
+                    pool: harness::POOL.to_string(),
+                    account: account.to_string(),
+                    health_factor: health,
+                    collateral: BTreeMap::new(),
+                    liabilities: BTreeMap::from([(0, 1)]),
+                    updated_ledger: 10,
+                    recheck_ledger: None,
+                })
+                .await
+                .expect("upsert");
+        }
+        // At or above the threshold: never flagged.
+        store
+            .upsert_user(&TrackedUser {
+                pool: harness::POOL.to_string(),
+                account: "HEALTHY".to_string(),
+                health_factor: 20_000_000,
+                collateral: BTreeMap::new(),
+                liabilities: BTreeMap::from([(0, 1)]),
+                updated_ledger: 10,
+                recheck_ledger: None,
+            })
+            .await
+            .expect("upsert");
+
+        // A page size of 1 forces every one of the four qualifying users
+        // onto its own page: a scan that flagged only the first page would
+        // miss three of the four.
+        let flagged = full_scan_and_flag(&store, harness::POOL, 5_000_000, 999, 1)
+            .await
+            .expect("full scan");
+        assert_eq!(flagged, 4);
+
+        for account in ["A", "B", "C", "D"] {
+            assert_eq!(
+                store
+                    .user(harness::POOL, account)
+                    .await
+                    .expect("read")
+                    .and_then(|user| user.recheck_ledger),
+                Some(999),
+                "{account} is below the threshold and must be flagged, second page included"
+            );
+        }
+        assert_eq!(
+            store
+                .user(harness::POOL, "HEALTHY")
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            None,
+            "a user at or above the threshold is never flagged"
+        );
+        Ok(())
+    }
+
+    /// Before `STARTUP_DELAY_LEDGERS` has elapsed nothing is submitted,
+    /// even armed: a bot that has just started has the least state and the
+    /// most reason to be wrong. Proven against a real `SubmissionQueue`
+    /// and a real bad-debt decision, with only the deepest leaf — an
+    /// actual submitted transaction — stood in for, exactly as
+    /// `queue.rs`'s own tests stand in for `Submitter::submit`.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn no_submission_before_the_startup_delay(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let account = synthetic_debtor();
+        // One `decide` call per `auctioneer_tick` call below.
+        script_snapshot_bad_debt(&rpc, &account);
+        script_snapshot_bad_debt(&rpc, &account);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let auctioneer = Auctioneer::new(&client, &store, auctioneer_config(), None);
+        let (_flag, shutdown) = watch::channel(false);
+
+        let (queue, mut queue_rx) = SubmissionQueue::new(8);
+        let worker = tokio::spawn(async move {
+            while let Some(queued) = queue_rx.recv().await {
+                let _ = queued.respond.send(Ok(TxOutcome::Succeeded {
+                    hash: TxHash([9_u8; 32]),
+                    ledger: 1,
+                    return_value: None,
+                }));
+            }
+        });
+
+        let cadence = AuctioneerCadence {
+            refresh_batch: 10,
+            oracle_scan_ledgers: 0,
+            oracle_phase: 0,
+            full_scan_ledgers: 0,
+            full_phase: 0,
+            scan_health_factor: 0,
+            price_delta_bps: 0,
+            startup_delay_ledgers: 1,
+        };
+        let pools = vec![harness::POOL.to_string()];
+        let ctx = AuctioneerContext {
+            store: &store,
+            pools: &pools,
+            auctioneer: &auctioneer,
+            cadence,
+            submission_queue: Some(&queue),
+            shutdown: &shutdown,
+        };
+        let mut state = AuctioneerState::default();
+        let tick = harness::fixture_tick();
+
+        // `flag_recheck` is an `UPDATE`, not an upsert: the row must
+        // already exist, exactly as the tracker's own refresh would have
+        // written it.
+        store
+            .upsert_user(&tracked_user(&account, tick.sequence))
+            .await
+            .expect("seed the row");
+        store
+            .flag_recheck(harness::POOL, &account, tick.sequence)
+            .await
+            .expect("flag");
+
+        // Tick one: `ticks_seen` becomes 1, and `1 > startup_delay_ledgers
+        // (1)` is false, so submissions stay locked even though the queue
+        // is right there and the decision is a real bad debt.
+        auctioneer_tick(&ctx, tick, &mut state)
+            .await
+            .expect("tick one");
+        assert!(
+            !state.submissions_unlocked,
+            "the first tick is still inside the delay"
+        );
+
+        let recorded = sqlx::query!(
+            "SELECT dry_run FROM creations WHERE pool = $1 AND account = $2 ORDER BY id",
+            harness::POOL,
+            account,
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("read the creation");
+        assert_eq!(recorded.len(), 1, "the decision was still recorded");
+        assert!(
+            recorded[0].dry_run,
+            "recorded as dry-run even though a live queue is configured: the startup \
+             delay has not elapsed"
+        );
+
+        // Re-flag: this is the same unresolved bad debt, and in a real bot
+        // some later event, oracle move or full scan would raise this
+        // again anyway.
+        store
+            .flag_recheck(harness::POOL, &account, tick.sequence)
+            .await
+            .expect("reflag");
+        let tick_two = LedgerTick {
+            sequence: tick.sequence + 1,
+            close_time: tick.close_time,
+        };
+        auctioneer_tick(&ctx, tick_two, &mut state)
+            .await
+            .expect("tick two");
+        assert!(
+            state.submissions_unlocked,
+            "the second tick is past the delay"
+        );
+
+        let recorded = sqlx::query!(
+            "SELECT dry_run FROM creations WHERE pool = $1 AND account = $2 ORDER BY id",
+            harness::POOL,
+            account,
+        )
+        .fetch_all(store.pool())
+        .await
+        .expect("read the creations");
+        assert_eq!(recorded.len(), 2);
+        assert!(
+            !recorded[1].dry_run,
+            "once the delay has elapsed, the same decision is actually submitted"
+        );
+
+        drop(queue);
+        worker.await.expect("worker");
+        Ok(())
+    }
+
+    /// The auctioneer failing does not stall the cursor: a decision is not
+    /// a stored effect of a ledger, so the tick that named the
+    /// auctioneer's own input is acknowledged and published *before* the
+    /// auctioneer is ever given a chance to run — and a later tick is
+    /// acknowledged too, proving the earlier failure poisoned nothing
+    /// downstream either.
+    ///
+    /// If the auctioneer were ever called from inside `apply_tick` — the
+    /// mistake the constraint forbids — this test would fail at its very
+    /// first assertion: `handle_message` would propagate the auctioneer's
+    /// chain error before `ack.send(())` is ever reached, so
+    /// `applied.await` would come back `Err`, not `Ok`.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_auctioneer_failure_does_not_stall_the_cursor(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        harness::script_snapshot(&rpc, &[harness::USER_ONE]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let tracker = Tracker::new(&client, &store);
+        let (_flag, shutdown) = watch::channel(false);
+        let (tick_tx, tick_rx) = tick_watch();
+        let mut state = LoopState::default();
+
+        handle_message(
+            &tracker,
+            &[],
+            quiet_cadence(),
+            &mut state,
+            &shutdown,
+            &tick_tx,
+            borrow(harness::POOL, harness::USER_ONE),
+        )
+        .await
+        .expect("apply the event");
+
+        let tick = harness::fixture_tick();
+        let (message, applied) = tick_message(harness::POOL, tick);
+        handle_message(
+            &tracker,
+            &[],
+            quiet_cadence(),
+            &mut state,
+            &shutdown,
+            &tick_tx,
+            message,
+        )
+        .await
+        .expect("apply the tick");
+
+        // The cursor's own proof, entirely independent of whatever the
+        // auctioneer does next: the tracker has already acknowledged and
+        // published.
+        assert!(
+            applied.await.is_ok(),
+            "the tick is acknowledged before the auctioneer ever runs"
+        );
+        assert_eq!(
+            *tick_rx.borrow(),
+            tick,
+            "and published to the auctioneer's watch"
+        );
+        assert_eq!(
+            store
+                .user(harness::POOL, harness::USER_ONE)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            Some(tick.sequence),
+            "the tick flagged the account: this is the auctioneer's own input"
+        );
+
+        // Now the auctioneer runs against that exact tick, and fails: its
+        // own snapshot read gets a 503.
+        rpc.expect_http("getLedgerEntries", 503);
+        let batch = store
+            .users_needing_recheck(harness::POOL, 10)
+            .await
+            .expect("read the recheck queue");
+        assert_eq!(batch.len(), 1);
+        let auctioneer = Auctioneer::new(&client, &store, auctioneer_config(), None);
+        let result = recheck_batch(
+            &auctioneer,
+            &store,
+            harness::POOL,
+            &batch,
+            tick,
+            None,
+            &shutdown,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "a chain failure deciding this pool's batch is logged, not propagated: {result:?}"
+        );
+        assert_eq!(
+            store
+                .user(harness::POOL, harness::USER_ONE)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            Some(tick.sequence),
+            "the flag a failed decision never accounted for stays up, for the next pass"
+        );
+
+        // And the tracker's cursor keeps moving: a later tick, with
+        // nothing new to refresh, is acknowledged exactly as any other
+        // clean tick would be. The auctioneer's failure a moment ago
+        // poisoned nothing in this path.
+        let next = LedgerTick {
+            sequence: tick.sequence + 1,
+            close_time: tick.close_time,
+        };
+        let (message, applied) = tick_message(harness::POOL, next);
+        handle_message(
+            &tracker,
+            &[],
+            quiet_cadence(),
+            &mut state,
+            &shutdown,
+            &tick_tx,
+            message,
+        )
+        .await
+        .expect("a later tick applies cleanly");
+        assert!(
+            applied.await.is_ok(),
+            "the cursor keeps moving after the auctioneer's failure"
         );
         Ok(())
     }
