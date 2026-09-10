@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 
 use crate::chain::xdr::encode::FillPercent;
-use crate::math::fixed::{div_floor, mul_floor, SCALAR_7};
+use crate::math::fixed::{div_floor, mul_ceil, mul_floor, SCALAR_7};
 use crate::math::position::{OraclePrices, PositionData, Positions};
 use crate::math::reserve::Reserve;
 use crate::math::MathError;
@@ -43,6 +43,13 @@ pub struct LiquidationPlan {
 /// Values every non-zero position, collateral and liabilities separately,
 /// each sorted by effective value, largest first — the order the selection
 /// walks.
+///
+/// Collateral rounds down and liabilities round up, the same direction
+/// [`calculate_position_data`](crate::math::position::calculate_position_data)
+/// uses and for the same reason: understating collateral or overstating a
+/// liability can only make this module's view of a position look worse
+/// than the contract's, never better, so a position this module treats as
+/// liquidatable is one the contract agrees is.
 ///
 /// `reserves` must already be accrued to the ledger being valued;
 /// [`PoolSnapshot::position_data`](crate::chain::pool::PoolSnapshot::position_data)
@@ -90,12 +97,12 @@ pub fn position_values(
         liabilities.push(PositionValue {
             index: *index,
             asset: reserve.asset.clone(),
-            raw: mul_floor(
+            raw: mul_ceil(
                 price,
                 reserve.to_asset_from_d_token(*d_tokens)?,
                 reserve.scalar,
             )?,
-            effective: mul_floor(
+            effective: mul_ceil(
                 price,
                 reserve.to_effective_asset_from_d_token(*d_tokens)?,
                 reserve.scalar,
@@ -478,13 +485,24 @@ mod tests {
     }
 
     /// A percent over 100 means one liability is not enough to close the
-    /// excess, so the next largest liability joins the bid. Two liabilities
-    /// of 400 raw each cannot be closed by the first alone.
+    /// excess, so the next largest liability joins the bid — and the retry
+    /// must actually change the answer, or this would pass with the retry
+    /// deleted. This reuses the worked example's collateral (raw 1_000,
+    /// effective 750, so cf 0.75) and excess (1_000 × 1.06 − 750 = 310, i.e.
+    /// 3_100_000_000), split the worked example's liability (raw 800,
+    /// effective 1_000) into two positions of raw 400, effective 500 each,
+    /// so lf is 1.25 either way — identical ratios to the worked example, at
+    /// half the raw liability:
+    ///   recovered = 0.425 (unchanged: cf and lf are unchanged)
+    ///   percent   = 310 / (0.425 × 400) × 100 = 182.35… → 182, over 100
+    /// so the second liability joins, and the selection becomes exactly the
+    /// worked example's liability (raw 800, effective 1_000), which gives
+    /// the worked example's own answer: 91.
     #[test]
     fn a_percent_over_one_hundred_adds_the_next_liability() {
         let data = PositionData {
-            collateral_base: 1_000_000_000,
-            collateral_raw: 1_333_333_333,
+            collateral_base: 7_500_000_000,
+            collateral_raw: 10_000_000_000,
             liability_base: 10_000_000_000,
             liability_raw: 8_000_000_000,
             scalar: SCALAR_7,
@@ -492,8 +510,8 @@ mod tests {
         let collateral = vec![PositionValue {
             index: 0,
             asset: "XLM".to_string(),
-            raw: 1_333_333_333,
-            effective: 1_000_000_000,
+            raw: 10_000_000_000,
+            effective: 7_500_000_000,
         }];
         let liabilities = vec![
             PositionValue {
@@ -517,15 +535,28 @@ mod tests {
             2,
             "one liability could not close the excess"
         );
-        assert!(
-            plan.percent.get() <= 100,
-            "the answer is always a percent the contract accepts"
+        assert_eq!(
+            plan.percent.get(),
+            91,
+            "the retry lands on exactly the worked example's percent, not \
+             the exhaustion fallback's 100"
         );
     }
 
     /// When the selected collateral cannot cover what the auction would
     /// withdraw, the percent is zero and the next largest collateral joins
-    /// the lot rather than the plan being abandoned.
+    /// the lot rather than the plan being abandoned. With only the first
+    /// collateral selected (raw 500, effective 375, cf 0.75 — same ratio as
+    /// the worked example) against the whole liability (raw 800, effective
+    /// 1_000, lf 1.25), `recovered` and the 91 the formula reaches are
+    /// identical to the worked example, but the withdrawal check uses only
+    /// the *selected* raw collateral: 800 × 0.91 × 1.2 = 873.6 exceeds 500,
+    /// so this first selection reports percent 0 and the second collateral
+    /// (raw 500, effective 375) joins the lot. With both collateral
+    /// positions selected (raw 1_000, effective 750 — the worked example's
+    /// own collateral) the same 91 now clears the withdrawal check (873.6 ≤
+    /// 1_000) and is returned as the answer, through the same branch the
+    /// worked example returns through, not the exhaustion fallback.
     #[test]
     fn an_underweight_lot_adds_the_next_collateral() {
         let data = PositionData {
@@ -562,6 +593,12 @@ mod tests {
             plan.lot.len(),
             2,
             "one collateral could not cover the withdrawal"
+        );
+        assert_eq!(
+            plan.percent.get(),
+            91,
+            "the retry lands on the worked example's percent through the \
+             real branch, not the exhaustion fallback's 100"
         );
     }
 
