@@ -360,6 +360,23 @@ pub struct ServiceConfig {
     pub full_scan_ledgers: u32,
     /// The health factor the full scan reports below, 7 decimals.
     pub scan_health_factor: i128,
+    /// The health factor at or below which a borrower is liquidatable, 7
+    /// decimals.
+    pub liq_hf_threshold: i128,
+    /// The health factor a liquidation aims to leave the borrower at, 7
+    /// decimals.
+    pub target_hf: i128,
+    /// How often, in ledgers, prices are re-read for a significant move.
+    pub oracle_scan_ledgers: u32,
+    /// How far a price must move, in basis points, to be worth rechecking
+    /// the borrowers exposed to it.
+    pub price_delta_bps: u32,
+    /// How many times a rejected percent is adjusted against the contract's
+    /// own answer before the borrower is left until the next recheck.
+    pub plan_iterations: u32,
+    /// Ledger ticks to wait after startup before any submission is
+    /// attempted.
+    pub startup_delay_ledgers: u32,
     /// Seeding.
     pub seed: SeedConfig,
 }
@@ -480,6 +497,50 @@ pub struct Args {
     /// The health factor that scan reports below.
     #[arg(long, env = "SCAN_HF_THRESHOLD", default_value = "1.2")]
     pub scan_hf_threshold: Decimal7,
+
+    /// The health factor at or below which a borrower is liquidatable.
+    ///
+    /// Below the contract's own strict test (`liability_base >
+    /// collateral_base`, i.e. 1.0) on purpose: the margin absorbs rounding
+    /// and the interest accrued between planning and execution, so an
+    /// auction the bot creates is one the contract still accepts when it
+    /// lands.
+    #[arg(long, env = "LIQ_HF_THRESHOLD", default_value = "0.998")]
+    pub liq_hf_threshold: Decimal7,
+
+    /// The health factor a liquidation aims to leave the borrower at.
+    ///
+    /// The contract refuses a post-liquidation health factor at or above
+    /// `1.15` (`InvalidLiqTooLarge`) or below `1.03` (`InvalidLiqTooSmall`),
+    /// so this sits between them with room for the auction to be filled a
+    /// ledger or two later than planned.
+    #[arg(long, env = "TARGET_HF", default_value = "1.06")]
+    pub target_hf: Decimal7,
+
+    /// How often, in ledgers, prices are re-read and a significant move
+    /// flags the borrowers it moved against.
+    #[arg(long, env = "ORACLE_SCAN_LEDGERS", default_value_t = 60)]
+    pub oracle_scan_ledgers: u32,
+
+    /// How far a price must move from its reference, in basis points, to be
+    /// worth rechecking the borrowers exposed to it.
+    #[arg(long, env = "PRICE_DELTA_BPS", default_value_t = 250)]
+    pub price_delta_bps: u32,
+
+    /// How many times a rejected percent is adjusted against the contract's
+    /// own answer before the borrower is left until the next recheck.
+    #[arg(long, env = "PLAN_ITERATIONS", default_value_t = 5)]
+    pub plan_iterations: u32,
+
+    /// Ledger ticks to wait after startup before any submission is
+    /// attempted.
+    ///
+    /// Zero by default, so a fresh deployment submits as soon as it is
+    /// ready. A nonzero value gives a poller that is catching up on a
+    /// backlog room to reach current chain state before the bot starts
+    /// acting on health factors it has not yet re-verified against it.
+    #[arg(long, env = "STARTUP_DELAY_LEDGERS", default_value_t = 0)]
+    pub startup_delay_ledgers: u32,
 
     /// The analytics API the tracker seeds from. Empty disables it.
     #[arg(
@@ -617,12 +678,38 @@ impl Args {
             refresh_batch: self.refresh_batch,
             full_scan_ledgers: self.full_scan_ledgers,
             scan_health_factor: self.scan_hf_threshold.get(),
+            liq_hf_threshold: self.liq_hf_threshold.get(),
+            target_hf: self.target_hf.get(),
+            oracle_scan_ledgers: self.oracle_scan_ledgers,
+            price_delta_bps: self.price_delta_bps,
+            plan_iterations: self.plan_iterations,
+            startup_delay_ledgers: self.startup_delay_ledgers,
             seed: SeedConfig {
                 url: Some(self.seed_url.clone()).filter(|url| !url.is_empty()),
                 health_factor_max: self.seed_hf_max.get(),
                 file: self.seed_file.clone(),
             },
         })
+    }
+
+    /// The key the auctioneer signs with: `AUCTIONEER_SECRET_KEY` when set,
+    /// otherwise `FILLER_SECRET_KEY`, and `None` when neither is — which is
+    /// the ordinary dry-run deployment and not an error.
+    ///
+    /// Both arrive from the environment, never from argv: a signing key on
+    /// the command line is readable from `/proc/<pid>/cmdline`, `ps` and
+    /// `docker inspect`.
+    pub fn auctioneer_signer(
+        &self,
+        filler: Option<String>,
+        auctioneer: Option<String>,
+    ) -> Result<Option<crate::chain::Signer>, LiquidatorError> {
+        let Some(secret) = auctioneer.or(filler) else {
+            return Ok(None);
+        };
+        crate::chain::Signer::from_secret(&secret)
+            .map(Some)
+            .map_err(|error| LiquidatorError::Config(format!("auctioneer key: {error}")))
     }
 }
 
@@ -700,6 +787,12 @@ mod tests {
             "REFRESH_BATCH",
             "FULL_SCAN_LEDGERS",
             "SCAN_HF_THRESHOLD",
+            "LIQ_HF_THRESHOLD",
+            "TARGET_HF",
+            "ORACLE_SCAN_LEDGERS",
+            "PRICE_DELTA_BPS",
+            "PLAN_ITERATIONS",
+            "STARTUP_DELAY_LEDGERS",
             "SEED_URL",
             "SEED_HF_MAX",
             "SEED_FILE",
@@ -715,6 +808,13 @@ mod tests {
     fn parse(argv: &[&str]) -> Args {
         assert_clean_environment();
         Args::try_parse_from(argv).unwrap()
+    }
+
+    /// The fallible sibling of `parse`, for the tests that want to assert
+    /// *how* parsing fails rather than unwrap a success.
+    fn try_parse(argv: &[&str]) -> clap::error::Result<Args> {
+        assert_clean_environment();
+        Args::try_parse_from(argv)
     }
 
     #[test]
@@ -1165,5 +1265,181 @@ supported_lot = ["*"]
             .service_with_secrets(Some("postgres://x".to_string()), None)
             .expect("configuration");
         assert_eq!(config.seed.url, None);
+    }
+
+    /// The auctioneer's thresholds parse into 7-decimal fixed point with the
+    /// spec's defaults, and a value with more precision than the scale can
+    /// hold is refused at startup rather than silently rounded — a
+    /// threshold that decides whether to liquidate is not a place to lose a
+    /// digit.
+    #[test]
+    fn the_auctioneer_thresholds_default_and_refuse_over_precision() {
+        assert_clean_environment();
+        let args = parse(&[
+            "liquidator",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "http://rpc",
+        ]);
+        assert_eq!(
+            args.liq_hf_threshold.get(),
+            9_980_000,
+            "LIQ_HF_THRESHOLD defaults to 0.998"
+        );
+        assert_eq!(
+            args.target_hf.get(),
+            10_600_000,
+            "TARGET_HF defaults to 1.06"
+        );
+        assert_eq!(args.oracle_scan_ledgers, 60);
+        assert_eq!(args.price_delta_bps, 250);
+        assert_eq!(args.plan_iterations, 5);
+        assert_eq!(args.startup_delay_ledgers, 0);
+
+        let refused = try_parse(&[
+            "liquidator",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "http://rpc",
+            "--target-hf",
+            "1.060000001",
+        ]);
+        assert!(
+            refused.is_err(),
+            "a value the 7-decimal scale cannot hold is a startup error"
+        );
+    }
+
+    /// The auctioneer's key is environment-only, like every other secret: a
+    /// key on the command line is readable in `ps`, `docker inspect` and
+    /// `/proc/<pid>/cmdline`.
+    #[test]
+    fn the_auctioneer_key_is_not_an_argument() {
+        assert_clean_environment();
+        assert!(
+            try_parse(&[
+                "liquidator",
+                "--network",
+                "testnet",
+                "--rpc-url",
+                "http://rpc",
+                "--auctioneer-secret-key",
+                "SB…",
+            ])
+            .is_err(),
+            "there is no such flag, and there must not be"
+        );
+    }
+
+    /// Unset, the auctioneer signs with the filler's key: one key is the
+    /// ordinary deployment, and the spec makes the separate key the option
+    /// rather than the requirement. A configured auctioneer key wins.
+    #[test]
+    fn the_auctioneer_falls_back_to_the_filler_key() {
+        assert_clean_environment();
+        let args = parse(&[
+            "liquidator",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "http://rpc",
+        ]);
+        // Two valid test seeds; any S… strkey this crate can decode will do.
+        let filler = "SAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC5MY";
+        let auctioneer = "SABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNE7";
+
+        let only_filler = args
+            .auctioneer_signer(Some(filler.to_string()), None)
+            .expect("signer")
+            .expect("a key is configured");
+        let both = args
+            .auctioneer_signer(Some(filler.to_string()), Some(auctioneer.to_string()))
+            .expect("signer")
+            .expect("a key is configured");
+        assert_ne!(
+            only_filler.address(),
+            both.address(),
+            "the auctioneer key wins when set"
+        );
+        assert!(
+            args.auctioneer_signer(None, None)
+                .expect("no key")
+                .is_none(),
+            "no key configured is not an error: dry-run needs none"
+        );
+    }
+
+    /// A secret never renders, whichever key it is.
+    #[test]
+    fn the_auctioneer_signer_renders_as_its_address() {
+        let signer = crate::chain::signer::Signer::from_secret(
+            "SAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC5MY",
+        )
+        .expect("signer");
+        let rendered = format!("{signer:?}");
+        assert!(
+            rendered.starts_with('G') || rendered.contains('G'),
+            "the address, not the seed"
+        );
+        assert!(!rendered.contains("SAAQCAIBAEAQ"), "the seed never renders");
+    }
+
+    /// A malformed auctioneer key is a configuration error, not a panic,
+    /// and the error text never carries the secret.
+    #[test]
+    fn a_bad_auctioneer_key_is_a_config_error_that_never_echoes_it() {
+        assert_clean_environment();
+        let args = parse(&[
+            "liquidator",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "http://rpc",
+        ]);
+        let error = args
+            .auctioneer_signer(None, Some("not-a-valid-key".to_string()))
+            .expect_err("a malformed key is refused");
+        let rendered = error.to_string();
+        assert!(!rendered.contains("not-a-valid-key"), "{rendered}");
+        assert!(matches!(error, LiquidatorError::Config(_)));
+    }
+
+    /// The five thresholds and cadence knobs, plus the startup delay, all
+    /// reach `ServiceConfig` unchanged.
+    #[test]
+    fn the_auctioneer_knobs_reach_the_service_configuration() {
+        assert_clean_environment();
+        let args = parse(&[
+            "liquidator",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "http://rpc",
+            "--pools-toml",
+            POOLS,
+            "--liq-hf-threshold",
+            "0.99",
+            "--target-hf",
+            "1.1",
+            "--oracle-scan-ledgers",
+            "30",
+            "--price-delta-bps",
+            "100",
+            "--plan-iterations",
+            "3",
+            "--startup-delay-ledgers",
+            "12",
+        ]);
+        let config = args
+            .service_with_secrets(Some("postgres://x".to_string()), None)
+            .expect("configuration");
+        assert_eq!(config.liq_hf_threshold, 9_900_000);
+        assert_eq!(config.target_hf, 11_000_000);
+        assert_eq!(config.oracle_scan_ledgers, 30);
+        assert_eq!(config.price_delta_bps, 100);
+        assert_eq!(config.plan_iterations, 3);
+        assert_eq!(config.startup_delay_ledgers, 12);
     }
 }
