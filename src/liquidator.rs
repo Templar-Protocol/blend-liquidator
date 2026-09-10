@@ -28,6 +28,7 @@ pub mod chain;
 pub mod config;
 pub mod ledger;
 pub mod math;
+pub mod queue;
 pub mod service;
 pub mod store;
 pub mod tracker;
