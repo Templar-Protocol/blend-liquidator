@@ -373,6 +373,13 @@ pub struct ServiceConfig {
     pub price_delta_bps: u32,
     /// How many times a rejected percent is adjusted against the contract's
     /// own answer before the borrower is left until the next recheck.
+    ///
+    /// Never zero, whatever `PLAN_ITERATIONS` says: the walk runs
+    /// `0..plan_iterations`, so a zero would simulate nothing at all and
+    /// skip every liquidation while reporting that it had exhausted its
+    /// iterations — a bot that looks busy and does nothing. One is the
+    /// floor because one attempt is what "ask the contract, do not adjust"
+    /// means.
     pub plan_iterations: u32,
     /// Ledger ticks to wait after startup before any submission is
     /// attempted.
@@ -529,6 +536,10 @@ pub struct Args {
 
     /// How many times a rejected percent is adjusted against the contract's
     /// own answer before the borrower is left until the next recheck.
+    ///
+    /// Zero is read as one: the walk would otherwise never simulate at all,
+    /// and every liquidation would be skipped as though the contract had
+    /// refused it.
     #[arg(long, env = "PLAN_ITERATIONS", default_value_t = 5)]
     pub plan_iterations: u32,
 
@@ -682,7 +693,18 @@ impl Args {
             target_health_factor: self.target_hf.get(),
             oracle_scan_ledgers: self.oracle_scan_ledgers,
             price_delta_bps: self.price_delta_bps,
-            plan_iterations: self.plan_iterations,
+            // Floored at one attempt: see `ServiceConfig::plan_iterations`.
+            // Warned about rather than refused, because the safe reading of
+            // "adjust it zero times" is "ask the contract once and take its
+            // answer", not "never ask at all".
+            plan_iterations: {
+                if self.plan_iterations == 0 {
+                    tracing::warn!(
+                        "PLAN_ITERATIONS is 0, which would skip every liquidation; using 1"
+                    );
+                }
+                self.plan_iterations.max(1)
+            },
             startup_delay_ledgers: self.startup_delay_ledgers,
             seed: SeedConfig {
                 url: Some(self.seed_url.clone()).filter(|url| !url.is_empty()),
@@ -1445,5 +1467,33 @@ supported_lot = ["*"]
         assert_eq!(config.price_delta_bps, 100);
         assert_eq!(config.plan_iterations, 3);
         assert_eq!(config.startup_delay_ledgers, 12);
+    }
+
+    /// `PLAN_ITERATIONS=0` is not "adjust nothing", it is "attempt
+    /// nothing": the auctioneer's walk runs `0..plan_iterations`, so zero
+    /// would skip every liquidation while logging that it had exhausted its
+    /// iterations. The floor is one attempt.
+    #[test]
+    fn plan_iterations_never_reaches_the_service_as_zero() {
+        assert_clean_environment();
+        let args = parse(&[
+            "liquidator",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "http://rpc",
+            "--pools-toml",
+            POOLS,
+            "--plan-iterations",
+            "0",
+        ]);
+        assert_eq!(args.plan_iterations, 0, "the flag itself takes the value");
+        let config = args
+            .service_with_secrets(Some("postgres://x".to_string()), None)
+            .expect("configuration");
+        assert_eq!(
+            config.plan_iterations, 1,
+            "and the service reads it as one attempt, never none"
+        );
     }
 }

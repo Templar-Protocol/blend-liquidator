@@ -35,6 +35,15 @@ use crate::math::{mul_floor, MathError, Reserve, SCALAR_7};
 use crate::queue::{QueueError, Submission, SubmissionQueue};
 use crate::store::{CreationKind, CreationRecord, Store, StoreError, TrackedUser};
 
+/// `PoolError::InvalidLiqTooLarge`: the liquidation would leave the
+/// borrower's health factor at or above `1.15`, so the percent is too high.
+const INVALID_LIQ_TOO_LARGE: u32 = 1_213;
+
+/// `PoolError::InvalidLiqTooSmall`: the liquidation would leave the
+/// borrower's health factor below `1.03`, so the percent is too low. The
+/// contract only raises this for a partial liquidation.
+const INVALID_LIQ_TOO_SMALL: u32 = 1_214;
+
 /// Why a borrower was not acted on. Every skip is a decision, and a decision
 /// worth naming: an operator asking "why did nothing happen" is asking about
 /// exactly this.
@@ -636,7 +645,7 @@ impl<'a> Auctioneer<'a> {
             match submitter.simulate_only(&operation).await? {
                 Judgment::Accepted => return Ok(Some((percent, operation, true))),
                 Judgment::Refused {
-                    contract_error: Some(1214),
+                    contract_error: Some(INVALID_LIQ_TOO_SMALL),
                     ..
                 } => {
                     if let Some(next) = percent
@@ -655,7 +664,7 @@ impl<'a> Auctioneer<'a> {
                     }
                 }
                 Judgment::Refused {
-                    contract_error: Some(1213),
+                    contract_error: Some(INVALID_LIQ_TOO_LARGE),
                     ..
                 } => {
                     if let Some(next) = percent
@@ -758,6 +767,8 @@ mod tests {
     use crate::chain::xdr::keys;
     use crate::fixture::{mainnet_fixed_v2, text};
     use crate::harness::{self, GOLDEN_HEALTH, POOL, USER_ONE, USER_TWO};
+    use crate::math::liquidation::PositionValue;
+    use crate::math::PositionData;
     use crate::queue::run_queue;
     use crate::store::TrackedAuction;
 
@@ -1753,15 +1764,23 @@ mod tests {
     }
 
     /// `plan_liquidation` chooses a percent for a selection, and
-    /// `bounded_plan` may then trim that selection to the pool's
+    /// `bounded_plan` then trims that selection to the pool's
     /// `max_positions` without recomputing the percent — an accepted
     /// approximation precisely because this percent-adjustment loop
-    /// corrects it against the contract's own answer. This plan is built in
-    /// exactly the shape the most aggressive trim leaves (one asset per
-    /// side, `bounded_plan`'s floor), carrying a percent that was chosen
-    /// for whatever larger, untrimmed selection existed before the trim and
-    /// that the contract now rejects once; the loop must still converge on
-    /// one it accepts.
+    /// corrects it against the contract's own answer.
+    ///
+    /// So the plan here is not hand-built: it comes out of
+    /// `plan_liquidation` itself, against a position whose excess only two
+    /// liabilities can close, under a cap of two positions in total. The
+    /// selection therefore grows to two liabilities, picks its percent for
+    /// that pair, and is then trimmed back to one asset per side —
+    /// `bounded_plan`'s floor — carrying a percent chosen for a selection
+    /// twice its size. That is the stale percent this loop exists to
+    /// correct, and the contract rejects it once before accepting.
+    ///
+    /// The arithmetic is `math::liquidation`'s own worked example, split
+    /// across two liabilities: cf 0.75, lf 1.25, incentive 1.2, recovered
+    /// 0.425 and excess 310 give 91 for the pair.
     #[sqlx::test(migrations = "./migrations")]
     async fn a_trimmed_plans_stale_percent_still_converges(db: sqlx::PgPool) -> sqlx::Result<()> {
         let store = Store::from_pool(db);
@@ -1769,22 +1788,60 @@ mod tests {
         let signer = auctioneer_signer();
         let network = Network::testnet();
         let account = synthetic_account(60);
-        let bid_asset = synthetic_account(61);
-        let lot_asset = synthetic_account(62);
+
+        let data = PositionData {
+            collateral_base: 7_500_000_000,
+            collateral_raw: 10_000_000_000,
+            liability_base: 10_000_000_000,
+            liability_raw: 8_000_000_000,
+            scalar: SCALAR_7,
+        };
+        let collateral = vec![PositionValue {
+            index: 0,
+            asset: synthetic_account(61),
+            raw: 10_000_000_000,
+            effective: 7_500_000_000,
+        }];
+        let liabilities = vec![
+            PositionValue {
+                index: 1,
+                asset: synthetic_account(62),
+                raw: 4_000_000_000,
+                effective: 5_000_000_000,
+            },
+            PositionValue {
+                index: 2,
+                asset: synthetic_account(63),
+                raw: 4_000_000_000,
+                effective: 5_000_000_000,
+            },
+        ];
+        // A cap of two: one liability cannot close the excess, so the
+        // selection grows to both — three positions in all — and the trim
+        // has to cut it back.
+        let plan = plan_liquidation(&data, &collateral, &liabilities, 10_600_000, 2)
+            .expect("plan")
+            .expect("an underwater position has a plan");
+        assert_eq!(
+            (plan.bid.len(), plan.lot.len()),
+            (1, 1),
+            "the cap really did trim the selection the percent was chosen \
+             for; without the trim the bid would name both liabilities"
+        );
+        assert_eq!(
+            plan.percent.get(),
+            91,
+            "the percent is the one chosen for the untrimmed pair"
+        );
 
         script_simulate_prelude(&rpc, &signer, 10, 100);
-        script_simulate_refused(&rpc, 1214, 100);
+        script_simulate_refused(&rpc, INVALID_LIQ_TOO_SMALL, 100);
         script_simulate_prelude(&rpc, &signer, 10, 100);
         script_simulate_accepted(&rpc, 100);
 
         let client = RpcClient::new(&rpc.url(), None).expect("client");
         let submitter = Submitter::new(&client, &network, &signer, tx_config());
         let auctioneer = Auctioneer::new(&client, &store, config(BTreeSet::new()), Some(submitter));
-        let plan = LiquidationPlan {
-            bid: vec![bid_asset],
-            lot: vec![lot_asset],
-            percent: FillPercent::try_from(70).expect("70 is in range"),
-        };
         let decision = Decision::Liquidate(plan);
         let tick = harness::fixture_tick();
 
@@ -1795,7 +1852,7 @@ mod tests {
             .expect("the loop converges on an accepted percent");
         assert_eq!(
             outcome.percent,
-            Some(FillPercent::try_from(71).expect("71 is in range")),
+            Some(FillPercent::try_from(92).expect("92 is in range")),
             "the trimmed selection's stale percent is corrected upward by \
              the loop, not recomputed from the assets"
         );
@@ -1901,6 +1958,82 @@ mod tests {
             "no RestoreFootprint transaction was sent"
         );
         assert!(rpc.calls("getFeeStats").is_empty(), "nothing was prepared");
+        Ok(())
+    }
+
+    /// With no auctioneer key there is no source account to simulate
+    /// against, so both `act` paths record the plan the contract was never
+    /// asked about and say so. Nothing is signed because nothing is even
+    /// asked: the chain is not touched at all.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn with_no_key_the_creation_is_recorded_unsimulated(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        // Deliberately scripted with nothing: any request at all would come
+        // back a 500 and fail the test.
+        let rpc = ScriptedRpc::start().await;
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let auctioneer = Auctioneer::new(&client, &store, config(BTreeSet::new()), None);
+        let account = synthetic_account(80);
+        let bad_debt_account = synthetic_account(81);
+        let plan = LiquidationPlan {
+            bid: vec![synthetic_account(82)],
+            lot: vec![synthetic_account(83)],
+            percent: FillPercent::try_from(64).expect("64 is in range"),
+        };
+        let tick = harness::fixture_tick();
+
+        let outcome = auctioneer
+            .act(POOL, &account, &Decision::Liquidate(plan), tick, None)
+            .await
+            .expect("act")
+            .expect("a creation");
+        assert!(
+            !outcome.simulated,
+            "no key, no source account, no simulation"
+        );
+        assert_eq!(
+            outcome.percent,
+            Some(FillPercent::try_from(64).expect("64 is in range")),
+            "the plan's own percent stands: there was no contract answer to \
+             adjust it against"
+        );
+        assert!(!outcome.submitted(), "and nothing was submitted");
+
+        let bad_debt = auctioneer
+            .act(POOL, &bad_debt_account, &Decision::BadDebt, tick, None)
+            .await
+            .expect("act")
+            .expect("a creation");
+        assert!(
+            !bad_debt.simulated,
+            "the bad-debt path answers the same way"
+        );
+        assert_eq!(bad_debt.kind, CreationKind::BadDebt);
+
+        let row = sqlx::query!(
+            "SELECT dry_run, tx_hash FROM creations WHERE account = $1",
+            account.as_str(),
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("the creation was recorded");
+        assert!(row.dry_run, "recorded as a dry run");
+        assert!(row.tx_hash.is_none(), "with no transaction behind it");
+
+        assert!(
+            rpc.calls("simulateTransaction").is_empty(),
+            "the contract was never asked"
+        );
+        assert!(
+            rpc.calls("getLedgerEntries").is_empty(),
+            "not even the source account was read"
+        );
+        assert!(
+            rpc.calls("sendTransaction").is_empty(),
+            "and nothing was sent"
+        );
         Ok(())
     }
 
@@ -2047,6 +2180,83 @@ mod tests {
         assert!(
             rpc.calls("sendTransaction").is_empty(),
             "the queue refused it before anything was sent"
+        );
+        Ok(())
+    }
+
+    /// A percent of 100 the contract still calls too small has nowhere
+    /// higher to go: the walk ends there rather than wrapping to 101, which
+    /// is not a `FillPercent` at all.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn too_small_at_one_hundred_percent_degrades_to_a_skip(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let signer = auctioneer_signer();
+        let network = Network::testnet();
+        let account = synthetic_account(100);
+
+        script_simulate_prelude(&rpc, &signer, 10, 100);
+        script_simulate_refused(&rpc, INVALID_LIQ_TOO_SMALL, 100);
+
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let auctioneer = Auctioneer::new(&client, &store, config(BTreeSet::new()), Some(submitter));
+        let plan = LiquidationPlan {
+            bid: vec![synthetic_account(101)],
+            lot: vec![synthetic_account(102)],
+            percent: FillPercent::try_from(100).expect("100 is the ceiling"),
+        };
+        let tick = harness::fixture_tick();
+
+        let outcome = auctioneer
+            .act(POOL, &account, &Decision::Liquidate(plan), tick, None)
+            .await
+            .expect("act");
+        assert!(outcome.is_none(), "nowhere higher to try: skipped");
+        assert_eq!(
+            rpc.calls("simulateTransaction").len(),
+            1,
+            "and no second attempt at a percent that cannot exist"
+        );
+        Ok(())
+    }
+
+    /// And a percent of 1 the contract calls too large has nowhere lower:
+    /// zero is not a `FillPercent` either, and `checked_sub` is what keeps
+    /// the arithmetic from wrapping to `u32::MAX` on the way to finding
+    /// that out.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn too_large_at_one_percent_degrades_to_a_skip(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let signer = auctioneer_signer();
+        let network = Network::testnet();
+        let account = synthetic_account(110);
+
+        script_simulate_prelude(&rpc, &signer, 10, 100);
+        script_simulate_refused(&rpc, INVALID_LIQ_TOO_LARGE, 100);
+
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let auctioneer = Auctioneer::new(&client, &store, config(BTreeSet::new()), Some(submitter));
+        let plan = LiquidationPlan {
+            bid: vec![synthetic_account(111)],
+            lot: vec![synthetic_account(112)],
+            percent: FillPercent::try_from(1).expect("1 is the floor"),
+        };
+        let tick = harness::fixture_tick();
+
+        let outcome = auctioneer
+            .act(POOL, &account, &Decision::Liquidate(plan), tick, None)
+            .await
+            .expect("act");
+        assert!(outcome.is_none(), "nowhere lower to try: skipped");
+        assert_eq!(
+            rpc.calls("simulateTransaction").len(),
+            1,
+            "and no second attempt at a percent of zero"
         );
         Ok(())
     }
