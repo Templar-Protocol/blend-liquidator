@@ -12,9 +12,13 @@
 //!
 //! `decide` needs no signer at all: a [`Decision`] is an answer, not an
 //! action, and this module's `decide` tests drive it through a scripted RPC
-//! with none configured. `act` needs one only to simulate against; with
-//! none configured, it records the plan the contract was never asked about
-//! and says so — see `act`'s own doc.
+//! with none configured. `act` needs one only to simulate *against* — as a
+//! source account, never as a signature: every simulation this module makes
+//! goes through [`Submitter::simulate_only`], which builds the transaction
+//! unsigned and neither signs, restores nor sends. The signing happens
+//! behind the submission queue, and only when one is given. With no signer
+//! configured at all, `act` records the plan the contract was never asked
+//! about and says so — see `act`'s own doc.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -22,7 +26,7 @@ use stellar_xdr::Operation;
 
 use crate::chain::pool::{bad_debt_op, new_auction_op, PoolReader, PoolSnapshot};
 use crate::chain::rpc::RpcClient;
-use crate::chain::tx::{Priority, Submitter};
+use crate::chain::tx::{Judgment, Priority, Submitter};
 use crate::chain::xdr::{AuctionType, FillPercent};
 use crate::chain::{ChainError, TxHash, TxOutcome};
 use crate::ledger::LedgerTick;
@@ -296,14 +300,16 @@ impl<'a> Auctioneer<'a> {
     /// submits it.
     ///
     /// `submit` is `None` in dry-run, and that is the whole of the
-    /// difference: the same simulation runs either way, so the percent
-    /// recorded in dry-run is one the contract would have accepted rather
-    /// than one the bot merely hoped for. A recorded creation that could
-    /// not have been made would make the audit worse than useless — unless
-    /// there is no auctioneer key configured at all, in which case there is
-    /// no source account to simulate against and the plan is recorded
-    /// unsimulated, `CreationOutcome::simulated` and the log line both
-    /// saying so.
+    /// difference: the same *simulation* runs either way, through
+    /// [`Submitter::simulate_only`], which builds unsigned and neither
+    /// signs, restores nor sends. So the percent recorded in dry-run is one
+    /// the contract would have accepted rather than one the bot merely
+    /// hoped for, and it costs this key no signature and no sequence
+    /// number. A recorded creation that could not have been made would make
+    /// the audit worse than useless — unless there is no auctioneer key
+    /// configured at all, in which case there is no source account to
+    /// simulate against and the plan is recorded unsimulated,
+    /// [`CreationOutcome::simulated`] and the log line both saying so.
     ///
     /// A [`Decision::Skip`] acts on nothing and returns `Ok(None)`, with the
     /// reason on a debug line: an operator asking "why did nothing happen"
@@ -325,28 +331,8 @@ impl<'a> Auctioneer<'a> {
             }
             Decision::BadDebt => {
                 let operation = bad_debt_op(pool, account).map_err(ChainError::from)?;
-                let simulated = match &self.submitter {
-                    None => {
-                        tracing::debug!(
-                            pool,
-                            account,
-                            "no auctioneer key configured; recording bad debt unsimulated"
-                        );
-                        false
-                    }
-                    Some(submitter) => match simulate(submitter, operation.clone()).await? {
-                        Simulated::Accepted => true,
-                        Simulated::Refused(code, message) => {
-                            tracing::debug!(
-                                pool,
-                                account,
-                                contract_error = ?code,
-                                %message,
-                                "bad debt refused by simulation; skipping"
-                            );
-                            return Ok(None);
-                        }
-                    },
+                let Some(simulated) = self.accept_bad_debt(pool, account, &operation).await? else {
+                    return Ok(None);
                 };
                 (
                     CreationKind::BadDebt,
@@ -414,6 +400,62 @@ impl<'a> Auctioneer<'a> {
         }))
     }
 
+    /// Whether the contract accepts `bad_debt` for this borrower, and
+    /// whether it was actually asked: `Some(true)` accepted and simulated,
+    /// `Some(false)` accepted because there was nothing to ask with, `None`
+    /// skip this borrower.
+    ///
+    /// With no auctioneer key there is no source account to simulate
+    /// against, so the operation is recorded unsimulated — the mirror of
+    /// `accept_percent`'s own no-key answer, and honest for the same
+    /// reason. Otherwise the contract judges it through
+    /// [`Submitter::simulate_only`], which builds unsigned: a dry-run may
+    /// take this path precisely because nothing in it signs or sends.
+    ///
+    /// A footprint holding archived entries is a skip, not a refusal:
+    /// restoring it is a submission, and this is not the code that means to
+    /// make one.
+    async fn accept_bad_debt(
+        &self,
+        pool: &str,
+        account: &str,
+        operation: &Operation,
+    ) -> Result<Option<bool>, AuctioneerError> {
+        let Some(submitter) = self.submitter.as_ref() else {
+            tracing::debug!(
+                pool,
+                account,
+                "no auctioneer key configured; recording bad debt unsimulated"
+            );
+            return Ok(Some(false));
+        };
+        match submitter.simulate_only(operation).await? {
+            Judgment::Accepted => Ok(Some(true)),
+            Judgment::Refused {
+                contract_error,
+                message,
+            } => {
+                tracing::debug!(
+                    pool,
+                    account,
+                    contract_error,
+                    %message,
+                    "bad debt refused by simulation; skipping"
+                );
+                Ok(None)
+            }
+            Judgment::NeedsRestore => {
+                tracing::info!(
+                    pool,
+                    account,
+                    "bad debt could not be judged: its footprint holds archived entries, \
+                     which only an armed submission restores; skipping"
+                );
+                Ok(None)
+            }
+        }
+    }
+
     /// Walks a liquidation plan's percent to one the contract accepts.
     ///
     /// With no auctioneer key configured there is no source account to
@@ -422,19 +464,28 @@ impl<'a> Auctioneer<'a> {
     /// than a silent skip of the walk.
     ///
     /// Otherwise, each attempt simulates `new_auction` at the current
-    /// percent through [`Submitter::prepare`]. `InvalidLiqTooSmall` (1214,
-    /// the post-liquidation health factor below `1.03`) raises the percent
-    /// by one; `InvalidLiqTooLarge` (1213, at or above `1.15`) lowers it by
-    /// one — `checked_add`/`checked_sub` and a [`FillPercent`] range check
-    /// rather than raw arithmetic, so the walk can never wrap past `1..=100`
-    /// and a percent that would leave that range ends the walk at once
-    /// instead of retrying a value the contract could not possibly accept.
-    /// Any other contract error ends the walk immediately too: adjusting a
-    /// percent against, say, `AuctionInProgress` would be more round trips
-    /// to learn what the first one already said. The walk also ends,
-    /// giving up, after `plan_iterations` attempts — a contract that
-    /// refuses forever must cost this one borrower a bounded number of
-    /// simulations, not the batch's whole cadence.
+    /// percent through [`Submitter::simulate_only`], which builds the
+    /// transaction unsigned: the walk may run in dry-run precisely because
+    /// nothing in it signs, restores or sends.
+    /// `InvalidLiqTooSmall` (1214, the post-liquidation health factor below
+    /// `1.03`) raises the percent by one; `InvalidLiqTooLarge` (1213, at or
+    /// above `1.15`) lowers it by one — `checked_add`/`checked_sub` and a
+    /// [`FillPercent`] range check rather than raw arithmetic, so the walk
+    /// can never wrap past `1..=100` and a percent that would leave that
+    /// range ends the walk at once instead of retrying a value the contract
+    /// could not possibly accept. Any other contract error ends the walk
+    /// immediately too: adjusting a percent against, say,
+    /// `AuctionInProgress` would be more round trips to learn what the first
+    /// one already said. The walk also ends, giving up, after
+    /// `plan_iterations` attempts — a contract that refuses forever must
+    /// cost this one borrower a bounded number of simulations, not the
+    /// batch's whole cadence.
+    ///
+    /// A simulation that comes back needing archived entries restored is
+    /// none of those: it is not a judgment on the percent at all, so the
+    /// percent is not adjusted and the walk does not retry. The borrower is
+    /// simply one this bot cannot judge right now, and the restore belongs
+    /// to a submission that means to spend a sequence number on it.
     ///
     /// This never recomputes the plan's asset lists: `bounded_plan` may
     /// have trimmed the selection to the pool's `max_positions` after the
@@ -475,9 +526,12 @@ impl<'a> Auctioneer<'a> {
         let mut percent = plan.percent;
         for _ in 0..self.config.plan_iterations {
             let operation = build(percent)?;
-            match simulate(submitter, operation.clone()).await? {
-                Simulated::Accepted => return Ok(Some((percent, operation, true))),
-                Simulated::Refused(Some(1214), _) => {
+            match submitter.simulate_only(&operation).await? {
+                Judgment::Accepted => return Ok(Some((percent, operation, true))),
+                Judgment::Refused {
+                    contract_error: Some(1214),
+                    ..
+                } => {
                     if let Some(next) = percent
                         .get()
                         .checked_add(1)
@@ -493,7 +547,10 @@ impl<'a> Auctioneer<'a> {
                         return Ok(None);
                     }
                 }
-                Simulated::Refused(Some(1213), _) => {
+                Judgment::Refused {
+                    contract_error: Some(1213),
+                    ..
+                } => {
                     if let Some(next) = percent
                         .get()
                         .checked_sub(1)
@@ -509,13 +566,27 @@ impl<'a> Auctioneer<'a> {
                         return Ok(None);
                     }
                 }
-                Simulated::Refused(code, message) => {
+                Judgment::Refused {
+                    contract_error,
+                    message,
+                } => {
                     tracing::debug!(
                         pool,
                         account,
-                        contract_error = ?code,
+                        contract_error,
                         %message,
                         "liquidation refused by simulation; skipping"
+                    );
+                    return Ok(None);
+                }
+                Judgment::NeedsRestore => {
+                    tracing::info!(
+                        pool,
+                        account,
+                        percent = percent.get(),
+                        "this borrower could not be judged: the auction's footprint holds \
+                         archived entries, which only an armed submission restores; skipping \
+                         without adjusting the percent"
                     );
                     return Ok(None);
                 }
@@ -528,35 +599,6 @@ impl<'a> Auctioneer<'a> {
             "percent adjustment exhausted its iterations; skipping until the next recheck"
         );
         Ok(None)
-    }
-}
-
-/// What one simulation of an operation found.
-enum Simulated {
-    /// The contract accepted it.
-    Accepted,
-    /// The contract refused it: the decoded pool error code, when the
-    /// refusal carried one, and the RPC's diagnostic text.
-    Refused(Option<u32>, String),
-}
-
-/// Simulates `operation` through `submitter`'s [`Submitter::prepare`],
-/// which needs no more than the ability to simulate — nothing here signs or
-/// sends. A refusal that is not a decodable contract error (a host trap, a
-/// malformed envelope) is still `Refused`, with `None` in place of the code:
-/// the caller's fallback arm, not a special case here, is what decides that
-/// is unrecoverable.
-async fn simulate(
-    submitter: &Submitter<'_>,
-    operation: Operation,
-) -> Result<Simulated, AuctioneerError> {
-    match submitter.prepare(operation, Priority::Normal).await {
-        Ok(_) => Ok(Simulated::Accepted),
-        Err(ChainError::Simulation {
-            contract_error,
-            message,
-        }) => Ok(Simulated::Refused(contract_error, message)),
-        Err(other) => Err(other.into()),
     }
 }
 
@@ -837,10 +879,12 @@ mod tests {
         }
     }
 
-    /// One `Submitter::prepare` attempt's account read and fee stats — the
-    /// prelude every simulation in `act`'s tests needs before the
-    /// `simulateTransaction` call that actually varies per attempt.
-    fn script_prepare_prelude(rpc: &ScriptedRpc, signer: &Signer, sequence: i64, ledger: u32) {
+    /// One `Submitter::simulate_only` attempt's prelude: the source
+    /// account's entry, and nothing else. A simulate-only call needs no fee
+    /// stats — it never assembles a transaction to pay for — so a test that
+    /// scripts one and sees it consumed would be scripting the signing path
+    /// by mistake.
+    fn script_simulate_prelude(rpc: &ScriptedRpc, signer: &Signer, sequence: i64, ledger: u32) {
         let key = LedgerKey::Account(LedgerKeyAccount {
             account_id: signer.account_id(),
         });
@@ -852,6 +896,14 @@ mod tests {
                  "lastModifiedLedgerSeq": 1}
             ]}),
         );
+    }
+
+    /// One `Submitter::prepare` attempt's prelude: the account read above,
+    /// plus the fee stats a transaction that will actually be signed and
+    /// paid for needs. Only the queue's own submission path takes this
+    /// route.
+    fn script_prepare_prelude(rpc: &ScriptedRpc, signer: &Signer, sequence: i64, ledger: u32) {
+        script_simulate_prelude(rpc, signer, sequence, ledger);
         rpc.expect(
             "getFeeStats",
             json!({"sorobanInclusionFee": {"p70": "100", "p90": "100"},
@@ -880,6 +932,25 @@ mod tests {
             "simulateTransaction",
             json!({"error": format!("HostError: Error(Contract, #{code})"),
                    "events": [diagnostic_error_b64(code)],
+                   "latestLedger": ledger}),
+        );
+    }
+
+    /// The `simulateTransaction` answer for an operation whose footprint
+    /// holds archived entries: a simulation that succeeded as far as it
+    /// could, carrying a `restorePreamble` the caller would have to submit a
+    /// `RestoreFootprint` transaction for before the call itself can be
+    /// judged. This is what a mainnet pool answers when a reserve or
+    /// positions entry has fallen out of the live state.
+    fn script_simulate_needs_restore(rpc: &ScriptedRpc, ledger: u32) {
+        rpc.expect(
+            "simulateTransaction",
+            json!({"transactionData": transaction_data_b64(10),
+                   "events": [],
+                   "minResourceFee": "10",
+                   "results": [{"auth": [], "xdr": scval_b64(&stellar_xdr::ScVal::Void)}],
+                   "restorePreamble": {"minResourceFee": "7",
+                                       "transactionData": transaction_data_b64(7)},
                    "latestLedger": ledger}),
         );
     }
@@ -1175,11 +1246,11 @@ mod tests {
         let lot_asset = synthetic_account(3);
 
         // Three attempts: too small, too small again, then accepted.
-        script_prepare_prelude(&rpc, &signer, 10, 100);
+        script_simulate_prelude(&rpc, &signer, 10, 100);
         script_simulate_refused(&rpc, 1214, 100);
-        script_prepare_prelude(&rpc, &signer, 10, 100);
+        script_simulate_prelude(&rpc, &signer, 10, 100);
         script_simulate_refused(&rpc, 1214, 100);
-        script_prepare_prelude(&rpc, &signer, 10, 100);
+        script_simulate_prelude(&rpc, &signer, 10, 100);
         script_simulate_accepted(&rpc, 100);
 
         let client = RpcClient::new(&rpc.url(), None).expect("client");
@@ -1228,9 +1299,9 @@ mod tests {
         let bid_asset = synthetic_account(5);
         let lot_asset = synthetic_account(6);
 
-        script_prepare_prelude(&rpc, &signer, 10, 100);
+        script_simulate_prelude(&rpc, &signer, 10, 100);
         script_simulate_refused(&rpc, 1213, 100);
-        script_prepare_prelude(&rpc, &signer, 10, 100);
+        script_simulate_prelude(&rpc, &signer, 10, 100);
         script_simulate_accepted(&rpc, 100);
 
         let client = RpcClient::new(&rpc.url(), None).expect("client");
@@ -1280,7 +1351,7 @@ mod tests {
         // `config`'s `plan_iterations` is 5; every one of the five attempts
         // is refused the same way.
         for _ in 0..5 {
-            script_prepare_prelude(&rpc, &signer, 10, 100);
+            script_simulate_prelude(&rpc, &signer, 10, 100);
             script_simulate_refused(&rpc, 1214, 100);
         }
 
@@ -1326,7 +1397,7 @@ mod tests {
         let lot_asset = synthetic_account(13);
 
         // AuctionInProgress (1212) is neither 1213 nor 1214.
-        script_prepare_prelude(&rpc, &signer, 10, 100);
+        script_simulate_prelude(&rpc, &signer, 10, 100);
         script_simulate_refused(&rpc, 1212, 100);
 
         let client = RpcClient::new(&rpc.url(), None).expect("client");
@@ -1370,7 +1441,7 @@ mod tests {
         let bid_asset = synthetic_account(21);
         let lot_asset = synthetic_account(22);
 
-        script_prepare_prelude(&rpc, &signer, 10, 100);
+        script_simulate_prelude(&rpc, &signer, 10, 100);
         script_simulate_accepted(&rpc, 100);
 
         let client = RpcClient::new(&rpc.url(), None).expect("client");
@@ -1429,12 +1500,14 @@ mod tests {
         let lot_asset = synthetic_account(32);
 
         // Round 1: `act`'s own percent-discovery simulation.
-        script_prepare_prelude(&rpc, &signer, 10, 100);
+        script_simulate_prelude(&rpc, &signer, 10, 100);
         script_simulate_accepted(&rpc, 100);
-        // Round 2: the queue's own `Submitter::submit` re-prepares from
-        // fresh state before it ever sends — a submission queue never
-        // reuses a simulation another caller already ran, since the
-        // sequence it reads must be the one still current at send time.
+        // Round 2: the queue's own `Submitter::submit` prepares from fresh
+        // state before it ever sends — a submission queue never reuses a
+        // simulation another caller already ran, since the sequence it
+        // reads must be the one still current at send time. This is the
+        // signing path, so it reads fee stats too, which the simulate-only
+        // round above never does.
         script_prepare_prelude(&rpc, &signer, 10, 100);
         script_simulate_accepted(&rpc, 100);
         rpc.expect(
@@ -1516,7 +1589,7 @@ mod tests {
         let network = Network::testnet();
         let account = synthetic_account(40);
 
-        script_prepare_prelude(&rpc, &signer, 10, 100);
+        script_simulate_prelude(&rpc, &signer, 10, 100);
         script_simulate_accepted(&rpc, 100);
 
         let client = RpcClient::new(&rpc.url(), None).expect("client");
@@ -1574,9 +1647,9 @@ mod tests {
         let bid_asset = synthetic_account(61);
         let lot_asset = synthetic_account(62);
 
-        script_prepare_prelude(&rpc, &signer, 10, 100);
+        script_simulate_prelude(&rpc, &signer, 10, 100);
         script_simulate_refused(&rpc, 1214, 100);
-        script_prepare_prelude(&rpc, &signer, 10, 100);
+        script_simulate_prelude(&rpc, &signer, 10, 100);
         script_simulate_accepted(&rpc, 100);
 
         let client = RpcClient::new(&rpc.url(), None).expect("client");
@@ -1601,6 +1674,108 @@ mod tests {
             "the trimmed selection's stale percent is corrected upward by \
              the loop, not recomputed from the assets"
         );
+        Ok(())
+    }
+
+    /// The headline safety invariant, in the case that used to breach it: a
+    /// simulation that comes back needing archived entries restored.
+    ///
+    /// `Submitter::prepare` answers that by *submitting* a
+    /// `RestoreFootprint` transaction from the auctioneer's own key — a
+    /// real fee, a consumed sequence number — before simulating again, so a
+    /// dry-run that simulated through it would have written to mainnet.
+    /// `Submitter::simulate_only` never does: the borrower is skipped, and
+    /// this test proves the absence three ways over. `ScriptedRpc` records
+    /// every request before it looks for a scripted answer, so an empty
+    /// call list is proof, not merely an unconsumed script.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_dry_run_never_restores_an_archived_footprint(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let signer = auctioneer_signer();
+        let network = Network::testnet();
+        let account = synthetic_account(70);
+        let bid_asset = synthetic_account(71);
+        let lot_asset = synthetic_account(72);
+
+        script_simulate_prelude(&rpc, &signer, 10, 100);
+        script_simulate_needs_restore(&rpc, 100);
+
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let auctioneer = Auctioneer::new(&client, &store, config(BTreeSet::new()), Some(submitter));
+        let plan = LiquidationPlan {
+            bid: vec![bid_asset],
+            lot: vec![lot_asset],
+            percent: FillPercent::try_from(50).expect("50 is in range"),
+        };
+        let decision = Decision::Liquidate(plan);
+        let tick = harness::fixture_tick();
+
+        let outcome = auctioneer
+            .act(POOL, &account, &decision, tick, None)
+            .await
+            .expect("act");
+        assert!(
+            outcome.is_none(),
+            "a borrower that cannot be judged is skipped, not recorded"
+        );
+
+        assert!(
+            rpc.calls("sendTransaction").is_empty(),
+            "a dry-run must never send anything — a RestoreFootprint \
+             transaction least of all"
+        );
+        assert!(
+            rpc.calls("getFeeStats").is_empty(),
+            "the signing path was never entered at all: `prepare` reads fee \
+             stats before it simulates, and `simulate_only` never does"
+        );
+        assert_eq!(
+            rpc.calls("simulateTransaction").len(),
+            1,
+            "one simulation and no retry: a restore is not an opinion about \
+             the percent, so the walk neither adjusts it nor tries again"
+        );
+
+        let rows = sqlx::query!(
+            "SELECT count(*) AS \"count!\" FROM creations WHERE account = $1",
+            account.as_str(),
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("count the rows");
+        assert_eq!(rows.count, 0, "nothing was decided, so nothing is recorded");
+        Ok(())
+    }
+
+    /// Bad debt takes the same simulate-only path, and skips the same way.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn bad_debt_needing_a_restore_is_skipped_too(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let signer = auctioneer_signer();
+        let network = Network::testnet();
+        let account = synthetic_account(73);
+
+        script_simulate_prelude(&rpc, &signer, 10, 100);
+        script_simulate_needs_restore(&rpc, 100);
+
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let auctioneer = Auctioneer::new(&client, &store, config(BTreeSet::new()), Some(submitter));
+        let tick = harness::fixture_tick();
+
+        let outcome = auctioneer
+            .act(POOL, &account, &Decision::BadDebt, tick, None)
+            .await
+            .expect("act");
+        assert!(outcome.is_none(), "skipped, not recorded");
+        assert!(
+            rpc.calls("sendTransaction").is_empty(),
+            "no RestoreFootprint transaction was sent"
+        );
+        assert!(rpc.calls("getFeeStats").is_empty(), "nothing was prepared");
         Ok(())
     }
 }
