@@ -13,6 +13,7 @@
 
 pub mod auction;
 pub mod fixed;
+pub mod liquidation;
 pub mod position;
 pub mod reserve;
 
