@@ -286,12 +286,15 @@ pub struct TrackedUser {
     /// The ledger this row was computed at.
     pub updated_ledger: u32,
     /// The ledger this row was flagged for an auctioneer decision at, or
-    /// `None` when there is nothing to decide. Only [`Store::user`],
-    /// [`Store::users_below_health`] and [`Store::users_stale`] leave this
-    /// `None` unconditionally — they do not select the column, and nothing
-    /// they are used for needs it. [`Store::users_needing_recheck`] is the
-    /// one caller that reads the real value, because
-    /// [`Store::clear_recheck`] needs it back to make its clear conditional.
+    /// `None` when there is nothing to decide. Every read that builds a
+    /// `TrackedUser` from a stored row — [`Store::user`],
+    /// [`Store::users_below_health`], [`Store::users_stale`] and
+    /// [`Store::users_needing_recheck`] alike — selects and reports the
+    /// real column, so this field means the same thing regardless of which
+    /// query produced the row: a caller that branches on it never has to
+    /// know which method it came from. [`Store::clear_recheck`] is what
+    /// needs the value back, but nothing about the field's meaning is
+    /// specific to that one caller.
     pub recheck_ledger: Option<u32>,
 }
 
@@ -336,7 +339,7 @@ impl Store {
     pub async fn user(&self, pool: &str, account: &str) -> Result<Option<TrackedUser>, StoreError> {
         let row = sqlx::query!(
             "SELECT pool, account, health_factor::text AS health_factor, collateral,
-                    liabilities, updated_ledger
+                    liabilities, updated_ledger, recheck_ledger
              FROM users WHERE pool = $1 AND account = $2",
             pool,
             account
@@ -351,7 +354,10 @@ impl Store {
                 collateral: index_amounts_from_json(&row.collateral, "collateral")?,
                 liabilities: index_amounts_from_json(&row.liabilities, "liabilities")?,
                 updated_ledger: ledger(row.updated_ledger, "updated_ledger")?,
-                recheck_ledger: None,
+                recheck_ledger: row
+                    .recheck_ledger
+                    .map(|value| ledger(value, "recheck_ledger"))
+                    .transpose()?,
             })
         })
         .transpose()
@@ -379,7 +385,7 @@ impl Store {
         };
         let rows = sqlx::query!(
             "SELECT pool, account, health_factor::text AS health_factor, collateral,
-                    liabilities, updated_ledger
+                    liabilities, updated_ledger, recheck_ledger
              FROM users
              WHERE pool = $1
                AND health_factor < $2::text::numeric
@@ -409,7 +415,10 @@ impl Store {
                     collateral: index_amounts_from_json(&row.collateral, "collateral")?,
                     liabilities: index_amounts_from_json(&row.liabilities, "liabilities")?,
                     updated_ledger: ledger(row.updated_ledger, "updated_ledger")?,
-                    recheck_ledger: None,
+                    recheck_ledger: row
+                        .recheck_ledger
+                        .map(|value| ledger(value, "recheck_ledger"))
+                        .transpose()?,
                 })
             })
             .collect()
@@ -430,7 +439,7 @@ impl Store {
     ) -> Result<Vec<TrackedUser>, StoreError> {
         let rows = sqlx::query!(
             "SELECT pool, account, health_factor::text AS health_factor, collateral,
-                    liabilities, updated_ledger
+                    liabilities, updated_ledger, recheck_ledger
              FROM users
              WHERE pool = $1 AND updated_ledger < $2
              ORDER BY updated_ledger ASC
@@ -450,7 +459,10 @@ impl Store {
                     collateral: index_amounts_from_json(&row.collateral, "collateral")?,
                     liabilities: index_amounts_from_json(&row.liabilities, "liabilities")?,
                     updated_ledger: ledger(row.updated_ledger, "updated_ledger")?,
-                    recheck_ledger: None,
+                    recheck_ledger: row
+                        .recheck_ledger
+                        .map(|value| ledger(value, "recheck_ledger"))
+                        .transpose()?,
                 })
             })
             .collect()
@@ -1384,6 +1396,51 @@ mod tests {
             .await
             .expect("read")
             .is_empty());
+        Ok(())
+    }
+
+    /// The flag is a property of the row, not of the query that happens to
+    /// have asked for it: `Store::user` must report it exactly as
+    /// `Store::users_needing_recheck` does, so a caller that reads a single
+    /// borrower cannot mistake a flagged row for an unflagged one.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_flag_set_on_a_user_is_visible_through_store_user_too(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        store
+            .upsert_user(&TrackedUser {
+                pool: POOL.to_string(),
+                account: USER.to_string(),
+                health_factor: 9_000_000,
+                collateral: BTreeMap::new(),
+                liabilities: BTreeMap::from([(0, 1)]),
+                updated_ledger: 10,
+                recheck_ledger: None,
+            })
+            .await
+            .expect("upsert");
+        assert_eq!(
+            store
+                .user(POOL, USER)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            None,
+            "an unflagged row reads back with no flag"
+        );
+
+        store.flag_recheck(POOL, USER, 100).await.expect("flag");
+        let read_back = store
+            .user(POOL, USER)
+            .await
+            .expect("read")
+            .expect("row exists");
+        assert_eq!(
+            read_back.recheck_ledger,
+            Some(100),
+            "the flag is visible through a single-user read, not only through the queue"
+        );
         Ok(())
     }
 

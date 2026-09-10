@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT pool, account, health_factor::text AS health_factor, collateral,\n                    liabilities, updated_ledger\n             FROM users\n             WHERE pool = $1 AND updated_ledger < $2\n             ORDER BY updated_ledger ASC\n             LIMIT $3",
+  "query": "SELECT pool, account, health_factor::text AS health_factor, collateral,\n                    liabilities, updated_ledger, recheck_ledger\n             FROM users WHERE pool = $1 AND account = $2",
   "describe": {
     "columns": [
       {
@@ -63,13 +63,23 @@
             "name": "updated_ledger"
           }
         }
+      },
+      {
+        "ordinal": 6,
+        "name": "recheck_ledger",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "recheck_ledger"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
         "Text",
-        "Int8",
-        "Int8"
+        "Text"
       ]
     },
     "nullable": [
@@ -78,8 +88,9 @@
       null,
       false,
       false,
-      false
+      false,
+      true
     ]
   },
-  "hash": "d847768270eae5e886cbcb47ccb630a471bad932f084ef45d331b02e640149ba"
+  "hash": "bb7ba19d7e77cef79e9ada955e81d7c4b8f1a01ae977998ef702e37505b44b8f"
 }
