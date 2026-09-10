@@ -362,10 +362,10 @@ pub struct ServiceConfig {
     pub scan_health_factor: i128,
     /// The health factor at or below which a borrower is liquidatable, 7
     /// decimals.
-    pub liq_hf_threshold: i128,
+    pub liquidation_health_factor: i128,
     /// The health factor a liquidation aims to leave the borrower at, 7
     /// decimals.
-    pub target_hf: i128,
+    pub target_health_factor: i128,
     /// How often, in ledgers, prices are re-read for a significant move.
     pub oracle_scan_ledgers: u32,
     /// How far a price must move, in basis points, to be worth rechecking
@@ -678,8 +678,8 @@ impl Args {
             refresh_batch: self.refresh_batch,
             full_scan_ledgers: self.full_scan_ledgers,
             scan_health_factor: self.scan_hf_threshold.get(),
-            liq_hf_threshold: self.liq_hf_threshold.get(),
-            target_hf: self.target_hf.get(),
+            liquidation_health_factor: self.liq_hf_threshold.get(),
+            target_health_factor: self.target_hf.get(),
             oracle_scan_ledgers: self.oracle_scan_ledgers,
             price_delta_bps: self.price_delta_bps,
             plan_iterations: self.plan_iterations,
@@ -767,6 +767,10 @@ mod tests {
     /// `lint-test` job export `DATABASE_URL` for the whole run so the sqlx
     /// query macros can check themselves, which would make this assertion
     /// fail on every sanctioned way of running these tests.
+    ///
+    /// `AUCTIONEER_SECRET_KEY` is excluded for the same reason: it too is
+    /// read straight from the environment (by `auctioneer_signer`), never
+    /// declared as a clap argument.
     fn assert_clean_environment() {
         for name in [
             "RPC_URL",
@@ -1435,8 +1439,8 @@ supported_lot = ["*"]
         let config = args
             .service_with_secrets(Some("postgres://x".to_string()), None)
             .expect("configuration");
-        assert_eq!(config.liq_hf_threshold, 9_900_000);
-        assert_eq!(config.target_hf, 11_000_000);
+        assert_eq!(config.liquidation_health_factor, 9_900_000);
+        assert_eq!(config.target_health_factor, 11_000_000);
         assert_eq!(config.oracle_scan_ledgers, 30);
         assert_eq!(config.price_delta_bps, 100);
         assert_eq!(config.plan_iterations, 3);
