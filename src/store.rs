@@ -647,8 +647,12 @@ impl Store {
     /// chain and its row being written would otherwise lose the record of a
     /// submission that exists, which is the one direction an audit must not
     /// fail in. The hash is therefore a second write, and a row carrying
-    /// `tx_hash IS NULL` with `dry_run = false` means exactly that — a
-    /// submission whose outcome this bot did not get to record.
+    /// `tx_hash IS NULL` with `dry_run = false` is an armed attempt whose
+    /// transaction was never named — either it was never submitted (the
+    /// queue refused it, or the bot crashed before the enqueue) or it was
+    /// submitted and this bot never recorded the outcome. Telling the two
+    /// apart takes an out-of-band check: the signing account's sequence
+    /// number.
     ///
     /// `false` means no row has that `id`. Nothing in this crate deletes a
     /// creation, so the caller logs it rather than failing a submission that

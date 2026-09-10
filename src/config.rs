@@ -374,12 +374,11 @@ pub struct ServiceConfig {
     /// How many times a rejected percent is adjusted against the contract's
     /// own answer before the borrower is left until the next recheck.
     ///
-    /// Never zero, whatever `PLAN_ITERATIONS` says: the walk runs
-    /// `0..plan_iterations`, so a zero would simulate nothing at all and
-    /// skip every liquidation while reporting that it had exhausted its
-    /// iterations — a bot that looks busy and does nothing. One is the
-    /// floor because one attempt is what "ask the contract, do not adjust"
-    /// means.
+    /// Never zero: the walk runs `0..plan_iterations`, so a zero would
+    /// simulate nothing at all and skip every liquidation while reporting
+    /// that it had exhausted its iterations — a bot that looks busy and
+    /// does nothing. `PLAN_ITERATIONS=0` is refused at parse (see `Args`),
+    /// so this field is never constructed with it.
     pub plan_iterations: u32,
     /// Ledger ticks to wait after startup before any submission is
     /// attempted.
@@ -537,10 +536,16 @@ pub struct Args {
     /// How many times a rejected percent is adjusted against the contract's
     /// own answer before the borrower is left until the next recheck.
     ///
-    /// Zero is read as one: the walk would otherwise never simulate at all,
-    /// and every liquidation would be skipped as though the contract had
-    /// refused it.
-    #[arg(long, env = "PLAN_ITERATIONS", default_value_t = 5)]
+    /// At least 1: zero would make the walk never simulate at all, so every
+    /// liquidation would be skipped as though the contract had refused it,
+    /// silently. Refusing it at parse time means that is a startup error,
+    /// not a bot that runs and never lands a fill.
+    #[arg(
+        long,
+        env = "PLAN_ITERATIONS",
+        default_value_t = 5,
+        value_parser = clap::value_parser!(u32).range(1..),
+    )]
     pub plan_iterations: u32,
 
     /// Ledger ticks to wait after startup before any submission is
@@ -693,18 +698,10 @@ impl Args {
             target_health_factor: self.target_hf.get(),
             oracle_scan_ledgers: self.oracle_scan_ledgers,
             price_delta_bps: self.price_delta_bps,
-            // Floored at one attempt: see `ServiceConfig::plan_iterations`.
-            // Warned about rather than refused, because the safe reading of
-            // "adjust it zero times" is "ask the contract once and take its
-            // answer", not "never ask at all".
-            plan_iterations: {
-                if self.plan_iterations == 0 {
-                    tracing::warn!(
-                        "PLAN_ITERATIONS is 0, which would skip every liquidation; using 1"
-                    );
-                }
-                self.plan_iterations.max(1)
-            },
+            // Never zero: `--plan-iterations`/`PLAN_ITERATIONS` refuses 0 at
+            // parse, so this is always at least 1. See
+            // `ServiceConfig::plan_iterations`.
+            plan_iterations: self.plan_iterations,
             startup_delay_ledgers: self.startup_delay_ledgers,
             seed: SeedConfig {
                 url: Some(self.seed_url.clone()).filter(|url| !url.is_empty()),
@@ -1472,28 +1469,11 @@ supported_lot = ["*"]
     /// `PLAN_ITERATIONS=0` is not "adjust nothing", it is "attempt
     /// nothing": the auctioneer's walk runs `0..plan_iterations`, so zero
     /// would skip every liquidation while logging that it had exhausted its
-    /// iterations. The floor is one attempt.
+    /// iterations — a bot that looks busy and does nothing. Refusing it at
+    /// parse time means the failure is a startup error, not that silent
+    /// bot.
     #[test]
-    fn plan_iterations_never_reaches_the_service_as_zero() {
-        assert_clean_environment();
-        let args = parse(&[
-            "liquidator",
-            "--network",
-            "testnet",
-            "--rpc-url",
-            "http://rpc",
-            "--pools-toml",
-            POOLS,
-            "--plan-iterations",
-            "0",
-        ]);
-        assert_eq!(args.plan_iterations, 0, "the flag itself takes the value");
-        let config = args
-            .service_with_secrets(Some("postgres://x".to_string()), None)
-            .expect("configuration");
-        assert_eq!(
-            config.plan_iterations, 1,
-            "and the service reads it as one attempt, never none"
-        );
+    fn a_zero_plan_iterations_is_refused_at_parse() {
+        assert!(Args::try_parse_from(["liquidator", "--plan-iterations", "0"]).is_err());
     }
 }

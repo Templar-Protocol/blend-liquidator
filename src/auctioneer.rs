@@ -534,7 +534,8 @@ impl<'a> Auctioneer<'a> {
     ///
     /// The order is the audit's: the row exists before the submission, so
     /// the hash is a second write and a row with `dry_run = false` and no
-    /// hash means a submission this bot did not see the end of. A row that
+    /// hash is an armed attempt whose transaction was never named — either
+    /// never submitted or submitted with the outcome unrecorded. A row that
     /// has gone missing between the two writes is logged, not raised —
     /// nothing deletes a creation, and failing here would report a
     /// submission that has already happened as one that did not.
@@ -554,13 +555,6 @@ impl<'a> Auctioneer<'a> {
             })
             .await?;
         let hash = outcome_hash(&outcome).to_hex();
-        if !self.store.attach_creation_tx(creation_id, &hash).await? {
-            tracing::warn!(
-                creation_id,
-                tx_hash = %hash,
-                "no creation row to attach this transaction to"
-            );
-        }
         tracing::info!(
             creation_id,
             pool = %record.pool,
@@ -569,6 +563,13 @@ impl<'a> Auctioneer<'a> {
             status = outcome_status(&outcome),
             "creation submitted"
         );
+        if !self.store.attach_creation_tx(creation_id, &hash).await? {
+            tracing::warn!(
+                creation_id,
+                tx_hash = %hash,
+                "no creation row to attach this transaction to"
+            );
+        }
         Ok(outcome)
     }
 
@@ -2174,8 +2175,8 @@ mod tests {
         );
         assert!(
             row.tx_hash.is_none(),
-            "there is no transaction to name, which is exactly what a row \
-             with no hash and dry_run = false means"
+            "an armed attempt whose transaction was never named — here \
+             because the queue refused it before anything was submitted"
         );
         assert!(
             rpc.calls("sendTransaction").is_empty(),
