@@ -1,0 +1,97 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT pool, account, health_factor::text AS health_factor, collateral,\n                            liabilities, updated_ledger, recheck_ledger\n                     FROM users\n                     WHERE pool = $1 AND jsonb_exists(collateral, $2)\n                     ORDER BY account ASC\n                     LIMIT $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "pool",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "pool"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "account",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "account"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "health_factor",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "collateral",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "collateral"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "liabilities",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "liabilities"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "updated_ledger",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "updated_ledger"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "recheck_ledger",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "recheck_ledger"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      null,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "e978e57ee7e768176d912eb18a9ed6197239a1c656ad5b7c5189de9a3c3c1238"
+}

@@ -92,6 +92,15 @@ impl OraclePrices {
             .copied()
             .ok_or_else(|| MathError::MissingPrice(asset.to_string()))
     }
+
+    /// Every priced asset and its price. `price` answers for one asset named
+    /// up front; a caller that instead needs to walk the whole snapshot —
+    /// the oracle scan comparing every asset against its own remembered
+    /// reference — reads this.
+    #[must_use]
+    pub fn prices(&self) -> &BTreeMap<String, i128> {
+        &self.prices
+    }
 }
 
 /// A position valued in the oracle's base asset, effective (factor-adjusted)

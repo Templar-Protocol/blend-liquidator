@@ -19,6 +19,15 @@
 //! behind the submission queue, and only when one is given. With no signer
 //! configured at all, `act` records the plan the contract was never asked
 //! about and says so — see `act`'s own doc.
+//!
+//! [`Auctioneer::scan_oracle`] is a third, narrower path: it never decides
+//! or acts on anything. It compares a pool's current prices against
+//! [`PriceWatch`]'s remembered reference, and for every asset that moved
+//! enough to matter it flags the borrowers exposed to it with
+//! [`Store::flag_recheck`] — the ordinary recheck path, the same one an
+//! auction fill or a tracker refresh flags, is what actually decides about
+//! them. `PriceWatch`'s references live in memory only, never in the store:
+//! see its own doc for why losing them on a restart is cheap.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -31,9 +40,9 @@ use crate::chain::xdr::{AuctionType, FillPercent};
 use crate::chain::{ChainError, TxHash, TxOutcome};
 use crate::ledger::LedgerTick;
 use crate::math::liquidation::{plan_liquidation, position_values, LiquidationPlan};
-use crate::math::{mul_floor, MathError, Reserve, SCALAR_7};
+use crate::math::{div_floor, mul_floor, MathError, OraclePrices, Reserve, SCALAR_7};
 use crate::queue::{QueueError, Submission, SubmissionQueue};
-use crate::store::{CreationKind, CreationRecord, Store, StoreError, TrackedUser};
+use crate::store::{CreationKind, CreationRecord, Side, Store, StoreError, TrackedUser};
 
 /// `PoolError::InvalidLiqTooLarge`: the liquidation would leave the
 /// borrower's health factor at or above `1.15`, so the percent is too high.
@@ -168,6 +177,182 @@ impl CreationOutcome {
     #[must_use]
     pub fn succeeded(&self) -> bool {
         matches!(self.submission, Some(TxOutcome::Succeeded { .. }))
+    }
+}
+
+/// Which way a price moved from its reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// The price rose: a liability priced in this asset grew, hurting a
+    /// borrower who owes it.
+    Up,
+    /// The price fell: collateral priced in this asset shrank, hurting a
+    /// borrower who holds it.
+    Down,
+}
+
+/// One asset's significant move, as [`PriceWatch::moved`] found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PriceMove {
+    /// The asset contract address that moved.
+    pub asset: String,
+    /// Which way it moved, and so which side of a position it moved
+    /// against.
+    pub direction: Direction,
+}
+
+/// One asset's last-noticed price, and when it was noticed: what a move is
+/// measured against, and what a day with no significant move refreshes.
+#[derive(Debug, Clone, Copy)]
+struct Reference {
+    price: i128,
+    set_at: u64,
+}
+
+/// `|price − reference| × 10_000 / reference`, in basis points, computed
+/// through the checked helpers so a move is judged exactly as the
+/// contract's own fixed-point arithmetic would — never through a float that
+/// could round a move across the significance line either way.
+///
+/// `reference` is always a price this same watch previously accepted from
+/// an [`OraclePrices`], and every price `OraclePrices::new` accepts is
+/// strictly positive, so the division here never sees a zero divisor in
+/// practice; the `Result` exists so a corrupted reference is reported
+/// rather than panicking.
+fn moved_direction(
+    price: i128,
+    reference: i128,
+    threshold_bps: u32,
+) -> Result<Option<Direction>, MathError> {
+    let diff = if price >= reference {
+        price.checked_sub(reference)
+    } else {
+        reference.checked_sub(price)
+    }
+    .ok_or(MathError::Overflow)?;
+    let delta_bps = div_floor(diff, reference, 10_000)?;
+    if delta_bps < i128::from(threshold_bps) {
+        return Ok(None);
+    }
+    Ok(Some(if price > reference {
+        Direction::Up
+    } else {
+        Direction::Down
+    }))
+}
+
+/// The oracle scan's memory: each pool's last-noticed price per asset.
+///
+/// Kept in memory only, and deliberately never in the store — there is no
+/// `prices` table, and there must not be one. Losing this on a restart
+/// re-anchors every asset at whatever price is read next; the worst that
+/// costs is a delayed recheck, because [`Auctioneer::decide`]'s ordinary
+/// full scan re-examines every borrower below `SCAN_HF_THRESHOLD` on its own
+/// cadence regardless of whether the oracle scan ever noticed a move. Do not
+/// "fix" this by adding a table — the durability belongs to the full scan,
+/// not to this watch.
+#[derive(Debug, Clone, Default)]
+pub struct PriceWatch {
+    /// Basis points a price must move from its reference to be reported.
+    delta_bps: u32,
+    /// Seconds a reference may stand with no significant move before it is
+    /// refreshed anyway, so a long slow drift under `delta_bps` cannot
+    /// accumulate silently forever.
+    stale_after: u64,
+    /// Pool to asset to that asset's last-noticed price in this pool. Two
+    /// pools never share a reference, even for the same asset address: the
+    /// same asset can be priced by two different oracles.
+    references: BTreeMap<String, BTreeMap<String, Reference>>,
+}
+
+impl PriceWatch {
+    /// A watch that reports moves of at least `delta_bps` basis points, and
+    /// refreshes a reference that has stood for `stale_after` seconds with
+    /// no such move.
+    #[must_use]
+    pub fn new(delta_bps: u32, stale_after: u64) -> Self {
+        Self {
+            delta_bps,
+            stale_after,
+            references: BTreeMap::new(),
+        }
+    }
+
+    /// Compares `prices` against `pool`'s remembered reference for every
+    /// asset `prices` names, and reports each one that moved at least
+    /// `delta_bps` from it.
+    ///
+    /// The reference itself updates three ways, never more than one per
+    /// asset per call: an asset seen for the first time is seeded at its
+    /// current price with no report at all — there is nothing yet to have
+    /// moved from; a significant move re-anchors the reference to the new
+    /// price, which is what keeps a slow drift reported once per
+    /// threshold-crossing step rather than once and then forever after,
+    /// against an ever-more-stale reference; and a reference that saw no
+    /// significant move but has stood for `stale_after` seconds is
+    /// refreshed to the current price anyway, silently, so a drift that
+    /// never single-handedly crosses `delta_bps` cannot go unnoticed
+    /// indefinitely.
+    ///
+    /// `now` is a caller-supplied clock reading — the tick's close time, in
+    /// practice — rather than read from the system clock here, so a test
+    /// can drive the staleness refresh deterministically instead of
+    /// sleeping for it.
+    pub fn moved(&mut self, pool: &str, prices: &OraclePrices, now: u64) -> Vec<PriceMove> {
+        let pool_references = self.references.entry(pool.to_string()).or_default();
+        let mut moves = Vec::new();
+        for (asset, price) in prices.prices() {
+            let Some(reference) = pool_references.get(asset) else {
+                pool_references.insert(
+                    asset.clone(),
+                    Reference {
+                        price: *price,
+                        set_at: now,
+                    },
+                );
+                continue;
+            };
+            match moved_direction(*price, reference.price, self.delta_bps) {
+                Ok(Some(direction)) => {
+                    moves.push(PriceMove {
+                        asset: asset.clone(),
+                        direction,
+                    });
+                    pool_references.insert(
+                        asset.clone(),
+                        Reference {
+                            price: *price,
+                            set_at: now,
+                        },
+                    );
+                }
+                Ok(None) => {
+                    let stale = match now.checked_sub(reference.set_at) {
+                        Some(elapsed) => elapsed >= self.stale_after,
+                        None => false,
+                    };
+                    if stale {
+                        pool_references.insert(
+                            asset.clone(),
+                            Reference {
+                                price: *price,
+                                set_at: now,
+                            },
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        pool,
+                        asset,
+                        %error,
+                        "could not judge this price against its reference; \
+                         leaving the reference alone"
+                    );
+                }
+            }
+        }
+        moves
     }
 }
 
@@ -716,6 +901,78 @@ impl<'a> Auctioneer<'a> {
             "percent adjustment exhausted its iterations; skipping until the next recheck"
         );
         Ok(None)
+    }
+
+    /// The oracle scan: refreshes `watch`'s reference prices for `pool` and
+    /// flags every borrower a significant move went against.
+    ///
+    /// This only notices, never judges: it calls neither `decide` nor
+    /// `act`. A liability's price rising is flagged as [`Side::Liability`]
+    /// exposure and a collateral's price falling as [`Side::Collateral`]
+    /// exposure — both hurt the borrower's health factor — and every user
+    /// [`Store::users_exposed_to`] returns for that side is handed to
+    /// [`Store::flag_recheck`], which is what actually queues them for
+    /// `decide` to judge on the ordinary recheck path.
+    ///
+    /// Reads a fresh snapshot naming no accounts: this is a price read, not
+    /// a position read, and [`PoolReader::snapshot`] still answers reserves,
+    /// prices and `asset_index` with an empty user list — no positions
+    /// entry is fetched for anyone.
+    ///
+    /// Returns how many `(borrower, move)` pairs were flagged — a single
+    /// borrower exposed to two moves in the same call counts twice, since
+    /// [`Store::flag_recheck`] is idempotent about it either way.
+    ///
+    /// # Errors
+    ///
+    /// A store failure ends the scan for the rest of `pool`'s moves: without
+    /// it there is no way to know who is exposed or to record that anyone
+    /// needs a recheck, so continuing would silently drop the borrowers a
+    /// later move in the same call went against.
+    pub async fn scan_oracle(
+        &self,
+        pool: &str,
+        watch: &mut PriceWatch,
+        tick: LedgerTick,
+        limit: i64,
+    ) -> Result<usize, AuctioneerError> {
+        let snapshot = PoolReader::new(self.rpc, pool).snapshot(&[]).await?;
+        let moves = watch.moved(pool, &snapshot.prices, tick.close_time);
+        let mut flagged = 0_usize;
+        for price_move in moves {
+            let Some(&index) = snapshot.asset_index.get(&price_move.asset) else {
+                tracing::warn!(
+                    pool,
+                    asset = %price_move.asset,
+                    "a priced asset has no reserve index in this snapshot; \
+                     skipping its exposure query"
+                );
+                continue;
+            };
+            let side = match price_move.direction {
+                Direction::Up => Side::Liability,
+                Direction::Down => Side::Collateral,
+            };
+            let exposed = self
+                .store
+                .users_exposed_to(pool, index, side, limit)
+                .await?;
+            for user in &exposed {
+                self.store
+                    .flag_recheck(pool, &user.account, tick.sequence)
+                    .await?;
+            }
+            tracing::info!(
+                pool,
+                asset = %price_move.asset,
+                direction = ?price_move.direction,
+                side = ?side,
+                count = exposed.len(),
+                "oracle scan flagged borrowers exposed to a significant price move"
+            );
+            flagged += exposed.len();
+        }
+        Ok(flagged)
     }
 }
 
@@ -2260,5 +2517,166 @@ mod tests {
             "and no second attempt at a percent of zero"
         );
         Ok(())
+    }
+
+    /// An `OraclePrices` naming one `asset` at `price`, 7 decimals — no
+    /// reserve or pool state behind it, since `PriceWatch` never reads
+    /// either.
+    fn oracle_prices(asset: &str, price: i128) -> OraclePrices {
+        let mut prices = BTreeMap::new();
+        prices.insert(asset.to_string(), price);
+        OraclePrices::new(7, prices).expect("a positive price is valid")
+    }
+
+    /// A move under the threshold is not a move: 250 bps on a price of
+    /// 1.0000 is 0.025, and 0.02 must not flag anything, or every ordinary
+    /// tick rechecks every borrower.
+    #[test]
+    fn a_move_under_the_threshold_flags_nothing() {
+        let mut watch = PriceWatch::new(250, u64::MAX);
+        let asset = "CASSET";
+        let seeded = watch.moved("POOL", &oracle_prices(asset, 10_000_000), 0);
+        assert!(
+            seeded.is_empty(),
+            "the first read only seeds the reference; nothing has moved yet"
+        );
+
+        // 1.0000 + 0.02 = 1.0200, a 200 bps move: under the 250 bps threshold.
+        let moves = watch.moved("POOL", &oracle_prices(asset, 10_200_000), 1);
+        assert!(
+            moves.is_empty(),
+            "a 200 bps move must not be reported against a 250 bps threshold"
+        );
+    }
+
+    /// A price that rises flags it as a liability risk; one that falls
+    /// flags it as a collateral risk. The direction is what decides which
+    /// borrowers are worth rechecking, so it is asserted, not the bare fact
+    /// of a move.
+    #[test]
+    fn the_direction_of_a_significant_move_is_reported() {
+        let asset = "CASSET";
+
+        let mut rising = PriceWatch::new(250, u64::MAX);
+        rising.moved("POOL", &oracle_prices(asset, 10_000_000), 0);
+        let up = rising.moved("POOL", &oracle_prices(asset, 10_500_000), 1);
+        assert_eq!(
+            up,
+            vec![PriceMove {
+                asset: asset.to_string(),
+                direction: Direction::Up,
+            }],
+            "a 500 bps rise is reported as Up"
+        );
+
+        let mut falling = PriceWatch::new(250, u64::MAX);
+        falling.moved("POOL", &oracle_prices(asset, 10_000_000), 0);
+        let down = falling.moved("POOL", &oracle_prices(asset, 9_500_000), 1);
+        assert_eq!(
+            down,
+            vec![PriceMove {
+                asset: asset.to_string(),
+                direction: Direction::Down,
+            }],
+            "a 500 bps fall is reported as Down"
+        );
+    }
+
+    /// The reference moves to the new price once a move is significant, so
+    /// a slow drift is reported once per step rather than once and then
+    /// forever.
+    #[test]
+    fn a_significant_move_re_anchors_the_reference() {
+        let mut watch = PriceWatch::new(250, u64::MAX);
+        let asset = "CASSET";
+        watch.moved("POOL", &oracle_prices(asset, 10_000_000), 0);
+
+        let first = watch.moved("POOL", &oracle_prices(asset, 10_300_000), 1);
+        assert_eq!(
+            first,
+            vec![PriceMove {
+                asset: asset.to_string(),
+                direction: Direction::Up,
+            }],
+            "a 300 bps rise is significant and reported"
+        );
+
+        // The price holds steady at the new level. An un-re-anchored
+        // reference stuck at 10_000_000 would still read this as the same
+        // 300 bps move and report it a second time, forever, even though
+        // the price has not moved since the last read.
+        let second = watch.moved("POOL", &oracle_prices(asset, 10_300_000), 2);
+        assert!(
+            second.is_empty(),
+            "the reference re-anchored to 10_300_000, so an unmoving price \
+             is not reported again"
+        );
+    }
+
+    /// A reference untouched for a day is refreshed even without a
+    /// significant move, so a long slow drift cannot accumulate silently
+    /// under the threshold.
+    #[test]
+    fn a_stale_reference_is_refreshed_after_a_day() {
+        const DAY: u64 = 86_400;
+        let mut watch = PriceWatch::new(250, DAY);
+        let asset = "CASSET";
+        watch.moved("POOL", &oracle_prices(asset, 10_000_000), 0);
+
+        // A 100 bps drift a full day later: under the 250 bps threshold, so
+        // never reported — refreshed or not.
+        let drifted = watch.moved("POOL", &oracle_prices(asset, 10_100_000), DAY);
+        assert!(
+            drifted.is_empty(),
+            "a sub-threshold drift is never reported on its own"
+        );
+
+        // A further 148 bps step, no time elapsed since the read above (so
+        // this call cannot itself trigger a fresh staleness refresh).
+        // Measured from the refreshed 10_100_000 reference this is under
+        // threshold; measured from the original, un-refreshed 10_000_000 it
+        // would be exactly 250 bps and reported.
+        let after_refresh = watch.moved("POOL", &oracle_prices(asset, 10_250_000), DAY);
+        assert!(
+            after_refresh.is_empty(),
+            "the reference refreshed to 10_100_000 after a day with no \
+             significant move, so this step reads as 148 bps, not the 250 \
+             bps it would be against the stale original reference"
+        );
+    }
+
+    /// Two pools do not share references: the same asset may be priced by
+    /// different oracles.
+    #[test]
+    fn pools_keep_separate_references() {
+        let mut watch = PriceWatch::new(250, u64::MAX);
+        let asset = "CASSET";
+        watch.moved("POOL_A", &oracle_prices(asset, 10_000_000), 0);
+        watch.moved("POOL_B", &oracle_prices(asset, 10_000_000), 0);
+
+        let a_moved = watch.moved("POOL_A", &oracle_prices(asset, 10_500_000), 1);
+        assert_eq!(
+            a_moved,
+            vec![PriceMove {
+                asset: asset.to_string(),
+                direction: Direction::Up,
+            }],
+            "pool A's move is reported and re-anchors pool A's own reference"
+        );
+
+        // The very same price that just moved pool A is also a significant
+        // move for pool B — proof that pool B's reference is still its own
+        // 10_000_000, untouched by pool A's update. If the two pools shared
+        // one reference map keyed only by asset, pool B would already sit
+        // at 10_500_000 and this would report nothing.
+        let b_moved = watch.moved("POOL_B", &oracle_prices(asset, 10_500_000), 1);
+        assert_eq!(
+            b_moved,
+            vec![PriceMove {
+                asset: asset.to_string(),
+                direction: Direction::Up,
+            }],
+            "pool B has its own, untouched reference"
+        );
     }
 }

@@ -298,6 +298,18 @@ pub struct TrackedUser {
     pub recheck_ledger: Option<u32>,
 }
 
+/// Which side of a position a reserve index is tested against.
+/// [`Store::users_exposed_to`] is the only reader of this: it decides which
+/// JSONB column — `collateral` or `liabilities` — the exposure test runs
+/// against, because the store is what knows the two maps' shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    /// Test `users.collateral` for the index.
+    Collateral,
+    /// Test `users.liabilities` for the index.
+    Liability,
+}
+
 impl Store {
     /// Writes a borrower, replacing any previous row for the same pool and
     /// account.
@@ -536,6 +548,96 @@ impl Store {
                 })
             })
             .collect()
+    }
+
+    /// The pool's borrowers holding `index` on `side` — collateral or a
+    /// liability, never both at once for one call — for the oracle scan to
+    /// recheck against a price move. Ordered by account, at most `limit`.
+    ///
+    /// `index` is rendered as the decimal text key the `collateral`/
+    /// `liabilities` JSONB maps are stored under, and tested with
+    /// `jsonb_exists`, the function spelling of JSONB's `?` key-existence
+    /// operator — `?` is also `sqlx`'s own bind-parameter character in some
+    /// contexts, so the function form sidesteps any doubt about which one a
+    /// `query!` call would see.
+    pub async fn users_exposed_to(
+        &self,
+        pool: &str,
+        index: u32,
+        side: Side,
+        limit: i64,
+    ) -> Result<Vec<TrackedUser>, StoreError> {
+        let key = index.to_string();
+        // Each `query!` call produces its own anonymous row type, so the two
+        // arms cannot share a `rows` binding or a mapping closure the way a
+        // single-query method does — the same duplication `users_stale` and
+        // its neighbours already accept. Each arm maps and collects on its
+        // own, so both arms agree on `Result<Vec<TrackedUser>, StoreError>`
+        // rather than on two distinct, incompatible `Record` types.
+        match side {
+            Side::Collateral => {
+                let rows = sqlx::query!(
+                    "SELECT pool, account, health_factor::text AS health_factor, collateral,
+                            liabilities, updated_ledger, recheck_ledger
+                     FROM users
+                     WHERE pool = $1 AND jsonb_exists(collateral, $2)
+                     ORDER BY account ASC
+                     LIMIT $3",
+                    pool,
+                    key,
+                    limit,
+                )
+                .fetch_all(&self.pool)
+                .await?;
+                rows.into_iter()
+                    .map(|row| {
+                        Ok(TrackedUser {
+                            pool: row.pool,
+                            account: row.account,
+                            health_factor: decimal(row.health_factor.as_deref(), "health_factor")?,
+                            collateral: index_amounts_from_json(&row.collateral, "collateral")?,
+                            liabilities: index_amounts_from_json(&row.liabilities, "liabilities")?,
+                            updated_ledger: ledger(row.updated_ledger, "updated_ledger")?,
+                            recheck_ledger: row
+                                .recheck_ledger
+                                .map(|value| ledger(value, "recheck_ledger"))
+                                .transpose()?,
+                        })
+                    })
+                    .collect()
+            }
+            Side::Liability => {
+                let rows = sqlx::query!(
+                    "SELECT pool, account, health_factor::text AS health_factor, collateral,
+                            liabilities, updated_ledger, recheck_ledger
+                     FROM users
+                     WHERE pool = $1 AND jsonb_exists(liabilities, $2)
+                     ORDER BY account ASC
+                     LIMIT $3",
+                    pool,
+                    key,
+                    limit,
+                )
+                .fetch_all(&self.pool)
+                .await?;
+                rows.into_iter()
+                    .map(|row| {
+                        Ok(TrackedUser {
+                            pool: row.pool,
+                            account: row.account,
+                            health_factor: decimal(row.health_factor.as_deref(), "health_factor")?,
+                            collateral: index_amounts_from_json(&row.collateral, "collateral")?,
+                            liabilities: index_amounts_from_json(&row.liabilities, "liabilities")?,
+                            updated_ledger: ledger(row.updated_ledger, "updated_ledger")?,
+                            recheck_ledger: row
+                                .recheck_ledger
+                                .map(|value| ledger(value, "recheck_ledger"))
+                                .transpose()?,
+                        })
+                    })
+                    .collect()
+            }
+        }
     }
 
     /// Clears the flag this decision saw, and only that one: `flagged_at`
@@ -1508,6 +1610,103 @@ mod tests {
             1,
             "the refresh rewrote the row without dropping the flag"
         );
+        Ok(())
+    }
+
+    /// The pinning assertion for `users_exposed_to`: a borrower holding the
+    /// queried reserve only on the *other* side must never come back. A
+    /// query that selected by index alone and ignored `side` entirely would
+    /// still pass a check that only asserted the right users are present —
+    /// it takes a borrower on the wrong side to catch that.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn users_exposed_to_selects_by_side_and_index(db: sqlx::PgPool) -> sqlx::Result<()> {
+        const HOLDS_COLLATERAL: &str = "GCOLLATERALHOLDER";
+        const HOLDS_LIABILITY: &str = "GLIABILITYHOLDER";
+        const OTHER_RESERVE: &str = "GOTHERRESERVEHOLDER";
+        let store = Store::from_pool(db);
+
+        // Reserve 3 as collateral only.
+        store
+            .upsert_user(&TrackedUser {
+                pool: POOL.to_string(),
+                account: HOLDS_COLLATERAL.to_string(),
+                health_factor: 10_000_000,
+                collateral: BTreeMap::from([(3, 1_000_000)]),
+                liabilities: BTreeMap::new(),
+                updated_ledger: 10,
+                recheck_ledger: None,
+            })
+            .await
+            .expect("upsert collateral holder");
+        // Reserve 3 as a liability only — the case that pins `side`.
+        store
+            .upsert_user(&TrackedUser {
+                pool: POOL.to_string(),
+                account: HOLDS_LIABILITY.to_string(),
+                health_factor: 10_000_000,
+                collateral: BTreeMap::new(),
+                liabilities: BTreeMap::from([(3, 1_000_000)]),
+                updated_ledger: 10,
+                recheck_ledger: None,
+            })
+            .await
+            .expect("upsert liability holder");
+        // A different reserve entirely, on both sides: must never come back
+        // for either query.
+        store
+            .upsert_user(&TrackedUser {
+                pool: POOL.to_string(),
+                account: OTHER_RESERVE.to_string(),
+                health_factor: 10_000_000,
+                collateral: BTreeMap::from([(9, 1)]),
+                liabilities: BTreeMap::from([(9, 1)]),
+                updated_ledger: 10,
+                recheck_ledger: None,
+            })
+            .await
+            .expect("upsert unrelated holder");
+
+        let collateral_side = store
+            .users_exposed_to(POOL, 3, Side::Collateral, 10)
+            .await
+            .expect("collateral query");
+        assert_eq!(
+            collateral_side
+                .iter()
+                .map(|user| user.account.as_str())
+                .collect::<Vec<_>>(),
+            vec![HOLDS_COLLATERAL],
+            "the borrower holding reserve 3 as a liability, not collateral, \
+             must not come back on the collateral side"
+        );
+
+        let liability_side = store
+            .users_exposed_to(POOL, 3, Side::Liability, 10)
+            .await
+            .expect("liability query");
+        assert_eq!(
+            liability_side
+                .iter()
+                .map(|user| user.account.as_str())
+                .collect::<Vec<_>>(),
+            vec![HOLDS_LIABILITY],
+            "the borrower holding reserve 3 as collateral, not a liability, \
+             must not come back on the liability side"
+        );
+
+        assert_eq!(
+            store
+                .users_exposed_to(POOL, 3, Side::Collateral, 1)
+                .await
+                .expect("limit")
+                .len(),
+            1
+        );
+        assert!(store
+            .users_exposed_to("COTHER", 3, Side::Collateral, 10)
+            .await
+            .expect("other pool")
+            .is_empty());
         Ok(())
     }
 
