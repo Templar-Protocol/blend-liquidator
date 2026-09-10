@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE users SET recheck_ledger = NULL\n             WHERE pool = $1 AND account = $2 AND recheck_ledger = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e11fb0cea5f0065ca1f158b889e1f24ca1e885d6cff3fc82d9c2ed1c6fbbf606"
+}

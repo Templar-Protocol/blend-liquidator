@@ -542,7 +542,12 @@ async fn full_scan(
     let (pool, tick) = subject;
     let store = tracker.store();
     let least_healthy = store
-        .users_below_health(pool, cadence.scan_health_factor, FULL_SCAN_REPORT_LIMIT)
+        .users_below_health(
+            pool,
+            cadence.scan_health_factor,
+            FULL_SCAN_REPORT_LIMIT,
+            None,
+        )
         .await?;
     let user_count = store.count_users(pool).await?;
     tracing::info!(
@@ -1400,6 +1405,7 @@ mod tests {
             collateral,
             liabilities,
             updated_ledger,
+            recheck_ledger: None,
         }
     }
 

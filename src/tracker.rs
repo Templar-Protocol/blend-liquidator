@@ -250,6 +250,7 @@ impl<'a> Tracker<'a> {
                             collateral: positions.collateral.clone(),
                             liabilities: positions.liabilities.clone(),
                             updated_ledger: snapshot.ledger,
+                            recheck_ledger: None,
                         })
                         .await?;
                     outcome.tracked += 1;
@@ -611,6 +612,7 @@ mod tests {
             collateral,
             liabilities,
             updated_ledger,
+            recheck_ledger: None,
         }
     }
 
