@@ -596,7 +596,9 @@ pub struct CreationRecord {
     /// The ledger the decision was taken at.
     pub ledger: u32,
     pub dry_run: bool,
-    /// The transaction, once there is one.
+    /// The transaction, when the writer already has one. The auctioneer
+    /// records the row before it submits, so it writes `None` here and
+    /// attaches the hash with [`Store::attach_creation_tx`] afterwards.
     pub tx_hash: Option<String>,
 }
 
@@ -635,6 +637,31 @@ impl Store {
         .fetch_one(&self.pool)
         .await?;
         Ok(row.id)
+    }
+
+    /// Attaches the transaction a recorded creation became. Answers whether
+    /// a row was updated.
+    ///
+    /// A creation is recorded *before* it is submitted, so the row exists
+    /// while the hash does not yet: a crash between a transaction landing on
+    /// chain and its row being written would otherwise lose the record of a
+    /// submission that exists, which is the one direction an audit must not
+    /// fail in. The hash is therefore a second write, and a row carrying
+    /// `tx_hash IS NULL` with `dry_run = false` means exactly that — a
+    /// submission whose outcome this bot did not get to record.
+    ///
+    /// `false` means no row has that `id`. Nothing in this crate deletes a
+    /// creation, so the caller logs it rather than failing a submission that
+    /// has already happened.
+    pub async fn attach_creation_tx(&self, id: i64, tx_hash: &str) -> Result<bool, StoreError> {
+        let done = sqlx::query!(
+            "UPDATE creations SET tx_hash = $2 WHERE id = $1",
+            id,
+            tx_hash
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
     }
 }
 
@@ -1517,6 +1544,63 @@ mod tests {
             .await
             .expect("record bad debt");
         assert!(bad_debt > id, "the serial advances");
+        Ok(())
+    }
+
+    /// The two-step audit: the row is written before the submission, and
+    /// the hash is attached once there is one. A row that never gets its
+    /// second write stays as `dry_run = false` with no hash — a submission
+    /// this bot did not see the end of, which is what the audit must be
+    /// able to say.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_creations_transaction_hash_is_attached_after_the_fact(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let id = store
+            .record_creation(&CreationRecord {
+                kind: CreationKind::Auction,
+                pool: POOL.to_string(),
+                account: USER.to_string(),
+                percent: Some(FillPercent::try_from(42).expect("percent")),
+                bid: vec!["USDC".to_string()],
+                lot: vec!["XLM".to_string()],
+                ledger: 64_271_340,
+                dry_run: false,
+                tx_hash: None,
+            })
+            .await
+            .expect("record");
+        let before = sqlx::query!("SELECT tx_hash FROM creations WHERE id = $1", id)
+            .fetch_one(store.pool())
+            .await
+            .expect("the row exists before the submission");
+        assert!(
+            before.tx_hash.is_none(),
+            "the row is written before there is a transaction to name"
+        );
+
+        let hash = "cd".repeat(32);
+        assert!(
+            store
+                .attach_creation_tx(id, &hash)
+                .await
+                .expect("attach the hash"),
+            "the row this bot just wrote is the one updated"
+        );
+        let after = sqlx::query!("SELECT tx_hash FROM creations WHERE id = $1", id)
+            .fetch_one(store.pool())
+            .await
+            .expect("the row still exists");
+        assert_eq!(after.tx_hash, Some(hash));
+
+        assert!(
+            !store
+                .attach_creation_tx(id + 1_000, "ef".repeat(32).as_str())
+                .await
+                .expect("a missing row is not an error"),
+            "no row, no update — and not a failure either"
+        );
         Ok(())
     }
 }

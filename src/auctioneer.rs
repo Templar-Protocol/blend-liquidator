@@ -106,7 +106,7 @@ pub enum AuctioneerError {
 /// One auctioneer submission, whether or not it was sent: the same shape
 /// [`CreationRecord`] persists, plus what simulation and the queue found out
 /// that the store's `creations` table has no column for (see `act`'s doc).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CreationOutcome {
     /// What kind of submission this was.
     pub kind: CreationKind,
@@ -118,11 +118,48 @@ pub struct CreationOutcome {
     /// auctioneer key is configured at all — there is then no source
     /// account to simulate against, dry-run or not.
     pub simulated: bool,
-    /// Whether this was put through the submission queue. `false` in
-    /// dry-run; never `true` without a `tx_hash`.
-    pub submitted: bool,
-    /// The transaction this became, once there is one.
-    pub tx_hash: Option<String>,
+    /// The `creations` row this was written as, written before anything was
+    /// submitted. What a caller reconciling an unresolved submission names
+    /// the row by.
+    pub creation_id: i64,
+    /// What the chain made of it: `None` in dry-run, where nothing was
+    /// sent.
+    ///
+    /// Every terminal state comes back here, not just the good one. A
+    /// caller must match on it rather than read `Some` as success:
+    /// [`TxOutcome::Failed`] consumed a sequence number and charged a fee,
+    /// [`TxOutcome::Expired`] provably never applied, and
+    /// [`TxOutcome::Unknown`] may still land — it carries the `sequence`
+    /// and `window` [`Submitter::wait_for`] resumes from, which is the only
+    /// way to find out which.
+    pub submission: Option<TxOutcome>,
+}
+
+impl CreationOutcome {
+    /// Whether this went through the submission queue at all. `false` in
+    /// dry-run, and never `true` without a transaction hash.
+    #[must_use]
+    pub fn submitted(&self) -> bool {
+        self.submission.is_some()
+    }
+
+    /// The transaction this became, once there is one. Every
+    /// [`TxOutcome`] carries a hash, a failed or unresolved one included:
+    /// a transaction that consumed a sequence number is worth naming
+    /// whatever became of it.
+    #[must_use]
+    pub fn tx_hash(&self) -> Option<TxHash> {
+        self.submission.as_ref().map(outcome_hash)
+    }
+
+    /// Whether the chain applied it and it succeeded. `false` for a
+    /// dry-run, a failure, an expiry and an unresolved outcome alike — the
+    /// three that are not successes are not interchangeable, so a caller
+    /// that needs to tell them apart reads `submission` itself.
+    #[must_use]
+    pub fn succeeded(&self) -> bool {
+        matches!(self.submission, Some(TxOutcome::Succeeded { .. }))
+    }
 }
 
 /// Decides who is liquidatable, against one store and one chain client, and
@@ -311,11 +348,31 @@ impl<'a> Auctioneer<'a> {
     /// simulate against and the plan is recorded unsimulated,
     /// [`CreationOutcome::simulated`] and the log line both saying so.
     ///
+    /// The audit is written **before** the submission, never after: the
+    /// row, and the structured log event that mirrors it, both exist before
+    /// the operation is handed to the queue, and the transaction's hash is
+    /// attached to that row once there is one. A crash at any point
+    /// therefore leaves a row that is at worst incomplete, never a
+    /// transaction on chain that nothing recorded — and a submission the
+    /// queue refused leaves the same row a dry-run would, rather than
+    /// nothing at all.
+    ///
     /// A [`Decision::Skip`] acts on nothing and returns `Ok(None)`, with the
     /// reason on a debug line: an operator asking "why did nothing happen"
     /// is asking about exactly this. Bad debt is submitted without the
     /// percent walk below: `bad_debt(user)` takes no percent, and the
     /// contract sizes it itself.
+    ///
+    /// # Errors
+    ///
+    /// This is one borrower's function, so **every** failure it reports is
+    /// one borrower's: a store write, a chain read the bot could not even
+    /// make, or a queue that refused the submission. Isolating them is the
+    /// caller's responsibility — [`Auctioneer::decide`] does the same job
+    /// for the deciding half of the tick — and a caller that lets an `Err`
+    /// from one account end the batch lets one refused borrower stop every
+    /// other borrower being acted on. The one failure worth ending a batch
+    /// over is [`AuctioneerError::Store`], for the reason `decide` gives.
     pub async fn act(
         &self,
         pool: &str,
@@ -360,21 +417,9 @@ impl<'a> Auctioneer<'a> {
             }
         };
 
-        let (tx_hash, submitted) = match submit {
-            Some(queue) => {
-                let label = format!("{kind:?} {account} on {pool}");
-                let outcome = queue
-                    .enqueue(Submission {
-                        operation,
-                        priority: Priority::Normal,
-                        label,
-                    })
-                    .await?;
-                (Some(outcome_hash(&outcome).to_hex()), true)
-            }
-            None => (None, false),
-        };
-
+        // Written first, and logged first: the spec's audit trail is meant
+        // to survive a database loss, so the row and the log line carry the
+        // same fields, and both precede the submission they describe.
         let record = CreationRecord {
             kind,
             pool: pool.to_string(),
@@ -384,19 +429,38 @@ impl<'a> Auctioneer<'a> {
             lot,
             ledger: tick.sequence,
             dry_run: submit.is_none(),
-            tx_hash: tx_hash.clone(),
+            tx_hash: None,
         };
-        self.store.record_creation(&record).await?;
+        let creation_id = self.store.record_creation(&record).await?;
+        tracing::info!(
+            creation_id,
+            pool,
+            account,
+            kind = ?record.kind,
+            percent = record.percent.map(FillPercent::get),
+            bid = ?record.bid,
+            lot = ?record.lot,
+            ledger = record.ledger,
+            dry_run = record.dry_run,
+            simulated,
+            "creation recorded"
+        );
 
-        tracing::info!(pool, account, kind = ?kind, simulated, submitted, "creation recorded");
+        let submission = match submit {
+            Some(queue) => Some(
+                self.submit_recorded(queue, creation_id, &record, operation)
+                    .await?,
+            ),
+            None => None,
+        };
 
         Ok(Some(CreationOutcome {
             kind,
             account: account.to_string(),
             percent,
             simulated,
-            submitted,
-            tx_hash,
+            creation_id,
+            submission,
         }))
     }
 
@@ -454,6 +518,49 @@ impl<'a> Auctioneer<'a> {
                 Ok(None)
             }
         }
+    }
+
+    /// Hands an already-recorded creation to the queue, then attaches the
+    /// transaction it became to the row `creation_id` names.
+    ///
+    /// The order is the audit's: the row exists before the submission, so
+    /// the hash is a second write and a row with `dry_run = false` and no
+    /// hash means a submission this bot did not see the end of. A row that
+    /// has gone missing between the two writes is logged, not raised —
+    /// nothing deletes a creation, and failing here would report a
+    /// submission that has already happened as one that did not.
+    async fn submit_recorded(
+        &self,
+        queue: &SubmissionQueue,
+        creation_id: i64,
+        record: &CreationRecord,
+        operation: Operation,
+    ) -> Result<TxOutcome, AuctioneerError> {
+        let label = format!("{:?} {} on {}", record.kind, record.account, record.pool);
+        let outcome = queue
+            .enqueue(Submission {
+                operation,
+                priority: Priority::Normal,
+                label,
+            })
+            .await?;
+        let hash = outcome_hash(&outcome).to_hex();
+        if !self.store.attach_creation_tx(creation_id, &hash).await? {
+            tracing::warn!(
+                creation_id,
+                tx_hash = %hash,
+                "no creation row to attach this transaction to"
+            );
+        }
+        tracing::info!(
+            creation_id,
+            pool = %record.pool,
+            account = %record.account,
+            tx_hash = %hash,
+            status = outcome_status(&outcome),
+            "creation submitted"
+        );
+        Ok(outcome)
     }
 
     /// Walks a liquidation plan's percent to one the contract accepts.
@@ -602,6 +709,18 @@ impl<'a> Auctioneer<'a> {
     }
 }
 
+/// What a submitted transaction's terminal state is called on a log line.
+/// A short label rather than `TxOutcome`'s `Debug`, whose `Failed` variant
+/// carries a whole decoded `TransactionResult`.
+fn outcome_status(outcome: &TxOutcome) -> &'static str {
+    match outcome {
+        TxOutcome::Succeeded { .. } => "succeeded",
+        TxOutcome::Failed { .. } => "failed",
+        TxOutcome::Expired { .. } => "expired",
+        TxOutcome::Unknown { .. } => "unknown",
+    }
+}
+
 /// The hash every [`TxOutcome`] variant carries, whatever the transaction's
 /// terminal state: even a failed, expired or unresolved transaction
 /// consumed a sequence number and is worth recording by its hash.
@@ -620,8 +739,9 @@ mod tests {
 
     use serde_json::{json, Value};
     use stellar_xdr::{
-        ContractDataDurability, ContractDataEntry, ExtensionPoint, LedgerEntryData, LedgerKey,
-        LedgerKeyAccount, TransactionResultResult, VecM,
+        ContractDataDurability, ContractDataEntry, ExtensionPoint, InvokeHostFunctionResult,
+        LedgerEntryData, LedgerKey, LedgerKeyAccount, OperationResult, OperationResultTr,
+        TransactionResultResult, VecM,
     };
 
     use super::*;
@@ -1460,8 +1580,12 @@ mod tests {
             .await
             .expect("act")
             .expect("a creation");
-        assert!(!outcome.submitted, "dry-run never submits");
-        assert!(outcome.tx_hash.is_none(), "dry-run never has a hash");
+        assert!(!outcome.submitted(), "dry-run never submits");
+        assert!(outcome.tx_hash().is_none(), "dry-run never has a hash");
+        assert!(
+            outcome.submission.is_none(),
+            "dry-run never has a chain outcome to carry back"
+        );
         assert!(
             outcome.simulated,
             "an auctioneer key was configured, so the percent was checked"
@@ -1556,8 +1680,9 @@ mod tests {
             tokio::join!(act_and_drop, run_queue(&submitter, receiver, &shutdown_rx));
         let outcome = outcome.expect("act").expect("a creation");
 
-        assert!(outcome.submitted, "armed, the creation is submitted");
-        let hash = outcome.tx_hash.clone().expect("a hash");
+        assert!(outcome.submitted(), "armed, the creation is submitted");
+        assert!(outcome.succeeded(), "this one landed");
+        let hash = outcome.tx_hash().expect("a hash").to_hex();
         assert_eq!(hash.len(), 64, "a tx hash renders as 64 hex digits");
 
         let row = sqlx::query!(
@@ -1776,6 +1901,153 @@ mod tests {
             "no RestoreFootprint transaction was sent"
         );
         assert!(rpc.calls("getFeeStats").is_empty(), "nothing was prepared");
+        Ok(())
+    }
+
+    /// A submission that lands and fails is not a submission that worked.
+    /// `act` carries every terminal `TxOutcome` back to the caller, and the
+    /// row still gets the hash: a failed transaction consumed a sequence
+    /// number and charged a fee, which is exactly what an audit is for.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_failed_submission_comes_back_as_failed(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let signer = auctioneer_signer();
+        let network = Network::testnet();
+        let account = synthetic_account(90);
+
+        // `act`'s own simulate-only round, then the queue's prepare-and-send.
+        script_simulate_prelude(&rpc, &signer, 10, 100);
+        script_simulate_accepted(&rpc, 100);
+        script_prepare_prelude(&rpc, &signer, 10, 100);
+        script_simulate_accepted(&rpc, 100);
+        rpc.expect(
+            "sendTransaction",
+            json!({"status": "PENDING", "hash": "$ENVELOPE_HASH",
+                   "latestLedger": 100, "latestLedgerCloseTime": "1"}),
+        );
+        let failed = TransactionResultResult::TxFailed(
+            VecM::try_from(vec![OperationResult::OpInner(
+                OperationResultTr::InvokeHostFunction(InvokeHostFunctionResult::Trapped),
+            )])
+            .expect("one operation result"),
+        );
+        rpc.expect(
+            "getTransaction",
+            json!({"status": "FAILED", "latestLedger": 101, "oldestLedger": 1,
+                   "ledger": 100, "createdAt": "1", "txHash": "ab".repeat(32),
+                   "envelopeXdr": "AAAA",
+                   "resultXdr": result_b64(failed),
+                   "resultMetaXdr": meta_v4_b64(None, vec![]),
+                   "diagnosticEventsXdr": [diagnostic_error_b64(1_205)]}),
+        );
+
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let auctioneer = Auctioneer::new(&client, &store, config(BTreeSet::new()), Some(submitter));
+        let (queue, receiver) = SubmissionQueue::new(4);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let tick = harness::fixture_tick();
+
+        let act_and_drop = async {
+            let outcome = auctioneer
+                .act(POOL, &account, &Decision::BadDebt, tick, Some(&queue))
+                .await;
+            drop(queue);
+            outcome
+        };
+        let (outcome, ()) =
+            tokio::join!(act_and_drop, run_queue(&submitter, receiver, &shutdown_rx));
+        let outcome = outcome.expect("act").expect("a creation");
+
+        assert!(outcome.submitted(), "it did go through the queue");
+        assert!(
+            !outcome.succeeded(),
+            "but it failed, and `succeeded` must not read `Some` as success"
+        );
+        let Some(TxOutcome::Failed { contract_error, .. }) = &outcome.submission else {
+            panic!("expected a Failed outcome, got {:?}", outcome.submission);
+        };
+        assert_eq!(
+            *contract_error,
+            Some(1_205),
+            "the pool's own error code survives the trip back to the caller"
+        );
+
+        let row = sqlx::query!(
+            "SELECT dry_run, tx_hash FROM creations WHERE account = $1",
+            account.as_str(),
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("the creation was recorded");
+        assert!(!row.dry_run);
+        assert_eq!(
+            row.tx_hash,
+            outcome.tx_hash().map(|hash| hash.to_hex()),
+            "a failed transaction is still the transaction this creation \
+             became, and the row says so"
+        );
+        Ok(())
+    }
+
+    /// The creation row exists before the submission does, so a submission
+    /// the queue refuses leaves the same audit trail a dry-run would —
+    /// never less. The queue here is shut down before `act` reaches it, so
+    /// the enqueue is answered with a refusal rather than a transaction.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_refused_submission_still_leaves_its_row(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let signer = auctioneer_signer();
+        let network = Network::testnet();
+        let account = synthetic_account(95);
+
+        script_simulate_prelude(&rpc, &signer, 10, 100);
+        script_simulate_accepted(&rpc, 100);
+
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let auctioneer = Auctioneer::new(&client, &store, config(BTreeSet::new()), Some(submitter));
+        let (queue, receiver) = SubmissionQueue::new(4);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(true);
+        let tick = harness::fixture_tick();
+
+        let act_and_drop = async {
+            let outcome = auctioneer
+                .act(POOL, &account, &Decision::BadDebt, tick, Some(&queue))
+                .await;
+            drop(queue);
+            outcome
+        };
+        let (outcome, ()) =
+            tokio::join!(act_and_drop, run_queue(&submitter, receiver, &shutdown_rx));
+        drop(shutdown_tx);
+        assert!(
+            matches!(outcome, Err(AuctioneerError::Queue(_))),
+            "the refusal reaches this borrower's caller"
+        );
+
+        let row = sqlx::query!(
+            "SELECT dry_run, tx_hash FROM creations WHERE account = $1",
+            account.as_str(),
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("the row was written before the submission was attempted");
+        assert!(
+            !row.dry_run,
+            "it was an armed attempt, and the audit says so"
+        );
+        assert!(
+            row.tx_hash.is_none(),
+            "there is no transaction to name, which is exactly what a row \
+             with no hash and dry_run = false means"
+        );
+        assert!(
+            rpc.calls("sendTransaction").is_empty(),
+            "the queue refused it before anything was sent"
+        );
         Ok(())
     }
 }
