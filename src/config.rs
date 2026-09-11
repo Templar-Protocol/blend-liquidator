@@ -582,8 +582,14 @@ pub struct Args {
     /// `1.15` (`InvalidLiqTooLarge`) or below `1.03` (`InvalidLiqTooSmall`),
     /// so this sits between them with room for the auction to be filled a
     /// ledger or two later than planned — and anything outside that band is
-    /// refused at parse rather than clamped. See [`target_health_factor`]
-    /// for what each direction costs if it is not.
+    /// refused at parse rather than clamped: `TARGET_HF=0` would make the
+    /// planned excess non-positive for every borrower, so every
+    /// liquidatable one is recorded as "no plan" for ever, silently, and a
+    /// value above the band burns `PLAN_ITERATIONS` simulations per
+    /// borrower before skipping it. The bounds are the contract's own and
+    /// nothing narrower — a tighter range would be this bot's opinion
+    /// rather than the contract's rule — and the ±1 percent walk is what
+    /// absorbs the margin at either edge.
     #[arg(
         long,
         env = "TARGET_HF",

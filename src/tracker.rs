@@ -274,6 +274,12 @@ impl<'a> Tracker<'a> {
     /// the tick first. Handing the span over instead compares a count of
     /// ledgers against a ledger sequence, which selects every row on a
     /// fresh network and no row at all on a live one.
+    ///
+    /// **No production caller.** `service::apply_tick` inlines the same two
+    /// steps rather than calling this, because that call site also needs
+    /// the account list to flag for the auctioneer and [`RefreshOutcome`]
+    /// reports only counts. This stays as the tested statement of what the
+    /// pass is; changing one and not the other is how they drift.
     pub async fn refresh_stale(
         &self,
         pool: &str,

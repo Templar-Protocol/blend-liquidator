@@ -124,23 +124,37 @@ make help                           # Docker Compose lifecycle
   submits through a `SubmissionQueue` only when one is given.
   `Auctioneer::scan_oracle` is a third, narrower path that decides nothing:
   it compares a pool's current prices against a remembered reference and
-  flags the borrowers exposed to whichever asset moved past
+  flags **every** borrower exposed to whichever asset moved past
   `PRICE_DELTA_BPS`, for the ordinary recheck path to decide about them.
+  That sweep is unbounded on purpose — `Store::flag_exposed_to` is one
+  statement per move, with no `LIMIT` — because the reference re-anchors on
+  the move it reports, so a borrower one scan skipped would not be reached
+  by the next one either. `REFRESH_BATCH` is a *rate* for the decide path
+  and must never become a cap here.
 - `src/service.rs` — wiring: `Service::check_config` validates the
   configuration against the chain *and* the database (connect and ping, per
   the spec's deployment contract) and reports without following anything;
   `Service::run` connects and migrates the store, seeds every pool whose
-  tracked-user count or events cursor is missing, then runs one
-  `LedgerPoller` per pool and one tracker task consuming their shared
-  channel until a shutdown signal arrives and every task has returned. The
-  tracker loop treats a `TrackerError::Store` as fatal and a `Chain` or
-  `Math` one as transient — it declines the tick, and the same range is read
-  again. Once a tick, the same task also runs the auctioneer: it fires the
+  tracked-user count or events cursor is missing, then runs four kinds of
+  task until a shutdown signal arrives and every one has returned: one
+  `LedgerPoller` per pool, one tracker task consuming their shared channel,
+  one auctioneer task, and — only when armed and a key is configured — one
+  submission-queue worker. The tracker loop treats a `TrackerError::Store`
+  as fatal and a `Chain` or `Math` one as transient — it declines the tick,
+  and the same range is read again.
+
+  **The auctioneer is a separate task, and must stay one.** It is not
+  inside the tracker's tick: the tracker's acknowledgement is what commits
+  the poller's cursor, and a decision is not a ledger effect, so an
+  auctioneer in that path could stall the cursor. It is fed by a
+  `tokio::sync::watch<LedgerTick>` the tracker publishes *after* it
+  acknowledges — never a second reader of the poller channel, which would
+  break the per-sender ordering the cursor rests on. Per tick it fires the
   oracle-scan and full-scan-and-flag cadences when due, then decides and
   acts on every pool's currently flagged users, gating whether the
   submission queue is even offered to `Auctioneer::act` on
-  `STARTUP_DELAY_LEDGERS` having elapsed since the first ledger this task
-  saw.
+  `STARTUP_DELAY_LEDGERS` having elapsed since the first ledger it saw.
+  `src/service.rs`'s module doc has the long form.
 - `src/harness.rs` (`cfg(test)`) — scripted-RPC and store scaffolding shared
   by the store, ledger and tracker tests: the fixture's pool, its two
   borrowers, and the golden health factors `chain::xdr::decode`'s test

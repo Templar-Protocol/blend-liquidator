@@ -3139,6 +3139,10 @@ mod tests {
         );
     }
 
+    /// `PoolError::AuctionInProgress`: an auction for this user already
+    /// exists — the benign refusal, and the cheapest one to script.
+    const AUCTION_IN_PROGRESS: u32 = 1_212;
+
     /// The `simulateTransaction` answer for an operation the contract
     /// refuses with `code`, in both the diagnostic events and the message.
     fn script_simulate_refused(rpc: &ScriptedRpc, code: u32) {
@@ -3706,8 +3710,8 @@ mod tests {
     /// recheck queue until an event, a price move or the full scan's
     /// ~1200-ledger period named it again.
     ///
-    /// The refusal scripted here is the pool's own `AuctionInProgress`
-    /// (1212), the benign one; the one that is not benign — a percent walk
+    /// The refusal scripted here is the pool's own `AuctionInProgress`,
+    /// the benign one; the one that is not benign — a percent walk
     /// that ran out of iterations a point short of the contract's band —
     /// reaches the same arm, because both are `ActOutcome::Refused`.
     #[sqlx::test(migrations = "./migrations")]
@@ -3721,7 +3725,7 @@ mod tests {
         // source-account read, then a contract refusal.
         script_snapshot_bad_debt(&rpc, &account);
         script_account_entry(&rpc, &signer);
-        script_simulate_refused(&rpc, 1_212);
+        script_simulate_refused(&rpc, AUCTION_IN_PROGRESS);
         let client = RpcClient::new(&rpc.url(), None).expect("client");
         let network = Network::testnet();
         let submitter = Submitter::new(&client, &network, &signer, test_tx_config());

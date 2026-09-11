@@ -286,8 +286,15 @@ pub struct TrackedUser {
     /// The ledger this row was computed at.
     pub updated_ledger: u32,
     /// The ledger this row was flagged for an auctioneer decision at, or
-    /// `None` when there is nothing to decide. Every read that builds a
-    /// `TrackedUser` from a stored row — [`Store::user`],
+    /// `None` when there is nothing to decide.
+    ///
+    /// Read-only in practice: setting it and calling [`Store::upsert_user`]
+    /// does **nothing**, because that write deliberately leaves the column
+    /// alone (see its own doc). [`Store::flag_recheck`] and
+    /// [`Store::flag_exposed_to`] raise it, [`Store::clear_recheck`] clears
+    /// it, and those are the only writers.
+    ///
+    /// Every read that builds a `TrackedUser` from a stored row — [`Store::user`],
     /// [`Store::users_below_health`], [`Store::users_stale`] and
     /// [`Store::users_needing_recheck`] alike — selects and reports the
     /// real column, so this field means the same thing regardless of which
@@ -312,7 +319,16 @@ pub enum Side {
 
 impl Store {
     /// Writes a borrower, replacing any previous row for the same pool and
-    /// account.
+    /// account — every column **except** `recheck_ledger`, which it
+    /// deliberately does not write.
+    ///
+    /// That omission is load-bearing, not an oversight: the tracker's
+    /// refresh and the auctioneer's recheck queue are independently
+    /// scheduled, so a refresh landing mid-decision must not drop a flag
+    /// the auctioneer has not acted on yet. [`Store::flag_recheck`] and
+    /// [`Store::flag_exposed_to`] raise the column and
+    /// [`Store::clear_recheck`] clears it; nothing else writes it, and
+    /// `TrackedUser::recheck_ledger` is ignored here.
     pub async fn upsert_user(&self, user: &TrackedUser) -> Result<(), StoreError> {
         sqlx::query!(
             "INSERT INTO users (pool, account, health_factor, collateral, liabilities, updated_ledger)
@@ -678,6 +694,15 @@ pub struct CreationRecord {
     pub lot: Vec<String>,
     /// The ledger the decision was taken at.
     pub ledger: u32,
+    /// Whether nothing was sent — and only that.
+    ///
+    /// It is an *audit predicate*, exact for reconciliation ("no
+    /// transaction exists for this row"), not a report of the bot's mode.
+    /// The auctioneer writes `submit.is_none()`, which is `true` for three
+    /// different causes: `DRY_RUN=true`, no signing key configured, and an
+    /// armed bot whose `STARTUP_DELAY_LEDGERS` has not yet elapsed. An
+    /// operator reading `dry_run = true` on an armed deployment is looking
+    /// at one of the last two, not at a mode that changed under them.
     pub dry_run: bool,
     /// The transaction, when the writer already has one. The auctioneer
     /// records the row before it submits, so it writes `None` here and

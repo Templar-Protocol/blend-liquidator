@@ -436,12 +436,13 @@ pub struct Auctioneer<'a> {
 /// needs the accrued numbers to price each position individually, the same
 /// instant [`PoolSnapshot::position_data`] accrues its own clone to for the
 /// health-factor gate — accruing a second time here, to the same
-/// `close_time`, is what keeps the two agreeing. Doing that accrual inside
-/// the per-user loop would accrue the whole reserve set again for every
-/// borrower the batch finds liquidatable; a full scan of a thousand
-/// borrowers is exactly the cadence a repeated accrual like that turns into
-/// a stall, so this runs once, before the loop, and every user's plan
-/// borrows from the one result.
+/// `close_time`, is what keeps the two agreeing.
+///
+/// It saves the *second* such pass, and only for the users that turn out
+/// liquidatable, not the first: `decide_one` calls `position_data` for
+/// every borrower in the batch, and that clones and accrues the whole
+/// reserve map on each call. So the per-user accrual this hoists out is one
+/// of two, not one of one — worth doing, and worth not overstating.
 fn accrue_reserves(
     snapshot: &PoolSnapshot,
     close_time: u64,
@@ -679,6 +680,13 @@ impl<'a> Auctioneer<'a> {
         // Written first, and logged first: the spec's audit trail is meant
         // to survive a database loss, so the row and the log line carry the
         // same fields, and both precede the submission they describe.
+        //
+        // `dry_run = submit.is_none()` is the audit predicate "nothing was
+        // sent", which is what reconciliation needs and is exact for it. It
+        // is not a report of the bot's mode: `submit` is also `None` with
+        // no key configured, and on an armed bot whose
+        // `STARTUP_DELAY_LEDGERS` has not elapsed. See
+        // `CreationRecord::dry_run`.
         let record = CreationRecord {
             kind,
             pool: pool.to_string(),
@@ -1109,6 +1117,13 @@ mod tests {
     /// A valid, distinct account strkey from `byte` alone — no real key
     /// behind it, and none needed: every test here only ever reads chain
     /// state through the scripted RPC, never signs anything.
+    /// `PoolError::AuctionInProgress`: an auction for this user already
+    /// exists. Named here rather than beside `INVALID_LIQ_TOO_LARGE` and
+    /// `INVALID_LIQ_TOO_SMALL` because nothing in `accept_percent` matches
+    /// on it — it is the "any other contract error" arm, and being neither
+    /// of those two is exactly what the tests using it assert.
+    const AUCTION_IN_PROGRESS: u32 = 1_212;
+
     fn synthetic_account(byte: u8) -> String {
         stellar_strkey::ed25519::PublicKey([byte; 32]).to_string()
     }
@@ -1773,9 +1788,9 @@ mod tests {
 
         // Three attempts: too small, too small again, then accepted.
         script_simulate_prelude(&rpc, &signer, 10, 100);
-        script_simulate_refused(&rpc, 1214, 100);
+        script_simulate_refused(&rpc, INVALID_LIQ_TOO_SMALL, 100);
         script_simulate_prelude(&rpc, &signer, 10, 100);
-        script_simulate_refused(&rpc, 1214, 100);
+        script_simulate_refused(&rpc, INVALID_LIQ_TOO_SMALL, 100);
         script_simulate_prelude(&rpc, &signer, 10, 100);
         script_simulate_accepted(&rpc, 100);
 
@@ -1827,7 +1842,7 @@ mod tests {
         let lot_asset = synthetic_account(6);
 
         script_simulate_prelude(&rpc, &signer, 10, 100);
-        script_simulate_refused(&rpc, 1213, 100);
+        script_simulate_refused(&rpc, INVALID_LIQ_TOO_LARGE, 100);
         script_simulate_prelude(&rpc, &signer, 10, 100);
         script_simulate_accepted(&rpc, 100);
 
@@ -1880,7 +1895,7 @@ mod tests {
         // is refused the same way.
         for _ in 0..5 {
             script_simulate_prelude(&rpc, &signer, 10, 100);
-            script_simulate_refused(&rpc, 1214, 100);
+            script_simulate_refused(&rpc, INVALID_LIQ_TOO_SMALL, 100);
         }
 
         let client = RpcClient::new(&rpc.url(), None).expect("client");
@@ -1925,9 +1940,9 @@ mod tests {
         let bid_asset = synthetic_account(12);
         let lot_asset = synthetic_account(13);
 
-        // AuctionInProgress (1212) is neither 1213 nor 1214.
+        // AuctionInProgress is neither of the percent walk's two codes.
         script_simulate_prelude(&rpc, &signer, 10, 100);
-        script_simulate_refused(&rpc, 1212, 100);
+        script_simulate_refused(&rpc, AUCTION_IN_PROGRESS, 100);
 
         let client = RpcClient::new(&rpc.url(), None).expect("client");
         let submitter = Submitter::new(&client, &network, &signer, tx_config());
@@ -1951,7 +1966,8 @@ mod tests {
         assert_eq!(
             rpc.calls("simulateTransaction").len(),
             1,
-            "one simulation, not a retry: 1212 is not the percent loop's business"
+            "one simulation, not a retry: AuctionInProgress is not the percent \
+             loop's business"
         );
         Ok(())
     }
