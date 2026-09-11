@@ -3738,11 +3738,23 @@ mod tests {
     /// acknowledged too, proving the earlier failure poisoned nothing
     /// downstream either.
     ///
-    /// If the auctioneer were ever called from inside `apply_tick` — the
-    /// mistake the constraint forbids — this test would fail at its very
-    /// first assertion: `handle_message` would propagate the auctioneer's
-    /// chain error before `ack.send(())` is ever reached, so
-    /// `applied.await` would come back `Err`, not `Ok`.
+    /// What pins "the auctioneer is never on the acknowledgement path" is
+    /// the call count, not the order of the assertions: the `Tick` arm
+    /// makes exactly the two `getLedgerEntries` calls its own refresh
+    /// scripts, and `ScriptedRpc` records every request before it decides
+    /// how to answer it. An auctioneer called from inside `apply_tick`
+    /// would read a snapshot of its own for the account this tick just
+    /// flagged, so it would show up here as a third call — whether its
+    /// error propagated, was logged and swallowed, or never happened at
+    /// all.
+    ///
+    /// The 503 below proves something narrower, and only that: it is
+    /// scripted *after* the tick was applied, so it says nothing about an
+    /// inline auctioneer (an unscripted method answers HTTP 500, which an
+    /// inline port keeping this module's log-and-continue split would
+    /// swallow). What it proves is that a chain failure inside
+    /// `recheck_batch` is logged rather than propagated, and that the
+    /// borrower it failed on keeps a flag.
     #[sqlx::test(migrations = "./migrations")]
     async fn an_auctioneer_failure_does_not_stall_the_cursor(db: sqlx::PgPool) -> sqlx::Result<()> {
         let store = Store::from_pool(db);
@@ -3800,6 +3812,17 @@ mod tests {
                 .and_then(|user| user.recheck_ledger),
             Some(tick.sequence),
             "the tick flagged the account: this is the auctioneer's own input"
+        );
+
+        // And the pin on the constraint itself: `harness::script_snapshot`
+        // scripts one snapshot — the pool's shape, then the batched
+        // entries — so two is every chain read the refresh makes and a
+        // third would be the auctioneer's own.
+        assert_eq!(
+            rpc.calls("getLedgerEntries").len(),
+            2,
+            "the tick made its refresh's own two reads and no other chain call: \
+             an auctioneer called from inside `apply_tick` would read a snapshot here"
         );
 
         // Now the auctioneer runs against that exact tick, and fails: its
