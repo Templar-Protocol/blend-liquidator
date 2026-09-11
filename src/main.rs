@@ -59,10 +59,15 @@ async fn main() {
     // Both arrive from the environment, never argv: a signing key on the
     // command line is readable from `/proc/<pid>/cmdline` and shows up in
     // `ps` and `docker inspect`. Neither is a clap argument for exactly
-    // that reason — see `Args::auctioneer_signer`'s own doc. An empty
-    // value counts as absent, the same treatment `Args::chain` and
+    // that reason — see `Args::signing_keys`' own doc. An empty value
+    // counts as absent, the same treatment `Args::chain` and
     // `Args::service` give `RPC_API_KEY` and `DATABASE_URL`.
-    let signer = match args.auctioneer_signer(
+    //
+    // Both are read, and both are parsed, even though at most one of them
+    // signs: the auctioneer must refuse to act on *either* address, and a
+    // filler key that is never parsed is an address the bot does not know
+    // is its own.
+    let keys = match args.signing_keys(
         std::env::var("FILLER_SECRET_KEY")
             .ok()
             .filter(|key| !key.is_empty()),
@@ -70,7 +75,7 @@ async fn main() {
             .ok()
             .filter(|key| !key.is_empty()),
     ) {
-        Ok(signer) => signer,
+        Ok(keys) => keys,
         Err(error) => {
             tracing::error!(%error, "configuration error");
             std::process::exit(EXIT_CONFIG);
@@ -85,7 +90,7 @@ async fn main() {
                 EXIT_CONFIG
             }
         },
-        RunMode::Loop => match Service::run(config, signer).await {
+        RunMode::Loop => match Service::run(config, keys).await {
             Ok(()) => 0,
             Err(error @ LiquidatorError::Config(_)) => {
                 tracing::error!(%error, "configuration error");

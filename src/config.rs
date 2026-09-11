@@ -141,6 +141,46 @@ impl<'de> serde::Deserialize<'de> for Decimal7 {
     }
 }
 
+/// The bottom of the pool contract's post-liquidation band, 7 decimals:
+/// below `1.03` it answers `InvalidLiqTooSmall` (1214).
+const TARGET_HF_MIN: i128 = 10_300_000;
+
+/// The top of that band, 7 decimals, exclusive: at or above `1.15` the
+/// contract answers `InvalidLiqTooLarge` (1213).
+const TARGET_HF_MAX: i128 = 11_500_000;
+
+/// `TARGET_HF`, refused outside the band the contract itself accepts.
+///
+/// The knob names the health factor a liquidation aims to leave the
+/// borrower at, and the plan's percent is computed straight from it:
+/// `excess = liability_base × TARGET_HF − collateral_base`. At `0` that
+/// excess is `−collateral_base`, never positive, so `plan_liquidation`
+/// returns `None` for every borrower and each liquidatable one is recorded
+/// `Skip(NoPlan)` — for ever, with no warning at all. Above the band it
+/// fails the other way: the walk starts far too high and burns
+/// `PLAN_ITERATIONS` simulations per borrower before skipping it, one warn
+/// line each.
+///
+/// The bounds are the contract's own and nothing narrower: it refuses a
+/// post-liquidation health factor below `1.03` (`InvalidLiqTooSmall`) and
+/// at or above `1.15` (`InvalidLiqTooLarge`), so `[1.03, 1.15)` is exactly
+/// the set of values that name an outcome the contract can accept. Picking
+/// a tighter range here would be this bot's opinion rather than the
+/// contract's rule, and the ±1 percent walk is what absorbs the margin at
+/// either edge. Refused at parse rather than clamped, for the same reason
+/// `PLAN_ITERATIONS` and `PRICE_DELTA_BPS` are: a knob value that makes the
+/// bot look busy and do nothing is a startup error, not a default.
+fn target_health_factor(text: &str) -> Result<Decimal7, String> {
+    let value: Decimal7 = text.parse()?;
+    if value.get() < TARGET_HF_MIN || value.get() >= TARGET_HF_MAX {
+        return Err(format!(
+            "`{text}` is outside the band the pool contract accepts: TARGET_HF must be at \
+             least 1.03 and below 1.15, or every liquidation this bot plans is refused"
+        ));
+    }
+    Ok(value)
+}
+
 /// An amount in an asset's own decimals, written as a decimal string
 /// because it exceeds what TOML integers and JSON numbers hold.
 fn amount_from_str(text: &str, field: &'static str) -> Result<i128, String> {
@@ -342,7 +382,8 @@ pub struct ServiceConfig {
     pub chain: ChainConfig,
     /// Postgres. May carry a password, so it never renders.
     pub database_url: Secret,
-    /// Connections in the pool.
+    /// Connections in the pool. Sized against the tasks that query
+    /// concurrently, not against one; see [`Args::database_max_connections`].
     pub database_max_connections: u32,
     /// The pools to follow.
     pub pools: Vec<PoolConfig>,
@@ -467,10 +508,17 @@ pub struct Args {
     pub run_mode: RunMode,
 
     /// Connections in the database pool.
+    ///
+    /// Must cover every task that queries concurrently: one ledger poller
+    /// per pool, the tracker, and the auctioneer — roughly `pools + 2`, and
+    /// the default covers up to eight pools. Sizing it below that does not
+    /// deadlock; it times out acquiring a connection, and every
+    /// [`crate::store::StoreError`] in this bot is fatal, so a load spike
+    /// becomes a process exit.
     #[arg(
         long,
         env = "DATABASE_MAX_CONNECTIONS",
-        default_value_t = 5,
+        default_value_t = 10,
         value_parser = clap::value_parser!(u32).range(1..=100),
     )]
     pub database_max_connections: u32,
@@ -533,8 +581,15 @@ pub struct Args {
     /// The contract refuses a post-liquidation health factor at or above
     /// `1.15` (`InvalidLiqTooLarge`) or below `1.03` (`InvalidLiqTooSmall`),
     /// so this sits between them with room for the auction to be filled a
-    /// ledger or two later than planned.
-    #[arg(long, env = "TARGET_HF", default_value = "1.06")]
+    /// ledger or two later than planned — and anything outside that band is
+    /// refused at parse rather than clamped. See [`target_health_factor`]
+    /// for what each direction costs if it is not.
+    #[arg(
+        long,
+        env = "TARGET_HF",
+        default_value = "1.06",
+        value_parser = target_health_factor,
+    )]
     pub target_hf: Decimal7,
 
     /// How often, in ledgers, prices are re-read and a significant move
@@ -709,6 +764,21 @@ impl Args {
                 ))
             }
         };
+        // `TARGET_HF` is bounded by its own value parser; this one is a
+        // relation between two knobs, which no single parser can see. The
+        // full scan flags borrowers below `SCAN_HF_THRESHOLD` and the
+        // auctioneer judges borrowers at or below `LIQ_HF_THRESHOLD`, so a
+        // liquidation threshold above the scan threshold names a band of
+        // borrowers the scan never flags: the bot would only ever reach
+        // them through an event or a price move, and silently.
+        if self.liq_hf_threshold > self.scan_hf_threshold {
+            return Err(LiquidatorError::Config(
+                "LIQ_HF_THRESHOLD is above SCAN_HF_THRESHOLD: the full scan only flags \
+                 borrowers below SCAN_HF_THRESHOLD, so a higher liquidation threshold \
+                 names borrowers nothing ever flags for a decision"
+                    .to_string(),
+            ));
+        }
         Ok(ServiceConfig {
             chain,
             database_url: Secret::new(database_url),
@@ -738,24 +808,94 @@ impl Args {
         })
     }
 
-    /// The key the auctioneer signs with: `AUCTIONEER_SECRET_KEY` when set,
-    /// otherwise `FILLER_SECRET_KEY`, and `None` when neither is — which is
-    /// the ordinary dry-run deployment and not an error.
+    /// Every signing key this process was given, each parsed whether or
+    /// not it is the one that signs: `AUCTIONEER_SECRET_KEY` and
+    /// `FILLER_SECRET_KEY`, both `None` in the ordinary dry-run deployment
+    /// and that is not an error.
+    ///
+    /// The filler's key is parsed even when the auctioneer's is what signs,
+    /// because its *address* is needed either way — see
+    /// [`SigningKeys::own_addresses`]. A malformed key is therefore a
+    /// startup error whichever of the two it is, rather than a key that
+    /// quietly does not exist until the phase that signs with it.
     ///
     /// Both arrive from the environment, never from argv: a signing key on
     /// the command line is readable from `/proc/<pid>/cmdline`, `ps` and
     /// `docker inspect`.
-    pub fn auctioneer_signer(
+    ///
+    /// # Errors
+    ///
+    /// [`LiquidatorError::Config`] naming which variable was malformed. The
+    /// message never carries the secret itself.
+    pub fn signing_keys(
         &self,
         filler: Option<String>,
         auctioneer: Option<String>,
-    ) -> Result<Option<crate::chain::Signer>, LiquidatorError> {
-        let Some(secret) = auctioneer.or(filler) else {
-            return Ok(None);
-        };
-        crate::chain::Signer::from_secret(&secret)
-            .map(Some)
-            .map_err(|error| LiquidatorError::Config(format!("auctioneer key: {error}")))
+    ) -> Result<SigningKeys, LiquidatorError> {
+        Ok(SigningKeys {
+            auctioneer: parse_signing_key("AUCTIONEER_SECRET_KEY", auctioneer)?,
+            filler: parse_signing_key("FILLER_SECRET_KEY", filler)?,
+        })
+    }
+}
+
+/// One optional secret key, parsed with `name` on the error rather than the
+/// value: the message an operator sees says which variable is wrong and
+/// never echoes what was in it.
+fn parse_signing_key(
+    name: &str,
+    secret: Option<String>,
+) -> Result<Option<crate::chain::Signer>, LiquidatorError> {
+    secret
+        .map(|secret| {
+            crate::chain::Signer::from_secret(&secret)
+                .map_err(|error| LiquidatorError::Config(format!("{name}: {error}")))
+        })
+        .transpose()
+}
+
+/// Every signing key this process holds.
+///
+/// Two keys, one signer: the auctioneer signs with `auctioneer` when it is
+/// configured and falls back to `filler`, but **both** addresses are the
+/// bot's own regardless of which one signs. The auctioneer must never
+/// create a liquidation auction against either — the contract has no reason
+/// to refuse the bot liquidating its own filler position, and in dry-run
+/// there is no contract to refuse at all — so
+/// [`SigningKeys::own_addresses`] reports both and
+/// [`SigningKeys::into_auctioneer_signer`] answers the separate question of
+/// which one signs.
+#[derive(Debug)]
+pub struct SigningKeys {
+    /// `AUCTIONEER_SECRET_KEY`, when set.
+    pub auctioneer: Option<crate::chain::Signer>,
+    /// `FILLER_SECRET_KEY`, when set. Held for its address even while
+    /// nothing signs with it: Phase 5 is where the filler's position first
+    /// exists, and it is the position this bot must not liquidate.
+    pub filler: Option<crate::chain::Signer>,
+}
+
+impl SigningKeys {
+    /// Every address this bot holds a key for — both when the two keys
+    /// differ, one when only one is configured or they are the same key,
+    /// and empty when none is, which excludes nothing rather than
+    /// everything.
+    #[must_use]
+    pub fn own_addresses(&self) -> std::collections::BTreeSet<String> {
+        [self.auctioneer.as_ref(), self.filler.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|signer| signer.address().to_string())
+            .collect()
+    }
+
+    /// The key the auctioneer signs with: its own when configured,
+    /// otherwise the filler's, and `None` when neither is — the ordinary
+    /// dry-run deployment, not an error. Consuming, because `Signer` is
+    /// deliberately not `Clone`: it holds key material.
+    #[must_use]
+    pub fn into_auctioneer_signer(self) -> Option<crate::chain::Signer> {
+        self.auctioneer.or(self.filler)
     }
 }
 
@@ -1362,6 +1502,72 @@ supported_lot = ["*"]
         );
     }
 
+    /// `TARGET_HF` outside the contract's post-liquidation band is refused
+    /// at parse, not clamped — the same standard `PLAN_ITERATIONS=0` and
+    /// `PRICE_DELTA_BPS=0` already hold.
+    ///
+    /// Zero is the one that matters most: `excess = liability_base ×
+    /// TARGET_HF − collateral_base` is then never positive, so every
+    /// liquidatable borrower is recorded `Skip(NoPlan)` for ever and
+    /// nothing warns. The edges are asserted in both directions, because a
+    /// bound written with the comparison the wrong way round would refuse
+    /// exactly the values it must accept.
+    #[test]
+    fn a_target_hf_outside_the_contracts_band_is_refused_at_parse() {
+        assert_clean_environment();
+        let parse_target = |value: &str| {
+            try_parse(&[
+                "liquidator",
+                "--network",
+                "testnet",
+                "--rpc-url",
+                "http://rpc",
+                "--target-hf",
+                value,
+            ])
+        };
+
+        for refused in ["0", "0.9", "1.0299999", "1.15", "1.2", "2"] {
+            assert!(
+                parse_target(refused).is_err(),
+                "TARGET_HF={refused} is outside the band the contract accepts"
+            );
+        }
+        for accepted in ["1.03", "1.06", "1.1499999"] {
+            assert!(
+                parse_target(accepted).is_ok(),
+                "TARGET_HF={accepted} names an outcome the contract accepts"
+            );
+        }
+    }
+
+    /// A liquidation threshold above the scan threshold names borrowers
+    /// the full scan never flags, so the auctioneer would only ever reach
+    /// them through an event or a price move. That is a relation between
+    /// two knobs, so it is checked where both are visible rather than in
+    /// either one's value parser.
+    #[test]
+    fn a_liquidation_threshold_above_the_scan_threshold_is_refused() {
+        assert_clean_environment();
+        let args = parse(&[
+            "liquidator",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "http://rpc",
+            "--pools-toml",
+            POOLS,
+            "--scan-hf-threshold",
+            "1.2",
+            "--liq-hf-threshold",
+            "1.3",
+        ]);
+        let error = args
+            .service_with_secrets(Some("postgres://x".to_string()), None)
+            .expect_err("refused");
+        assert!(error.to_string().contains("LIQ_HF_THRESHOLD"), "{error}");
+    }
+
     /// The auctioneer's key is environment-only, like every other secret: a
     /// key on the command line is readable in `ps`, `docker inspect` and
     /// `/proc/<pid>/cmdline`.
@@ -1383,6 +1589,11 @@ supported_lot = ["*"]
         );
     }
 
+    /// Two valid test seeds for the key tests; any S… strkey this crate
+    /// can decode will do, and neither has ever held funds.
+    const FILLER_SEED: &str = "SAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC5MY";
+    const AUCTIONEER_SEED: &str = "SABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNE7";
+
     /// Unset, the auctioneer signs with the filler's key: one key is the
     /// ordinary deployment, and the spec makes the separate key the option
     /// rather than the requirement. A configured auctioneer key wins.
@@ -1396,17 +1607,19 @@ supported_lot = ["*"]
             "--rpc-url",
             "http://rpc",
         ]);
-        // Two valid test seeds; any S… strkey this crate can decode will do.
-        let filler = "SAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC5MY";
-        let auctioneer = "SABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNE7";
 
         let only_filler = args
-            .auctioneer_signer(Some(filler.to_string()), None)
-            .expect("signer")
+            .signing_keys(Some(FILLER_SEED.to_string()), None)
+            .expect("keys")
+            .into_auctioneer_signer()
             .expect("a key is configured");
         let both = args
-            .auctioneer_signer(Some(filler.to_string()), Some(auctioneer.to_string()))
-            .expect("signer")
+            .signing_keys(
+                Some(FILLER_SEED.to_string()),
+                Some(AUCTIONEER_SEED.to_string()),
+            )
+            .expect("keys")
+            .into_auctioneer_signer()
             .expect("a key is configured");
         assert_ne!(
             only_filler.address(),
@@ -1414,11 +1627,76 @@ supported_lot = ["*"]
             "the auctioneer key wins when set"
         );
         assert!(
-            args.auctioneer_signer(None, None)
+            args.signing_keys(None, None)
                 .expect("no key")
+                .into_auctioneer_signer()
                 .is_none(),
             "no key configured is not an error: dry-run needs none"
         );
+    }
+
+    /// The spec's "never for the filler or auctioneer addresses", pinned
+    /// for the case that used to breach it: two *different* keys.
+    ///
+    /// Only one of them signs — the auctioneer's — so a set derived from
+    /// the signing key alone holds one address, and the filler's own
+    /// position is then a borrower this bot would happily create a
+    /// liquidation auction against. The contract has no reason to refuse
+    /// that, and in dry-run there is no contract to refuse at all.
+    #[test]
+    fn both_configured_keys_are_addresses_the_bot_refuses_to_act_on() {
+        assert_clean_environment();
+        let args = parse(&[
+            "liquidator",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "http://rpc",
+        ]);
+
+        let keys = args
+            .signing_keys(
+                Some(FILLER_SEED.to_string()),
+                Some(AUCTIONEER_SEED.to_string()),
+            )
+            .expect("keys");
+        let filler = crate::chain::Signer::from_secret(FILLER_SEED).expect("filler");
+        let auctioneer = crate::chain::Signer::from_secret(AUCTIONEER_SEED).expect("auctioneer");
+        assert_ne!(
+            filler.address(),
+            auctioneer.address(),
+            "the two seeds must differ, or this test proves nothing"
+        );
+
+        let own = keys.own_addresses();
+        assert_eq!(own.len(), 2, "both keys, not just the one that signs");
+        assert!(own.contains(filler.address()), "the filler's address");
+        assert!(
+            own.contains(auctioneer.address()),
+            "the auctioneer's address"
+        );
+        assert_eq!(
+            keys.into_auctioneer_signer()
+                .expect("a key is configured")
+                .address(),
+            auctioneer.address(),
+            "and the auctioneer's key is still the one that signs"
+        );
+
+        // One key configured is one address; none is none, which excludes
+        // nothing rather than everything.
+        assert_eq!(
+            args.signing_keys(Some(FILLER_SEED.to_string()), None)
+                .expect("keys")
+                .own_addresses()
+                .len(),
+            1
+        );
+        assert!(args
+            .signing_keys(None, None)
+            .expect("keys")
+            .own_addresses()
+            .is_empty());
     }
 
     /// A secret never renders, whichever key it is.
@@ -1449,11 +1727,31 @@ supported_lot = ["*"]
             "http://rpc",
         ]);
         let error = args
-            .auctioneer_signer(None, Some("not-a-valid-key".to_string()))
+            .signing_keys(None, Some("not-a-valid-key".to_string()))
             .expect_err("a malformed key is refused");
         let rendered = error.to_string();
         assert!(!rendered.contains("not-a-valid-key"), "{rendered}");
+        assert!(
+            rendered.contains("AUCTIONEER_SECRET_KEY"),
+            "the message names the variable: {rendered}"
+        );
         assert!(matches!(error, LiquidatorError::Config(_)));
+
+        // The filler's key is parsed too, even when the auctioneer's is
+        // what would sign: an address the bot must not act on is worth a
+        // startup error rather than a key that quietly does not exist.
+        let error = args
+            .signing_keys(
+                Some("also-not-a-key".to_string()),
+                Some(AUCTIONEER_SEED.to_string()),
+            )
+            .expect_err("a malformed filler key is refused too");
+        let rendered = error.to_string();
+        assert!(!rendered.contains("also-not-a-key"), "{rendered}");
+        assert!(
+            rendered.contains("FILLER_SECRET_KEY"),
+            "the message names the variable: {rendered}"
+        );
     }
 
     /// The five thresholds and cadence knobs, plus the startup delay, all

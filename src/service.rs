@@ -52,7 +52,7 @@ use crate::chain::pool::{PoolReader, PoolSnapshot};
 use crate::chain::rpc::RpcClient;
 use crate::chain::xdr::PoolStatus;
 use crate::chain::{Network, Signer, Submitter, TxConfig};
-use crate::config::{PoolConfig, SeedConfig, ServiceConfig};
+use crate::config::{PoolConfig, SeedConfig, ServiceConfig, SigningKeys};
 use crate::ledger::{LedgerPoller, LedgerTick, PollerConfig, PollerMessage};
 use crate::queue::{run_queue, SubmissionQueue};
 use crate::store::{events_cursor, Cursor, Store, StoreError, TrackedUser};
@@ -851,12 +851,13 @@ async fn full_scan_and_flag(
 /// for the next pass rather than cleared by a decision that never saw it.
 ///
 /// A per-borrower failure — a borrower [`Auctioneer::decide`] left out of
-/// its result, or one whose [`Auctioneer::act`] returned anything but a
-/// store error — is logged with the account and keeps its flag, and that
-/// flag is **moved forward**: re-raised at this tick's ledger, or left at
-/// the batch's own if that is the newer of the two (the exact rule, and
-/// why, are in [`move_flag_forward`]). Leaving it where it was is what
-/// starves a pool:
+/// its result, one whose [`Auctioneer::act`] returned anything but a
+/// store error, and one whose `act` came back
+/// [`crate::auctioneer::ActOutcome::Refused`] — is logged with the account
+/// and keeps its flag, and that flag is **moved forward**: re-raised at
+/// this tick's ledger, or left at the batch's own if that is the newer of
+/// the two (the exact rule, and why, are in [`move_flag_forward`]).
+/// Leaving it where it was is what starves a pool:
 /// [`Store::users_needing_recheck`] orders `recheck_ledger ASC, account
 /// ASC`, so an untouched flag is the oldest in its pool and comes back at
 /// the head of every following batch. A borrower nothing can decide is
@@ -875,6 +876,17 @@ async fn full_scan_and_flag(
 /// `n / REFRESH_BATCH` passes however many of them keep failing. The flag
 /// is never dropped, so the failing borrower is retried too, just behind
 /// everyone else rather than in front of them.
+///
+/// A *refusal* is the case that is easy to mistake for success. `act`
+/// answers `Refused` when it wanted to act and could not — the contract
+/// said no, the percent walk exhausted its iterations, or the footprint
+/// needs a restore — and `Skipped` when nothing was owed at all. Only the
+/// second clears the flag: a refused borrower is one this bot believes is
+/// liquidatable, so dropping it from the queue would hide it until an
+/// event, a price move or the full scan's own period named it again. The
+/// retry is bounded for the same reason an undecidable borrower's is: the
+/// flag moves to this tick's ledger and everything flagged earlier sorts
+/// ahead of it.
 ///
 /// A whole-batch failure is different and is left alone: when `decide`
 /// itself returns `Err` — the one snapshot it reads for the batch — no
@@ -946,7 +958,31 @@ async fn recheck_batch(
             .act(pool, &account, &decision, tick, submit)
             .await
         {
-            Ok(_outcome) => {
+            // A refusal is not a skip: something was owed and could not be
+            // done, so the flag moves forward instead of being cleared —
+            // exactly what an undecidable borrower's does, and bounded the
+            // same way. Clearing it would drop a borrower this bot believes
+            // is liquidatable out of the recheck queue until an event, a
+            // price move or the full scan's ~1200-ledger period named it
+            // again. `ActOutcome::settled` is where that rule lives.
+            Ok(outcome) if !outcome.settled() => {
+                tracing::debug!(
+                    pool,
+                    account,
+                    ledger = tick.sequence,
+                    "this borrower was owed an action that could not be made; re-flagged \
+                     at this ledger for a later pass"
+                );
+                move_flag_forward(
+                    store,
+                    pool,
+                    &account,
+                    flagged_at.get(account.as_str()).copied(),
+                    tick,
+                )
+                .await?;
+            }
+            Ok(_settled) => {
                 if let Some(&flagged_at) = flagged_at.get(account.as_str()) {
                     match store.clear_recheck(pool, &account, flagged_at).await {
                         Ok(true) => {}
@@ -1272,7 +1308,11 @@ fn resume_on_panic(error: tokio::task::JoinError) -> ! {
 /// exits immediately with code 130 — the shell's convention for "killed by
 /// `SIGINT`" — rather than wait any further for a graceful shutdown that is
 /// apparently not coming.
-fn spawn_shutdown_listener(shutdown: watch::Sender<bool>) {
+///
+/// The sender is shared rather than owned: [`Service::run`]'s join loop
+/// raises the same flag when a task returns an error, so that a failure and
+/// a signal drain the remaining tasks by exactly the same route.
+fn spawn_shutdown_listener(shutdown: Arc<watch::Sender<bool>>) {
     tokio::spawn(async move {
         wait_for_signal().await;
         tracing::warn!("shutdown requested; finishing in-flight work");
@@ -1289,29 +1329,37 @@ fn spawn_shutdown_listener(shutdown: watch::Sender<bool>) {
 /// (see its own doc). `Signer` is deliberately not `Clone` — it holds key
 /// material — so an `Arc` is what lets both tasks borrow the one key
 /// without duplicating it in memory.
+///
+/// `own_addresses` is computed from **every** key the process was given,
+/// not from the one that signs: with `AUCTIONEER_SECRET_KEY` and
+/// `FILLER_SECRET_KEY` set to different keys only the auctioneer's signs,
+/// and deriving the set from `signer` alone would leave the filler's own
+/// position a borrower the auctioneer is willing to liquidate. It is
+/// therefore taken from [`SigningKeys::own_addresses`] before the choice of
+/// signer collapses the two.
 struct SigningContext {
     network: Network,
     tx_config: TxConfig,
     signer: Option<Arc<Signer>>,
+    own_addresses: BTreeSet<String>,
 }
 
 impl SigningContext {
-    fn from_config(config: &ServiceConfig, signer: Option<Signer>) -> Self {
+    fn from_config(config: &ServiceConfig, keys: SigningKeys) -> Self {
+        let own_addresses = keys.own_addresses();
         Self {
             network: Network::from_config(&config.chain),
             tx_config: TxConfig::from_config(&config.chain),
-            signer: signer.map(Arc::new),
+            signer: keys.into_auctioneer_signer().map(Arc::new),
+            own_addresses,
         }
     }
 
-    /// The bot's own accounts, filler included — empty when no key is
-    /// configured at all, which excludes nothing rather than everything.
+    /// Every account this bot holds a key for, the filler's included —
+    /// empty when no key is configured at all, which excludes nothing
+    /// rather than everything.
     fn own_addresses(&self) -> BTreeSet<String> {
-        self.signer
-            .as_deref()
-            .map(|signer: &Signer| signer.address().to_string())
-            .into_iter()
-            .collect()
+        self.own_addresses.clone()
     }
 }
 
@@ -1413,6 +1461,54 @@ fn spawn_auctioneer(
     });
 }
 
+/// Joins every service task, draining the set rather than short-circuiting
+/// out of it, and reports the first error once they have all returned.
+///
+/// Returning on the first `Err` would drop the [`JoinSet`], which aborts
+/// every task still running — including `run_queue`, possibly between
+/// `sendTransaction` and the `getTransaction` poll that learns the
+/// outcome. That is precisely what [`crate::queue::run_queue`]'s own doc
+/// says must never happen: it would leave a signing key's sequence number
+/// consumed by a transaction the bot never saw the end of, and a
+/// `creations` row with `dry_run = false` and no hash.
+/// `Store::attach_creation_tx` failing with a store error immediately after
+/// a successful submission is a concrete way into exactly that.
+///
+/// So the first error raises `shutdown` — which every loop in this service
+/// observes between units of work — and this keeps joining until every task
+/// has returned on its own. The error path and the graceful-shutdown path
+/// are then the same path, which is what the queue's doc already assumes.
+/// Only the *first* error is reported: the ones after it are usually this
+/// shutdown's own consequences, and a panic still propagates as a panic.
+async fn drain_tasks(
+    mut tasks: JoinSet<Result<(), LiquidatorError>>,
+    shutdown: &watch::Sender<bool>,
+) -> Result<(), LiquidatorError> {
+    let mut failure: Option<LiquidatorError> = None;
+    while let Some(outcome) = tasks.join_next().await {
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                if failure.is_none() {
+                    tracing::error!(
+                        %error,
+                        "a service task failed; shutting down and waiting for the rest"
+                    );
+                    let _ = shutdown.send(true);
+                    failure = Some(error);
+                } else {
+                    tracing::warn!(%error, "another task failed while shutting down");
+                }
+            }
+            Err(error) => resume_on_panic(error),
+        }
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 /// The bot's two entry points: [`run`](Service::run) follows the configured
 /// pools until shut down, and [`check_config`](Service::check_config)
 /// validates and reports without following anything. Both are associated
@@ -1453,19 +1549,26 @@ impl Service {
     /// one submission-queue worker for that signer's key — until a
     /// shutdown signal arrives and every task has returned.
     ///
-    /// `signer` is `None` for the ordinary dry-run deployment with no
-    /// `AUCTIONEER_SECRET_KEY`/`FILLER_SECRET_KEY` configured; see
-    /// [`crate::config::Args::auctioneer_signer`]. Whether a submission is
-    /// ever actually sent is `!config.dry_run && signer.is_some()` — the
+    /// `keys` holds both of `AUCTIONEER_SECRET_KEY` and
+    /// `FILLER_SECRET_KEY`, either or both of which may be absent — neither
+    /// configured is the ordinary dry-run deployment; see
+    /// [`crate::config::Args::signing_keys`]. At most one of them signs
+    /// (the auctioneer's, else the filler's), but **both** addresses go
+    /// into the set the auctioneer refuses to act on. Whether a submission
+    /// is ever actually sent is `!config.dry_run && signer.is_some()` — the
     /// one gate this crate has into live trading, per the safety invariant
     /// that `DRY_RUN` defaults `true`.
-    pub async fn run(config: ServiceConfig, signer: Option<Signer>) -> Result<(), LiquidatorError> {
+    pub async fn run(config: ServiceConfig, keys: SigningKeys) -> Result<(), LiquidatorError> {
         // Installed before anything that takes time. Seeding a busy pool
         // is tens of seconds of sequential round trips, and until this is
         // in place a `SIGTERM` in that window reaches the default handler
         // and kills the process outright rather than draining it.
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        spawn_shutdown_listener(shutdown_tx);
+        // Shared rather than moved: the join loop at the bottom of this
+        // function needs to raise the same flag when a task fails, so that
+        // an error path and a signal path shut the bot down the same way.
+        let shutdown_tx = Arc::new(shutdown_tx);
+        spawn_shutdown_listener(Arc::clone(&shutdown_tx));
 
         let store = connect_store(&config).await?;
         store.migrate().await?;
@@ -1502,7 +1605,7 @@ impl Service {
         // `None`, once (and only once) every poller has stopped.
         drop(message_tx);
 
-        let signing = SigningContext::from_config(&config, signer);
+        let signing = SigningContext::from_config(&config, keys);
         let submission_queue =
             spawn_submission_queue(&mut tasks, &rpc, &signing, config.dry_run, &shutdown_rx);
 
@@ -1568,13 +1671,7 @@ impl Service {
             .map_err(LiquidatorError::from)
         });
 
-        while let Some(outcome) = tasks.join_next().await {
-            match outcome {
-                Ok(result) => result?,
-                Err(error) => resume_on_panic(error),
-            }
-        }
-        Ok(())
+        drain_tasks(tasks, &shutdown_tx).await
     }
 }
 
@@ -3023,6 +3120,36 @@ mod tests {
         }
     }
 
+    /// The source-account read `Submitter::simulate_only` makes before it
+    /// builds anything: one `getLedgerEntries` for the signer's own
+    /// account entry, and nothing else. A simulate-only call needs no fee
+    /// stats, so a test that scripts those is scripting the signing path
+    /// by mistake.
+    fn script_account_entry(rpc: &ScriptedRpc, signer: &Signer) {
+        let key = stellar_xdr::LedgerKey::Account(stellar_xdr::LedgerKeyAccount {
+            account_id: signer.account_id(),
+        });
+        rpc.expect(
+            "getLedgerEntries",
+            json!({"latestLedger": 1_u32, "entries": [
+                {"key": to_base64(&key).expect("key"),
+                 "xdr": crate::chain::script::account_entry_b64(signer.address(), 1),
+                 "lastModifiedLedgerSeq": 1}
+            ]}),
+        );
+    }
+
+    /// The `simulateTransaction` answer for an operation the contract
+    /// refuses with `code`, in both the diagnostic events and the message.
+    fn script_simulate_refused(rpc: &ScriptedRpc, code: u32) {
+        rpc.expect(
+            "simulateTransaction",
+            json!({"error": format!("HostError: Error(Contract, #{code})"),
+                   "events": [crate::chain::script::diagnostic_error_b64(code)],
+                   "latestLedger": 1_u32}),
+        );
+    }
+
     /// A `Positions` ledger entry naming only a liability, on reserve
     /// index 1, and no collateral at all — the one shape `decide_one`
     /// calls bad debt outright, with no health-factor arithmetic and no
@@ -3567,6 +3694,198 @@ mod tests {
             "and sorts behind the borrower flagged after it, rather than ahead of it"
         );
         Ok(())
+    }
+
+    /// A borrower the contract *refused* keeps its flag, and moves forward
+    /// exactly as an undecidable one does.
+    ///
+    /// This is the case that used to look like success. `act` answered
+    /// `Ok(None)` both for "there was nothing to do" and for "I wanted to
+    /// act and could not", and the caller cleared the flag either way — so
+    /// a borrower this bot believes is liquidatable dropped out of the
+    /// recheck queue until an event, a price move or the full scan's
+    /// ~1200-ledger period named it again.
+    ///
+    /// The refusal scripted here is the pool's own `AuctionInProgress`
+    /// (1212), the benign one; the one that is not benign — a percent walk
+    /// that ran out of iterations a point short of the contract's band —
+    /// reaches the same arm, because both are `ActOutcome::Refused`.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_borrower_the_contract_refused_keeps_its_flag(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let account = synthetic_debtor();
+        let behind = synthetic_account(76);
+        let signer = test_signer();
+        // Decidable — bad debt outright — then `simulate_only`'s own
+        // source-account read, then a contract refusal.
+        script_snapshot_bad_debt(&rpc, &account);
+        script_account_entry(&rpc, &signer);
+        script_simulate_refused(&rpc, 1_212);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let network = Network::testnet();
+        let submitter = Submitter::new(&client, &network, &signer, test_tx_config());
+        let auctioneer = Auctioneer::new(&client, &store, auctioneer_config(), Some(submitter));
+        let (_flag, shutdown) = watch::channel(false);
+
+        for (account, ledger) in [(&account, 100_u32), (&behind, 120)] {
+            store
+                .upsert_user(&tracked_user(account, ledger))
+                .await
+                .expect("seed the row");
+            store
+                .flag_recheck(harness::POOL, account, ledger)
+                .await
+                .expect("flag");
+        }
+
+        let batch = store
+            .users_needing_recheck(harness::POOL, 1)
+            .await
+            .expect("read the recheck queue");
+        assert_eq!(batch.len(), 1);
+        let tick = harness::fixture_tick();
+        recheck_batch(
+            &auctioneer,
+            &store,
+            harness::POOL,
+            &batch,
+            tick,
+            None,
+            &shutdown,
+        )
+        .await
+        .expect("a refusal is this borrower's answer, not the pass's failure");
+
+        assert!(
+            rpc.calls("sendTransaction").is_empty(),
+            "nothing was sent: the contract refused at simulation"
+        );
+        assert_eq!(
+            store
+                .user(harness::POOL, &account)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            Some(tick.sequence),
+            "a refused borrower keeps its flag, raised to this pass's ledger — not \
+             cleared as though nothing had been owed"
+        );
+        let queue: Vec<String> = store
+            .users_needing_recheck(harness::POOL, 10)
+            .await
+            .expect("read the recheck queue")
+            .into_iter()
+            .map(|user| user.account)
+            .collect();
+        assert_eq!(
+            queue,
+            vec![behind.clone(), account.clone()],
+            "and sorts behind the borrower flagged after it, so the retry costs one \
+             batch slot per pass rather than the whole batch"
+        );
+        Ok(())
+    }
+
+    /// A healthy borrower is a `Skipped`, not a `Refused`, so its flag is
+    /// cleared: the distinction must not have turned every answer into a
+    /// reason to keep rechecking, which would starve the queue just as
+    /// surely as clearing every answer hid a liquidatable borrower.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_skipped_borrower_still_has_its_flag_cleared(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        // The fixture's own borrower, whose health factor is above the
+        // threshold: `Decision::Skip(SkipReason::Healthy)`.
+        harness::script_snapshot(&rpc, &[harness::USER_TWO]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let auctioneer = Auctioneer::new(&client, &store, auctioneer_config(), None);
+        let (_flag, shutdown) = watch::channel(false);
+        let tick = harness::fixture_tick();
+
+        store
+            .upsert_user(&tracked_user(harness::USER_TWO, tick.sequence))
+            .await
+            .expect("seed the row");
+        store
+            .flag_recheck(harness::POOL, harness::USER_TWO, 100)
+            .await
+            .expect("flag");
+        let batch = store
+            .users_needing_recheck(harness::POOL, 10)
+            .await
+            .expect("read");
+
+        recheck_batch(
+            &auctioneer,
+            &store,
+            harness::POOL,
+            &batch,
+            tick,
+            None,
+            &shutdown,
+        )
+        .await
+        .expect("a healthy borrower's pass never fails");
+        assert!(
+            store
+                .users_needing_recheck(harness::POOL, 10)
+                .await
+                .expect("read")
+                .is_empty(),
+            "nothing was owed, so the flag is cleared"
+        );
+        Ok(())
+    }
+
+    /// One task's error must not abort another task's in-flight work.
+    ///
+    /// Returning on the first `Err` drops the `JoinSet`, and dropping a
+    /// `JoinSet` aborts every task still in it — including `run_queue`,
+    /// possibly between `sendTransaction` and the `getTransaction` poll
+    /// that learns the outcome, which is the one thing that module's doc
+    /// says must never happen. The stand-in below returns only once the
+    /// shutdown flag is raised and records that it got to return at all;
+    /// an aborted task never reaches that store, so the assertion
+    /// distinguishes "drained" from "cancelled" rather than merely
+    /// observing an error came back.
+    #[tokio::test]
+    async fn a_failing_task_shuts_the_rest_down_instead_of_aborting_them() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let finished = Arc::new(AtomicBool::new(false));
+        let mut tasks: JoinSet<Result<(), LiquidatorError>> = JoinSet::new();
+
+        let mut watcher = shutdown_rx.clone();
+        let flag = Arc::clone(&finished);
+        tasks.spawn(async move {
+            while !*watcher.borrow_and_update() {
+                if watcher.changed().await.is_err() {
+                    break;
+                }
+            }
+            flag.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        tasks.spawn(async { Err(LiquidatorError::Config("a task failed".to_string())) });
+
+        let error = drain_tasks(tasks, &shutdown_tx)
+            .await
+            .expect_err("the failure is reported");
+        assert!(
+            matches!(error, LiquidatorError::Config(_)),
+            "and it is the first error, not a shutdown artefact"
+        );
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "the other task ran to its own end rather than being aborted mid-flight"
+        );
+        assert!(
+            *shutdown_rx.borrow(),
+            "the failure raised the shutdown flag, so the error path and the signal \
+             path drain by the same route"
+        );
     }
 
     /// The full scan flags every user below the threshold, across pages: a

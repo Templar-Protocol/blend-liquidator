@@ -20,7 +20,14 @@ use crate::chain::ChainError;
 use stellar_xdr::Operation;
 
 /// What a caller asks the queue to send.
-#[derive(Debug)]
+///
+/// `Debug` is written by hand, and prints the label and the priority only.
+/// The derive would print `operation`'s contents — an `InvokeHostFunction`
+/// carrying the pool, the borrower and the amounts — which is exactly what
+/// this module states it does not log, and a derived impl makes breaking
+/// that a one-liner for the next caller that puts a `Submission` on a
+/// tracing field. `Signer`, `Secret` and `ChainConfig` are hand-written for
+/// the same reason.
 pub struct Submission {
     /// The operation to invoke.
     pub operation: Operation,
@@ -33,13 +40,33 @@ pub struct Submission {
 }
 
 /// A submission paired with the channel its answer goes back on.
-#[derive(Debug)]
+///
+/// `Debug` is hand-written for the reason [`Submission`]'s is, and prints
+/// the same two fields.
 pub struct QueuedSubmission {
     /// The work.
     pub submission: Submission,
     /// Where the outcome goes. A dropped receiver means the caller gave up;
     /// the send fails and the queue moves on.
     pub respond: oneshot::Sender<Result<TxOutcome, ChainError>>,
+}
+
+impl std::fmt::Debug for Submission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Submission")
+            .field("label", &self.label)
+            .field("priority", &self.priority)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for QueuedSubmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueuedSubmission")
+            .field("label", &self.submission.label)
+            .field("priority", &self.submission.priority)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Why a submission did not produce an outcome.

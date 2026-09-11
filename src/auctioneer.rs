@@ -98,10 +98,15 @@ pub struct AuctioneerConfig {
     /// resimulated before it is returned. `act`'s percent-adjustment loop is
     /// what bounds itself by it.
     pub plan_iterations: u32,
-    /// The bot's own accounts, filler included. The contract refuses to let
-    /// the bot liquidate itself, but in dry-run there is no contract to
+    /// Every account this bot holds a key for — the auctioneer's, the
+    /// filler's, or both when the two keys differ. The contract refuses to
+    /// let the bot liquidate itself, but in dry-run there is no contract to
     /// refuse, and a bot that would have tried is one that will try when
     /// armed.
+    ///
+    /// Built from every configured key rather than from whichever one
+    /// signs: see [`crate::config::SigningKeys::own_addresses`], which is
+    /// the only thing that fills this set in the running bot.
     pub own_addresses: BTreeSet<String>,
 }
 
@@ -178,6 +183,59 @@ impl CreationOutcome {
     #[must_use]
     pub fn succeeded(&self) -> bool {
         matches!(self.submission, Some(TxOutcome::Succeeded { .. }))
+    }
+}
+
+/// What [`Auctioneer::act`] did about one decision.
+///
+/// The distinction that matters is between the second and the first two:
+/// *skipped* means nothing was owed, *refused* means something was owed and
+/// could not be done. A caller that reads both as success clears the
+/// borrower's recheck flag either way, and a borrower this bot believes is
+/// liquidatable then drops out of the recheck queue entirely — back only
+/// when an event names it, a price moves against it, or the full scan fires
+/// at `FULL_SCAN_LEDGERS`. The likeliest refusals are benign (someone else
+/// opened the auction first), but "the percent walk ran out of iterations
+/// one point short of the contract's band" is not: that borrower is
+/// liquidatable now.
+///
+/// The distinction lives in this type rather than in the caller because
+/// there will be more than one caller: Phase 5's filler needs the same
+/// answer from the same shape.
+#[derive(Debug)]
+pub enum ActOutcome {
+    /// Nothing was owed. The decision was a [`Decision::Skip`], and its
+    /// reason is the one `decide` gave.
+    Skipped(SkipReason),
+    /// Something was owed and could not be done: the contract refused the
+    /// operation, the percent walk exhausted `PLAN_ITERATIONS`, or the
+    /// footprint holds archived entries only an armed submission restores.
+    /// Nothing was recorded, because a creation the contract would not have
+    /// accepted would make the audit worse than useless.
+    Refused,
+    /// The creation was recorded, and — when a submission queue was given —
+    /// submitted.
+    Recorded(CreationOutcome),
+}
+
+impl ActOutcome {
+    /// Whether this borrower is settled for now, so its recheck flag may be
+    /// cleared. `false` for [`ActOutcome::Refused`] alone: a refusal is the
+    /// one answer that leaves work outstanding, so the flag moves forward —
+    /// behind everything flagged earlier, which bounds the retry to one
+    /// batch slot per pass — rather than being dropped.
+    #[must_use]
+    pub fn settled(&self) -> bool {
+        !matches!(self, Self::Refused)
+    }
+
+    /// The creation this became, if it became one.
+    #[must_use]
+    pub fn recorded(self) -> Option<CreationOutcome> {
+        match self {
+            Self::Recorded(outcome) => Some(outcome),
+            Self::Skipped(_) | Self::Refused => None,
+        }
     }
 }
 
@@ -552,11 +610,17 @@ impl<'a> Auctioneer<'a> {
     /// queue refused leaves the same row a dry-run would, rather than
     /// nothing at all.
     ///
-    /// A [`Decision::Skip`] acts on nothing and returns `Ok(None)`, with the
-    /// reason on a debug line: an operator asking "why did nothing happen"
-    /// is asking about exactly this. Bad debt is submitted without the
-    /// percent walk below: `bad_debt(user)` takes no percent, and the
-    /// contract sizes it itself.
+    /// A [`Decision::Skip`] acts on nothing and answers
+    /// [`ActOutcome::Skipped`], with the reason on a debug line: an
+    /// operator asking "why did nothing happen" is asking about exactly
+    /// this. A decision this *wanted* to act on and could not — the
+    /// contract refused it, the percent walk exhausted `plan_iterations`,
+    /// or the footprint needs a restore — answers [`ActOutcome::Refused`]
+    /// instead, and the two are deliberately not the same value: see
+    /// [`ActOutcome`] for what a caller that conflates them costs the
+    /// borrower. Bad debt is submitted without the percent walk below:
+    /// `bad_debt(user)` takes no percent, and the contract sizes it
+    /// itself.
     ///
     /// # Errors
     ///
@@ -575,16 +639,16 @@ impl<'a> Auctioneer<'a> {
         decision: &Decision,
         tick: LedgerTick,
         submit: Option<&SubmissionQueue>,
-    ) -> Result<Option<CreationOutcome>, AuctioneerError> {
+    ) -> Result<ActOutcome, AuctioneerError> {
         let (kind, percent, bid, lot, operation, simulated) = match decision {
             Decision::Skip(reason) => {
                 tracing::debug!(pool, account, reason = ?reason, "skip: no action taken");
-                return Ok(None);
+                return Ok(ActOutcome::Skipped(*reason));
             }
             Decision::BadDebt => {
                 let operation = bad_debt_op(pool, account).map_err(ChainError::from)?;
                 let Some(simulated) = self.accept_bad_debt(pool, account, &operation).await? else {
-                    return Ok(None);
+                    return Ok(ActOutcome::Refused);
                 };
                 (
                     CreationKind::BadDebt,
@@ -599,7 +663,7 @@ impl<'a> Auctioneer<'a> {
                 let Some((percent, operation, simulated)) =
                     self.accept_percent(pool, account, plan).await?
                 else {
-                    return Ok(None);
+                    return Ok(ActOutcome::Refused);
                 };
                 (
                     CreationKind::Auction,
@@ -649,7 +713,7 @@ impl<'a> Auctioneer<'a> {
             None => None,
         };
 
-        Ok(Some(CreationOutcome {
+        Ok(ActOutcome::Recorded(CreationOutcome {
             kind,
             account: account.to_string(),
             percent,
@@ -1730,6 +1794,7 @@ mod tests {
             .act(POOL, &account, &decision, tick, None)
             .await
             .expect("act")
+            .recorded()
             .expect("a creation");
         assert_eq!(
             outcome.percent,
@@ -1781,6 +1846,7 @@ mod tests {
             .act(POOL, &account, &decision, tick, None)
             .await
             .expect("act")
+            .recorded()
             .expect("a creation");
         assert_eq!(
             outcome.percent,
@@ -1833,8 +1899,9 @@ mod tests {
             .await
             .expect("act");
         assert!(
-            outcome.is_none(),
-            "no percent was ever accepted, so nothing was recorded"
+            matches!(outcome, ActOutcome::Refused),
+            "no percent was ever accepted, so nothing was recorded — and the answer is \
+             a refusal, not a skip: this borrower is still owed an action"
         );
         assert_eq!(
             rpc.calls("simulateTransaction").len(),
@@ -1878,8 +1945,8 @@ mod tests {
             .await
             .expect("act");
         assert!(
-            outcome.is_none(),
-            "an unrelated contract error skips the borrower"
+            matches!(outcome, ActOutcome::Refused),
+            "an unrelated contract error leaves the borrower refused, not skipped"
         );
         assert_eq!(
             rpc.calls("simulateTransaction").len(),
@@ -1921,6 +1988,7 @@ mod tests {
             .act(POOL, &account, &decision, tick, None)
             .await
             .expect("act")
+            .recorded()
             .expect("a creation");
         assert!(!outcome.submitted(), "dry-run never submits");
         assert!(outcome.tx_hash().is_none(), "dry-run never has a hash");
@@ -2020,7 +2088,7 @@ mod tests {
         };
         let (outcome, ()) =
             tokio::join!(act_and_drop, run_queue(&submitter, receiver, &shutdown_rx));
-        let outcome = outcome.expect("act").expect("a creation");
+        let outcome = outcome.expect("act").recorded().expect("a creation");
 
         assert!(outcome.submitted(), "armed, the creation is submitted");
         assert!(outcome.succeeded(), "this one landed");
@@ -2069,6 +2137,7 @@ mod tests {
             .act(POOL, &account, &decision, tick, None)
             .await
             .expect("act")
+            .recorded()
             .expect("a creation");
         assert_eq!(outcome.kind, CreationKind::BadDebt);
         assert_eq!(outcome.percent, None, "bad debt carries no percent");
@@ -2180,6 +2249,7 @@ mod tests {
             .act(POOL, &account, &decision, tick, None)
             .await
             .expect("act")
+            .recorded()
             .expect("the loop converges on an accepted percent");
         assert_eq!(
             outcome.percent,
@@ -2230,8 +2300,9 @@ mod tests {
             .await
             .expect("act");
         assert!(
-            outcome.is_none(),
-            "a borrower that cannot be judged is skipped, not recorded"
+            matches!(outcome, ActOutcome::Refused),
+            "a borrower that cannot be judged is refused, not recorded — and not \
+             `Skipped` either: nothing about it says there was nothing to do"
         );
 
         assert!(
@@ -2283,7 +2354,10 @@ mod tests {
             .act(POOL, &account, &Decision::BadDebt, tick, None)
             .await
             .expect("act");
-        assert!(outcome.is_none(), "skipped, not recorded");
+        assert!(
+            matches!(outcome, ActOutcome::Refused),
+            "refused, not recorded"
+        );
         assert!(
             rpc.calls("sendTransaction").is_empty(),
             "no RestoreFootprint transaction was sent"
@@ -2319,6 +2393,7 @@ mod tests {
             .act(POOL, &account, &Decision::Liquidate(plan), tick, None)
             .await
             .expect("act")
+            .recorded()
             .expect("a creation");
         assert!(
             !outcome.simulated,
@@ -2336,6 +2411,7 @@ mod tests {
             .act(POOL, &bad_debt_account, &Decision::BadDebt, tick, None)
             .await
             .expect("act")
+            .recorded()
             .expect("a creation");
         assert!(
             !bad_debt.simulated,
@@ -2422,7 +2498,7 @@ mod tests {
         };
         let (outcome, ()) =
             tokio::join!(act_and_drop, run_queue(&submitter, receiver, &shutdown_rx));
-        let outcome = outcome.expect("act").expect("a creation");
+        let outcome = outcome.expect("act").recorded().expect("a creation");
 
         assert!(outcome.submitted(), "it did go through the queue");
         assert!(
@@ -2545,7 +2621,10 @@ mod tests {
             .act(POOL, &account, &Decision::Liquidate(plan), tick, None)
             .await
             .expect("act");
-        assert!(outcome.is_none(), "nowhere higher to try: skipped");
+        assert!(
+            matches!(outcome, ActOutcome::Refused),
+            "nowhere higher to try: refused"
+        );
         assert_eq!(
             rpc.calls("simulateTransaction").len(),
             1,
@@ -2583,7 +2662,10 @@ mod tests {
             .act(POOL, &account, &Decision::Liquidate(plan), tick, None)
             .await
             .expect("act");
-        assert!(outcome.is_none(), "nowhere lower to try: skipped");
+        assert!(
+            matches!(outcome, ActOutcome::Refused),
+            "nowhere lower to try: refused"
+        );
         assert_eq!(
             rpc.calls("simulateTransaction").len(),
             1,
