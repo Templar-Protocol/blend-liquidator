@@ -758,8 +758,8 @@ struct AuctioneerCadence {
     scan_health_factor: i128,
     /// Basis points a price must move before the oracle scan reports it.
     price_delta_bps: u32,
-    /// Ticks the auctioneer task has observed before any submission is
-    /// attempted, even when armed.
+    /// Ledgers of chain advance, measured from the first tick this task
+    /// observes, before any submission is attempted even when armed.
     startup_delay_ledgers: u32,
 }
 
@@ -1001,12 +1001,22 @@ struct AuctioneerState {
     last_oracle_scan: BTreeMap<String, u32>,
     /// The ledger each pool's full scan last fired at.
     last_full_scan: BTreeMap<String, u32>,
-    /// How many ticks this task has observed since it started.
-    ticks_seen: u32,
-    /// Whether `ticks_seen` has passed `startup_delay_ledgers`. Latches
-    /// `true` and stays there — the delay is measured from startup, never
-    /// re-armed — so the "first tick submissions become possible" log line
-    /// fires at most once.
+    /// The ledger of the first tick this task observed, which the startup
+    /// delay is measured from. `None` until that first tick: there is no
+    /// meaningful "how far has the chain moved" before one has arrived.
+    ///
+    /// The ledger, deliberately, and not a count of ticks: every pool's
+    /// poller publishes to the one watch this task reads, so with `n`
+    /// pools a count would reach `STARTUP_DELAY_LEDGERS` in roughly
+    /// `STARTUP_DELAY_LEDGERS / n` ledgers — a safety knob quietly
+    /// under-delivering by the pool count, in the direction of arming
+    /// sooner — while a pass slow enough to coalesce two wakeups into one
+    /// would push the same count the other way.
+    first_tick_ledger: Option<u32>,
+    /// Whether the chain has moved `startup_delay_ledgers` past
+    /// `first_tick_ledger`. Latches `true` and stays there — the delay is
+    /// measured from startup, never re-armed — so the "submissions are
+    /// now possible" log line fires at most once.
     submissions_unlocked: bool,
 }
 
@@ -1028,14 +1038,16 @@ struct AuctioneerContext<'a> {
 /// each pool's currently flagged users, and fire the oracle-scan and
 /// full-scan-and-flag cadences when due.
 ///
-/// `state.ticks_seen` and `state.submissions_unlocked` gate whether
-/// `ctx.submission_queue` is actually handed to [`recheck_batch`] (`None`
-/// before the startup delay has elapsed, regardless of whether the queue
-/// itself exists — i.e. regardless of dry-run or armed) or passed through
-/// unchanged after it has. Saturating the counter is deliberate: a startup
-/// delay near `u32::MAX` must never wrap it past zero and unlock
-/// submissions immediately, which is exactly backwards for a knob whose
-/// whole purpose is to delay them.
+/// `state.submissions_unlocked` gates whether `ctx.submission_queue` is
+/// actually handed to [`recheck_batch`] (`None` until the chain has moved
+/// `startup_delay_ledgers` past the first tick this task saw, regardless
+/// of whether the queue itself exists — i.e. regardless of dry-run or
+/// armed) or passed through unchanged after it has. The elapsed distance
+/// is a `saturating_sub` because ticks are not monotonic across pools: a
+/// pool whose poller is a ledger or two behind publishes a tick older
+/// than the first one seen, and `u32 - u32` going negative is a panic in
+/// a debug build. Saturating reads that as "no ledgers have elapsed yet",
+/// which keeps submissions locked — the safe direction.
 ///
 /// A [`StoreError`] is fatal, exactly as it is in [`tracker_loop`]:
 /// without a trustworthy store there is no way to know who is flagged or
@@ -1049,12 +1061,14 @@ async fn auctioneer_tick(
     tick: LedgerTick,
     state: &mut AuctioneerState,
 ) -> Result<(), LiquidatorError> {
-    state.ticks_seen = state.ticks_seen.saturating_add(1);
-    if !state.submissions_unlocked && state.ticks_seen > ctx.cadence.startup_delay_ledgers {
+    let first_ledger = *state.first_tick_ledger.get_or_insert(tick.sequence);
+    let elapsed = tick.sequence.saturating_sub(first_ledger);
+    if !state.submissions_unlocked && elapsed >= ctx.cadence.startup_delay_ledgers {
         state.submissions_unlocked = true;
         tracing::info!(
-            tick = state.ticks_seen,
             ledger = tick.sequence,
+            first_ledger,
+            elapsed,
             "the startup delay has elapsed; submissions are now possible"
         );
     }
@@ -3667,9 +3681,10 @@ mod tests {
             .await
             .expect("flag");
 
-        // Tick one: `ticks_seen` becomes 1, and `1 > startup_delay_ledgers
-        // (1)` is false, so submissions stay locked even though the queue
-        // is right there and the decision is a real bad debt.
+        // Tick one is the ledger the delay is measured from: nothing has
+        // elapsed yet (`0 >= startup_delay_ledgers (1)` is false), so
+        // submissions stay locked even though the queue is right there
+        // and the decision is a real bad debt.
         auctioneer_tick(&ctx, tick, &mut state)
             .await
             .expect("tick one");
@@ -3700,6 +3715,8 @@ mod tests {
             .flag_recheck(harness::POOL, &account, tick.sequence)
             .await
             .expect("reflag");
+        // One ledger on: the chain, not the wakeup count, is what the
+        // delay measures, so this is exactly `startup_delay_ledgers`.
         let tick_two = LedgerTick {
             sequence: tick.sequence + 1,
             close_time: tick.close_time,
