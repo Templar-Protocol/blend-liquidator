@@ -299,7 +299,7 @@ pub struct TrackedUser {
 }
 
 /// Which side of a position a reserve index is tested against.
-/// [`Store::users_exposed_to`] is the only reader of this: it decides which
+/// [`Store::flag_exposed_to`] is the only reader of this: it decides which
 /// JSONB column — `collateral` or `liabilities` — the exposure test runs
 /// against, because the store is what knows the two maps' shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -556,9 +556,23 @@ impl Store {
             .collect()
     }
 
-    /// The pool's borrowers holding `index` on `side` — collateral or a
-    /// liability, never both at once for one call — for the oracle scan to
-    /// recheck against a price move. Ordered by account, at most `limit`.
+    /// Flags every one of `pool`'s borrowers holding `index` on `side` —
+    /// collateral or a liability, never both at once for one call — at
+    /// `ledger`, and answers how many rows the statement matched.
+    ///
+    /// Deliberately unbounded, and deliberately one statement rather than a
+    /// bounded read followed by a write per row. This is the oracle scan's
+    /// whole job: a limit here would mean a price move reached only the
+    /// first `limit` borrowers exposed to it — the same ones every time
+    /// under any fixed order — and left the rest to wait for the full scan,
+    /// which is the one cadence that is measured in hours rather than
+    /// ledgers. One round trip also keeps the cost independent of how many
+    /// borrowers a move reaches.
+    ///
+    /// The write is exactly [`Store::flag_recheck`]'s: `GREATEST` of the
+    /// stored value and `ledger`, which raises an unflagged row (where
+    /// `recheck_ledger` is `NULL`, since `GREATEST` ignores nulls) and can
+    /// never lower a flag another task just raised.
     ///
     /// `index` is rendered as the decimal text key the `collateral`/
     /// `liabilities` JSONB maps are stored under, and tested with
@@ -566,84 +580,45 @@ impl Store {
     /// operator — `?` is also `sqlx`'s own bind-parameter character in some
     /// contexts, so the function form sidesteps any doubt about which one a
     /// `query!` call would see.
-    pub async fn users_exposed_to(
+    pub async fn flag_exposed_to(
         &self,
         pool: &str,
         index: u32,
         side: Side,
-        limit: i64,
-    ) -> Result<Vec<TrackedUser>, StoreError> {
+        ledger: u32,
+    ) -> Result<u64, StoreError> {
         let key = index.to_string();
-        // Each `query!` call produces its own anonymous row type, so the two
-        // arms cannot share a `rows` binding or a mapping closure the way a
-        // single-query method does — the same duplication `users_stale` and
-        // its neighbours already accept. Each arm maps and collects on its
-        // own, so both arms agree on `Result<Vec<TrackedUser>, StoreError>`
-        // rather than on two distinct, incompatible `Record` types.
-        match side {
+        let flagged_at = i64::from(ledger);
+        // Each `query!` call produces its own anonymous type, so the two
+        // arms cannot share one statement even though only the column name
+        // differs — the same duplication `users_stale` and its neighbours
+        // already accept. Both arms answer with a `PgQueryResult`, which is
+        // one type, so the `match` itself is the shared half.
+        let done = match side {
             Side::Collateral => {
-                let rows = sqlx::query!(
-                    "SELECT pool, account, health_factor::text AS health_factor, collateral,
-                            liabilities, updated_ledger, recheck_ledger
-                     FROM users
-                     WHERE pool = $1 AND jsonb_exists(collateral, $2)
-                     ORDER BY account ASC
-                     LIMIT $3",
+                sqlx::query!(
+                    "UPDATE users SET recheck_ledger = GREATEST(recheck_ledger, $3)
+                     WHERE pool = $1 AND jsonb_exists(collateral, $2)",
                     pool,
                     key,
-                    limit,
+                    flagged_at,
                 )
-                .fetch_all(&self.pool)
-                .await?;
-                rows.into_iter()
-                    .map(|row| {
-                        Ok(TrackedUser {
-                            pool: row.pool,
-                            account: row.account,
-                            health_factor: decimal(row.health_factor.as_deref(), "health_factor")?,
-                            collateral: index_amounts_from_json(&row.collateral, "collateral")?,
-                            liabilities: index_amounts_from_json(&row.liabilities, "liabilities")?,
-                            updated_ledger: ledger(row.updated_ledger, "updated_ledger")?,
-                            recheck_ledger: row
-                                .recheck_ledger
-                                .map(|value| ledger(value, "recheck_ledger"))
-                                .transpose()?,
-                        })
-                    })
-                    .collect()
+                .execute(&self.pool)
+                .await?
             }
             Side::Liability => {
-                let rows = sqlx::query!(
-                    "SELECT pool, account, health_factor::text AS health_factor, collateral,
-                            liabilities, updated_ledger, recheck_ledger
-                     FROM users
-                     WHERE pool = $1 AND jsonb_exists(liabilities, $2)
-                     ORDER BY account ASC
-                     LIMIT $3",
+                sqlx::query!(
+                    "UPDATE users SET recheck_ledger = GREATEST(recheck_ledger, $3)
+                     WHERE pool = $1 AND jsonb_exists(liabilities, $2)",
                     pool,
                     key,
-                    limit,
+                    flagged_at,
                 )
-                .fetch_all(&self.pool)
-                .await?;
-                rows.into_iter()
-                    .map(|row| {
-                        Ok(TrackedUser {
-                            pool: row.pool,
-                            account: row.account,
-                            health_factor: decimal(row.health_factor.as_deref(), "health_factor")?,
-                            collateral: index_amounts_from_json(&row.collateral, "collateral")?,
-                            liabilities: index_amounts_from_json(&row.liabilities, "liabilities")?,
-                            updated_ledger: ledger(row.updated_ledger, "updated_ledger")?,
-                            recheck_ledger: row
-                                .recheck_ledger
-                                .map(|value| ledger(value, "recheck_ledger"))
-                                .transpose()?,
-                        })
-                    })
-                    .collect()
+                .execute(&self.pool)
+                .await?
             }
-        }
+        };
+        Ok(done.rows_affected())
     }
 
     /// Clears the flag this decision saw, and only that one: `flagged_at`
@@ -1690,13 +1665,14 @@ mod tests {
         Ok(())
     }
 
-    /// The pinning assertion for `users_exposed_to`: a borrower holding the
-    /// queried reserve only on the *other* side must never come back. A
-    /// query that selected by index alone and ignored `side` entirely would
-    /// still pass a check that only asserted the right users are present —
-    /// it takes a borrower on the wrong side to catch that.
+    /// The pinning assertion for `flag_exposed_to`: a borrower holding the
+    /// queried reserve only on the *other* side must never be flagged. A
+    /// statement that selected by index alone and ignored `side` entirely
+    /// would still pass a check that only asserted the right users were
+    /// flagged — it takes a borrower on the wrong side to catch that.
+    /// Pool scoping and the monotonic `GREATEST` write are pinned here too.
     #[sqlx::test(migrations = "./migrations")]
-    async fn users_exposed_to_selects_by_side_and_index(db: sqlx::PgPool) -> sqlx::Result<()> {
+    async fn flag_exposed_to_flags_by_side_and_index(db: sqlx::PgPool) -> sqlx::Result<()> {
         const HOLDS_COLLATERAL: &str = "GCOLLATERALHOLDER";
         const HOLDS_LIABILITY: &str = "GLIABILITYHOLDER";
         const OTHER_RESERVE: &str = "GOTHERRESERVEHOLDER";
@@ -1743,47 +1719,79 @@ mod tests {
             .await
             .expect("upsert unrelated holder");
 
-        let collateral_side = store
-            .users_exposed_to(POOL, 3, Side::Collateral, 10)
+        let flagged = store
+            .flag_exposed_to(POOL, 3, Side::Collateral, 500)
             .await
-            .expect("collateral query");
+            .expect("collateral flagging");
+        assert_eq!(flagged, 1, "one borrower holds reserve 3 as collateral");
         assert_eq!(
-            collateral_side
-                .iter()
-                .map(|user| user.account.as_str())
-                .collect::<Vec<_>>(),
-            vec![HOLDS_COLLATERAL],
-            "the borrower holding reserve 3 as a liability, not collateral, \
-             must not come back on the collateral side"
+            store
+                .user(POOL, HOLDS_COLLATERAL)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            Some(500)
+        );
+        for untouched in [HOLDS_LIABILITY, OTHER_RESERVE] {
+            assert_eq!(
+                store
+                    .user(POOL, untouched)
+                    .await
+                    .expect("read")
+                    .and_then(|user| user.recheck_ledger),
+                None,
+                "{untouched} holds reserve 3 as a liability or not at all, so the \
+                 collateral side must not flag it"
+            );
+        }
+
+        let flagged = store
+            .flag_exposed_to(POOL, 3, Side::Liability, 600)
+            .await
+            .expect("liability flagging");
+        assert_eq!(flagged, 1, "one borrower holds reserve 3 as a liability");
+        assert_eq!(
+            store
+                .user(POOL, HOLDS_LIABILITY)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            Some(600)
+        );
+        assert_eq!(
+            store
+                .user(POOL, HOLDS_COLLATERAL)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            Some(500),
+            "the liability side must not touch the collateral holder's flag"
         );
 
-        let liability_side = store
-            .users_exposed_to(POOL, 3, Side::Liability, 10)
+        // The write is `flag_recheck`'s, so an older ledger cannot lower a
+        // flag another task already raised.
+        store
+            .flag_exposed_to(POOL, 3, Side::Collateral, 400)
             .await
-            .expect("liability query");
+            .expect("an older flagging");
         assert_eq!(
-            liability_side
-                .iter()
-                .map(|user| user.account.as_str())
-                .collect::<Vec<_>>(),
-            vec![HOLDS_LIABILITY],
-            "the borrower holding reserve 3 as collateral, not a liability, \
-             must not come back on the liability side"
+            store
+                .user(POOL, HOLDS_COLLATERAL)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            Some(500),
+            "GREATEST keeps the newer flag"
         );
 
         assert_eq!(
             store
-                .users_exposed_to(POOL, 3, Side::Collateral, 1)
+                .flag_exposed_to("COTHER", 3, Side::Collateral, 700)
                 .await
-                .expect("limit")
-                .len(),
-            1
+                .expect("other pool"),
+            0,
+            "another pool's borrowers are not this pool's exposure"
         );
-        assert!(store
-            .users_exposed_to("COTHER", 3, Side::Collateral, 10)
-            .await
-            .expect("other pool")
-            .is_empty());
         Ok(())
     }
 

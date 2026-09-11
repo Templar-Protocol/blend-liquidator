@@ -24,10 +24,11 @@
 //! or acts on anything. It compares a pool's current prices against
 //! [`PriceWatch`]'s remembered reference, and for every asset that moved
 //! enough to matter it flags the borrowers exposed to it with
-//! [`Store::flag_recheck`] — the ordinary recheck path, the same one an
-//! auction fill or a tracker refresh flags, is what actually decides about
-//! them. `PriceWatch`'s references live in memory only, never in the store:
-//! see its own doc for why losing them on a restart is cheap.
+//! [`Store::flag_exposed_to`] — every one of them, in one statement per
+//! move — and the ordinary recheck path, the same one an auction fill or a
+//! tracker refresh flags, is what actually decides about them.
+//! `PriceWatch`'s references live in memory only, never in the store: see
+//! its own doc for why losing them on a restart is cheap.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -904,15 +905,26 @@ impl<'a> Auctioneer<'a> {
     }
 
     /// The oracle scan: refreshes `watch`'s reference prices for `pool` and
-    /// flags every borrower a significant move went against.
+    /// flags **every** borrower a significant move went against.
     ///
     /// This only notices, never judges: it calls neither `decide` nor
     /// `act`. A liability's price rising is flagged as [`Side::Liability`]
     /// exposure and a collateral's price falling as [`Side::Collateral`]
-    /// exposure — both hurt the borrower's health factor — and every user
-    /// [`Store::users_exposed_to`] returns for that side is handed to
-    /// [`Store::flag_recheck`], which is what actually queues them for
+    /// exposure — both hurt the borrower's health factor — and
+    /// [`Store::flag_exposed_to`] raises the flag on every exposed row in
+    /// one statement per move, which is what actually queues them for
     /// `decide` to judge on the ordinary recheck path.
+    ///
+    /// Unbounded on purpose, and no knob bounds it. [`PriceWatch::moved`]
+    /// re-anchors the reference in the same call that reports a move, so a
+    /// move is reported exactly once: a borrower this scan did not reach
+    /// would not be reached by the next one either, because the crash it
+    /// missed has become the new baseline. A cap here — `REFRESH_BATCH`, or
+    /// any other — would therefore mean the same fixed prefix of each
+    /// pool's borrowers got every oracle-scan recheck and the rest got none
+    /// at all, waiting up to a full `FULL_SCAN_LEDGERS` period instead.
+    /// Bounding the *decide* side is what `REFRESH_BATCH` is for; this side
+    /// is a durable flag, not work.
     ///
     /// Reads a fresh snapshot naming no accounts: this is a price read, not
     /// a position read, and [`PoolReader::snapshot`] still answers reserves,
@@ -921,24 +933,23 @@ impl<'a> Auctioneer<'a> {
     ///
     /// Returns how many `(borrower, move)` pairs were flagged — a single
     /// borrower exposed to two moves in the same call counts twice, since
-    /// [`Store::flag_recheck`] is idempotent about it either way.
+    /// the flag is idempotent about it either way.
     ///
     /// # Errors
     ///
     /// A store failure ends the scan for the rest of `pool`'s moves: without
-    /// it there is no way to know who is exposed or to record that anyone
-    /// needs a recheck, so continuing would silently drop the borrowers a
-    /// later move in the same call went against.
+    /// it there is no way to record that anyone needs a recheck, so
+    /// continuing would silently drop the borrowers a later move in the
+    /// same call went against.
     pub async fn scan_oracle(
         &self,
         pool: &str,
         watch: &mut PriceWatch,
         tick: LedgerTick,
-        limit: i64,
-    ) -> Result<usize, AuctioneerError> {
+    ) -> Result<u64, AuctioneerError> {
         let snapshot = PoolReader::new(self.rpc, pool).snapshot(&[]).await?;
         let moves = watch.moved(pool, &snapshot.prices, tick.close_time);
-        let mut flagged = 0_usize;
+        let mut flagged = 0_u64;
         for price_move in moves {
             let Some(&index) = snapshot.asset_index.get(&price_move.asset) else {
                 tracing::warn!(
@@ -953,24 +964,19 @@ impl<'a> Auctioneer<'a> {
                 Direction::Up => Side::Liability,
                 Direction::Down => Side::Collateral,
             };
-            let exposed = self
+            let count = self
                 .store
-                .users_exposed_to(pool, index, side, limit)
+                .flag_exposed_to(pool, index, side, tick.sequence)
                 .await?;
-            for user in &exposed {
-                self.store
-                    .flag_recheck(pool, &user.account, tick.sequence)
-                    .await?;
-            }
             tracing::info!(
                 pool,
                 asset = %price_move.asset,
                 direction = ?price_move.direction,
                 side = ?side,
-                count = exposed.len(),
-                "oracle scan flagged borrowers exposed to a significant price move"
+                count,
+                "oracle scan flagged every borrower exposed to a significant price move"
             );
-            flagged += exposed.len();
+            flagged = flagged.saturating_add(count);
         }
         Ok(flagged)
     }
@@ -2589,7 +2595,7 @@ mod tests {
     /// The pin for `scan_oracle`'s own glue: the `Direction` → `Side`
     /// mapping, the moved asset's reserve index from the snapshot's
     /// `asset_index`, and the flag-every-exposed-borrower loop. Neither
-    /// `PriceWatch::moved` nor `Store::users_exposed_to` is exercised in
+    /// `PriceWatch::moved` nor `Store::flag_exposed_to` is exercised in
     /// isolation here — both already have their own tests — only the join
     /// between them.
     ///
@@ -2664,7 +2670,7 @@ mod tests {
         // so nobody is flagged.
         harness::script_snapshot(&rpc, &[]);
         let seeded = auctioneer
-            .scan_oracle(POOL, &mut watch, base, 10)
+            .scan_oracle(POOL, &mut watch, base)
             .await
             .expect("seeding scan");
         assert_eq!(seeded, 0, "the first read only seeds the reference");
@@ -2679,7 +2685,7 @@ mod tests {
         };
         script_snapshot_with_price(&rpc, &asset, risen, original.timestamp);
         let flagged_up = auctioneer
-            .scan_oracle(POOL, &mut watch, up_tick, 10)
+            .scan_oracle(POOL, &mut watch, up_tick)
             .await
             .expect("rising scan");
         assert_eq!(
@@ -2716,7 +2722,7 @@ mod tests {
         };
         script_snapshot_with_price(&rpc, &asset, fallen, original.timestamp);
         let flagged_down = auctioneer
-            .scan_oracle(POOL, &mut watch, down_tick, 10)
+            .scan_oracle(POOL, &mut watch, down_tick)
             .await
             .expect("falling scan");
         assert_eq!(
@@ -2744,6 +2750,110 @@ mod tests {
             "the fall must not re-flag the liability holder — that move helped them, so \
              its recheck flag stays exactly where the earlier rise left it"
         );
+        Ok(())
+    }
+
+    /// The coverage pin: a price move must reach **every** borrower
+    /// exposed to it, not a bounded prefix of them.
+    ///
+    /// Twenty-five borrowers hold the moved reserve as a liability —
+    /// deliberately more than `REFRESH_BATCH`'s default of 20, and more
+    /// than any other batch-sized knob in this crate. Twenty is exactly the
+    /// number a bounded scan would have flagged, so a test seeding twenty
+    /// would pass against the bug it exists to catch; only a count above
+    /// every such bound distinguishes "all of them" from "a page of them".
+    ///
+    /// It matters because [`PriceWatch::moved`] re-anchors the reference in
+    /// the same call that reports the move: a borrower this scan skips is
+    /// not picked up by the next one, because the move it missed has become
+    /// the baseline. A bounded scan therefore serves the same fixed prefix
+    /// for the life of the process and leaves the tail to the full scan's
+    /// ~1200-ledger cadence.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_oracle_scan_flags_every_exposed_borrower_not_a_batch(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        /// More than `REFRESH_BATCH`'s default of 20, which is the bound
+        /// this scan used to inherit.
+        const EXPOSED: u8 = 25;
+
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let auctioneer = Auctioneer::new(&client, &store, config(BTreeSet::new()), None);
+
+        let fixture = mainnet_fixed_v2();
+        let asset = fixture["reserves"][0]["asset"]
+            .as_str()
+            .expect("asset")
+            .to_string();
+        let index = 0_u32;
+        let original_price: ScVal = from_base64(
+            fixture["reserves"][0]["lastprice_return_xdr"]
+                .as_str()
+                .expect("price"),
+        )
+        .expect("decode");
+        let original = decode::price_data(&original_price)
+            .expect("price_data")
+            .expect("the fixture's reserve is priced");
+
+        let borrowers: Vec<String> = (0..EXPOSED).map(synthetic_account).collect();
+        for account in &borrowers {
+            store
+                .upsert_user(&TrackedUser {
+                    pool: POOL.to_string(),
+                    account: account.clone(),
+                    health_factor: 0,
+                    collateral: BTreeMap::new(),
+                    liabilities: BTreeMap::from([(index, 1_000_000_000)]),
+                    updated_ledger: 0,
+                    recheck_ledger: None,
+                })
+                .await
+                .expect("seed an exposed borrower");
+        }
+
+        let mut watch = PriceWatch::new(250, u64::MAX);
+        let base = harness::fixture_tick();
+        harness::script_snapshot(&rpc, &[]);
+        assert_eq!(
+            auctioneer
+                .scan_oracle(POOL, &mut watch, base)
+                .await
+                .expect("seeding scan"),
+            0,
+            "the first read only seeds the reference"
+        );
+
+        let risen = original.price + original.price / 5;
+        let tick = LedgerTick {
+            sequence: base.sequence + 1,
+            close_time: base.close_time + 1,
+        };
+        script_snapshot_with_price(&rpc, &asset, risen, original.timestamp);
+        let flagged = auctioneer
+            .scan_oracle(POOL, &mut watch, tick)
+            .await
+            .expect("rising scan");
+        assert_eq!(
+            flagged,
+            u64::from(EXPOSED),
+            "every borrower exposed to the move is flagged, not REFRESH_BATCH of them"
+        );
+
+        for account in &borrowers {
+            assert_eq!(
+                store
+                    .user(POOL, account)
+                    .await
+                    .expect("read")
+                    .expect("row")
+                    .recheck_ledger,
+                Some(tick.sequence),
+                "{account} holds the moved reserve as a liability and must be flagged"
+            );
+        }
         Ok(())
     }
 

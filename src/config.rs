@@ -489,7 +489,14 @@ pub struct Args {
     #[arg(long, env = "USER_REFRESH_LEDGERS", default_value_t = 241_920)]
     pub user_refresh_ledgers: u32,
 
-    /// How many stale users to refresh per tick.
+    /// A rate, not a cap: how many stale users the tracker refreshes per
+    /// tick, how many flagged borrowers the auctioneer decides and acts on
+    /// per pool per tick, and the page size the full scan flags with.
+    ///
+    /// It deliberately does not bound the oracle scan. That scan flags
+    /// every borrower a price move went against, because `PriceWatch`
+    /// re-anchors its reference on the move it reports — so a borrower a
+    /// bounded scan skipped would not be picked up by the next scan either.
     #[arg(
         long,
         env = "REFRESH_BATCH",

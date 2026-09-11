@@ -751,7 +751,9 @@ const SUBMISSION_QUEUE_CAPACITY: usize = 64;
 #[derive(Debug, Clone, Copy)]
 struct AuctioneerCadence {
     /// How many flagged users to decide and act on per pool per tick, and
-    /// the page size the full scan flags with.
+    /// the page size the full scan flags with. Never the oracle scan's
+    /// bound: that scan flags every exposed borrower, per
+    /// [`Auctioneer::scan_oracle`]'s own doc.
     refresh_batch: u32,
     /// How often, in ledgers, prices are re-read for a significant move.
     oracle_scan_ledgers: u32,
@@ -1121,11 +1123,7 @@ async fn auctioneer_tick(
                     PRICE_REFERENCE_STALE_AFTER_SECS,
                 )
             });
-            match ctx
-                .auctioneer
-                .scan_oracle(pool, watch, tick, i64::from(ctx.cadence.refresh_batch))
-                .await
-            {
+            match ctx.auctioneer.scan_oracle(pool, watch, tick).await {
                 Ok(flagged) => tracing::info!(pool, flagged, "oracle scan"),
                 Err(AuctioneerError::Store(error)) => return Err(LiquidatorError::Store(error)),
                 Err(error) => tracing::warn!(
