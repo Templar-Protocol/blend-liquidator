@@ -830,13 +830,39 @@ async fn full_scan_and_flag(
 /// so a flag raised again while this batch was deciding is left standing
 /// for the next pass rather than cleared by a decision that never saw it.
 ///
-/// A per-borrower failure — from [`Auctioneer::decide`] or
-/// [`Auctioneer::act`] alike — is logged with the account and leaves that
-/// account's flag exactly where it was: still set, so the next tick's
-/// batch picks it up again. Isolating a per-borrower failure is this
-/// function's job, per `act`'s own doc. Only [`AuctioneerError::Store`]
-/// ends the pass early and propagates, for the reason it is fatal
-/// everywhere else in this module: the bot cannot trust what it reads.
+/// A per-borrower failure — a borrower [`Auctioneer::decide`] left out of
+/// its result, or one whose [`Auctioneer::act`] returned anything but a
+/// store error — is logged with the account and keeps its flag, and that
+/// flag is **moved forward** to this tick's ledger rather than left where
+/// it was. Leaving it where it was is what starves a pool:
+/// [`Store::users_needing_recheck`] orders `recheck_ledger ASC, account
+/// ASC`, so an untouched flag is the oldest in its pool and comes back at
+/// the head of every following batch. A borrower nothing can decide is
+/// not hypothetical — an oracle that stops pricing one reserve makes
+/// `position_data` fail for every borrower holding it at once, and
+/// `validate` deliberately keeps the bot following a pool with an
+/// unpriced reserve — so `REFRESH_BATCH` such borrowers would fill every
+/// batch for ever and no other borrower in that pool would be decided
+/// again, with nothing but a repeated per-user warning to show for it.
+///
+/// Moving the flag forward cannot itself livelock. The row is written at
+/// the later of `tick`'s ledger and the ledger the batch read it at, so
+/// every borrower flagged before this tick sorts strictly ahead of it:
+/// each pass serves `REFRESH_BATCH` borrowers none of which it has
+/// already tried this cycle, and a queue of `n` is fully served in
+/// `n / REFRESH_BATCH` passes however many of them keep failing. The flag
+/// is never dropped, so the failing borrower is retried too, just behind
+/// everyone else rather than in front of them.
+///
+/// A whole-batch failure is different and is left alone: when `decide`
+/// itself returns `Err` — the one snapshot it reads for the batch — no
+/// borrower was served ahead of any other, there is no queue position to
+/// correct, and the next pass reads the same batch again.
+///
+/// Isolating a per-borrower failure is this function's job, per `act`'s
+/// own doc. Only [`AuctioneerError::Store`] ends the pass early and
+/// propagates, for the reason it is fatal everywhere else in this module:
+/// the bot cannot trust what it reads.
 async fn recheck_batch(
     auctioneer: &Auctioneer<'_>,
     store: &Store,
@@ -868,6 +894,24 @@ async fn recheck_batch(
             return Ok(());
         }
     };
+    // The borrowers `decide` skipped: it logs each one's own failure and
+    // leaves it out of the result. Moved forward before anything is acted
+    // on, so the shutdown check below cannot leave them holding the
+    // oldest flags in the pool either.
+    let mut undecided: BTreeSet<&str> = batch.iter().map(|user| user.account.as_str()).collect();
+    for (account, _) in &decisions {
+        undecided.remove(account.as_str());
+    }
+    for account in undecided {
+        tracing::debug!(
+            pool,
+            account,
+            ledger = tick.sequence,
+            "no decision for this borrower; re-flagged at this ledger so the queue \
+             behind it is not held up"
+        );
+        move_flag_forward(store, pool, account, flagged_at.get(account).copied(), tick).await?;
+    }
     for (account, decision) in decisions {
         // Checked between users, never inside a submission: a submission
         // already in flight is waited for, because abandoning it would
@@ -895,23 +939,60 @@ async fn recheck_batch(
                 }
             }
             Err(AuctioneerError::Store(error)) => return Err(LiquidatorError::Store(error)),
-            Err(error) => tracing::warn!(
-                pool,
-                account,
-                %error,
-                "acting on this borrower failed; it stays flagged for the next pass"
-            ),
+            Err(error) => {
+                tracing::warn!(
+                    pool,
+                    account,
+                    %error,
+                    ledger = tick.sequence,
+                    "acting on this borrower failed; re-flagged at this ledger for a \
+                     later pass"
+                );
+                move_flag_forward(
+                    store,
+                    pool,
+                    &account,
+                    flagged_at.get(account.as_str()).copied(),
+                    tick,
+                )
+                .await?;
+            }
         }
     }
     Ok(())
 }
 
+/// Re-raises one borrower's recheck flag at `tick`'s ledger, so a
+/// borrower this pass could not decide or act on is retried on a later
+/// pass instead of holding the oldest flag in its pool — see
+/// [`recheck_batch`]'s doc for why that ordering is the whole point.
+///
+/// `flagged_at` is the ledger the batch read the flag at. When it is
+/// newer than `tick` — the auctioneer runs behind the tracker, so a pool
+/// can have flagged a borrower at a ledger this pass has not been told
+/// about yet — it is kept, because writing `tick`'s older ledger would
+/// move the row *towards* the head of the queue, which is the direction
+/// this exists to prevent. Taking the later of the two also means this
+/// never lowers a flag another task raised.
+async fn move_flag_forward(
+    store: &Store,
+    pool: &str,
+    account: &str,
+    flagged_at: Option<u32>,
+    tick: LedgerTick,
+) -> Result<(), LiquidatorError> {
+    let ledger = flagged_at.map_or(tick.sequence, |flagged| flagged.max(tick.sequence));
+    store
+        .flag_recheck(pool, account, ledger)
+        .await
+        .map_err(LiquidatorError::Store)
+}
+
 /// Mutable state the auctioneer task carries from one tick to the next:
-/// how many it has seen, whether the startup delay has elapsed enough to
-/// allow a submission, and each pool's oracle-scan and full-scan cadence
-/// state. Bundled into one struct, rather than five `&mut` parameters on
-/// [`auctioneer_tick`], for the same reason [`LoopState`] exists for the
-/// tracker.
+/// where the startup delay is measured from and whether it has elapsed,
+/// and each pool's oracle-scan and full-scan cadence state. Bundled into
+/// one struct, rather than five `&mut` parameters on [`auctioneer_tick`],
+/// for the same reason [`LoopState`] exists for the tracker.
 #[derive(Debug, Default)]
 struct AuctioneerState {
     /// Each pool's oracle-scan reference prices.
@@ -2877,12 +2958,43 @@ mod tests {
         stellar_strkey::ed25519::PublicKey([42_u8; 32]).to_string()
     }
 
+    /// Another one, distinct from [`synthetic_debtor`] and from every
+    /// other `seed` these tests pass.
+    fn synthetic_account(seed: u8) -> String {
+        stellar_strkey::ed25519::PublicKey([seed; 32]).to_string()
+    }
+
+    /// A key for the one test here that needs a [`Submitter`] at all. It
+    /// signs nothing: that test's simulation never gets past the source
+    /// account's own read.
+    fn test_signer() -> Signer {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7_u8; 32]);
+        let secret = stellar_strkey::ed25519::PrivateKey(key.to_bytes()).to_string();
+        Signer::from_secret(&secret).expect("signer")
+    }
+
+    /// Fee and polling policy short enough that nothing in a test waits on
+    /// a real interval.
+    fn test_tx_config() -> TxConfig {
+        TxConfig {
+            poll_interval: std::time::Duration::from_millis(1),
+            send_retry_pause: std::time::Duration::from_millis(1),
+            wait_cap: std::time::Duration::from_millis(200),
+            ..TxConfig::new(100, 200, 3)
+        }
+    }
+
     /// A `Positions` ledger entry naming only a liability, on reserve
     /// index 1, and no collateral at all — the one shape `decide_one`
     /// calls bad debt outright, with no health-factor arithmetic and no
     /// percent walk to script around: `liability_base > 0 &&
     /// collateral_base == 0`.
     fn bad_debt_positions_entry_xdr(account: &str) -> String {
+        positions_entry_xdr(account, &[(1, 10_000_000_000)])
+    }
+
+    /// A `Positions` ledger entry with `liabilities` and nothing else.
+    fn positions_entry_xdr(account: &str, liabilities: &[(u32, i128)]) -> String {
         let side = |amounts: &[(u32, i128)]| {
             map(amounts
                 .iter()
@@ -2892,7 +3004,7 @@ mod tests {
         };
         let value = map(vec![
             (symbol("collateral").unwrap(), side(&[])),
-            (symbol("liabilities").unwrap(), side(&[(1, 10_000_000_000)])),
+            (symbol("liabilities").unwrap(), side(liabilities)),
             (symbol("supply").unwrap(), side(&[])),
         ])
         .unwrap();
@@ -2914,9 +3026,18 @@ mod tests {
     /// same reserves, same oracle prices, all from the fixture — except
     /// `account` gets a hand-built, liability-only positions entry instead
     /// of whatever (if anything) the fixture holds for it. Stands in for
-    /// `harness::script_snapshot` in the one test here that needs a
-    /// decision other than `Skip`.
+    /// `harness::script_snapshot` in the tests here that need a decision
+    /// other than `Skip`.
     fn script_snapshot_bad_debt(rpc: &ScriptedRpc, account: &str) {
+        script_snapshot_positions(rpc, &[(account, bad_debt_positions_entry_xdr(account))]);
+    }
+
+    /// The same, for any number of accounts and any hand-built positions
+    /// entry: `positions` pairs an account with the entry the snapshot's
+    /// batched read answers for it. An account the batch asks about but
+    /// this list does not name is simply absent from the answer, which is
+    /// what the RPC does for a key with no entry.
+    fn script_snapshot_positions(rpc: &ScriptedRpc, positions: &[(&str, String)]) {
         let fixture = mainnet_fixed_v2();
         let ledger = fixture["ledger"].as_u64().unwrap();
         rpc.expect(
@@ -2938,10 +3059,12 @@ mod tests {
                 reserve["data_entry_xdr"].as_str().unwrap(),
             ));
         }
-        entries.push(entry(
-            &keys::positions(harness::POOL, account).unwrap(),
-            &bad_debt_positions_entry_xdr(account),
-        ));
+        for (account, positions_xdr) in positions {
+            entries.push(entry(
+                &keys::positions(harness::POOL, account).unwrap(),
+                positions_xdr,
+            ));
+        }
         rpc.expect(
             "getLedgerEntries",
             json!({"latestLedger": ledger, "entries": entries}),
@@ -3124,9 +3247,294 @@ mod tests {
         Ok(())
     }
 
+    /// A borrower `decide` could not decide keeps its flag, but the flag
+    /// **moves forward** to this pass's ledger: `users_needing_recheck`
+    /// orders `recheck_ledger ASC`, so a flag left where it was is the
+    /// oldest in the pool and comes back at the head of every following
+    /// batch for ever. The ordering, not the mere presence of a flag, is
+    /// what this asserts — a flag that is still set proves nothing about
+    /// the queue behind it.
+    ///
+    /// The undecidable borrower here holds a liability in reserve index
+    /// 99, which the fixture's pool does not have, so `position_data`
+    /// fails for it and for nothing else in the batch. That is the shape
+    /// an oracle which stops pricing a reserve produces for every
+    /// borrower holding it at once.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_undecidable_borrower_moves_to_the_back_of_the_queue(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let stuck = synthetic_account(70);
+        let decidable = synthetic_account(71);
+        let behind = synthetic_account(72);
+        script_snapshot_positions(
+            &rpc,
+            &[
+                (
+                    stuck.as_str(),
+                    positions_entry_xdr(&stuck, &[(99, 10_000_000_000)]),
+                ),
+                (decidable.as_str(), positions_entry_xdr(&decidable, &[])),
+            ],
+        );
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let auctioneer = Auctioneer::new(&client, &store, auctioneer_config(), None);
+        let (_flag, shutdown) = watch::channel(false);
+
+        for (account, ledger) in [(&stuck, 100_u32), (&decidable, 110), (&behind, 120)] {
+            store
+                .upsert_user(&tracked_user(account, ledger))
+                .await
+                .expect("seed the row");
+            store
+                .flag_recheck(harness::POOL, account, ledger)
+                .await
+                .expect("flag");
+        }
+
+        // A batch of two, as `REFRESH_BATCH` bounds it: the oldest two
+        // flags. `behind` is flagged after both and waits its turn.
+        let batch = store
+            .users_needing_recheck(harness::POOL, 2)
+            .await
+            .expect("read the recheck queue");
+        assert_eq!(
+            batch.iter().map(|user| &user.account).collect::<Vec<_>>(),
+            vec![&stuck, &decidable],
+            "the two oldest flags, oldest first"
+        );
+
+        let tick = harness::fixture_tick();
+        recheck_batch(
+            &auctioneer,
+            &store,
+            harness::POOL,
+            &batch,
+            tick,
+            None,
+            &shutdown,
+        )
+        .await
+        .expect("one undecidable borrower does not fail the pass");
+
+        assert_eq!(
+            store
+                .user(harness::POOL, &decidable)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            None,
+            "the borrower that was decided had its own flag cleared"
+        );
+        assert_eq!(
+            store
+                .user(harness::POOL, &stuck)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            Some(tick.sequence),
+            "the borrower nothing could decide is still flagged, at this pass's ledger"
+        );
+        let queue: Vec<String> = store
+            .users_needing_recheck(harness::POOL, 10)
+            .await
+            .expect("read the recheck queue")
+            .into_iter()
+            .map(|user| user.account)
+            .collect();
+        assert_eq!(
+            queue,
+            vec![behind.clone(), stuck.clone()],
+            "the undecidable borrower now sorts behind one flagged after it; left \
+             where it was it would still be first, and first in every batch after this"
+        );
+        Ok(())
+    }
+
+    /// The starvation itself: with a batch of one, a borrower queued
+    /// behind an undecidable one **is reached** on the next pass. This is
+    /// the assertion that fails if a flag is left where it was — the pass
+    /// would read the same undecidable borrower for ever and no other
+    /// borrower in the pool would be decided again.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_borrower_behind_an_undecidable_one_is_reached(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let stuck = synthetic_account(73);
+        let next = synthetic_account(74);
+        // One snapshot per pass: the first batch holds `stuck`, the
+        // second — if the queue moved at all — holds `next`.
+        script_snapshot_positions(
+            &rpc,
+            &[(
+                stuck.as_str(),
+                positions_entry_xdr(&stuck, &[(99, 10_000_000_000)]),
+            )],
+        );
+        script_snapshot_positions(&rpc, &[(next.as_str(), positions_entry_xdr(&next, &[]))]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let auctioneer = Auctioneer::new(&client, &store, auctioneer_config(), None);
+        let (_flag, shutdown) = watch::channel(false);
+
+        for (account, ledger) in [(&stuck, 100_u32), (&next, 110)] {
+            store
+                .upsert_user(&tracked_user(account, ledger))
+                .await
+                .expect("seed the row");
+            store
+                .flag_recheck(harness::POOL, account, ledger)
+                .await
+                .expect("flag");
+        }
+
+        let tick = harness::fixture_tick();
+        let first = store
+            .users_needing_recheck(harness::POOL, 1)
+            .await
+            .expect("read the recheck queue");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].account, stuck, "the oldest flag comes first");
+        recheck_batch(
+            &auctioneer,
+            &store,
+            harness::POOL,
+            &first,
+            tick,
+            None,
+            &shutdown,
+        )
+        .await
+        .expect("pass one");
+
+        let next_tick = LedgerTick {
+            sequence: tick.sequence + 1,
+            close_time: tick.close_time,
+        };
+        let second = store
+            .users_needing_recheck(harness::POOL, 1)
+            .await
+            .expect("read the recheck queue");
+        assert_eq!(second.len(), 1);
+        assert_eq!(
+            second[0].account, next,
+            "the second pass reaches the borrower queued behind the undecidable one"
+        );
+        recheck_batch(
+            &auctioneer,
+            &store,
+            harness::POOL,
+            &second,
+            next_tick,
+            None,
+            &shutdown,
+        )
+        .await
+        .expect("pass two");
+
+        assert_eq!(
+            store
+                .user(harness::POOL, &next)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            None,
+            "and decides it: its flag is cleared"
+        );
+        assert_eq!(
+            store
+                .user(harness::POOL, &stuck)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            Some(tick.sequence),
+            "the undecidable borrower is retried later, not dropped"
+        );
+        Ok(())
+    }
+
+    /// The other half of the same rule: a borrower whose `act` failed —
+    /// a chain error under the simulation, not a store error — is
+    /// re-flagged at this pass's ledger too, for the same reason.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_borrower_whose_action_failed_moves_forward_too(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let account = synthetic_debtor();
+        let behind = synthetic_account(75);
+        // Decidable — bad debt outright — and then `act`'s own
+        // `simulate_only` reads the signer's account entry, which is the
+        // third `getLedgerEntries` of the pass and gets a 503.
+        script_snapshot_bad_debt(&rpc, &account);
+        rpc.expect_http("getLedgerEntries", 503);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let signer = test_signer();
+        let network = Network::testnet();
+        let submitter = Submitter::new(&client, &network, &signer, test_tx_config());
+        let auctioneer = Auctioneer::new(&client, &store, auctioneer_config(), Some(submitter));
+        let (_flag, shutdown) = watch::channel(false);
+
+        for (account, ledger) in [(&account, 100_u32), (&behind, 120)] {
+            store
+                .upsert_user(&tracked_user(account, ledger))
+                .await
+                .expect("seed the row");
+            store
+                .flag_recheck(harness::POOL, account, ledger)
+                .await
+                .expect("flag");
+        }
+
+        let batch = store
+            .users_needing_recheck(harness::POOL, 1)
+            .await
+            .expect("read the recheck queue");
+        assert_eq!(batch.len(), 1);
+        let tick = harness::fixture_tick();
+        recheck_batch(
+            &auctioneer,
+            &store,
+            harness::POOL,
+            &batch,
+            tick,
+            None,
+            &shutdown,
+        )
+        .await
+        .expect("a failed action is this borrower's failure, not the pass's");
+
+        assert_eq!(
+            store
+                .user(harness::POOL, &account)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            Some(tick.sequence),
+            "still flagged, and at this pass's ledger"
+        );
+        let queue: Vec<String> = store
+            .users_needing_recheck(harness::POOL, 10)
+            .await
+            .expect("read the recheck queue")
+            .into_iter()
+            .map(|user| user.account)
+            .collect();
+        assert_eq!(
+            queue,
+            vec![behind.clone(), account.clone()],
+            "and sorts behind the borrower flagged after it, rather than ahead of it"
+        );
+        Ok(())
+    }
+
     /// The full scan flags every user below the threshold, across pages: a
     /// borrower on the second page is exactly the one a single-page scan
-    /// would have missed.
+    /// would have missed. And it observes shutdown as it pages, so a pool
+    /// with thousands of borrowers below the threshold does not flag all
+    /// of them before shutdown is next looked at.
     #[sqlx::test(migrations = "./migrations")]
     async fn the_full_scan_flags_every_user_below_the_threshold(
         db: sqlx::PgPool,
@@ -3424,7 +3832,8 @@ mod tests {
                 .expect("read")
                 .and_then(|user| user.recheck_ledger),
             Some(tick.sequence),
-            "the flag a failed decision never accounted for stays up, for the next pass"
+            "the flag a failed decision never accounted for stays up, at this tick's \
+             ledger, for a later pass"
         );
 
         // And the tracker's cursor keeps moving: a later tick, with
