@@ -370,6 +370,13 @@ pub struct ServiceConfig {
     pub oracle_scan_ledgers: u32,
     /// How far a price must move, in basis points, to be worth rechecking
     /// the borrowers exposed to it.
+    ///
+    /// Never zero: at zero, an unchanged price computes a delta of `0`,
+    /// which fails the "moved at least this much" test and falls through to
+    /// the direction branch, where `price > reference` is false on
+    /// equality — reporting a spurious `Down` and flagging every borrower
+    /// on every scan. `PRICE_DELTA_BPS=0` is refused at parse (see `Args`),
+    /// so this field is never constructed with it.
     pub price_delta_bps: u32,
     /// How many times a rejected percent is adjusted against the contract's
     /// own answer before the borrower is left until the next recheck.
@@ -530,7 +537,20 @@ pub struct Args {
 
     /// How far a price must move from its reference, in basis points, to be
     /// worth rechecking the borrowers exposed to it.
-    #[arg(long, env = "PRICE_DELTA_BPS", default_value_t = 250)]
+    ///
+    /// At least 1: at zero, an unchanged price computes a delta of `0`,
+    /// which fails the "moved at least this much" test and falls through to
+    /// the direction branch, where `price > reference` is false on
+    /// equality — reporting a spurious `Down` and flagging every borrower
+    /// on every scan, forever. Refusing it at parse time means that is a
+    /// startup error, not a bot that runs and never stops rechecking
+    /// everyone.
+    #[arg(
+        long,
+        env = "PRICE_DELTA_BPS",
+        default_value_t = 250,
+        value_parser = clap::value_parser!(u32).range(1..),
+    )]
     pub price_delta_bps: u32,
 
     /// How many times a rejected percent is adjusted against the contract's
@@ -1475,5 +1495,17 @@ supported_lot = ["*"]
     #[test]
     fn a_zero_plan_iterations_is_refused_at_parse() {
         assert!(Args::try_parse_from(["liquidator", "--plan-iterations", "0"]).is_err());
+    }
+
+    /// `PRICE_DELTA_BPS=0` is not "recheck on any move", it is "recheck on
+    /// no move at all": an unchanged price computes a delta of `0`, which
+    /// fails the "moved at least this much" test and falls through to the
+    /// direction branch, where `price > reference` is false on equality —
+    /// reporting a spurious `Down` and flagging every borrower on every
+    /// scan, forever. Refusing it at parse time means the failure is a
+    /// startup error, not that silent every-scan flood.
+    #[test]
+    fn a_zero_price_delta_bps_is_refused_at_parse() {
+        assert!(Args::try_parse_from(["liquidator", "--price-delta-bps", "0"]).is_err());
     }
 }

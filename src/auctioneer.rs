@@ -1007,7 +1007,7 @@ mod tests {
     use serde_json::{json, Value};
     use stellar_xdr::{
         ContractDataDurability, ContractDataEntry, ExtensionPoint, InvokeHostFunctionResult,
-        LedgerEntryData, LedgerKey, LedgerKeyAccount, OperationResult, OperationResultTr,
+        LedgerEntryData, LedgerKey, LedgerKeyAccount, OperationResult, OperationResultTr, ScVal,
         TransactionResultResult, VecM,
     };
 
@@ -1019,8 +1019,9 @@ mod tests {
     };
     use crate::chain::signer::{Network, Signer};
     use crate::chain::tx::TxConfig;
+    use crate::chain::xdr::decode;
     use crate::chain::xdr::encode::{
-        address, i128_val, map, sc_address, symbol, to_base64, vec as sc_vec,
+        address, from_base64, i128_val, map, sc_address, symbol, to_base64, vec as sc_vec,
     };
     use crate::chain::xdr::keys;
     use crate::fixture::{mainnet_fixed_v2, text};
@@ -1245,6 +1246,72 @@ mod tests {
                     ledger,
                 ),
             );
+        }
+    }
+
+    /// A SEP-40 `Option<PriceData>` return naming `price` and `timestamp`,
+    /// base64 encoded exactly as `simulateTransaction`'s `results[0].xdr`
+    /// carries a `lastprice` answer — see `chain::xdr::decode::price_data`.
+    /// What `script_snapshot_with_price` substitutes for one reserve's own
+    /// fixture-attested price, to move it without touching the others.
+    fn price_return_xdr(price: i128, timestamp: u64) -> String {
+        let value = map(vec![
+            (symbol("price").expect("symbol"), i128_val(price)),
+            (symbol("timestamp").expect("symbol"), ScVal::U64(timestamp)),
+        ])
+        .expect("price map");
+        to_base64(&value).expect("encodes")
+    }
+
+    /// Scripts one `PoolReader::snapshot(&[])` — no accounts, exactly what
+    /// `scan_oracle` reads — exactly as `harness::script_snapshot` does for
+    /// the shape, reserve configs and data, and the oracle's decimals,
+    /// except that `asset`'s `lastprice` answer is `price` (at `timestamp`)
+    /// rather than the fixture's own attested price. The other reserves
+    /// keep their real, unmodified prices, so a caller can move exactly one
+    /// asset and be sure nothing else moved with it.
+    fn script_snapshot_with_price(rpc: &ScriptedRpc, asset: &str, price: i128, timestamp: u64) {
+        let fixture = mainnet_fixed_v2();
+        let ledger = fixture["ledger"].as_u64().expect("ledger");
+        rpc.expect(
+            "getLedgerEntries",
+            json!({"latestLedger": ledger, "entries": [
+                entry(&keys::instance(POOL).expect("key"), text(&fixture, &["instance_entry_xdr"])),
+                entry(&keys::reserve_list(POOL).expect("key"), text(&fixture, &["res_list_entry_xdr"])),
+            ]}),
+        );
+        let mut entries = Vec::new();
+        for reserve in fixture["reserves"].as_array().expect("reserves") {
+            let reserve_asset = reserve["asset"].as_str().expect("asset");
+            entries.push(entry(
+                &keys::reserve_config(POOL, reserve_asset).expect("key"),
+                reserve["config_entry_xdr"].as_str().expect("config"),
+            ));
+            entries.push(entry(
+                &keys::reserve_data(POOL, reserve_asset).expect("key"),
+                reserve["data_entry_xdr"].as_str().expect("data"),
+            ));
+        }
+        rpc.expect(
+            "getLedgerEntries",
+            json!({"latestLedger": ledger, "entries": entries}),
+        );
+        let ledger = u32::try_from(ledger).expect("ledger fits");
+        rpc.expect(
+            "simulateTransaction",
+            simulation(text(&fixture, &["oracle_decimals_return_xdr"]), ledger),
+        );
+        for reserve in fixture["reserves"].as_array().expect("reserves") {
+            let reserve_asset = reserve["asset"].as_str().expect("asset");
+            let return_xdr = if reserve_asset == asset {
+                price_return_xdr(price, timestamp)
+            } else {
+                reserve["lastprice_return_xdr"]
+                    .as_str()
+                    .expect("price")
+                    .to_string()
+            };
+            rpc.expect("simulateTransaction", simulation(&return_xdr, ledger));
         }
     }
 
@@ -2515,6 +2582,167 @@ mod tests {
             rpc.calls("simulateTransaction").len(),
             1,
             "and no second attempt at a percent of zero"
+        );
+        Ok(())
+    }
+
+    /// The pin for `scan_oracle`'s own glue: the `Direction` → `Side`
+    /// mapping, the moved asset's reserve index from the snapshot's
+    /// `asset_index`, and the flag-every-exposed-borrower loop. Neither
+    /// `PriceWatch::moved` nor `Store::users_exposed_to` is exercised in
+    /// isolation here — both already have their own tests — only the join
+    /// between them.
+    ///
+    /// A borrower holding the fixture's first reserve as a liability and a
+    /// second borrower holding that very same reserve as collateral are
+    /// seeded. A price rise must flag only the liability holder — a
+    /// liability priced in a rising asset is what hurts a borrower — and a
+    /// price fall, from the risen reference `moved` re-anchors to, must
+    /// flag only the collateral holder. Asserting a bare "someone was
+    /// flagged" would still pass with `Direction::Up`/`Direction::Down`
+    /// swapped in the mapping, since exactly one row is exposed on either
+    /// side query; only naming which account moved, and which did not,
+    /// catches that.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn scan_oracle_flags_the_side_a_price_move_went_against(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let auctioneer = Auctioneer::new(&client, &store, config(BTreeSet::new()), None);
+
+        let fixture = mainnet_fixed_v2();
+        let asset = fixture["reserves"][0]["asset"]
+            .as_str()
+            .expect("asset")
+            .to_string();
+        // `chain::xdr::decode`'s own `decodes_a_reserve_config_and_data`
+        // test decodes this same fixture reserve's config to index 0.
+        let index = 0_u32;
+        let original_price: ScVal = from_base64(
+            fixture["reserves"][0]["lastprice_return_xdr"]
+                .as_str()
+                .expect("price"),
+        )
+        .expect("decode");
+        let original = decode::price_data(&original_price)
+            .expect("price_data")
+            .expect("the fixture's reserve is priced");
+
+        let liability_holder = synthetic_account(201);
+        let collateral_holder = synthetic_account(202);
+        store
+            .upsert_user(&TrackedUser {
+                pool: POOL.to_string(),
+                account: liability_holder.clone(),
+                health_factor: 0,
+                collateral: BTreeMap::new(),
+                liabilities: BTreeMap::from([(index, 1_000_000_000)]),
+                updated_ledger: 0,
+                recheck_ledger: None,
+            })
+            .await
+            .expect("seed the liability holder");
+        store
+            .upsert_user(&TrackedUser {
+                pool: POOL.to_string(),
+                account: collateral_holder.clone(),
+                health_factor: 0,
+                collateral: BTreeMap::from([(index, 1_000_000_000)]),
+                liabilities: BTreeMap::new(),
+                updated_ledger: 0,
+                recheck_ledger: None,
+            })
+            .await
+            .expect("seed the collateral holder");
+
+        let mut watch = PriceWatch::new(250, u64::MAX);
+        let base = harness::fixture_tick();
+
+        // The first read only seeds the reference: nothing has moved yet,
+        // so nobody is flagged.
+        harness::script_snapshot(&rpc, &[]);
+        let seeded = auctioneer
+            .scan_oracle(POOL, &mut watch, base, 10)
+            .await
+            .expect("seeding scan");
+        assert_eq!(seeded, 0, "the first read only seeds the reference");
+
+        // The asset rises 20%, well past the 250 bps threshold: a
+        // liability priced in it grew, so `Direction::Up` must map to
+        // `Side::Liability`.
+        let risen = original.price + original.price / 5;
+        let up_tick = LedgerTick {
+            sequence: base.sequence + 1,
+            close_time: base.close_time + 1,
+        };
+        script_snapshot_with_price(&rpc, &asset, risen, original.timestamp);
+        let flagged_up = auctioneer
+            .scan_oracle(POOL, &mut watch, up_tick, 10)
+            .await
+            .expect("rising scan");
+        assert_eq!(
+            flagged_up, 1,
+            "exactly one borrower is exposed on either side of this reserve"
+        );
+        let liability_row = store
+            .user(POOL, &liability_holder)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(
+            liability_row.recheck_ledger,
+            Some(up_tick.sequence),
+            "the liability holder is flagged when the asset's price rises"
+        );
+        let collateral_row = store
+            .user(POOL, &collateral_holder)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(
+            collateral_row.recheck_ledger, None,
+            "a price rise must not flag the collateral holder — that move helped them"
+        );
+
+        // From the risen reference, the asset falls 20%: collateral priced
+        // in it shrank, so `Direction::Down` must map to
+        // `Side::Collateral`.
+        let fallen = risen - risen / 5;
+        let down_tick = LedgerTick {
+            sequence: base.sequence + 2,
+            close_time: base.close_time + 2,
+        };
+        script_snapshot_with_price(&rpc, &asset, fallen, original.timestamp);
+        let flagged_down = auctioneer
+            .scan_oracle(POOL, &mut watch, down_tick, 10)
+            .await
+            .expect("falling scan");
+        assert_eq!(
+            flagged_down, 1,
+            "exactly one borrower is exposed on either side of this reserve"
+        );
+        let collateral_row = store
+            .user(POOL, &collateral_holder)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(
+            collateral_row.recheck_ledger,
+            Some(down_tick.sequence),
+            "the collateral holder is flagged when the asset's price falls"
+        );
+        let liability_row = store
+            .user(POOL, &liability_holder)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(
+            liability_row.recheck_ledger,
+            Some(up_tick.sequence),
+            "the fall must not re-flag the liability holder — that move helped them, so \
+             its recheck flag stays exactly where the earlier rise left it"
         );
         Ok(())
     }
