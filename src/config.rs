@@ -387,8 +387,8 @@ pub struct ServiceConfig {
     /// does nothing. `PLAN_ITERATIONS=0` is refused at parse (see `Args`),
     /// so this field is never constructed with it.
     pub plan_iterations: u32,
-    /// Ledger ticks to wait after startup before any submission is
-    /// attempted.
+    /// A count of ledgers, measured from the first ledger the auctioneer
+    /// sees, before any submission is attempted.
     pub startup_delay_ledgers: u32,
     /// Seeding.
     pub seed: SeedConfig,
@@ -568,8 +568,8 @@ pub struct Args {
     )]
     pub plan_iterations: u32,
 
-    /// Ledger ticks to wait after startup before any submission is
-    /// attempted.
+    /// A count of ledgers, measured from the first ledger the auctioneer
+    /// sees, before any submission is attempted.
     ///
     /// Zero by default, so a fresh deployment submits as soon as it is
     /// ready. A nonzero value gives a poller that is catching up on a

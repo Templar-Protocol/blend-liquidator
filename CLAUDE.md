@@ -6,16 +6,22 @@ A liquidation bot for [Blend Protocol](https://blend.capital) lending pools on
 Stellar. It is intended to repay the debt of underwater positions and receive
 their collateral at a discount.
 
-**Status: Phase 3.** Phase 1 landed the pure fixed-point math (`math`) and
+**Status: Phase 4.** Phase 1 landed the pure fixed-point math (`math`) and
 the ScVal/ledger-entry codecs (`chain::xdr`); Phase 2 landed the chain layer
 (`chain::rpc`, `chain::pool`, `chain::signer`, `chain::tx`); Phase 3 landed
 the Postgres store, a per-pool ledger poller and a tracker (`store`,
-`ledger`, `tracker`, `service`), so the binary now validates its
-configuration, seeds its tracked-user set from the analytics API or a static
-file, and follows every configured pool — applying events and refreshing
-borrowers' health factors from chain — until it is shut down. It still
-creates no auctions and fills nothing: no signer is wired into `service`
-yet. The repository scaffolding is complete and enforced.
+`ledger`, `tracker`, `service`), so the binary validates its configuration,
+seeds its tracked-user set from the analytics API or a static file, and
+follows every configured pool — applying events and refreshing borrowers'
+health factors from chain — until it is shut down. Phase 4 landed the
+auctioneer (`auctioneer`, `queue`, `math::liquidation`): once a tick, it
+decides which tracked borrowers are liquidatable or owe bad debt, builds
+the auction the contract should accept, lets the contract judge the percent
+through simulation, records every decision — dry-run or not — and, only
+when a signing key is configured and `DRY_RUN=false`, submits it through a
+per-key queue. It still fills no auction: nothing pays a bid or takes a
+lot yet, and no signer is wired in for anything but creating auctions. That
+is Phase 5. The repository scaffolding is complete and enforced.
 
 **This bot is NOT non-custodial.** It is designed to hold a signing key and
 submit transactions itself — that is the point of a liquidation bot. Treat
@@ -39,11 +45,20 @@ make help                           # Docker Compose lifecycle
 - `src/liquidator.rs` — library root: crate-level docs and the error taxonomy
   (`LiquidatorError`).
 - `src/config.rs` — CLI and environment configuration (`Args`, `clap`),
-  including the strict boolean parser behind `DRY_RUN`.
+  including the strict boolean parser behind `DRY_RUN`. The auctioneer's
+  thresholds and cadence are here too: `LIQ_HF_THRESHOLD`, `TARGET_HF`,
+  `ORACLE_SCAN_LEDGERS`, `PRICE_DELTA_BPS`, `PLAN_ITERATIONS` and
+  `STARTUP_DELAY_LEDGERS` are ordinary `clap` arguments, but its signing
+  key, `AUCTIONEER_SECRET_KEY`, is read from the environment only by
+  `Args::auctioneer_signer` and is never a clap field — like every other
+  secret, because argv is world-readable.
 - `src/main.rs` — binary entry point: tracing setup, argument parsing, exit.
 - `src/math/` — the pure port of the pool contract's arithmetic: `fixed`
   (checked rounding), `reserve` (accrual and token conversions), `position`
-  (effective values and health factor), `auction` (Dutch-auction scaling).
+  (effective values and health factor), `auction` (Dutch-auction scaling),
+  `liquidation` (which auction to create — `plan_liquidation` selects the
+  bid and lot assets and the percent that closes a borrower's excess down
+  to `TARGET_HF`, walking in more assets when the selection cannot).
   Nothing here does I/O and nothing panics.
 - `src/chain/xdr/` — ScVal codecs for the pool: `encode` (values, operations,
   simulation envelopes), `keys` (ledger keys, durability included), `decode`
@@ -87,6 +102,30 @@ make help                           # Docker Compose lifecycle
   (`AnalyticsSeed`) or a static file (`FileSeed`) — deduplicates them,
   refreshes them in batches, and reports how many sources failed so an
   incomplete seed is retried on the next full scan.
+- `src/queue.rs` — `SubmissionQueue`: one ordered queue per signing key.
+  A Soroban transaction is built against its source account's sequence
+  number at prepare time, so two tasks preparing for the same key
+  concurrently would race to consume it; one queue per key makes that
+  unreachable rather than merely recoverable. It owns ordering only — what
+  to submit, at what fee priority, and what a failure means are the
+  caller's (`Auctioneer::act` today; Phase 5's filler will hold a second
+  queue for its own key).
+- `src/auctioneer.rs` — the auctioneer. `Auctioneer::decide` reads one
+  snapshot per batch of tracked users, values each at the tick's own close
+  time — the same instant the tracker valued them at — and answers with a
+  `Decision` per user: liquidate (a `LiquidationPlan`), move to bad debt, or
+  skip with a `SkipReason` (healthy, an auction already open, no plan
+  closes the excess, the bot's own account, or no liabilities left).
+  `decide` needs no signer at all. `Auctioneer::act` turns a decision into
+  an operation, lets the contract judge it by simulating through
+  `Submitter::simulate_only` and adjusting the percent against
+  `InvalidLiqTooLarge`/`InvalidLiqTooSmall` up to `PLAN_ITERATIONS` times,
+  records the creation — dry-run or not — before it submits anything, and
+  submits through a `SubmissionQueue` only when one is given.
+  `Auctioneer::scan_oracle` is a third, narrower path that decides nothing:
+  it compares a pool's current prices against a remembered reference and
+  flags the borrowers exposed to whichever asset moved past
+  `PRICE_DELTA_BPS`, for the ordinary recheck path to decide about them.
 - `src/service.rs` — wiring: `Service::check_config` validates the
   configuration against the chain *and* the database (connect and ping, per
   the spec's deployment contract) and reports without following anything;
@@ -96,14 +135,24 @@ make help                           # Docker Compose lifecycle
   channel until a shutdown signal arrives and every task has returned. The
   tracker loop treats a `TrackerError::Store` as fatal and a `Chain` or
   `Math` one as transient — it declines the tick, and the same range is read
-  again.
+  again. Once a tick, the same task also runs the auctioneer: it fires the
+  oracle-scan and full-scan-and-flag cadences when due, then decides and
+  acts on every pool's currently flagged users, gating whether the
+  submission queue is even offered to `Auctioneer::act` on
+  `STARTUP_DELAY_LEDGERS` having elapsed since the first ledger this task
+  saw.
 - `src/harness.rs` (`cfg(test)`) — scripted-RPC and store scaffolding shared
   by the store, ledger and tracker tests: the fixture's pool, its two
   borrowers, and the golden health factors `chain::xdr::decode`'s test
   derives from the same contract-attested inputs.
 - `migrations/` — the store's schema, embedded in the binary and applied by
-  `Store::migrate`. The `sqlx::query!` macros in `src/store.rs` are checked
-  against it at compile time; see the query-macro gotcha below.
+  `Store::migrate`: `0001` is the initial schema (cursors, `users`,
+  `auctions`); `0002` adds the `creations` audit table (every auctioneer
+  submission, the ones dry-run only simulated included) and the
+  `users.recheck_ledger` flag with its partial index, the queue
+  `Store::users_needing_recheck` reads oldest-flag-first. The
+  `sqlx::query!` macros in `src/store.rs` are checked against it at compile
+  time; see the query-macro gotcha below.
 - `examples/pool_snapshot.rs` — prints a live pool's reserves and users'
   health factors.
 - `examples/capture_fixture.rs` — refreshes `tests/fixtures/` from a live
@@ -111,8 +160,8 @@ make help                           # Docker Compose lifecycle
 
 The module layout beyond this follows
 `docs/superpowers/specs/2026-09-04-blend-liquidator-bot-design.md`; the
-phases still to land are the auctioneer, the filler and executor, unwind,
-and the rest of the operational surface.
+phases still to land are the filler and executor, unwind, and the rest of
+the operational surface.
 
 ## Conventions
 
@@ -247,6 +296,38 @@ and the rest of the operational surface.
   through the environment, never through a committed file. Nothing there
   percent-encodes `POSTGRES_PASSWORD` either, so a password containing
   `@`, `:` or `/` produces a malformed URL.
+- `Submitter::prepare` **signs unconditionally**, and when a simulation
+  reports an archived footprint it signs and sends a `RestoreFootprint`
+  transaction of its own before it ever returns — simulating *through*
+  `prepare` is a submission. `Submitter::simulate_only` is the only path
+  that builds unsigned, never restores and never calls `sendTransaction`,
+  which is what makes it the one a dry-run — or anything judging a
+  candidate before committing to it — may call. This was a Critical in
+  Phase 4: `Auctioneer::act`'s percent-adjustment loop must simulate
+  through `simulate_only`, never `prepare`, or a dry-run signs and spends a
+  restore's sequence number while claiming to have done nothing.
+- The contract's own auction bounds, which `Auctioneer::act` adjusts the
+  percent against rather than predicting: a post-liquidation health factor
+  at or above `1_1500000` is `InvalidLiqTooLarge` (error code `1213`), and
+  below `1_0300000` is `InvalidLiqTooSmall` (`1214`, raised only for a
+  partial liquidation). `TARGET_HF`'s default of `1.06` sits between them
+  with room for a ledger or two of drift before the auction is filled.
+- `PoolSnapshot::position_data` accrues a **clone** of `self.reserves`
+  before valuing a position, so `snapshot.reserves` itself is never
+  accrued and stays exactly as read. Anything that values positions
+  alongside a snapshot — the auctioneer included — must accrue to the same
+  close time `position_data` used, or the two describe different ledgers
+  and their numbers will not agree.
+- A borrower's `recheck_ledger` flag must be **moved forward**, never left
+  alone, when a pass cannot decide or act on it — re-raised at the current
+  tick's ledger (or the flag's own, if that is already newer).
+  `Store::users_needing_recheck` orders `recheck_ledger ASC, account ASC`,
+  so an untouched flag stays the oldest in its pool and comes back at the
+  head of every following batch: one borrower nothing can decide (an
+  oracle that stops pricing a reserve breaks `position_data` for everyone
+  holding it) would otherwise starve every other borrower behind it,
+  forever. This was Phase 4's second Critical; see `recheck_batch` and
+  `move_flag_forward` in `src/service.rs`.
 
 ## Workflow
 

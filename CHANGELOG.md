@@ -9,6 +9,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The auctioneer (`src/auctioneer.rs`, `Auctioneer`): `decide` reads one
+  snapshot per batch of tracked users, values each at the tick's own close
+  time — the instant the tracker already valued them at, so the decision
+  and the stored health factor cannot disagree — and answers with a
+  `Decision` per user: liquidate (via the new `math::liquidation`'s
+  `plan_liquidation`, which selects the auction's bid and lot assets and
+  the percent that closes the borrower's excess down to `TARGET_HF`,
+  walking in more assets when the current selection cannot), move to bad
+  debt, or skip with a named `SkipReason` (healthy, an auction already
+  open, no plan closes the excess, the bot's own account, or no
+  liabilities left). `decide` needs no signer at all. `act` turns a
+  decision into an operation, lets the contract judge it by simulating
+  unsigned through `Submitter::simulate_only` — never `prepare`, which
+  signs unconditionally and, on an archived footprint, signs and sends a
+  restore transaction of its own — adjusting the percent against the
+  contract's own `InvalidLiqTooLarge`/`InvalidLiqTooSmall` refusals up to
+  `PLAN_ITERATIONS` times, records every creation (the ones dry-run only
+  simulated included) before it submits anything, and submits through a
+  `SubmissionQueue` only when one is configured. `scan_oracle` is a third
+  path that decides nothing itself: it compares a pool's current prices
+  against a remembered reference and, via `Store::flag_recheck`, flags the
+  borrowers exposed to whichever asset moved past `PRICE_DELTA_BPS` for
+  the ordinary recheck path to decide about.
+- `src/queue.rs`'s `SubmissionQueue`: one ordered queue per signing key, so
+  two tasks preparing a transaction for the same key cannot race to spend
+  its sequence number and produce an unrecoverable `BadSequence` — Phase
+  5's filler will hold a second queue for its own key.
+- `RUN_MODE=loop` now runs the auctioneer off the same tick the tracker
+  already runs on: once per tick it fires the oracle-scan
+  (`ORACLE_SCAN_LEDGERS`) and full-scan-and-flag (`FULL_SCAN_LEDGERS`,
+  reusing `SCAN_HF_THRESHOLD`) cadences when due, then decides and acts on
+  every pool's currently flagged users. A borrower a pass cannot decide or
+  act on has its recheck flag moved forward — re-raised at the current
+  tick's ledger, never left where it was — so one borrower nothing can
+  decide (an unpriced reserve breaks every position holding it at once)
+  cannot starve the rest of the queue behind it, which
+  `Store::users_needing_recheck` orders oldest-flag-first. No submission
+  is attempted until `STARTUP_DELAY_LEDGERS` ledgers have elapsed since the
+  first ledger the auctioneer observed, dry-run or armed alike.
+- New knobs: `LIQ_HF_THRESHOLD` (the health factor at or below which a
+  borrower is liquidatable — below the contract's own strict `1.0` test,
+  so the margin absorbs rounding and the interest accrued between planning
+  and execution), `TARGET_HF` (the health factor a liquidation aims to
+  leave the borrower at, between the contract's
+  `InvalidLiqTooLarge`/`InvalidLiqTooSmall` bounds of `1.15`/`1.03`),
+  `ORACLE_SCAN_LEDGERS`, `PRICE_DELTA_BPS` and `PLAN_ITERATIONS` (both
+  refused at zero rather than clamped — a zero price delta flags every
+  borrower on every scan forever, and zero plan iterations would simulate
+  nothing and skip every liquidation silently), and
+  `STARTUP_DELAY_LEDGERS` (a count of ledgers from the first the
+  auctioneer sees, before which no submission is attempted).
+  `AUCTIONEER_SECRET_KEY` — falling back to `FILLER_SECRET_KEY` — is the
+  auctioneer's signing key, read from the environment only like every
+  other secret; with neither set the auctioneer still decides and records,
+  it just never signs, which is the ordinary dry-run deployment and not an
+  error.
+- Migration `0002`: a `creations` table auditing every auctioneer
+  submission (the ones dry-run only simulated included, with a `tx_hash`
+  only once one was actually sent), and a durable `users.recheck_ledger`
+  flag — with a partial index — that the auctioneer's recheck queue reads
+  oldest-flag-first.
+- The bot still fills no auction of its own or anyone else's: nothing pays
+  a bid or takes a lot yet. That is Phase 5's filler and executor.
 - The Postgres store (`src/store.rs`): cursors per polling task, tracked
   borrowers (`users`, one row while an account owes something, deleted the
   moment it does not) and open auctions (`auctions`), migrated by embedded,
