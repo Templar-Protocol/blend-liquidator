@@ -492,8 +492,13 @@ impl Store {
     }
 
     /// Flags `account` for an auctioneer decision, recording the ledger the
-    /// flag was raised at. Raising a flag that is already up moves it
-    /// forward: the newest reason to look is the one worth recording.
+    /// flag was raised at. The column only ever moves forward: `GREATEST`
+    /// takes the higher of the stored value and `ledger` (and, since
+    /// `GREATEST` ignores nulls, raises an unflagged row — where
+    /// `recheck_ledger` is `NULL` — straight to `ledger`), so a caller
+    /// racing an independently scheduled task can never lower a flag the
+    /// other one just raised, regardless of which call reaches the row
+    /// last.
     pub async fn flag_recheck(
         &self,
         pool: &str,
@@ -501,7 +506,8 @@ impl Store {
         ledger: u32,
     ) -> Result<(), StoreError> {
         sqlx::query!(
-            "UPDATE users SET recheck_ledger = $3 WHERE pool = $1 AND account = $2",
+            "UPDATE users SET recheck_ledger = GREATEST(recheck_ledger, $3)
+             WHERE pool = $1 AND account = $2",
             pool,
             account,
             i64::from(ledger),
@@ -1529,6 +1535,77 @@ mod tests {
             .await
             .expect("read")
             .is_empty());
+        Ok(())
+    }
+
+    /// `flag_recheck` only ever moves the column forward: a later call with
+    /// a *lower* ledger than what is already stored must not move it back.
+    /// This is the one place the invariant `move_flag_forward` in
+    /// `service.rs` relies on actually lives — pinning it here catches a
+    /// regression to a plain assignment, which the durability test above
+    /// would not, since that test only ever raises. `GREATEST` ignoring a
+    /// `NULL` argument is the other half a reader will doubt, so this also
+    /// checks that flagging a never-flagged row still raises it.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn flag_recheck_never_lowers_the_stored_ledger(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        store
+            .upsert_user(&TrackedUser {
+                pool: POOL.to_string(),
+                account: USER.to_string(),
+                health_factor: 9_000_000,
+                collateral: BTreeMap::new(),
+                liabilities: BTreeMap::from([(0, 1)]),
+                updated_ledger: 10,
+                recheck_ledger: None,
+            })
+            .await
+            .expect("upsert");
+
+        // Raising a flag on a never-flagged row (recheck_ledger IS NULL)
+        // still sets it, because GREATEST ignores a null argument.
+        store.flag_recheck(POOL, USER, 100).await.expect("raise");
+        assert_eq!(
+            store
+                .user(POOL, USER)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            Some(100),
+            "GREATEST(NULL, 100) must raise the flag, not stay null"
+        );
+
+        // A stale writer (e.g. this pass's own belt-and-braces re-flag)
+        // calls in with a ledger older than one a concurrent task already
+        // stored. The stored value must not move backwards.
+        store
+            .flag_recheck(POOL, USER, 50)
+            .await
+            .expect("stale write");
+        assert_eq!(
+            store
+                .user(POOL, USER)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            Some(100),
+            "a lower ledger must never overwrite a higher stored flag"
+        );
+
+        // A genuinely newer flag still moves it forward.
+        store
+            .flag_recheck(POOL, USER, 150)
+            .await
+            .expect("newer write");
+        assert_eq!(
+            store
+                .user(POOL, USER)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            Some(150),
+            "a higher ledger still moves the flag forward"
+        );
         Ok(())
     }
 

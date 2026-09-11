@@ -987,13 +987,19 @@ async fn recheck_batch(
 /// pass instead of holding the oldest flag in its pool — see
 /// [`recheck_batch`]'s doc for why that ordering is the whole point.
 ///
-/// `flagged_at` is the ledger the batch read the flag at. When it is
-/// newer than `tick` — the auctioneer runs behind the tracker, so a pool
-/// can have flagged a borrower at a ledger this pass has not been told
-/// about yet — it is kept, because writing `tick`'s older ledger would
-/// move the row *towards* the head of the queue, which is the direction
-/// this exists to prevent. Taking the later of the two also means this
-/// never lowers a flag another task raised.
+/// `flagged_at` is the ledger the batch read the flag at, fixed before
+/// `decide` and `act` ran. When it is newer than `tick` — the auctioneer
+/// runs behind the tracker, so a pool can have flagged a borrower at a
+/// ledger this pass has not been told about yet — it is kept, because
+/// writing `tick`'s older ledger would move the row *towards* the head of
+/// the queue, which is the direction this exists to prevent. Taking the
+/// later of the two here is belt-and-braces, not the guarantee: `act` can
+/// span several real ledger closes, so by the time this runs the
+/// independently scheduled tracker may already have flagged the same
+/// account at a ledger newer than both `flagged_at` and `tick`. It is
+/// [`Store::flag_recheck`] — the only place that writes the column — that
+/// actually makes the flag monotonic, by taking the `GREATEST` of the
+/// stored value and what is written here.
 async fn move_flag_forward(
     store: &Store,
     pool: &str,

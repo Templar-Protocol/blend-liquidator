@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE users SET recheck_ledger = GREATEST(recheck_ledger, $3)\n             WHERE pool = $1 AND account = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7467ad4371b78814d25219057a3d57dd945aa216a9582a60eee4a035d4acf099"
+}
