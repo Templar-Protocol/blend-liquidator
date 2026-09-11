@@ -472,9 +472,12 @@ async fn handle_message(
                 let _ = ack.send(());
                 // Published only now: the auctioneer's whole input is
                 // downstream of "this ledger's effects are in the store",
-                // never upstream of it. A dropped receiver (no auctioneer
-                // configured, or it has already exited) is not an error —
-                // the tracker does not care whether anyone is listening.
+                // never upstream of it. A dropped receiver — the
+                // auctioneer task has exited, or this is a test driving
+                // `handle_message` with no receiver held — is not an
+                // error: the tracker never waits on anyone listening.
+                // "No auctioneer configured" is not one of the cases:
+                // `Service::run` spawns it unconditionally.
                 let _ = tick_tx.send(tick);
             }
         }
@@ -726,11 +729,15 @@ async fn tracker_loop(
 /// the reference price after a day without a significant move").
 const PRICE_REFERENCE_STALE_AFTER_SECS: u64 = 86_400;
 
-/// The submission queue's backlog bound. `run_queue` still sends one
-/// submission at a time regardless of this: it only bounds how many
-/// decided creations may wait for their turn before `enqueue` applies
-/// backpressure to the auctioneer loop that calls it — comfortably above
-/// one full recheck batch, so an ordinary pass never blocks on it.
+/// The submission queue's backlog bound. It bounds how many decided
+/// creations may wait for their turn before `enqueue` applies
+/// backpressure to the auctioneer loop that calls it. An ordinary pass
+/// never reaches the bound whatever `REFRESH_BATCH` is set to — not
+/// because 64 is larger than a batch (it need not be), but because
+/// `SubmissionQueue::enqueue` awaits its own outcome before
+/// [`recheck_batch`] moves to the next borrower, so this bot never has
+/// more than one creation in flight. The slack is for a future caller
+/// that enqueues without awaiting, not for a batch.
 const SUBMISSION_QUEUE_CAPACITY: usize = 64;
 
 /// Timings and thresholds the auctioneer task reads every tick, bundled
@@ -791,16 +798,27 @@ fn auctioneer_cadence_from(config: &ServiceConfig) -> AuctioneerCadence {
 /// reading one page: a borrower who only shows up on the second page is
 /// exactly the one a single-page scan would miss, and it is the one this
 /// scan exists to catch.
+///
+/// `shutdown` is observed between pages, never inside one: a pool with
+/// thousands of borrowers below the threshold would otherwise page and
+/// flag every one of them before the next shutdown check, and a flag is
+/// worth nothing to a process that is exiting. Stopping early is safe
+/// because the scan is a safety net, not a ledger effect — the next
+/// process's own full scan flags whatever this one did not reach.
 async fn full_scan_and_flag(
     store: &Store,
     pool: &str,
     threshold: i128,
     ledger: u32,
     page_limit: i64,
+    shutdown: &watch::Receiver<bool>,
 ) -> Result<usize, StoreError> {
     let mut flagged = 0_usize;
     let mut after: Option<(i128, String)> = None;
     loop {
+        if *shutdown.borrow() {
+            return Ok(flagged);
+        }
         let page = store
             .users_below_health(
                 pool,
@@ -833,8 +851,10 @@ async fn full_scan_and_flag(
 /// A per-borrower failure — a borrower [`Auctioneer::decide`] left out of
 /// its result, or one whose [`Auctioneer::act`] returned anything but a
 /// store error — is logged with the account and keeps its flag, and that
-/// flag is **moved forward** to this tick's ledger rather than left where
-/// it was. Leaving it where it was is what starves a pool:
+/// flag is **moved forward**: re-raised at this tick's ledger, or left at
+/// the batch's own if that is the newer of the two (the exact rule, and
+/// why, are in [`move_flag_forward`]). Leaving it where it was is what
+/// starves a pool:
 /// [`Store::users_needing_recheck`] orders `recheck_ledger ASC, account
 /// ASC`, so an untouched flag is the oldest in its pool and comes back at
 /// the head of every following batch. A borrower nothing can decide is
@@ -1123,6 +1143,7 @@ async fn auctioneer_tick(
                 ctx.cadence.scan_health_factor,
                 tick.sequence,
                 i64::from(ctx.cadence.refresh_batch),
+                ctx.shutdown,
             )
             .await
             {
@@ -3590,7 +3611,8 @@ mod tests {
         // A page size of 1 forces every one of the four qualifying users
         // onto its own page: a scan that flagged only the first page would
         // miss three of the four.
-        let flagged = full_scan_and_flag(&store, harness::POOL, 5_000_000, 999, 1)
+        let (flag, shutdown) = watch::channel(false);
+        let flagged = full_scan_and_flag(&store, harness::POOL, 5_000_000, 999, 1, &shutdown)
             .await
             .expect("full scan");
         assert_eq!(flagged, 4);
@@ -3615,6 +3637,37 @@ mod tests {
             None,
             "a user at or above the threshold is never flagged"
         );
+
+        // Shutdown is observed between pages, so a pool with thousands of
+        // borrowers below the threshold stops where it is rather than
+        // paging through all of them first. With the flag already up the
+        // scan does nothing at all: the check is at the head of the loop,
+        // which is the same check every later page passes through.
+        for account in ["A", "B", "C", "D"] {
+            assert!(
+                store
+                    .clear_recheck(harness::POOL, account, 999)
+                    .await
+                    .expect("clear"),
+                "the flag this scan raised is cleared before the next one"
+            );
+        }
+        flag.send(true).expect("shut down");
+        let flagged = full_scan_and_flag(&store, harness::POOL, 5_000_000, 1_000, 1, &shutdown)
+            .await
+            .expect("full scan under shutdown");
+        assert_eq!(flagged, 0, "a scan under shutdown flags nothing");
+        for account in ["A", "B", "C", "D"] {
+            assert_eq!(
+                store
+                    .user(harness::POOL, account)
+                    .await
+                    .expect("read")
+                    .and_then(|user| user.recheck_ledger),
+                None,
+                "{account} was not flagged by a scan that stopped for shutdown"
+            );
+        }
         Ok(())
     }
 
