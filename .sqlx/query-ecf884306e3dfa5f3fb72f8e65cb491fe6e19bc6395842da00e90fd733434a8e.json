@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO fills (pool, account, auction_type, fill_ledger, percent, bid, lot,\n                                 bid_value, lot_value, est_profit, dry_run)\n             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::numeric, $9::text::numeric,\n                     $10::text::numeric, $11)\n             RETURNING id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "fills",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int2",
+        "Int8",
+        "Int2",
+        "Jsonb",
+        "Jsonb",
+        "Text",
+        "Text",
+        "Text",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ecf884306e3dfa5f3fb72f8e65cb491fe6e19bc6395842da00e90fd733434a8e"
+}
