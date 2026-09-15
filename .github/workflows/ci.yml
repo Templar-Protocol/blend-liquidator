@@ -58,9 +58,11 @@ jobs:
           context: .
           push: false
 
-  # The three-way Rust version pin, which no compiler or linter catches on its
-  # own: it fails by having CI and Docker accept syntax the declared MSRV does
-  # not support, so everything is green until someone builds on the minimum.
+  # The cross-file pins no compiler or linter catches on its own. The three-way
+  # Rust version pin fails by having CI and Docker accept syntax the declared
+  # MSRV does not support, so everything is green until someone builds on the
+  # minimum; a second stellar-strkey in Cargo.lock compiles cleanly and
+  # cargo-deny allows it.
   # Runnable locally: ./scripts/check-repo-invariants.sh
   invariants:
     runs-on: ubuntu-latest

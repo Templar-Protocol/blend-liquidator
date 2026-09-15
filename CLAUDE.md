@@ -214,6 +214,13 @@ and the rest of the operational surface.
   and 0.13's `rustls` feature goes through `aws-lc-rs` (OpenSSL licence);
   neither is in `deny.toml`, and adding them there is a licence decision,
   not a build fix.
+- `stellar-strkey` moves only with `stellar-xdr`. The bot depends on it
+  directly just to decode an `S…` secret, at the version `stellar-xdr`
+  itself depends on — a `0.0.x` requirement, which cargo reads as that
+  exact patch — so any other version is a second copy, not an upgrade.
+  Dependabot ignores it for that reason, and `scripts/check-repo-invariants.sh`
+  fails while `Cargo.lock` holds two: when a `stellar-xdr` bump moves its
+  copy, bump this one in the same PR.
 - `getLedgerEntries` omits absent keys rather than returning nulls, so a
   lookup must go by key, never by position, and "the RPC returned fewer
   entries than keys" is the normal shape of "some of these do not exist".
