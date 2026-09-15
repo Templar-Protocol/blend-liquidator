@@ -90,6 +90,9 @@ pub fn fill_delay(
         0
     } else if lot_raw == 0 {
         RAMP_END_BLOCKS
+    // Unchecked in I256: lot_raw, bid_raw <= i128::MAX (~1.7e38) and margin
+    // <= BPS + u32::MAX (~4.3e9), so the larger product here is at most
+    // ~7.3e47 — far short of I256::MAX (~5.8e76).
     } else if I256::from(lot_raw) * I256::from(BPS) >= I256::from(bid_raw) * I256::from(margin) {
         // Lot ramp: the smallest d with lot · d / 200 ≥ bid · margin / BPS.
         let denominator = lot_raw.checked_mul(BPS).ok_or(MathError::Overflow)?;
@@ -121,6 +124,10 @@ pub fn fill_delay(
 #[must_use]
 pub fn meets_margin(delay: u32, lot_raw: i128, bid_raw: i128, profit_bps: u32) -> bool {
     let margin = I256::from(BPS) + I256::from(profit_bps);
+    // Unchecked in I256: lot_raw, bid_raw <= i128::MAX (~1.7e38), the
+    // modifiers <= SCALAR_7 (1e7), and margin <= BPS + u32::MAX (~4.3e9),
+    // so the larger product here is at most ~7.3e54 — far short of
+    // I256::MAX (~5.8e76).
     I256::from(lot_raw) * I256::from(lot_modifier(delay)) * I256::from(BPS)
         >= I256::from(bid_raw) * I256::from(bid_modifier(delay)) * margin
 }
