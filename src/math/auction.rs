@@ -13,9 +13,9 @@ use super::fixed::{mul_ceil, mul_floor, MathError, SCALAR_7};
 /// Half a percent at 7 decimals: the per-block step of both ramps.
 const PER_BLOCK_SCALAR: i128 = 50_000;
 /// The block at which the lot ramp ends and the bid ramp begins.
-const RAMP_BLOCKS: u32 = 200;
+pub const RAMP_BLOCKS: u32 = 200;
 /// The block at which the bid ramp ends and the fill is free.
-const RAMP_END_BLOCKS: u32 = 400;
+pub const RAMP_END_BLOCKS: u32 = 400;
 
 /// An auction as the contract stores it: what the filler pays (`bid`), what
 /// it receives (`lot`), and the block the auction began on. Amounts are
