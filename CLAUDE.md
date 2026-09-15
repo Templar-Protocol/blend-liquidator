@@ -127,7 +127,8 @@ make help                           # Docker Compose lifecycle
   `Submitter::simulate_only` and adjusting the percent against
   `InvalidLiqTooLarge`/`InvalidLiqTooSmall` up to `PLAN_ITERATIONS` times,
   records the creation — dry-run or not — before it submits anything, and
-  submits through a `SubmissionQueue` only when one is given.
+  submits through a `SubmissionQueue` only when one is given — and refuses
+  one in dry-run, or without a signer, before anything is simulated.
   `Auctioneer::scan_oracle` is a third, narrower path that decides nothing:
   it compares a pool's current prices against a remembered reference and
   flags **every** borrower exposed to whichever asset moved past
@@ -347,7 +348,8 @@ the operational surface.
   and their numbers will not agree.
 - A borrower's `recheck_ledger` flag must be **moved forward**, never left
   alone, when a pass cannot decide or act on it — or when its submission
-  failed, expired or was lost on chain — re-raised one ledger *past* the
+  failed, expired or was lost on chain, or an armed pass recorded it but
+  held it back (the startup delay, or no key) — re-raised one ledger *past* the
   current tick's (or at the flag's own, if that is already newer). One past,
   not at: the tracker raises flags at the very tick the pass runs on, so
   re-raising at the tick would leave the row exactly where it was.

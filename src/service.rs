@@ -973,14 +973,15 @@ async fn recheck_batch(
         undecided.remove(account.as_str());
     }
     for account in undecided {
+        let retry_at =
+            move_flag_forward(store, pool, account, flagged_at.get(account).copied(), tick).await?;
         tracing::debug!(
             pool,
             account,
-            ledger = tick.sequence,
-            "no decision for this borrower; re-flagged at this ledger so the queue \
-             behind it is not held up"
+            retry_at,
+            "no decision for this borrower; re-flagged to be retried at this ledger so the \
+             queue behind it is not held up"
         );
-        move_flag_forward(store, pool, account, flagged_at.get(account).copied(), tick).await?;
     }
     for (account, decision) in decisions {
         // Checked between users, never inside a submission: a submission
@@ -1003,14 +1004,7 @@ async fn recheck_batch(
             // move or the full scan's ~1200-ledger period named it again.
             // `ActOutcome::settled` is where that rule lives.
             Ok(outcome) if !outcome.settled() => {
-                tracing::debug!(
-                    pool,
-                    account,
-                    ledger = tick.sequence,
-                    "this borrower was owed an action that could not be made; re-flagged \
-                     at this ledger for a later pass"
-                );
-                move_flag_forward(
+                let retry_at = move_flag_forward(
                     store,
                     pool,
                     &account,
@@ -1018,6 +1012,13 @@ async fn recheck_batch(
                     tick,
                 )
                 .await?;
+                tracing::debug!(
+                    pool,
+                    account,
+                    retry_at,
+                    "this borrower was owed an action that was not made; re-flagged to be \
+                     retried at this ledger"
+                );
             }
             Ok(_settled) => {
                 if let Some(&flagged_at) = flagged_at.get(account.as_str()) {
@@ -1035,15 +1036,7 @@ async fn recheck_batch(
             }
             Err(AuctioneerError::Store(error)) => return Err(LiquidatorError::Store(error)),
             Err(error) => {
-                tracing::warn!(
-                    pool,
-                    account,
-                    %error,
-                    ledger = tick.sequence,
-                    "acting on this borrower failed; re-flagged at this ledger for a \
-                     later pass"
-                );
-                move_flag_forward(
+                let retry_at = move_flag_forward(
                     store,
                     pool,
                     &account,
@@ -1051,6 +1044,13 @@ async fn recheck_batch(
                     tick,
                 )
                 .await?;
+                tracing::warn!(
+                    pool,
+                    account,
+                    %error,
+                    retry_at,
+                    "acting on this borrower failed; re-flagged to be retried at this ledger"
+                );
             }
         }
     }
@@ -1082,19 +1082,24 @@ async fn recheck_batch(
 /// [`Store::flag_recheck`] — the only place that writes the column — that
 /// actually makes the flag monotonic, by taking the `GREATEST` of the
 /// stored value and what is written here.
+///
+/// Answers the ledger it wrote, so a caller's log line names the number
+/// an operator will find in `users.recheck_ledger` — or an older one, only
+/// if the tracker has since flagged the account newer still.
 async fn move_flag_forward(
     store: &Store,
     pool: &str,
     account: &str,
     flagged_at: Option<u32>,
     tick: LedgerTick,
-) -> Result<(), LiquidatorError> {
+) -> Result<u32, LiquidatorError> {
     let retry_at = tick.sequence.saturating_add(1);
     let ledger = flagged_at.map_or(retry_at, |flagged| flagged.max(retry_at));
     store
         .flag_recheck(pool, account, ledger)
         .await
-        .map_err(LiquidatorError::Store)
+        .map_err(LiquidatorError::Store)?;
+    Ok(ledger)
 }
 
 /// Mutable state the auctioneer task carries from one tick to the next:
@@ -1113,14 +1118,18 @@ struct AuctioneerState {
     /// The ledger of the first tick this task observed, which the startup
     /// delay is measured from. `None` until that first tick: there is no
     /// meaningful "how far has the chain moved" before one has arrived.
+    /// It is also the smallest sequence this task will ever see: the watch
+    /// it reads only moves forward (`handle_message` publishes through
+    /// `send_if_modified`, gated on a newer sequence), so a pool whose
+    /// poller is a ledger or two behind never moves it backwards.
     ///
-    /// The ledger, deliberately, and not a count of ticks: every pool's
-    /// poller publishes to the one watch this task reads, so with `n`
-    /// pools a count would reach `STARTUP_DELAY_LEDGERS` in roughly
-    /// `STARTUP_DELAY_LEDGERS / n` ledgers — a safety knob quietly
-    /// under-delivering by the pool count, in the direction of arming
-    /// sooner — while a pass slow enough to coalesce two wakeups into one
-    /// would push the same count the other way.
+    /// The ledger, deliberately, and not a count of wakeups: the watch
+    /// coalesces — a pass slower than a ledger close wakes once for
+    /// several ledgers — and publishes only a tick newer than the last, so
+    /// how many times this task wakes depends on the pass's speed and on
+    /// the pollers' relative lag, not on how far the chain has moved. A
+    /// count would have a safety knob deliver a distance it never
+    /// measured; the ledger is the chain's own.
     first_tick_ledger: Option<u32>,
     /// Whether the chain has moved `startup_delay_ledgers` past
     /// `first_tick_ledger`. Latches `true` and stays there — the delay is
@@ -1152,11 +1161,14 @@ struct AuctioneerContext<'a> {
 /// `startup_delay_ledgers` past the first tick this task saw, regardless
 /// of whether the queue itself exists — i.e. regardless of dry-run or
 /// armed) or passed through unchanged after it has. The elapsed distance
-/// is a `saturating_sub` because ticks are not monotonic across pools: a
-/// pool whose poller is a ledger or two behind publishes a tick older
-/// than the first one seen, and `u32 - u32` going negative is a panic in
-/// a debug build. Saturating reads that as "no ledgers have elapsed yet",
-/// which keeps submissions locked — the safe direction.
+/// cannot underflow: the watch this task reads is monotonic — the tracker
+/// publishes through `send_if_modified`, gated on a newer sequence, so a
+/// pool whose poller is a ledger or two behind never moves it backwards —
+/// and the first tick seen is therefore the smallest. It is written as a
+/// `saturating_sub` all the same, so the arithmetic stays total and a
+/// later change to how ticks are published cannot turn this line into a
+/// debug-build panic: a saturated answer reads as "no ledgers have
+/// elapsed yet", which keeps submissions locked — the safe direction.
 ///
 /// A [`StoreError`] is fatal, exactly as it is in [`tracker_loop`]:
 /// without a trustworthy store there is no way to know who is flagged or
@@ -4126,10 +4138,13 @@ mod tests {
 
     /// Before `STARTUP_DELAY_LEDGERS` has elapsed nothing is submitted,
     /// even armed: a bot that has just started has the least state and the
-    /// most reason to be wrong. Proven against a real `SubmissionQueue`
-    /// and a real bad-debt decision, with only the deepest leaf — an
-    /// actual submitted transaction — stood in for, exactly as
-    /// `queue.rs`'s own tests stand in for `Submitter::submit`.
+    /// most reason to be wrong. The borrower it held fire on is not
+    /// forgotten, either: the creation is recorded, the flag moves forward
+    /// rather than being cleared, and the pass after the delay picks the
+    /// same borrower up again on its own. Proven against a real
+    /// `SubmissionQueue` and a real bad-debt decision, with only the
+    /// deepest leaf — an actual submitted transaction — stood in for,
+    /// exactly as `queue.rs`'s own tests stand in for `Submitter::submit`.
     #[sqlx::test(migrations = "./migrations")]
     async fn no_submission_before_the_startup_delay(db: sqlx::PgPool) -> sqlx::Result<()> {
         let store = Store::from_pool(db);
@@ -4228,13 +4243,19 @@ mod tests {
              transaction"
         );
 
-        // Re-flag: this is the same unresolved bad debt, and in a real bot
-        // some later event, oracle move or full scan would raise this
-        // again anyway.
-        store
-            .flag_recheck(harness::POOL, &account, tick.sequence)
-            .await
-            .expect("reflag");
+        // Held back, not settled: the bot still believes this is bad debt
+        // and merely declined to send, so the flag moved forward instead
+        // of being cleared, and the next pass reads it again without an
+        // event, a price move or the full scan having to name it twice.
+        assert_eq!(
+            store
+                .user(harness::POOL, &account)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            Some(tick.sequence + 1),
+            "a creation the delay held back is re-flagged one past the tick"
+        );
         // One ledger on: the chain, not the wakeup count, is what the
         // delay measures, so this is exactly `startup_delay_ledgers`.
         let tick_two = LedgerTick {
@@ -4261,6 +4282,15 @@ mod tests {
         assert!(
             recorded[1].tx_hash.is_some(),
             "once the delay has elapsed, the same decision is actually submitted"
+        );
+        assert_eq!(
+            store
+                .user(harness::POOL, &account)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            None,
+            "sent and succeeded, the borrower is settled and its flag cleared"
         );
 
         drop(queue);

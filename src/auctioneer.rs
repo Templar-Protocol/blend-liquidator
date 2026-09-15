@@ -156,8 +156,15 @@ pub struct CreationOutcome {
     /// submitted. What a caller reconciling an unresolved submission names
     /// the row by.
     pub creation_id: i64,
-    /// What the chain made of it: `None` in dry-run, where nothing was
-    /// sent.
+    /// The configured `DRY_RUN` mode that row was written under — the same
+    /// value as [`CreationRecord::dry_run`], carried so that
+    /// [`ActOutcome::settled`] can tell the two ways `submission` ends up
+    /// `None` apart: a dry-run sent nothing because it never would, an
+    /// armed bot sent nothing because it held fire.
+    pub dry_run: bool,
+    /// What the chain made of it: `None` when nothing was sent — dry-run,
+    /// or an armed bot given no queue to send through (the startup delay
+    /// still running, or no key configured).
     ///
     /// Every terminal state comes back here, not just the good one. A
     /// caller must match on it rather than read `Some` as success:
@@ -170,8 +177,9 @@ pub struct CreationOutcome {
 }
 
 impl CreationOutcome {
-    /// Whether this went through the submission queue at all. `false` in
-    /// dry-run, and never `true` without a transaction hash.
+    /// Whether this went through the submission queue at all. `false` when
+    /// nothing was sent — dry-run, or an armed bot with no queue — and never
+    /// `true` without a transaction hash.
     #[must_use]
     pub fn submitted(&self) -> bool {
         self.submission.is_some()
@@ -230,29 +238,38 @@ pub enum ActOutcome {
 
 impl ActOutcome {
     /// Whether this borrower is settled for now, so its recheck flag may be
-    /// cleared. `false` for [`ActOutcome::Refused`], and for a recorded
+    /// cleared. `false` for [`ActOutcome::Refused`], for a recorded
     /// creation whose submission came back as anything but
-    /// [`TxOutcome::Succeeded`]: both leave work outstanding, so the flag
-    /// moves forward — behind everything flagged earlier, which bounds the
-    /// retry to one batch slot per pass — rather than being dropped.
+    /// [`TxOutcome::Succeeded`], and for one an armed bot recorded but never
+    /// sent: each leaves work outstanding, so the flag moves forward —
+    /// behind everything flagged earlier, which bounds the retry to one
+    /// batch slot per pass — rather than being dropped.
     #[must_use]
     pub fn settled(&self) -> bool {
         match self {
             Self::Skipped(_) => true,
             Self::Refused => false,
-            // Recorded is settled by what the chain made of it, not by the
-            // row existing: `Failed` charged a fee and created no auction,
-            // `Expired` provably never applied, and `Unknown` may or may
-            // not have. None of those is a borrower to forget. If the
-            // auction did land, the next decision sees it in the store —
-            // the tracker writes it from the pool's own event — and skips;
-            // if it did not, the borrower is still owed one. Nothing sent
-            // (dry-run, or no queue) is settled: the decision was the whole
-            // action.
-            Self::Recorded(outcome) => outcome
-                .submission
-                .as_ref()
-                .is_none_or(|submission| matches!(submission, TxOutcome::Succeeded { .. })),
+            Self::Recorded(outcome) => match &outcome.submission {
+                // Settled by what the chain made of it, not by the row
+                // existing: `Failed` charged a fee and created no auction,
+                // `Expired` provably never applied, and `Unknown` may or
+                // may not have. None of those is a borrower to forget. If
+                // the auction did land, the next decision sees it in the
+                // store — the tracker writes it from the pool's own event —
+                // and skips; if it did not, the borrower is still owed one.
+                Some(submission) => matches!(submission, TxOutcome::Succeeded { .. }),
+                // Nothing sent. In dry-run that is the whole action: the
+                // decision was recorded, and there was never going to be
+                // more. Armed, it means the bot held fire — the startup
+                // delay had not elapsed, or no key is configured — on a
+                // borrower it believes is liquidatable, so that borrower is
+                // decided again on the next pass rather than dropped from
+                // the queue until an event, a price move or the full scan
+                // names it again. The `creations` row draws the same line:
+                // `dry_run = false` with no hash is an armed attempt that
+                // was never sent.
+                None => outcome.dry_run,
+            },
         }
     }
 
@@ -642,8 +659,9 @@ impl<'a> Auctioneer<'a> {
     /// the percent, then records what it decided and — when armed —
     /// submits it.
     ///
-    /// `submit` is `None` in dry-run, and that is the whole of the
-    /// difference: the same *simulation* runs either way, through
+    /// `submit` is `None` in dry-run — `Some` there is refused outright, as
+    /// is a queue with no signer to judge for it — and that is the whole of
+    /// the difference: the same *simulation* runs either way, through
     /// [`Submitter::simulate_only`], which builds unsigned and neither
     /// signs, restores nor sends. So the percent recorded in dry-run is one
     /// the contract would have accepted rather than one the bot merely
@@ -702,6 +720,19 @@ impl<'a> Auctioneer<'a> {
             return Err(AuctioneerError::Chain(ChainError::Config(
                 "a submission queue was given to an auctioneer with no signer, so nothing \
                  could be judged before it was sent",
+            )));
+        }
+        // The other half of the same coupling: a queue means "send this",
+        // and dry-run means nothing is sent, so the two cannot both be true
+        // of one call. `Service::run` builds no queue at all in dry-run
+        // (`spawn_submission_queue` answers `None`), so this is unreachable
+        // from the binary; it is refused here so that the public pieces
+        // composed by hand cannot make a dry-run that submits — the silent
+        // direction `DRY_RUN`'s strict parser exists to close.
+        if submit.is_some() && self.config.dry_run {
+            return Err(AuctioneerError::Chain(ChainError::Config(
+                "a submission queue was given to a dry-run auctioneer; dry-run sends nothing, \
+                 so the queue is refused rather than used",
             )));
         }
         let (kind, percent, bid, lot, operation, simulated) = match decision {
@@ -791,6 +822,7 @@ impl<'a> Auctioneer<'a> {
             percent,
             simulated,
             creation_id,
+            dry_run: record.dry_run,
             submission,
         }))
     }
@@ -2170,6 +2202,34 @@ mod tests {
         Ok(())
     }
 
+    /// `settled()` draws the `creations` row's own line: nothing sent is the
+    /// whole action in dry-run, and an attempt held back when armed. An
+    /// armed bot inside its startup delay, or with no key to send with,
+    /// still believes the borrower liquidatable — clearing the flag would
+    /// drop it from the recheck queue until the full scan found it again.
+    #[test]
+    fn a_creation_an_armed_bot_held_back_is_not_settled() {
+        let never_sent = |dry_run: bool| {
+            ActOutcome::Recorded(CreationOutcome {
+                kind: CreationKind::BadDebt,
+                account: synthetic_account(97),
+                percent: None,
+                simulated: true,
+                creation_id: 1,
+                dry_run,
+                submission: None,
+            })
+        };
+        assert!(
+            never_sent(true).settled(),
+            "dry-run: the decision was the whole action"
+        );
+        assert!(
+            !never_sent(false).settled(),
+            "armed and never sent: the borrower is still owed one"
+        );
+    }
+
     /// A queue handed to an auctioneer with no signer is refused before
     /// anything is simulated or sent: sending an operation the contract
     /// was never asked about is the one thing `act` exists to prevent.
@@ -2202,6 +2262,64 @@ mod tests {
         assert!(
             rpc.calls("simulateTransaction").is_empty() && rpc.calls("sendTransaction").is_empty(),
             "refused before any chain call at all"
+        );
+        let rows = sqlx::query!(
+            "SELECT count(*) AS n FROM creations WHERE account = $1",
+            account.as_str(),
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("count");
+        assert_eq!(rows.n, Some(0), "nothing was recorded either");
+        Ok(())
+    }
+
+    /// A queue handed to a dry-run auctioneer is refused the same way: a
+    /// queue means "send this" and dry-run means nothing is sent, so the
+    /// two cannot both be true of one call. `Service::run` builds no queue
+    /// at all in dry-run (`spawn_submission_queue` answers `None`); the
+    /// public pieces composed by hand must not be able to make a dry-run
+    /// that submits, which is the silent direction `DRY_RUN`'s strict
+    /// parser exists to close.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_queue_given_to_a_dry_run_auctioneer_is_refused_before_anything_is_sent(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let signer = auctioneer_signer();
+        let network = Network::testnet();
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        // `config` is `dry_run: true`, and a signer is configured, so the
+        // signer-less guard is not what refuses this one.
+        let auctioneer = Auctioneer::new(&client, &store, config(BTreeSet::new()), Some(submitter));
+        let (queue, mut receiver) = SubmissionQueue::new(queue_capacity());
+        let account = synthetic_account(98);
+
+        let outcome = auctioneer
+            .act(
+                POOL,
+                &account,
+                &Decision::BadDebt,
+                harness::fixture_tick(),
+                Some(&queue),
+            )
+            .await;
+        assert!(
+            matches!(outcome, Err(AuctioneerError::Chain(ChainError::Config(_)))),
+            "{outcome:?}"
+        );
+        assert!(
+            rpc.calls("simulateTransaction").is_empty() && rpc.calls("sendTransaction").is_empty(),
+            "refused before any chain call at all"
+        );
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "nothing was enqueued"
         );
         let rows = sqlx::query!(
             "SELECT count(*) AS n FROM creations WHERE account = $1",

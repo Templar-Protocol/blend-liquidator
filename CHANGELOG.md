@@ -32,10 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SubmissionQueue` only when one is configured. `act` answers an
   `ActOutcome`, which distinguishes a borrower it *skipped* (nothing was
   owed) from one it was *refused* (something was owed and could not be
-  done, or whose submission failed, expired or was lost on chain) — the
-  caller clears the recheck flag only for the first, so a borrower the
-  contract refused is retried on a later pass instead of being forgotten
-  until the next full scan. A retry is re-flagged one ledger *past* the
+  done, whose submission failed, expired or was lost on chain, or that an
+  armed bot recorded but held back — the startup delay still running, or
+  no key to send with) — the caller clears the recheck flag only for the
+  first, so a borrower the contract refused is retried on a later pass
+  instead of being forgotten until the next full scan. A retry is re-flagged one ledger *past* the
   tick that could not act on it, so it sorts behind everything flagged on
   that tick rather than returning to the head of the next batch. `scan_oracle` is a third path
   that decides nothing itself: it compares a pool's current prices against
@@ -61,8 +62,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`ORACLE_SCAN_LEDGERS`) and full-scan-and-flag (`FULL_SCAN_LEDGERS`,
   reusing `SCAN_HF_THRESHOLD`) cadences when due, then decides and acts on
   every pool's currently flagged users. A borrower a pass cannot decide or
-  act on has its recheck flag moved forward — re-raised at the current
-  tick's ledger, never left where it was — so one borrower nothing can
+  act on has its recheck flag moved forward — re-raised one ledger past
+  the current tick's, never left where it was — so one borrower nothing can
   decide (an unpriced reserve breaks every position holding it at once)
   cannot starve the rest of the queue behind it, which
   `Store::users_needing_recheck` orders oldest-flag-first. No submission
@@ -75,8 +76,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leave the borrower at — refused at parse outside the contract's own
   `InvalidLiqTooSmall`/`InvalidLiqTooLarge` band of `[1.03, 1.15)`, since
   `TARGET_HF=0` would make every liquidatable borrower a silent
-  "no plan" for ever; `LIQ_HF_THRESHOLD` above `SCAN_HF_THRESHOLD` is
-  refused for the mirror reason),
+  "no plan" for ever; `LIQ_HF_THRESHOLD` at or above `SCAN_HF_THRESHOLD`
+  is refused for the mirror reason),
   `ORACLE_SCAN_LEDGERS`, `PRICE_DELTA_BPS` and `PLAN_ITERATIONS` (both
   refused at zero rather than clamped — a zero price delta flags every
   borrower on every scan forever, and zero plan iterations would simulate
