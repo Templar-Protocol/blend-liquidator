@@ -1,12 +1,18 @@
 # Dependabot configuration.
 #
-# One repo invariant shapes this file, and it is enforced by an ignore rule
-# rather than by reviewer vigilance: the Rust version is pinned in THREE places
-# that must move together — Cargo.toml `rust-version`, rust-toolchain.toml
-# `channel`, and the Dockerfile builder's `FROM rust:X-bookworm`. A Dependabot
-# PR bumping only the Dockerfile would desync them, so the docker ecosystem
-# below takes digest refreshes (security-relevant and safe) but not version
-# bumps. scripts/check-repo-invariants.sh is the gate that catches it anyway.
+# Two repo invariants shape this file, and each is enforced by an ignore rule
+# rather than by reviewer vigilance, with scripts/check-repo-invariants.sh as
+# the gate that catches it anyway:
+#
+# - The Rust version is pinned in THREE places that must move together —
+#   Cargo.toml `rust-version`, rust-toolchain.toml `channel`, and the
+#   Dockerfile builder's `FROM rust:X-bookworm`. A Dependabot PR bumping only
+#   the Dockerfile would desync them, so the docker ecosystem below takes
+#   digest refreshes (security-relevant and safe) but not version bumps.
+# - stellar-strkey is pinned to the version stellar-xdr itself depends on, so
+#   the tree holds one copy. A Dependabot PR bumping it alone would add a
+#   second, so the cargo ecosystem below never bumps it: it moves with
+#   stellar-xdr.
 version: 2
 updates:
   # ── Cargo ────────────────────────────────────────────
@@ -21,6 +27,14 @@ updates:
     commit-message:
       prefix: "deps"
       include: "scope"
+    ignore:
+      # Moves with stellar-xdr, never alone (see the header). stellar-xdr's own
+      # requirement is a `0.0.x` one, which cargo reads as that exact patch, so
+      # any other version here is a second copy rather than a shared one. A
+      # stellar-xdr bump that moves its copy fails check-repo-invariants.sh
+      # until Cargo.toml's follows in the same PR. Advisories are still gated:
+      # cargo-deny's advisory check reads Cargo.lock, not this file.
+      - dependency-name: "stellar-strkey"
     groups:
       # One PR for the long tail of compatible updates; anything major still
       # arrives on its own so it gets read properly. "Major" is by version
