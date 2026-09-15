@@ -179,6 +179,12 @@ pub struct FillTerms {
     /// Fill by [`FORCE_FILL_MAX_DELAY`], and past the auction's end at all.
     pub force_fill: bool,
     /// How many rounds of supply → percent → delay the plan may take.
+    ///
+    /// Never zero: the rounds run `0..plan_iterations`, so a zero would
+    /// project nothing at all and answer `Health` for every auction while
+    /// reporting that it had exhausted its rounds — a bot that looks busy
+    /// and does nothing. `PLAN_ITERATIONS=0` is refused at parse (see
+    /// `Args`), so the filler never builds these terms with it.
     pub plan_iterations: u32,
 }
 
@@ -315,9 +321,18 @@ const SUPPLY_ROUNDING_ALLOWANCE: i128 = 2;
 ///    shortfall, when the pool permits it (remember when the wallet capped
 ///    it); else the largest lower percent that projects healthy; else the
 ///    first later ledger at which `max_percent` projects healthy (ruling
-///    10). Candidates are searched exactly (ruling 11).
+///    10). Candidates are searched exactly (ruling 11), and a candidate
+///    the search finds is the plan: it is drafted from the very projection
+///    it was found with, never re-projected by a later round that
+///    `plan_iterations` may not reach.
 /// 5. Out of rounds or candidates: `Unfunded` if the wallet capped a
 ///    supply along the way, else `Health`.
+///
+/// Whatever a round or a search produces is still refused as
+/// `Unprofitable` when its own lot no longer covers its own bid: step 1
+/// judges the margin on the whole auction, and a lowered percent or a
+/// rounding step can take the fill itself under it. Only `force_fill`
+/// accepts a loss.
 ///
 /// The request order a plan produces — fill, repays, withdrawals, supply —
 /// is the order the executor sends them in; the contract checks health
@@ -348,7 +363,7 @@ pub fn plan_fill(terms: &FillTerms, inputs: &FillInputs<'_>) -> Result<PlannedFi
         terms.profit_bps,
         terms.force_fill,
     )?;
-    let mut ledger = start
+    let ledger = start
         .checked_add(delay)
         .ok_or(MathError::Overflow)?
         .max(earliest);
@@ -361,7 +376,7 @@ pub fn plan_fill(terms: &FillTerms, inputs: &FillInputs<'_>) -> Result<PlannedFi
         .checked_add(reach)
         .ok_or(MathError::Overflow)?
         .max(ledger);
-    let mut percent = inputs.max_percent;
+    let percent = inputs.max_percent;
     let mut supply = 0_i128;
     let mut unfunded = false;
 
@@ -371,9 +386,7 @@ pub fn plan_fill(terms: &FillTerms, inputs: &FillInputs<'_>) -> Result<PlannedFi
             return Ok(PlannedFill::Skip(FillSkip::TooManyPositions));
         }
         if healthy(terms, &projection)? {
-            return Ok(PlannedFill::Fill(draft(
-                inputs, ledger, percent, projection,
-            )?));
+            return settle(terms, inputs, ledger, percent, projection);
         }
         if terms.supply_allowed {
             let wanted = supply
@@ -386,14 +399,15 @@ pub fn plan_fill(terms: &FillTerms, inputs: &FillInputs<'_>) -> Result<PlannedFi
                 continue;
             }
         }
-        if let Some(lower) = largest_healthy_percent(terms, inputs, ledger, percent, supply)? {
-            percent = lower;
-            continue;
+        if let Some((lower, projection)) =
+            largest_healthy_percent(terms, inputs, ledger, percent, supply)?
+        {
+            return settle(terms, inputs, ledger, lower, projection);
         }
-        if let Some(later) = first_healthy_ledger(terms, inputs, ledger, last, supply)? {
-            ledger = later;
-            percent = inputs.max_percent;
-            continue;
+        if let Some((later, projection)) =
+            first_healthy_ledger(terms, inputs, ledger, last, supply)?
+        {
+            return settle(terms, inputs, later, inputs.max_percent, projection);
         }
         break;
     }
@@ -463,7 +477,8 @@ fn add_to<K: Ord>(map: &mut BTreeMap<K, i128>, key: K, amount: i128) -> Result<(
 /// 3. a `WithdrawAll` of each lot asset whose reserve has no collateral
 ///    factor;
 /// 4. a `SupplyCollateral` of `supply` of the primary asset, clamped to
-///    what the wallet holds after the repays;
+///    what the wallet holds after the repays, and only when that mints at
+///    least one b-token;
 ///
 /// and the result valued by `calculate_position_data`. Every amount
 /// `spend` records is first debited from a copy of the wallet that no
@@ -537,16 +552,19 @@ fn project(
     let supply = supply.min(primary_available);
     if supply > 0 {
         let (index, reserve) = reserve_for(inputs, &terms.primary_asset)?;
-        add_to(
-            &mut positions.collateral,
-            index,
-            reserve.to_b_token_down(supply)?,
-        )?;
-        add_to(&mut spend, terms.primary_asset.clone(), supply)?;
-        actions.push(FillAction::SupplyCollateral {
-            asset: terms.primary_asset.clone(),
-            amount: supply,
-        });
+        let b_tokens = reserve.to_b_token_down(supply)?;
+        // A supply too small to mint a b-token is no supply at all: the
+        // contract's `add_collateral` refuses a zero mint
+        // (`InvalidBTokenMintAmount`), so sending it would cost the whole
+        // fill for as long as the dust sat in the wallet.
+        if b_tokens > 0 {
+            add_to(&mut positions.collateral, index, b_tokens)?;
+            add_to(&mut spend, terms.primary_asset.clone(), supply)?;
+            actions.push(FillAction::SupplyCollateral {
+                asset: terms.primary_asset.clone(),
+                amount: supply,
+            });
+        }
     }
 
     let data = calculate_position_data(inputs.reserves, inputs.prices, &positions)?;
@@ -623,18 +641,23 @@ fn supply_for(
 /// The largest percent below `below` whose exact projection at `ledger`
 /// with `supply` is [`healthy`], searched from `below − 1` down to 1
 /// (ruling 11); `None` when none is.
+///
+/// The projection it was found with travels back with it, so the caller
+/// drafts the candidate it proved rather than projecting the same triple
+/// again in a round `plan_iterations` may not have left.
 fn largest_healthy_percent(
     terms: &FillTerms,
     inputs: &FillInputs<'_>,
     ledger: u32,
     below: FillPercent,
     supply: i128,
-) -> Result<Option<FillPercent>, MathError> {
+) -> Result<Option<(FillPercent, Projection)>, MathError> {
     for value in (1..below.get()).rev() {
         let percent = FillPercent::try_from(value)
             .map_err(|_| MathError::InvalidInput("a fill percent is 1 to 100"))?;
-        if healthy(terms, &project(terms, inputs, ledger, percent, supply)?)? {
-            return Ok(Some(percent));
+        let projection = project(terms, inputs, ledger, percent, supply)?;
+        if healthy(terms, &projection)? {
+            return Ok(Some((percent, projection)));
         }
     }
     Ok(None)
@@ -644,23 +667,52 @@ fn largest_healthy_percent(
 /// projection at `inputs.max_percent` with `supply` is [`healthy`]
 /// (rulings 10 and 11); `None` when none is, and when `after` is the last
 /// ledger a `u32` holds.
+///
+/// The projection it was found with travels back with it, for
+/// [`largest_healthy_percent`]'s reason.
 fn first_healthy_ledger(
     terms: &FillTerms,
     inputs: &FillInputs<'_>,
     after: u32,
     last: u32,
     supply: i128,
-) -> Result<Option<u32>, MathError> {
+) -> Result<Option<(u32, Projection)>, MathError> {
     let Some(first) = after.checked_add(1) else {
         return Ok(None);
     };
     for ledger in first..=last {
         let projection = project(terms, inputs, ledger, inputs.max_percent, supply)?;
         if healthy(terms, &projection)? {
-            return Ok(Some(ledger));
+            return Ok(Some((ledger, projection)));
         }
     }
     Ok(None)
+}
+
+/// What a healthy projection answers with: the draft it becomes, or the
+/// skip it turns out to be.
+///
+/// Every plan leaves through here, wherever its projection came from — a
+/// round or one of the two searches — so both of the refusals that are
+/// judged on the finished fill are judged on all of them: a fill that
+/// raises the filler's position count past `max_positions`, and one whose
+/// own lot no longer covers its own bid, which only a `force_fill` pool
+/// accepts.
+fn settle(
+    terms: &FillTerms,
+    inputs: &FillInputs<'_>,
+    ledger: u32,
+    percent: FillPercent,
+    projection: Projection,
+) -> Result<PlannedFill, MathError> {
+    if over_positions(terms, inputs, &projection) {
+        return Ok(PlannedFill::Skip(FillSkip::TooManyPositions));
+    }
+    let draft = draft(inputs, ledger, percent, projection)?;
+    if !terms.force_fill && draft.est_profit <= 0 {
+        return Ok(PlannedFill::Skip(FillSkip::Unprofitable));
+    }
+    Ok(PlannedFill::Fill(draft))
 }
 
 /// The draft a healthy projection becomes: its requests and spend, the
@@ -1014,7 +1066,14 @@ mod plan_tests {
 
     /// At 110 ledgers the fill hands over 1.1e11 XLM ($825 effective)
     /// against the whole bid ($1,052.63 effective): 0.78, under the 1.1
-    /// floor. The wallet's XLM closes it by supplying the primary asset.
+    /// floor. The wallet's XLM closes it by supplying the primary asset:
+    /// the floor wants ⌈1.1 × 10_526_315_790⌉ = 11_578_947_369 of
+    /// effective collateral, 3_328_947_369 more than the lot's 8.25e9, so
+    /// the supply is ⌈3_328_947_369 × 1e7 / 1e6⌉ × 1e7 / 7_500_000 =
+    /// 44_385_964_920 stroops plus the two-unit rounding allowance. That
+    /// lands the projection exactly on the floor: ⌊(1.1e11 +
+    /// 44_385_964_922) × 0.75⌋ × 0.1 = 11_578_947_369 against the same
+    /// 10_526_315_790, a health factor of 1.1 to the stroop.
     #[test]
     fn the_primary_asset_is_supplied_to_close_a_shortfall() {
         let pool = pool();
@@ -1034,10 +1093,9 @@ mod plan_tests {
             panic!("expected one supply, got {:?}", draft.actions);
         };
         assert_eq!(asset.as_str(), XLM);
-        assert!(*amount > 0 && *amount <= 1_000_000_000_000, "{amount}");
+        assert_eq!(*amount, 44_385_964_922);
         assert_eq!(draft.spend, BTreeMap::from([(XLM.to_string(), *amount)]));
-        let health = draft.projected_health.expect("the fill leaves liabilities");
-        assert!(health >= 11_000_000, "{health}");
+        assert_eq!(draft.projected_health, Some(11_000_000));
     }
 
     /// 1,000 XLM ($75 effective) cannot close the gap at 100%, so the whole
@@ -1150,7 +1208,8 @@ mod plan_tests {
 
     /// A repay is capped at the balance; what it leaves (6e9 d-tokens,
     /// 6_315_789_474 effective, needing 6_947_368_422) the $825 of lot
-    /// covers.
+    /// covers: ⌊8.25e9 × 1e7 / 6_315_789_474⌋ = 13_062_499, a health
+    /// factor of 1.306.
     #[test]
     fn a_repay_is_capped_at_what_the_wallet_holds() {
         let pool = pool();
@@ -1171,7 +1230,7 @@ mod plan_tests {
                 amount: 4_000_000_000
             }]
         );
-        assert!(draft.projected_health.expect("liabilities remain") >= 11_000_000);
+        assert_eq!(draft.projected_health, Some(13_062_499));
     }
 
     /// Lot in a reserve with no collateral factor adds nothing to health
@@ -1363,6 +1422,154 @@ mod plan_tests {
             percent(100),
         );
         assert_eq!(planned, PlannedFill::Skip(FillSkip::Unfunded));
+    }
+
+    /// A candidate a search proves is the plan, not one held over for a
+    /// round that may never come. With a single round to spend, the ledger
+    /// search's find is drafted where it was found; two rounds — one to
+    /// fund the supply, one to search — prove the same of the percent
+    /// search. Both answered a skip while the search's find waited for a
+    /// verification round.
+    #[test]
+    fn a_search_that_runs_out_of_rounds_still_returns_what_it_found() {
+        let pool = pool();
+        let one_round = FillTerms {
+            plan_iterations: 1,
+            ..terms()
+        };
+        let waited = draft(plan(
+            &one_round,
+            &pool,
+            &Positions::default(),
+            &BTreeMap::new(),
+            &auction(),
+            START + 1,
+            percent(100),
+        ));
+        assert_eq!(
+            (waited.fill_ledger, waited.percent),
+            (START + 155, percent(100))
+        );
+
+        let two_rounds = FillTerms {
+            plan_iterations: 2,
+            ..terms()
+        };
+        let wallet = BTreeMap::from([(XLM.to_string(), 10_000_000_000)]);
+        let lowered = draft(plan(
+            &two_rounds,
+            &pool,
+            &Positions::default(),
+            &wallet,
+            &auction(),
+            START + 1,
+            percent(100),
+        ));
+        assert_eq!(
+            (lowered.fill_ledger, lowered.percent),
+            (START + 110, percent(22))
+        );
+    }
+
+    /// The margin is judged on the whole auction, so a fill whose own lot
+    /// no longer covers its own bid can still reach a draft. At a zero
+    /// margin $2,000 of lot against $2,000 of bid meets the margin on the
+    /// lot ramp at ⌈200 × 2e10 / 2e10⌉ = 200 ledgers, where both modifiers
+    /// are one: the whole lot for the whole bid, a profit of exactly
+    /// nothing. Only `force_fill` takes it.
+    #[test]
+    fn a_fill_that_gains_nothing_is_unprofitable() {
+        let pool = pool();
+        let terms = FillTerms {
+            profit_bps: 0,
+            ..terms()
+        };
+        let auction = AuctionData {
+            lot: BTreeMap::from([(XLM.to_string(), 200_000_000_000)]),
+            bid: BTreeMap::from([(USDC.to_string(), 20_000_000_000)]),
+            block: START,
+        };
+        let planned = plan(
+            &terms,
+            &pool,
+            &well_collateralised(),
+            &BTreeMap::new(),
+            &auction,
+            START + 1,
+            percent(100),
+        );
+        assert_eq!(planned, PlannedFill::Skip(FillSkip::Unprofitable));
+        let forced = FillTerms {
+            force_fill: true,
+            ..terms
+        };
+        let draft = draft(plan(
+            &forced,
+            &pool,
+            &well_collateralised(),
+            &BTreeMap::new(),
+            &auction,
+            START + 1,
+            percent(100),
+        ));
+        assert_eq!(draft.fill_ledger, START + 200);
+        assert_eq!(
+            (draft.lot_value, draft.bid_value, draft.est_profit),
+            (20_000_000_000, 20_000_000_000, 0)
+        );
+    }
+
+    /// `min_collateral`, not the health factor, is what a plan can be short
+    /// of: at 110 ledgers the fill is worth 8.25e9 of effective collateral
+    /// against 10_526_315_790 of effective liability — a health factor of
+    /// 0.78 — but against a $10,000 `min_collateral` the binding shortfall
+    /// is 1e11 − 8.25e9 = 91_750_000_000, far more than the floor's
+    /// 3_328_947_369. The supply is ⌈91_750_000_000 × 1e7 / 1e6⌉ × 1e7 /
+    /// 7_500_000 = 1_223_333_333_334 stroops plus the two-unit allowance,
+    /// which lands the projection exactly on 1e11 of effective collateral
+    /// and a health factor of ⌊1e11 × 1e7 / 10_526_315_790⌋ = 94_999_999.
+    #[test]
+    fn a_plan_supplies_up_to_the_pools_minimum_collateral() {
+        let pool = pool();
+        let terms = FillTerms {
+            min_collateral: 100_000_000_000,
+            ..terms()
+        };
+        let wallet = BTreeMap::from([(XLM.to_string(), 10_000_000_000_000)]);
+        let draft = draft(plan(
+            &terms,
+            &pool,
+            &Positions::default(),
+            &wallet,
+            &auction(),
+            START + 1,
+            percent(100),
+        ));
+        assert_eq!(draft.fill_ledger, START + 110);
+        assert_eq!(
+            draft.actions,
+            vec![FillAction::SupplyCollateral {
+                asset: XLM.to_string(),
+                amount: 1_223_333_333_336
+            }]
+        );
+        assert_eq!(draft.projected_health, Some(94_999_999));
+        // The projection the plan was drafted from, valued again from its
+        // parts: the lot plus the supply as collateral, the bid as
+        // liabilities. Its effective collateral is what `min_collateral`
+        // asked for, to the stroop.
+        let data = calculate_position_data(
+            &pool.reserves,
+            &pool.prices,
+            &Positions {
+                collateral: BTreeMap::from([(0, 110_000_000_000 + 1_223_333_333_336)]),
+                liabilities: BTreeMap::from([(1, 10_000_000_000)]),
+                ..Positions::default()
+            },
+        )
+        .expect("values");
+        assert_eq!(data.collateral_base, 100_000_000_000);
+        assert!(data.collateral_base >= terms.min_collateral);
     }
 
     /// The executor's re-plan passes a lower ceiling, and the plan honours
