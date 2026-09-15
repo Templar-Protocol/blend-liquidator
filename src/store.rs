@@ -285,11 +285,57 @@ pub struct TrackedUser {
     pub liabilities: BTreeMap<u32, i128>,
     /// The ledger this row was computed at.
     pub updated_ledger: u32,
+    /// The ledger this row was flagged for an auctioneer decision at, or
+    /// `None` when there is nothing to decide.
+    ///
+    /// Read-only in practice: setting it and calling [`Store::upsert_user`]
+    /// does **nothing**, because that write deliberately leaves the column
+    /// alone (see its own doc). [`Store::flag_recheck`] and
+    /// [`Store::flag_exposed_to`] raise it, [`Store::clear_recheck`] clears
+    /// it, and those are the only writers.
+    ///
+    /// Every read that builds a `TrackedUser` from a stored row — [`Store::user`],
+    /// [`Store::users_below_health`], [`Store::users_stale`] and
+    /// [`Store::users_needing_recheck`] alike — selects and reports the
+    /// real column, so this field means the same thing regardless of which
+    /// query produced the row: a caller that branches on it never has to
+    /// know which method it came from. [`Store::clear_recheck`] is what
+    /// needs the value back, but nothing about the field's meaning is
+    /// specific to that one caller.
+    ///
+    /// The value is the ledger the flag *sorts at* in the recheck queue,
+    /// which is the ledger it was raised at except for one deliberate case:
+    /// a pass that could not decide or act on the borrower re-raises it one
+    /// ledger past the tick it ran at, so the retry sorts behind everything
+    /// flagged on that tick rather than tying with it and coming back at
+    /// the head of the next batch by account order.
+    pub recheck_ledger: Option<u32>,
+}
+
+/// Which side of a position a reserve index is tested against.
+/// [`Store::flag_exposed_to`] is the only reader of this: it decides which
+/// JSONB column — `collateral` or `liabilities` — the exposure test runs
+/// against, because the store is what knows the two maps' shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    /// Test `users.collateral` for the index.
+    Collateral,
+    /// Test `users.liabilities` for the index.
+    Liability,
 }
 
 impl Store {
     /// Writes a borrower, replacing any previous row for the same pool and
-    /// account.
+    /// account — every column **except** `recheck_ledger`, which it
+    /// deliberately does not write.
+    ///
+    /// That omission is load-bearing, not an oversight: the tracker's
+    /// refresh and the auctioneer's recheck queue are independently
+    /// scheduled, so a refresh landing mid-decision must not drop a flag
+    /// the auctioneer has not acted on yet. [`Store::flag_recheck`] and
+    /// [`Store::flag_exposed_to`] raise the column and
+    /// [`Store::clear_recheck`] clears it; nothing else writes it, and
+    /// `TrackedUser::recheck_ledger` is ignored here.
     pub async fn upsert_user(&self, user: &TrackedUser) -> Result<(), StoreError> {
         sqlx::query!(
             "INSERT INTO users (pool, account, health_factor, collateral, liabilities, updated_ledger)
@@ -328,7 +374,7 @@ impl Store {
     pub async fn user(&self, pool: &str, account: &str) -> Result<Option<TrackedUser>, StoreError> {
         let row = sqlx::query!(
             "SELECT pool, account, health_factor::text AS health_factor, collateral,
-                    liabilities, updated_ledger
+                    liabilities, updated_ledger, recheck_ledger
              FROM users WHERE pool = $1 AND account = $2",
             pool,
             account
@@ -343,37 +389,58 @@ impl Store {
                 collateral: index_amounts_from_json(&row.collateral, "collateral")?,
                 liabilities: index_amounts_from_json(&row.liabilities, "liabilities")?,
                 updated_ledger: ledger(row.updated_ledger, "updated_ledger")?,
+                recheck_ledger: row
+                    .recheck_ledger
+                    .map(|value| ledger(value, "recheck_ledger"))
+                    .transpose()?,
             })
         })
         .transpose()
     }
 
-    /// The pool's borrowers below `threshold`, least healthy first. The
-    /// threshold is exclusive, so a user exactly at a scan threshold is not
-    /// rechecked by it.
+    /// The pool's least healthy borrowers below `threshold`, in
+    /// `(health_factor, account)` order — the order the index backing this
+    /// query stores. `after` continues a walk after the last row of the
+    /// previous page; `None` starts at the beginning.
+    ///
+    /// The threshold is exclusive, and paging is by keyset rather than by
+    /// offset because rows move between pages as the tracker refreshes
+    /// them: an offset would skip a borrower whose health factor fell while
+    /// the scan was walking, which is the borrower the scan exists to find.
     pub async fn users_below_health(
         &self,
         pool: &str,
         threshold: i128,
         limit: i64,
+        after: Option<(i128, &str)>,
     ) -> Result<Vec<TrackedUser>, StoreError> {
+        let (after_health, after_account) = match after {
+            Some((health, account)) => (Some(health.to_string()), Some(account)),
+            None => (None, None),
+        };
         let rows = sqlx::query!(
             "SELECT pool, account, health_factor::text AS health_factor, collateral,
-                    liabilities, updated_ledger
+                    liabilities, updated_ledger, recheck_ledger
              FROM users
-             WHERE pool = $1 AND health_factor < $2::text::numeric
-             ORDER BY health_factor ASC
+             WHERE pool = $1
+               AND health_factor < $2::text::numeric
+               AND ($4::text IS NULL
+                    OR (health_factor, account) > ($4::text::numeric, $5))
+             ORDER BY health_factor ASC, account ASC
              LIMIT $3",
             pool,
             threshold.to_string(),
             limit,
+            after_health,
+            after_account,
         )
         .fetch_all(&self.pool)
         .await?;
-        // The three row-to-`TrackedUser` conversions below cannot share a
-        // helper: each `sqlx::query!` call produces its own anonymous row
-        // type, so there is no common type a `fn` or trait could take. The
-        // duplication is the honest cost of compile-time-checked queries.
+        // The four row-to-`TrackedUser` conversions in this file cannot
+        // share a helper: each `sqlx::query!` call produces its own
+        // anonymous row type, so there is no common type a `fn` or trait
+        // could take. The duplication is the honest cost of
+        // compile-time-checked queries.
         rows.into_iter()
             .map(|row| {
                 Ok(TrackedUser {
@@ -383,6 +450,10 @@ impl Store {
                     collateral: index_amounts_from_json(&row.collateral, "collateral")?,
                     liabilities: index_amounts_from_json(&row.liabilities, "liabilities")?,
                     updated_ledger: ledger(row.updated_ledger, "updated_ledger")?,
+                    recheck_ledger: row
+                        .recheck_ledger
+                        .map(|value| ledger(value, "recheck_ledger"))
+                        .transpose()?,
                 })
             })
             .collect()
@@ -403,7 +474,7 @@ impl Store {
     ) -> Result<Vec<TrackedUser>, StoreError> {
         let rows = sqlx::query!(
             "SELECT pool, account, health_factor::text AS health_factor, collateral,
-                    liabilities, updated_ledger
+                    liabilities, updated_ledger, recheck_ledger
              FROM users
              WHERE pool = $1 AND updated_ledger < $2
              ORDER BY updated_ledger ASC
@@ -423,6 +494,10 @@ impl Store {
                     collateral: index_amounts_from_json(&row.collateral, "collateral")?,
                     liabilities: index_amounts_from_json(&row.liabilities, "liabilities")?,
                     updated_ledger: ledger(row.updated_ledger, "updated_ledger")?,
+                    recheck_ledger: row
+                        .recheck_ledger
+                        .map(|value| ledger(value, "recheck_ledger"))
+                        .transpose()?,
                 })
             })
             .collect()
@@ -437,6 +512,279 @@ impl Store {
         .fetch_one(&self.pool)
         .await?;
         Ok(row.count)
+    }
+
+    /// Flags `account` for an auctioneer decision, recording the ledger the
+    /// flag was raised at. The column only ever moves forward: `GREATEST`
+    /// takes the higher of the stored value and `ledger` (and, since
+    /// `GREATEST` ignores nulls, raises an unflagged row — where
+    /// `recheck_ledger` is `NULL` — straight to `ledger`), so a caller
+    /// racing an independently scheduled task can never lower a flag the
+    /// other one just raised, regardless of which call reaches the row
+    /// last.
+    pub async fn flag_recheck(
+        &self,
+        pool: &str,
+        account: &str,
+        ledger: u32,
+    ) -> Result<(), StoreError> {
+        sqlx::query!(
+            "UPDATE users SET recheck_ledger = GREATEST(recheck_ledger, $3)
+             WHERE pool = $1 AND account = $2",
+            pool,
+            account,
+            i64::from(ledger),
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The pool's flagged rows, oldest flag first, at most `limit`. The
+    /// order is what keeps a flag from starving behind a busier one. Each
+    /// row's `recheck_ledger` is the flag it was read under, which the
+    /// caller passes back to [`Store::clear_recheck`].
+    pub async fn users_needing_recheck(
+        &self,
+        pool: &str,
+        limit: i64,
+    ) -> Result<Vec<TrackedUser>, StoreError> {
+        let rows = sqlx::query!(
+            "SELECT pool, account, health_factor::text AS health_factor, collateral,
+                    liabilities, updated_ledger, recheck_ledger
+             FROM users
+             WHERE pool = $1 AND recheck_ledger IS NOT NULL
+             ORDER BY recheck_ledger ASC, account ASC
+             LIMIT $2",
+            pool,
+            limit,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(TrackedUser {
+                    pool: row.pool,
+                    account: row.account,
+                    health_factor: decimal(row.health_factor.as_deref(), "health_factor")?,
+                    collateral: index_amounts_from_json(&row.collateral, "collateral")?,
+                    liabilities: index_amounts_from_json(&row.liabilities, "liabilities")?,
+                    updated_ledger: ledger(row.updated_ledger, "updated_ledger")?,
+                    recheck_ledger: row
+                        .recheck_ledger
+                        .map(|value| ledger(value, "recheck_ledger"))
+                        .transpose()?,
+                })
+            })
+            .collect()
+    }
+
+    /// Flags every one of `pool`'s borrowers holding `index` on `side` —
+    /// collateral or a liability, never both at once for one call — at
+    /// `ledger`, and answers how many rows the statement matched.
+    ///
+    /// Deliberately unbounded, and deliberately one statement rather than a
+    /// bounded read followed by a write per row. This is the oracle scan's
+    /// whole job: a limit here would mean a price move reached only the
+    /// first `limit` borrowers exposed to it — the same ones every time
+    /// under any fixed order — and left the rest to wait for the full scan,
+    /// which is the one cadence that is measured in hours rather than
+    /// ledgers. One round trip also keeps the cost independent of how many
+    /// borrowers a move reaches.
+    ///
+    /// The write is exactly [`Store::flag_recheck`]'s: `GREATEST` of the
+    /// stored value and `ledger`, which raises an unflagged row (where
+    /// `recheck_ledger` is `NULL`, since `GREATEST` ignores nulls) and can
+    /// never lower a flag another task just raised.
+    ///
+    /// `index` is rendered as the decimal text key the `collateral`/
+    /// `liabilities` JSONB maps are stored under, and tested with
+    /// `jsonb_exists`, the function spelling of JSONB's `?` key-existence
+    /// operator — `?` is also `sqlx`'s own bind-parameter character in some
+    /// contexts, so the function form sidesteps any doubt about which one a
+    /// `query!` call would see.
+    pub async fn flag_exposed_to(
+        &self,
+        pool: &str,
+        index: u32,
+        side: Side,
+        ledger: u32,
+    ) -> Result<u64, StoreError> {
+        let key = index.to_string();
+        let flagged_at = i64::from(ledger);
+        // Each `query!` call produces its own anonymous type, so the two
+        // arms cannot share one statement even though only the column name
+        // differs — the same duplication `users_stale` and its neighbours
+        // already accept. Both arms answer with a `PgQueryResult`, which is
+        // one type, so the `match` itself is the shared half.
+        let done = match side {
+            Side::Collateral => {
+                sqlx::query!(
+                    "UPDATE users SET recheck_ledger = GREATEST(recheck_ledger, $3)
+                     WHERE pool = $1 AND jsonb_exists(collateral, $2)",
+                    pool,
+                    key,
+                    flagged_at,
+                )
+                .execute(&self.pool)
+                .await?
+            }
+            Side::Liability => {
+                sqlx::query!(
+                    "UPDATE users SET recheck_ledger = GREATEST(recheck_ledger, $3)
+                     WHERE pool = $1 AND jsonb_exists(liabilities, $2)",
+                    pool,
+                    key,
+                    flagged_at,
+                )
+                .execute(&self.pool)
+                .await?
+            }
+        };
+        Ok(done.rows_affected())
+    }
+
+    /// Clears the flag this decision saw, and only that one: `flagged_at`
+    /// makes the clear conditional, so a flag raised again while the
+    /// auctioneer was deciding survives the decision that did not account
+    /// for it. `false` means exactly that happened.
+    pub async fn clear_recheck(
+        &self,
+        pool: &str,
+        account: &str,
+        flagged_at: u32,
+    ) -> Result<bool, StoreError> {
+        let done = sqlx::query!(
+            "UPDATE users SET recheck_ledger = NULL
+             WHERE pool = $1 AND account = $2 AND recheck_ledger = $3",
+            pool,
+            account,
+            i64::from(flagged_at),
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+}
+
+/// What kind of submission the auctioneer made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreationKind {
+    /// `new_auction` for a user liquidation.
+    Auction,
+    /// `bad_debt`, which the contract sizes itself.
+    BadDebt,
+}
+
+impl CreationKind {
+    /// The `kind` column's value. The column is text with a `CHECK`, so a
+    /// reader can see what happened without this crate.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auction => "auction",
+            Self::BadDebt => "bad_debt",
+        }
+    }
+}
+
+/// One auctioneer submission, recorded whether or not it was sent: in
+/// dry-run the decision is the whole artefact, and an audit that only kept
+/// live submissions could not answer what the bot would have done.
+#[derive(Debug, Clone)]
+pub struct CreationRecord {
+    pub kind: CreationKind,
+    pub pool: String,
+    pub account: String,
+    /// The percent the auction named; `None` for bad debt, which has none.
+    pub percent: Option<FillPercent>,
+    pub bid: Vec<String>,
+    pub lot: Vec<String>,
+    /// The ledger the decision was taken at.
+    pub ledger: u32,
+    /// The bot's configured `DRY_RUN` mode when this row was written — the
+    /// spec's meaning of the column, and only that.
+    ///
+    /// It is not "whether this row was sent": that is `tx_hash`. So the
+    /// four states an operator can read are exact. `dry_run = true` is a
+    /// dry-run bot, and never carries a hash. `dry_run = false` with a hash
+    /// is an armed submission the chain was asked about. `dry_run = false`
+    /// with no hash is an armed attempt whose transaction was never named:
+    /// no signing key was configured, `STARTUP_DELAY_LEDGERS` had not
+    /// elapsed, the queue refused it, or the bot died before the hash was
+    /// attached — each of which the log line beside the row names, and the
+    /// signing account's sequence number distinguishes from a submission
+    /// that landed unrecorded.
+    pub dry_run: bool,
+    /// The transaction, when the writer already has one. The auctioneer
+    /// records the row before it submits, so it writes `None` here and
+    /// attaches the hash with [`Store::attach_creation_tx`] afterwards.
+    pub tx_hash: Option<String>,
+}
+
+impl Store {
+    /// Records a creation and returns its id.
+    pub async fn record_creation(&self, creation: &CreationRecord) -> Result<i64, StoreError> {
+        let percent = creation
+            .percent
+            .map(|percent| {
+                i16::try_from(percent.get()).map_err(|_| StoreError::Decimal {
+                    column: "percent",
+                    value: percent.get().to_string(),
+                })
+            })
+            .transpose()?;
+        let row = sqlx::query!(
+            "INSERT INTO creations (tx_hash, kind, pool, account, percent, bid, lot, ledger, dry_run)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             RETURNING id",
+            creation.tx_hash,
+            creation.kind.as_str(),
+            creation.pool,
+            creation.account,
+            percent,
+            serde_json::to_value(&creation.bid).map_err(|error| StoreError::Json {
+                column: "bid",
+                detail: error.to_string(),
+            })?,
+            serde_json::to_value(&creation.lot).map_err(|error| StoreError::Json {
+                column: "lot",
+                detail: error.to_string(),
+            })?,
+            i64::from(creation.ledger),
+            creation.dry_run,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.id)
+    }
+
+    /// Attaches the transaction a recorded creation became. Answers whether
+    /// a row was updated.
+    ///
+    /// A creation is recorded *before* it is submitted, so the row exists
+    /// while the hash does not yet: a crash between a transaction landing on
+    /// chain and its row being written would otherwise lose the record of a
+    /// submission that exists, which is the one direction an audit must not
+    /// fail in. The hash is therefore a second write, and a row carrying
+    /// `tx_hash IS NULL` with `dry_run = false` is an armed attempt whose
+    /// transaction was never named — either it was never submitted (the
+    /// queue refused it, or the bot crashed before the enqueue) or it was
+    /// submitted and this bot never recorded the outcome. Telling the two
+    /// apart takes an out-of-band check: the signing account's sequence
+    /// number.
+    ///
+    /// `false` means no row has that `id`. Nothing in this crate deletes a
+    /// creation, so the caller logs it rather than failing a submission that
+    /// has already happened.
+    pub async fn attach_creation_tx(&self, id: i64, tx_hash: &str) -> Result<bool, StoreError> {
+        let done = sqlx::query!(
+            "UPDATE creations SET tx_hash = $2 WHERE id = $1",
+            id,
+            tx_hash
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
     }
 }
 
@@ -807,6 +1155,7 @@ mod tests {
             collateral,
             liabilities,
             updated_ledger,
+            recheck_ledger: None,
         }
     }
 
@@ -864,7 +1213,7 @@ mod tests {
             .expect("c");
 
         let scanned = store
-            .users_below_health(POOL, 12_000_000, 10)
+            .users_below_health(POOL, 12_000_000, 10, None)
             .await
             .expect("scan");
         let accounts: Vec<&str> = scanned.iter().map(|u| u.account.as_str()).collect();
@@ -872,20 +1221,20 @@ mod tests {
 
         assert_eq!(
             store
-                .users_below_health(POOL, 12_000_000, 1)
+                .users_below_health(POOL, 12_000_000, 1, None)
                 .await
                 .expect("limit")
                 .len(),
             1
         );
         assert!(store
-            .users_below_health("COTHER", 12_000_000, 10)
+            .users_below_health("COTHER", 12_000_000, 10, None)
             .await
             .expect("other")
             .is_empty());
         // The threshold is exclusive: a user exactly at it is healthy enough.
         assert!(store
-            .users_below_health(POOL, 8_000_000, 10)
+            .users_below_health(POOL, 8_000_000, 10, None)
             .await
             .expect("exact")
             .is_empty());
@@ -1079,5 +1428,503 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// The scan walks every page: the keyset continues after the last row of
+    /// the previous page, so a user below the threshold cannot be hidden by a
+    /// limit. Ordering is `(health_factor, account)` — the index's own order —
+    /// and two users sharing a health factor are separated by the account.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn users_below_health_pages_through_every_user(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        for (account, health) in [
+            ("A", 1_000_000),
+            ("B", 2_000_000),
+            ("C", 2_000_000),
+            ("D", 3_000_000),
+        ] {
+            store
+                .upsert_user(&TrackedUser {
+                    pool: POOL.to_string(),
+                    account: account.to_string(),
+                    health_factor: health,
+                    collateral: BTreeMap::new(),
+                    liabilities: BTreeMap::from([(0, 1)]),
+                    updated_ledger: 10,
+                    recheck_ledger: None,
+                })
+                .await
+                .expect("upsert");
+        }
+
+        let mut seen = Vec::new();
+        let mut after: Option<(i128, String)> = None;
+        loop {
+            let page = store
+                .users_below_health(
+                    POOL,
+                    5_000_000,
+                    2,
+                    after.as_ref().map(|(hf, account)| (*hf, account.as_str())),
+                )
+                .await
+                .expect("page");
+            if page.is_empty() {
+                break;
+            }
+            if let Some(last) = page.last() {
+                after = Some((last.health_factor, last.account.clone()));
+            }
+            seen.extend(page.into_iter().map(|user| user.account));
+        }
+        assert_eq!(
+            seen,
+            vec!["A", "B", "C", "D"],
+            "every user, in health then account order"
+        );
+        Ok(())
+    }
+
+    /// A flag survives the process: it is a column on the row, and clearing it
+    /// is conditional on the ledger it was set at, so a flag raised again while
+    /// the auctioneer was deciding is not cleared by that decision.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_recheck_flag_is_durable_and_clears_only_the_flag_it_saw(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        store
+            .upsert_user(&TrackedUser {
+                pool: POOL.to_string(),
+                account: USER.to_string(),
+                health_factor: 9_000_000,
+                collateral: BTreeMap::new(),
+                liabilities: BTreeMap::from([(0, 1)]),
+                updated_ledger: 10,
+                recheck_ledger: None,
+            })
+            .await
+            .expect("upsert");
+
+        assert!(
+            store
+                .users_needing_recheck(POOL, 10)
+                .await
+                .expect("read")
+                .is_empty(),
+            "a fresh row is not flagged"
+        );
+
+        store.flag_recheck(POOL, USER, 100).await.expect("flag");
+        let flagged = store.users_needing_recheck(POOL, 10).await.expect("read");
+        assert_eq!(flagged.len(), 1);
+        assert_eq!(flagged[0].account, USER);
+        assert_eq!(flagged[0].recheck_ledger, Some(100));
+
+        // A newer flag arrives while the auctioneer is deciding on the old one.
+        store.flag_recheck(POOL, USER, 200).await.expect("reflag");
+        assert!(
+            !store
+                .clear_recheck(POOL, USER, 100)
+                .await
+                .expect("stale clear"),
+            "clearing the flag it saw must not clear a newer one"
+        );
+        assert_eq!(
+            store
+                .users_needing_recheck(POOL, 10)
+                .await
+                .expect("read")
+                .len(),
+            1,
+            "the newer flag stands"
+        );
+
+        assert!(store.clear_recheck(POOL, USER, 200).await.expect("clear"));
+        assert!(store
+            .users_needing_recheck(POOL, 10)
+            .await
+            .expect("read")
+            .is_empty());
+        Ok(())
+    }
+
+    /// `flag_recheck` only ever moves the column forward: a later call with
+    /// a *lower* ledger than what is already stored must not move it back.
+    /// This is the one place the invariant `move_flag_forward` in
+    /// `service.rs` relies on actually lives — pinning it here catches a
+    /// regression to a plain assignment, which the durability test above
+    /// would not, since that test only ever raises. `GREATEST` ignoring a
+    /// `NULL` argument is the other half a reader will doubt, so this also
+    /// checks that flagging a never-flagged row still raises it.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn flag_recheck_never_lowers_the_stored_ledger(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        store
+            .upsert_user(&TrackedUser {
+                pool: POOL.to_string(),
+                account: USER.to_string(),
+                health_factor: 9_000_000,
+                collateral: BTreeMap::new(),
+                liabilities: BTreeMap::from([(0, 1)]),
+                updated_ledger: 10,
+                recheck_ledger: None,
+            })
+            .await
+            .expect("upsert");
+
+        // Raising a flag on a never-flagged row (recheck_ledger IS NULL)
+        // still sets it, because GREATEST ignores a null argument.
+        store.flag_recheck(POOL, USER, 100).await.expect("raise");
+        assert_eq!(
+            store
+                .user(POOL, USER)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            Some(100),
+            "GREATEST(NULL, 100) must raise the flag, not stay null"
+        );
+
+        // A stale writer (e.g. this pass's own belt-and-braces re-flag)
+        // calls in with a ledger older than one a concurrent task already
+        // stored. The stored value must not move backwards.
+        store
+            .flag_recheck(POOL, USER, 50)
+            .await
+            .expect("stale write");
+        assert_eq!(
+            store
+                .user(POOL, USER)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            Some(100),
+            "a lower ledger must never overwrite a higher stored flag"
+        );
+
+        // A genuinely newer flag still moves it forward.
+        store
+            .flag_recheck(POOL, USER, 150)
+            .await
+            .expect("newer write");
+        assert_eq!(
+            store
+                .user(POOL, USER)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            Some(150),
+            "a higher ledger still moves the flag forward"
+        );
+        Ok(())
+    }
+
+    /// The flag is a property of the row, not of the query that happens to
+    /// have asked for it: `Store::user` must report it exactly as
+    /// `Store::users_needing_recheck` does, so a caller that reads a single
+    /// borrower cannot mistake a flagged row for an unflagged one.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_flag_set_on_a_user_is_visible_through_store_user_too(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        store
+            .upsert_user(&TrackedUser {
+                pool: POOL.to_string(),
+                account: USER.to_string(),
+                health_factor: 9_000_000,
+                collateral: BTreeMap::new(),
+                liabilities: BTreeMap::from([(0, 1)]),
+                updated_ledger: 10,
+                recheck_ledger: None,
+            })
+            .await
+            .expect("upsert");
+        assert_eq!(
+            store
+                .user(POOL, USER)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            None,
+            "an unflagged row reads back with no flag"
+        );
+
+        store.flag_recheck(POOL, USER, 100).await.expect("flag");
+        let read_back = store
+            .user(POOL, USER)
+            .await
+            .expect("read")
+            .expect("row exists");
+        assert_eq!(
+            read_back.recheck_ledger,
+            Some(100),
+            "the flag is visible through a single-user read, not only through the queue"
+        );
+        Ok(())
+    }
+
+    /// An upsert must not clear a pending flag: the tracker rewrites the row
+    /// whenever it refreshes a user, and the auctioneer's work is not that
+    /// refresh's to discard.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn refreshing_a_user_leaves_its_recheck_flag_alone(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let user = TrackedUser {
+            pool: POOL.to_string(),
+            account: USER.to_string(),
+            health_factor: 9_000_000,
+            collateral: BTreeMap::new(),
+            liabilities: BTreeMap::from([(0, 1)]),
+            updated_ledger: 10,
+            recheck_ledger: None,
+        };
+        store.upsert_user(&user).await.expect("upsert");
+        store.flag_recheck(POOL, USER, 100).await.expect("flag");
+        store
+            .upsert_user(&TrackedUser {
+                updated_ledger: 20,
+                ..user
+            })
+            .await
+            .expect("re-upsert");
+        assert_eq!(
+            store
+                .users_needing_recheck(POOL, 10)
+                .await
+                .expect("read")
+                .len(),
+            1,
+            "the refresh rewrote the row without dropping the flag"
+        );
+        Ok(())
+    }
+
+    /// The pinning assertion for `flag_exposed_to`: a borrower holding the
+    /// queried reserve only on the *other* side must never be flagged. A
+    /// statement that selected by index alone and ignored `side` entirely
+    /// would still pass a check that only asserted the right users were
+    /// flagged — it takes a borrower on the wrong side to catch that.
+    /// Pool scoping and the monotonic `GREATEST` write are pinned here too.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn flag_exposed_to_flags_by_side_and_index(db: sqlx::PgPool) -> sqlx::Result<()> {
+        const HOLDS_COLLATERAL: &str = "GCOLLATERALHOLDER";
+        const HOLDS_LIABILITY: &str = "GLIABILITYHOLDER";
+        const OTHER_RESERVE: &str = "GOTHERRESERVEHOLDER";
+        let store = Store::from_pool(db);
+
+        // Reserve 3 as collateral only.
+        store
+            .upsert_user(&TrackedUser {
+                pool: POOL.to_string(),
+                account: HOLDS_COLLATERAL.to_string(),
+                health_factor: 10_000_000,
+                collateral: BTreeMap::from([(3, 1_000_000)]),
+                liabilities: BTreeMap::new(),
+                updated_ledger: 10,
+                recheck_ledger: None,
+            })
+            .await
+            .expect("upsert collateral holder");
+        // Reserve 3 as a liability only — the case that pins `side`.
+        store
+            .upsert_user(&TrackedUser {
+                pool: POOL.to_string(),
+                account: HOLDS_LIABILITY.to_string(),
+                health_factor: 10_000_000,
+                collateral: BTreeMap::new(),
+                liabilities: BTreeMap::from([(3, 1_000_000)]),
+                updated_ledger: 10,
+                recheck_ledger: None,
+            })
+            .await
+            .expect("upsert liability holder");
+        // A different reserve entirely, on both sides: must never come back
+        // for either query.
+        store
+            .upsert_user(&TrackedUser {
+                pool: POOL.to_string(),
+                account: OTHER_RESERVE.to_string(),
+                health_factor: 10_000_000,
+                collateral: BTreeMap::from([(9, 1)]),
+                liabilities: BTreeMap::from([(9, 1)]),
+                updated_ledger: 10,
+                recheck_ledger: None,
+            })
+            .await
+            .expect("upsert unrelated holder");
+
+        let flagged = store
+            .flag_exposed_to(POOL, 3, Side::Collateral, 500)
+            .await
+            .expect("collateral flagging");
+        assert_eq!(flagged, 1, "one borrower holds reserve 3 as collateral");
+        assert_eq!(
+            store
+                .user(POOL, HOLDS_COLLATERAL)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            Some(500)
+        );
+        for untouched in [HOLDS_LIABILITY, OTHER_RESERVE] {
+            assert_eq!(
+                store
+                    .user(POOL, untouched)
+                    .await
+                    .expect("read")
+                    .and_then(|user| user.recheck_ledger),
+                None,
+                "{untouched} holds reserve 3 as a liability or not at all, so the \
+                 collateral side must not flag it"
+            );
+        }
+
+        let flagged = store
+            .flag_exposed_to(POOL, 3, Side::Liability, 600)
+            .await
+            .expect("liability flagging");
+        assert_eq!(flagged, 1, "one borrower holds reserve 3 as a liability");
+        assert_eq!(
+            store
+                .user(POOL, HOLDS_LIABILITY)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            Some(600)
+        );
+        assert_eq!(
+            store
+                .user(POOL, HOLDS_COLLATERAL)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            Some(500),
+            "the liability side must not touch the collateral holder's flag"
+        );
+
+        // The write is `flag_recheck`'s, so an older ledger cannot lower a
+        // flag another task already raised.
+        store
+            .flag_exposed_to(POOL, 3, Side::Collateral, 400)
+            .await
+            .expect("an older flagging");
+        assert_eq!(
+            store
+                .user(POOL, HOLDS_COLLATERAL)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            Some(500),
+            "GREATEST keeps the newer flag"
+        );
+
+        assert_eq!(
+            store
+                .flag_exposed_to("COTHER", 3, Side::Collateral, 700)
+                .await
+                .expect("other pool"),
+            0,
+            "another pool's borrowers are not this pool's exposure"
+        );
+        Ok(())
+    }
+
+    /// A creation is recorded whether or not it was sent, because the audit
+    /// exists to say what the bot decided, and in dry-run the decision is all
+    /// there is. A bad-debt creation carries no percent.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_dry_run_creation_is_recorded_with_no_hash(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let id = store
+            .record_creation(&CreationRecord {
+                kind: CreationKind::Auction,
+                pool: POOL.to_string(),
+                account: USER.to_string(),
+                percent: Some(FillPercent::try_from(42).expect("percent")),
+                bid: vec!["USDC".to_string()],
+                lot: vec!["XLM".to_string()],
+                ledger: 64_271_340,
+                dry_run: true,
+                tx_hash: None,
+            })
+            .await
+            .expect("record");
+        assert!(id > 0, "the row is identified by its serial");
+
+        let bad_debt = store
+            .record_creation(&CreationRecord {
+                kind: CreationKind::BadDebt,
+                pool: POOL.to_string(),
+                account: USER.to_string(),
+                percent: None,
+                bid: Vec::new(),
+                lot: Vec::new(),
+                ledger: 64_271_341,
+                dry_run: false,
+                tx_hash: Some("ab".repeat(32)),
+            })
+            .await
+            .expect("record bad debt");
+        assert!(bad_debt > id, "the serial advances");
+        Ok(())
+    }
+
+    /// The two-step audit: the row is written before the submission, and
+    /// the hash is attached once there is one. A row that never gets its
+    /// second write stays as `dry_run = false` with no hash — a submission
+    /// this bot did not see the end of, which is what the audit must be
+    /// able to say.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_creations_transaction_hash_is_attached_after_the_fact(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let id = store
+            .record_creation(&CreationRecord {
+                kind: CreationKind::Auction,
+                pool: POOL.to_string(),
+                account: USER.to_string(),
+                percent: Some(FillPercent::try_from(42).expect("percent")),
+                bid: vec!["USDC".to_string()],
+                lot: vec!["XLM".to_string()],
+                ledger: 64_271_340,
+                dry_run: false,
+                tx_hash: None,
+            })
+            .await
+            .expect("record");
+        let before = sqlx::query!("SELECT tx_hash FROM creations WHERE id = $1", id)
+            .fetch_one(store.pool())
+            .await
+            .expect("the row exists before the submission");
+        assert!(
+            before.tx_hash.is_none(),
+            "the row is written before there is a transaction to name"
+        );
+
+        let hash = "cd".repeat(32);
+        assert!(
+            store
+                .attach_creation_tx(id, &hash)
+                .await
+                .expect("attach the hash"),
+            "the row this bot just wrote is the one updated"
+        );
+        let after = sqlx::query!("SELECT tx_hash FROM creations WHERE id = $1", id)
+            .fetch_one(store.pool())
+            .await
+            .expect("the row still exists");
+        assert_eq!(after.tx_hash, Some(hash));
+
+        assert!(
+            !store
+                .attach_creation_tx(id + 1_000, "ef".repeat(32).as_str())
+                .await
+                .expect("a missing row is not an error"),
+            "no row, no update — and not a failure either"
+        );
+        Ok(())
     }
 }

@@ -11,11 +11,17 @@
 //! Phase 1 landed the pure fixed-point math and the ScVal/ledger-entry
 //! codecs (`math`, `chain::xdr`); Phase 2 landed the chain layer
 //! (`chain::rpc`, `chain::pool`, `chain::signer`, `chain::tx`); Phase 3
-//! lands the store, the ledger poller, the tracker and `service`, which
+//! landed the store, the ledger poller, the tracker and `service`, which
 //! wires them into a bot that validates its configuration, seeds its
-//! tracked-user set and follows every configured pool until shut down. No
-//! signer is wired in yet, so the bot only ever reads: the auctioneer, the
-//! filler and executor, unwind, and the rest of the operational surface are
+//! tracked-user set and follows every configured pool until shut down.
+//! Phase 4 lands the auctioneer (`auctioneer`, `queue`,
+//! `math::liquidation`): the bot now decides which tracked borrowers are
+//! liquidatable, builds the auction the contract should accept, lets the
+//! contract judge the percent through simulation, records every creation
+//! it decides to make, and — only when `DRY_RUN=false` **and** a signing
+//! key is configured — signs and submits it through a per-key queue. That
+//! is the one write path so far: it still fills no auction, and the
+//! filler, executor, unwind and the rest of the operational surface are
 //! still to land. The repository scaffolding around it — CI gates, lint
 //! posture, dev container, release preflight — is complete and enforced
 //! from the first commit, so the liquidation logic lands into a repo that
@@ -24,10 +30,12 @@
 //! The module layout follows the design spec at
 //! `docs/superpowers/specs/2026-09-04-blend-liquidator-bot-design.md`.
 
+pub mod auctioneer;
 pub mod chain;
 pub mod config;
 pub mod ledger;
 pub mod math;
+pub mod queue;
 pub mod service;
 pub mod store;
 pub mod tracker;
@@ -64,4 +72,7 @@ pub enum LiquidatorError {
     /// The tracker failed to apply an event or refresh a borrower.
     #[error("tracker: {0}")]
     Tracker(#[from] tracker::TrackerError),
+    /// The auctioneer failed to decide who is liquidatable, or to act on it.
+    #[error("auctioneer: {0}")]
+    Auctioneer(#[from] auctioneer::AuctioneerError),
 }

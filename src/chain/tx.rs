@@ -16,9 +16,15 @@
 //! error no retry can fix, which ends the wait at once rather than at the
 //! cap.
 //!
-//! This layer never consults `DRY_RUN`: nothing here should be called by a
-//! dry-run path. The decision to sign and submit at all belongs to the
-//! executor that owns it.
+//! This layer never consults `DRY_RUN`: the decision to sign and submit at
+//! all belongs to the executor that owns it. Everything here that signs —
+//! `prepare`, `restore`, `send`, `submit` — is an armed path, and `prepare`
+//! is one of them twice over: it signs unconditionally, and it submits a
+//! `RestoreFootprint` transaction of its own when a simulation reports
+//! archived entries, so simulating *through* it is a submission.
+//! [`Submitter::simulate_only`] is the single exception and the only method
+//! a dry-run may call — it builds unsigned, simulates, and returns what the
+//! contract said, signing nothing.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -476,6 +482,78 @@ impl<'a> Submitter<'a> {
             resource_fee: call.min_resource_fee,
         })
     }
+
+    /// Asks the contract what it makes of `operation`, and does nothing
+    /// else: it reads the source account, builds the transaction
+    /// **unsigned**, simulates it, and returns the answer.
+    ///
+    /// This is the one path into this module that never produces a
+    /// signature, never restores an archived entry and never calls
+    /// `sendTransaction` — which is what makes it the path a dry-run may
+    /// take. `prepare` and `submit` both sign, and `prepare` submits a
+    /// `RestoreFootprint` transaction of its own when a simulation reports
+    /// archived entries; a caller that must not spend this key's sequence
+    /// number must call this instead of either. `DRY_RUN` is not read here
+    /// — the caller owns that decision — so the guarantee this method
+    /// offers is unconditional rather than a mode.
+    ///
+    /// A simulation reporting archived entries comes back as
+    /// [`Judgment::NeedsRestore`]: not a refusal and not an error, because
+    /// what the contract would say about the operation itself is simply
+    /// unknown until those entries are restored, and restoring them is a
+    /// submission, which this method does not make.
+    ///
+    /// # Errors
+    ///
+    /// [`ChainError`] when the operation could not be judged at all: the
+    /// account read or the simulation request failed, or the sequence
+    /// number overflows. A contract's refusal is not one of those — it is
+    /// [`Judgment::Refused`], carrying the pool's error code when the
+    /// refusal decoded to one.
+    pub async fn simulate_only(&self, operation: &Operation) -> Result<Judgment, ChainError> {
+        let account = self.rpc.account(self.signer.address()).await?;
+        let sequence = account
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| ChainError::Shape("the account sequence overflows i64".to_string()))?;
+        match self
+            .simulate_call(operation, sequence, account.latest_ledger)
+            .await
+        {
+            Ok((call, _)) if call.restore.is_some() => Ok(Judgment::NeedsRestore),
+            Ok(_) => Ok(Judgment::Accepted),
+            Err(ChainError::Simulation {
+                message,
+                contract_error,
+            }) => Ok(Judgment::Refused {
+                contract_error,
+                message,
+            }),
+            Err(other) => Err(other),
+        }
+    }
+}
+
+/// What the contract made of an operation it was shown but never asked to
+/// sign — [`Submitter::simulate_only`]'s answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Judgment {
+    /// The host ran the call and would let it through.
+    Accepted,
+    /// The host refused it: the pool's error code, when the refusal decoded
+    /// to one, and the RPC's diagnostic text. A refusal with no code is a
+    /// trap or a malformed envelope, which is a refusal all the same.
+    Refused {
+        /// The pool's error code, when the refusal carried one.
+        contract_error: Option<u32>,
+        /// The RPC's text, diagnostic log included.
+        message: String,
+    },
+    /// The operation's footprint holds archived entries, so the host could
+    /// not judge the call itself. Restoring them consumes a sequence number
+    /// and costs a resource fee, so it is [`Submitter::submit`]'s business
+    /// and never a simulate-only caller's.
+    NeedsRestore,
 }
 
 /// What a `getTransaction` answer means for a transaction identified by
@@ -1053,6 +1131,75 @@ mod tests {
         assert!(
             rpc.calls("sendTransaction").is_empty(),
             "nothing is sent after a failed simulation"
+        );
+    }
+
+    /// The guarantee `simulate_only` exists for: a simulation whose
+    /// footprint holds archived entries is reported, not acted on.
+    /// `prepare` answers the same preamble by signing and sending a
+    /// `RestoreFootprint` transaction; this path sends nothing, and never
+    /// reads fee stats either, because it has no transaction to pay for.
+    #[tokio::test]
+    async fn simulate_only_reports_an_archived_footprint_and_restores_nothing() {
+        let rpc = ScriptedRpc::start().await;
+        script_account(&rpc, 41, 100);
+        script_simulation(&rpc, 1_000, 100, Some(500));
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let (network, signer) = (Network::testnet(), signer());
+        let submitter = Submitter::new(&client, &network, &signer, config());
+
+        let judgment = submitter.simulate_only(&operation()).await.unwrap();
+
+        assert_eq!(judgment, Judgment::NeedsRestore);
+        assert!(
+            rpc.calls("sendTransaction").is_empty(),
+            "a simulate-only call never sends, a restore least of all"
+        );
+        assert!(
+            rpc.calls("getFeeStats").is_empty(),
+            "and never prices a transaction it is not going to build"
+        );
+        assert_eq!(
+            rpc.calls("simulateTransaction").len(),
+            1,
+            "one simulation: there is no second one, because there was no \
+             restore in between"
+        );
+    }
+
+    /// The envelope it simulates carries no signature at all, and the
+    /// contract's refusal comes back as a value rather than an error.
+    #[tokio::test]
+    async fn simulate_only_simulates_an_unsigned_envelope() {
+        let rpc = ScriptedRpc::start().await;
+        script_account(&rpc, 41, 100);
+        rpc.expect(
+            "simulateTransaction",
+            json!({"error": "HostError: Error(Contract, #1214)", "events": [diagnostic_error_b64(1214)], "latestLedger": 100}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let (network, signer) = (Network::testnet(), signer());
+        let submitter = Submitter::new(&client, &network, &signer, config());
+
+        let judgment = submitter.simulate_only(&operation()).await.unwrap();
+
+        assert_eq!(
+            judgment,
+            Judgment::Refused {
+                contract_error: Some(1214),
+                message: "HostError: Error(Contract, #1214)".to_string(),
+            }
+        );
+        let simulated = rpc.calls("simulateTransaction");
+        let envelope: TransactionEnvelope =
+            from_base64(simulated[0]["transaction"].as_str().unwrap()).unwrap();
+        let TransactionEnvelope::Tx(v1) = envelope else {
+            panic!("expected a v1 envelope")
+        };
+        assert!(
+            v1.signatures.is_empty(),
+            "the envelope this key was shown to the network in carries no \
+             signature of its own"
         );
     }
 

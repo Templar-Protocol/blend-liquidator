@@ -141,6 +141,46 @@ impl<'de> serde::Deserialize<'de> for Decimal7 {
     }
 }
 
+/// The bottom of the pool contract's post-liquidation band, 7 decimals:
+/// below `1.03` it answers `InvalidLiqTooSmall` (1214).
+const TARGET_HF_MIN: i128 = 10_300_000;
+
+/// The top of that band, 7 decimals, exclusive: at or above `1.15` the
+/// contract answers `InvalidLiqTooLarge` (1213).
+const TARGET_HF_MAX: i128 = 11_500_000;
+
+/// `TARGET_HF`, refused outside the band the contract itself accepts.
+///
+/// The knob names the health factor a liquidation aims to leave the
+/// borrower at, and the plan's percent is computed straight from it:
+/// `excess = liability_base × TARGET_HF − collateral_base`. At `0` that
+/// excess is `−collateral_base`, never positive, so `plan_liquidation`
+/// returns `None` for every borrower and each liquidatable one is recorded
+/// `Skip(NoPlan)` — for ever, with no warning at all. Above the band it
+/// fails the other way: the walk starts far too high and burns
+/// `PLAN_ITERATIONS` simulations per borrower before skipping it, one warn
+/// line each.
+///
+/// The bounds are the contract's own and nothing narrower: it refuses a
+/// post-liquidation health factor below `1.03` (`InvalidLiqTooSmall`) and
+/// at or above `1.15` (`InvalidLiqTooLarge`), so `[1.03, 1.15)` is exactly
+/// the set of values that name an outcome the contract can accept. Picking
+/// a tighter range here would be this bot's opinion rather than the
+/// contract's rule, and the ±1 percent walk is what absorbs the margin at
+/// either edge. Refused at parse rather than clamped, for the same reason
+/// `PLAN_ITERATIONS` and `PRICE_DELTA_BPS` are: a knob value that makes the
+/// bot look busy and do nothing is a startup error, not a default.
+fn target_health_factor(text: &str) -> Result<Decimal7, String> {
+    let value: Decimal7 = text.parse()?;
+    if value.get() < TARGET_HF_MIN || value.get() >= TARGET_HF_MAX {
+        return Err(format!(
+            "`{text}` is outside the band the pool contract accepts: TARGET_HF must be at \
+             least 1.03 and below 1.15, or every liquidation this bot plans is refused"
+        ));
+    }
+    Ok(value)
+}
+
 /// An amount in an asset's own decimals, written as a decimal string
 /// because it exceeds what TOML integers and JSON numbers hold.
 fn amount_from_str(text: &str, field: &'static str) -> Result<i128, String> {
@@ -342,7 +382,8 @@ pub struct ServiceConfig {
     pub chain: ChainConfig,
     /// Postgres. May carry a password, so it never renders.
     pub database_url: Secret,
-    /// Connections in the pool.
+    /// Connections in the pool. Sized against the tasks that query
+    /// concurrently, not against one; see [`Args::database_max_connections`].
     pub database_max_connections: u32,
     /// The pools to follow.
     pub pools: Vec<PoolConfig>,
@@ -360,6 +401,36 @@ pub struct ServiceConfig {
     pub full_scan_ledgers: u32,
     /// The health factor the full scan reports below, 7 decimals.
     pub scan_health_factor: i128,
+    /// The health factor at or below which a borrower is liquidatable, 7
+    /// decimals.
+    pub liquidation_health_factor: i128,
+    /// The health factor a liquidation aims to leave the borrower at, 7
+    /// decimals.
+    pub target_health_factor: i128,
+    /// How often, in ledgers, prices are re-read for a significant move.
+    pub oracle_scan_ledgers: u32,
+    /// How far a price must move, in basis points, to be worth rechecking
+    /// the borrowers exposed to it.
+    ///
+    /// Never zero: at zero, an unchanged price computes a delta of `0`,
+    /// which fails the "moved at least this much" test and falls through to
+    /// the direction branch, where `price > reference` is false on
+    /// equality — reporting a spurious `Down` and flagging every borrower
+    /// on every scan. `PRICE_DELTA_BPS=0` is refused at parse (see `Args`),
+    /// so this field is never constructed with it.
+    pub price_delta_bps: u32,
+    /// How many times a rejected percent is adjusted against the contract's
+    /// own answer before the borrower is left until the next recheck.
+    ///
+    /// Never zero: the walk runs `0..plan_iterations`, so a zero would
+    /// simulate nothing at all and skip every liquidation while reporting
+    /// that it had exhausted its iterations — a bot that looks busy and
+    /// does nothing. `PLAN_ITERATIONS=0` is refused at parse (see `Args`),
+    /// so this field is never constructed with it.
+    pub plan_iterations: u32,
+    /// A count of ledgers, measured from the first ledger the auctioneer
+    /// sees, before any submission is attempted.
+    pub startup_delay_ledgers: u32,
     /// Seeding.
     pub seed: SeedConfig,
 }
@@ -437,10 +508,17 @@ pub struct Args {
     pub run_mode: RunMode,
 
     /// Connections in the database pool.
+    ///
+    /// Must cover every task that queries concurrently: one ledger poller
+    /// per pool, the tracker, and the auctioneer — roughly `pools + 2`, and
+    /// the default covers up to eight pools. Sizing it below that does not
+    /// deadlock; it times out acquiring a connection, and every
+    /// [`crate::store::StoreError`] in this bot is fatal, so a load spike
+    /// becomes a process exit.
     #[arg(
         long,
         env = "DATABASE_MAX_CONNECTIONS",
-        default_value_t = 5,
+        default_value_t = 10,
         value_parser = clap::value_parser!(u32).range(1..=100),
     )]
     pub database_max_connections: u32,
@@ -459,7 +537,14 @@ pub struct Args {
     #[arg(long, env = "USER_REFRESH_LEDGERS", default_value_t = 241_920)]
     pub user_refresh_ledgers: u32,
 
-    /// How many stale users to refresh per tick.
+    /// A rate, not a cap: how many stale users the tracker refreshes per
+    /// tick, how many flagged borrowers the auctioneer decides and acts on
+    /// per pool per tick, and the page size the full scan flags with.
+    ///
+    /// It deliberately does not bound the oracle scan. That scan flags
+    /// every borrower a price move went against, because `PriceWatch`
+    /// re-anchors its reference on the move it reports — so a borrower a
+    /// bounded scan skipped would not be picked up by the next scan either.
     #[arg(
         long,
         env = "REFRESH_BATCH",
@@ -480,6 +565,97 @@ pub struct Args {
     /// The health factor that scan reports below.
     #[arg(long, env = "SCAN_HF_THRESHOLD", default_value = "1.2")]
     pub scan_hf_threshold: Decimal7,
+
+    /// The health factor at or below which a borrower is liquidatable.
+    ///
+    /// Below the contract's own strict test (`liability_base >
+    /// collateral_base`, i.e. 1.0) on purpose: the margin absorbs rounding
+    /// and the interest accrued between planning and execution, so an
+    /// auction the bot creates is one the contract still accepts when it
+    /// lands.
+    #[arg(long, env = "LIQ_HF_THRESHOLD", default_value = "0.998")]
+    pub liq_hf_threshold: Decimal7,
+
+    /// The health factor a liquidation aims to leave the borrower at.
+    ///
+    /// The contract refuses a post-liquidation health factor at or above
+    /// `1.15` (`InvalidLiqTooLarge`) or below `1.03` (`InvalidLiqTooSmall`),
+    /// so this sits between them with room for the auction to be filled a
+    /// ledger or two later than planned — and anything outside that band is
+    /// refused at parse rather than clamped: `TARGET_HF=0` would make the
+    /// planned excess non-positive for every borrower, so every
+    /// liquidatable one is recorded as "no plan" for ever, silently, and a
+    /// value above the band burns `PLAN_ITERATIONS` simulations per
+    /// borrower before skipping it. The bounds are the contract's own and
+    /// nothing narrower — a tighter range would be this bot's opinion
+    /// rather than the contract's rule — and the ±1 percent walk is what
+    /// absorbs the margin at either edge.
+    #[arg(
+        long,
+        env = "TARGET_HF",
+        default_value = "1.06",
+        value_parser = target_health_factor,
+    )]
+    pub target_hf: Decimal7,
+
+    /// How often, in ledgers, prices are re-read and a significant move
+    /// flags the borrowers it moved against.
+    ///
+    /// Zero is refused at parse. `scan_due` never fires for a zero period,
+    /// so `0` would not mean "every ledger": it would silently switch the
+    /// oracle scan off for the life of the process, leaving a price crash
+    /// to be noticed by the full scan's cadence alone. A startup error is
+    /// the loud direction, the same posture as `FULL_SCAN_LEDGERS`.
+    #[arg(
+        long,
+        env = "ORACLE_SCAN_LEDGERS",
+        default_value_t = 60,
+        value_parser = clap::value_parser!(u32).range(1..),
+    )]
+    pub oracle_scan_ledgers: u32,
+
+    /// How far a price must move from its reference, in basis points, to be
+    /// worth rechecking the borrowers exposed to it.
+    ///
+    /// At least 1: at zero, an unchanged price computes a delta of `0`,
+    /// which fails the "moved at least this much" test and falls through to
+    /// the direction branch, where `price > reference` is false on
+    /// equality — reporting a spurious `Down` and flagging every borrower
+    /// on every scan, forever. Refusing it at parse time means that is a
+    /// startup error, not a bot that runs and never stops rechecking
+    /// everyone.
+    #[arg(
+        long,
+        env = "PRICE_DELTA_BPS",
+        default_value_t = 250,
+        value_parser = clap::value_parser!(u32).range(1..),
+    )]
+    pub price_delta_bps: u32,
+
+    /// How many times a rejected percent is adjusted against the contract's
+    /// own answer before the borrower is left until the next recheck.
+    ///
+    /// At least 1: zero would make the walk never simulate at all, so every
+    /// liquidation would be skipped as though the contract had refused it,
+    /// silently. Refusing it at parse time means that is a startup error,
+    /// not a bot that runs and never lands a fill.
+    #[arg(
+        long,
+        env = "PLAN_ITERATIONS",
+        default_value_t = 5,
+        value_parser = clap::value_parser!(u32).range(1..),
+    )]
+    pub plan_iterations: u32,
+
+    /// A count of ledgers, measured from the first ledger the auctioneer
+    /// sees, before any submission is attempted.
+    ///
+    /// Zero by default, so a fresh deployment submits as soon as it is
+    /// ready. A nonzero value gives a poller that is catching up on a
+    /// backlog room to reach current chain state before the bot starts
+    /// acting on health factors it has not yet re-verified against it.
+    #[arg(long, env = "STARTUP_DELAY_LEDGERS", default_value_t = 0)]
+    pub startup_delay_ledgers: u32,
 
     /// The analytics API the tracker seeds from. Empty disables it.
     #[arg(
@@ -605,6 +781,24 @@ impl Args {
                 ))
             }
         };
+        // `TARGET_HF` is bounded by its own value parser; this one is a
+        // relation between two knobs, which no single parser can see. The
+        // full scan flags borrowers *strictly* below `SCAN_HF_THRESHOLD`
+        // and the auctioneer judges borrowers *at or* below
+        // `LIQ_HF_THRESHOLD`, so the liquidation threshold must sit
+        // strictly below the scan threshold: at equality, a borrower
+        // exactly on it is liquidatable but is never flagged by the scan,
+        // and above it a whole band is — reachable only through an event
+        // or a price move, and silently.
+        if self.liq_hf_threshold >= self.scan_hf_threshold {
+            return Err(LiquidatorError::Config(
+                "LIQ_HF_THRESHOLD is at or above SCAN_HF_THRESHOLD: the full scan only \
+                 flags borrowers strictly below SCAN_HF_THRESHOLD, so a liquidation \
+                 threshold at or above it names borrowers nothing ever flags for a \
+                 decision"
+                    .to_string(),
+            ));
+        }
         Ok(ServiceConfig {
             chain,
             database_url: Secret::new(database_url),
@@ -617,12 +811,111 @@ impl Args {
             refresh_batch: self.refresh_batch,
             full_scan_ledgers: self.full_scan_ledgers,
             scan_health_factor: self.scan_hf_threshold.get(),
+            liquidation_health_factor: self.liq_hf_threshold.get(),
+            target_health_factor: self.target_hf.get(),
+            oracle_scan_ledgers: self.oracle_scan_ledgers,
+            price_delta_bps: self.price_delta_bps,
+            // Never zero: `--plan-iterations`/`PLAN_ITERATIONS` refuses 0 at
+            // parse, so this is always at least 1. See
+            // `ServiceConfig::plan_iterations`.
+            plan_iterations: self.plan_iterations,
+            startup_delay_ledgers: self.startup_delay_ledgers,
             seed: SeedConfig {
                 url: Some(self.seed_url.clone()).filter(|url| !url.is_empty()),
                 health_factor_max: self.seed_hf_max.get(),
                 file: self.seed_file.clone(),
             },
         })
+    }
+
+    /// Every signing key this process was given, each parsed whether or
+    /// not it is the one that signs: `AUCTIONEER_SECRET_KEY` and
+    /// `FILLER_SECRET_KEY`, both `None` in the ordinary dry-run deployment
+    /// and that is not an error.
+    ///
+    /// The filler's key is parsed even when the auctioneer's is what signs,
+    /// because its *address* is needed either way — see
+    /// [`SigningKeys::own_addresses`]. A malformed key is therefore a
+    /// startup error whichever of the two it is, rather than a key that
+    /// quietly does not exist until the phase that signs with it.
+    ///
+    /// Both arrive from the environment, never from argv: a signing key on
+    /// the command line is readable from `/proc/<pid>/cmdline`, `ps` and
+    /// `docker inspect`.
+    ///
+    /// # Errors
+    ///
+    /// [`LiquidatorError::Config`] naming which variable was malformed. The
+    /// message never carries the secret itself.
+    pub fn signing_keys(
+        &self,
+        filler: Option<String>,
+        auctioneer: Option<String>,
+    ) -> Result<SigningKeys, LiquidatorError> {
+        Ok(SigningKeys {
+            auctioneer: parse_signing_key("AUCTIONEER_SECRET_KEY", auctioneer)?,
+            filler: parse_signing_key("FILLER_SECRET_KEY", filler)?,
+        })
+    }
+}
+
+/// One optional secret key, parsed with `name` on the error rather than the
+/// value: the message an operator sees says which variable is wrong and
+/// never echoes what was in it.
+fn parse_signing_key(
+    name: &str,
+    secret: Option<String>,
+) -> Result<Option<crate::chain::Signer>, LiquidatorError> {
+    secret
+        .map(|secret| {
+            crate::chain::Signer::from_secret(&secret)
+                .map_err(|error| LiquidatorError::Config(format!("{name}: {error}")))
+        })
+        .transpose()
+}
+
+/// Every signing key this process holds.
+///
+/// Two keys, one signer: the auctioneer signs with `auctioneer` when it is
+/// configured and falls back to `filler`, but **both** addresses are the
+/// bot's own regardless of which one signs. The auctioneer must never
+/// create a liquidation auction against either — the contract has no reason
+/// to refuse the bot liquidating its own filler position, and in dry-run
+/// there is no contract to refuse at all — so
+/// [`SigningKeys::own_addresses`] reports both and
+/// [`SigningKeys::into_auctioneer_signer`] answers the separate question of
+/// which one signs.
+#[derive(Debug)]
+pub struct SigningKeys {
+    /// `AUCTIONEER_SECRET_KEY`, when set.
+    pub auctioneer: Option<crate::chain::Signer>,
+    /// `FILLER_SECRET_KEY`, when set. Held for its address even while
+    /// nothing signs with it: Phase 5 is where the filler's position first
+    /// exists, and it is the position this bot must not liquidate.
+    pub filler: Option<crate::chain::Signer>,
+}
+
+impl SigningKeys {
+    /// Every address this bot holds a key for — both when the two keys
+    /// differ, one when only one is configured or they are the same key,
+    /// and empty when none is, which excludes nothing rather than
+    /// everything.
+    #[must_use]
+    pub fn own_addresses(&self) -> std::collections::BTreeSet<String> {
+        [self.auctioneer.as_ref(), self.filler.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|signer| signer.address().to_string())
+            .collect()
+    }
+
+    /// The key the auctioneer signs with: its own when configured,
+    /// otherwise the filler's, and `None` when neither is — the ordinary
+    /// dry-run deployment, not an error. Consuming, because `Signer` is
+    /// deliberately not `Clone`: it holds key material.
+    #[must_use]
+    pub fn into_auctioneer_signer(self) -> Option<crate::chain::Signer> {
+        self.auctioneer.or(self.filler)
     }
 }
 
@@ -680,6 +973,11 @@ mod tests {
     /// `lint-test` job export `DATABASE_URL` for the whole run so the sqlx
     /// query macros can check themselves, which would make this assertion
     /// fail on every sanctioned way of running these tests.
+    ///
+    /// `AUCTIONEER_SECRET_KEY` and `FILLER_SECRET_KEY` are excluded for the
+    /// same reason: both are read straight from the environment by
+    /// `main.rs` and handed to [`Args::signing_keys`], and neither is ever
+    /// declared as a clap argument.
     fn assert_clean_environment() {
         for name in [
             "RPC_URL",
@@ -700,6 +998,12 @@ mod tests {
             "REFRESH_BATCH",
             "FULL_SCAN_LEDGERS",
             "SCAN_HF_THRESHOLD",
+            "LIQ_HF_THRESHOLD",
+            "TARGET_HF",
+            "ORACLE_SCAN_LEDGERS",
+            "PRICE_DELTA_BPS",
+            "PLAN_ITERATIONS",
+            "STARTUP_DELAY_LEDGERS",
             "SEED_URL",
             "SEED_HF_MAX",
             "SEED_FILE",
@@ -715,6 +1019,13 @@ mod tests {
     fn parse(argv: &[&str]) -> Args {
         assert_clean_environment();
         Args::try_parse_from(argv).unwrap()
+    }
+
+    /// The fallible sibling of `parse`, for the tests that want to assert
+    /// *how* parsing fails rather than unwrap a success.
+    fn try_parse(argv: &[&str]) -> clap::error::Result<Args> {
+        assert_clean_environment();
+        Args::try_parse_from(argv)
     }
 
     #[test]
@@ -1165,5 +1476,393 @@ supported_lot = ["*"]
             .service_with_secrets(Some("postgres://x".to_string()), None)
             .expect("configuration");
         assert_eq!(config.seed.url, None);
+    }
+
+    /// The auctioneer's thresholds parse into 7-decimal fixed point with the
+    /// spec's defaults, and a value with more precision than the scale can
+    /// hold is refused at startup rather than silently rounded — a
+    /// threshold that decides whether to liquidate is not a place to lose a
+    /// digit.
+    #[test]
+    fn the_auctioneer_thresholds_default_and_refuse_over_precision() {
+        assert_clean_environment();
+        let args = parse(&[
+            "liquidator",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "http://rpc",
+        ]);
+        assert_eq!(
+            args.liq_hf_threshold.get(),
+            9_980_000,
+            "LIQ_HF_THRESHOLD defaults to 0.998"
+        );
+        assert_eq!(
+            args.target_hf.get(),
+            10_600_000,
+            "TARGET_HF defaults to 1.06"
+        );
+        assert_eq!(args.oracle_scan_ledgers, 60);
+        assert_eq!(args.price_delta_bps, 250);
+        assert_eq!(args.plan_iterations, 5);
+        assert_eq!(args.startup_delay_ledgers, 0);
+
+        let refused = try_parse(&[
+            "liquidator",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "http://rpc",
+            "--target-hf",
+            "1.060000001",
+        ]);
+        assert!(
+            refused.is_err(),
+            "a value the 7-decimal scale cannot hold is a startup error"
+        );
+    }
+
+    /// `TARGET_HF` outside the contract's post-liquidation band is refused
+    /// at parse, not clamped — the same standard `PLAN_ITERATIONS=0` and
+    /// `PRICE_DELTA_BPS=0` already hold.
+    ///
+    /// Zero is the one that matters most: `excess = liability_base ×
+    /// TARGET_HF − collateral_base` is then never positive, so every
+    /// liquidatable borrower is recorded `Skip(NoPlan)` for ever and
+    /// nothing warns. The edges are asserted in both directions, because a
+    /// bound written with the comparison the wrong way round would refuse
+    /// exactly the values it must accept.
+    #[test]
+    fn a_target_hf_outside_the_contracts_band_is_refused_at_parse() {
+        assert_clean_environment();
+        let parse_target = |value: &str| {
+            try_parse(&[
+                "liquidator",
+                "--network",
+                "testnet",
+                "--rpc-url",
+                "http://rpc",
+                "--target-hf",
+                value,
+            ])
+        };
+
+        for refused in ["0", "0.9", "1.0299999", "1.15", "1.2", "2"] {
+            assert!(
+                parse_target(refused).is_err(),
+                "TARGET_HF={refused} is outside the band the contract accepts"
+            );
+        }
+        for accepted in ["1.03", "1.06", "1.1499999"] {
+            assert!(
+                parse_target(accepted).is_ok(),
+                "TARGET_HF={accepted} names an outcome the contract accepts"
+            );
+        }
+    }
+
+    /// A liquidation threshold above the scan threshold names borrowers
+    /// the full scan never flags, so the auctioneer would only ever reach
+    /// them through an event or a price move. That is a relation between
+    /// two knobs, so it is checked where both are visible rather than in
+    /// either one's value parser.
+    #[test]
+    fn a_liquidation_threshold_above_the_scan_threshold_is_refused() {
+        assert_clean_environment();
+        let args = parse(&[
+            "liquidator",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "http://rpc",
+            "--pools-toml",
+            POOLS,
+            "--scan-hf-threshold",
+            "1.2",
+            "--liq-hf-threshold",
+            "1.3",
+        ]);
+        let error = args
+            .service_with_secrets(Some("postgres://x".to_string()), None)
+            .expect_err("refused");
+        assert!(error.to_string().contains("LIQ_HF_THRESHOLD"), "{error}");
+
+        // Equality is refused too: the scan flags strictly below its
+        // threshold while the auctioneer liquidates at or below its own, so
+        // a borrower exactly on a shared value is liquidatable and never
+        // flagged.
+        let equal = parse(&[
+            "liquidator",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "http://rpc",
+            "--pools-toml",
+            POOLS,
+            "--scan-hf-threshold",
+            "1.2",
+            "--liq-hf-threshold",
+            "1.2",
+        ]);
+        let error = equal
+            .service_with_secrets(Some("postgres://x".to_string()), None)
+            .expect_err("equality refused");
+        assert!(error.to_string().contains("at or above"), "{error}");
+    }
+
+    /// The auctioneer's key is environment-only, like every other secret: a
+    /// key on the command line is readable in `ps`, `docker inspect` and
+    /// `/proc/<pid>/cmdline`.
+    #[test]
+    fn the_auctioneer_key_is_not_an_argument() {
+        assert_clean_environment();
+        assert!(
+            try_parse(&[
+                "liquidator",
+                "--network",
+                "testnet",
+                "--rpc-url",
+                "http://rpc",
+                "--auctioneer-secret-key",
+                "SB…",
+            ])
+            .is_err(),
+            "there is no such flag, and there must not be"
+        );
+    }
+
+    /// Two valid test seeds for the key tests; any S… strkey this crate
+    /// can decode will do, and neither has ever held funds.
+    const FILLER_SEED: &str = "SAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC5MY";
+    const AUCTIONEER_SEED: &str = "SABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNE7";
+
+    /// Unset, the auctioneer signs with the filler's key: one key is the
+    /// ordinary deployment, and the spec makes the separate key the option
+    /// rather than the requirement. A configured auctioneer key wins.
+    #[test]
+    fn the_auctioneer_falls_back_to_the_filler_key() {
+        assert_clean_environment();
+        let args = parse(&[
+            "liquidator",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "http://rpc",
+        ]);
+
+        let only_filler = args
+            .signing_keys(Some(FILLER_SEED.to_string()), None)
+            .expect("keys")
+            .into_auctioneer_signer()
+            .expect("a key is configured");
+        let both = args
+            .signing_keys(
+                Some(FILLER_SEED.to_string()),
+                Some(AUCTIONEER_SEED.to_string()),
+            )
+            .expect("keys")
+            .into_auctioneer_signer()
+            .expect("a key is configured");
+        assert_ne!(
+            only_filler.address(),
+            both.address(),
+            "the auctioneer key wins when set"
+        );
+        assert!(
+            args.signing_keys(None, None)
+                .expect("no key")
+                .into_auctioneer_signer()
+                .is_none(),
+            "no key configured is not an error: dry-run needs none"
+        );
+    }
+
+    /// The spec's "never for the filler or auctioneer addresses", pinned
+    /// for the case that used to breach it: two *different* keys.
+    ///
+    /// Only one of them signs — the auctioneer's — so a set derived from
+    /// the signing key alone holds one address, and the filler's own
+    /// position is then a borrower this bot would happily create a
+    /// liquidation auction against. The contract has no reason to refuse
+    /// that, and in dry-run there is no contract to refuse at all.
+    #[test]
+    fn both_configured_keys_are_addresses_the_bot_refuses_to_act_on() {
+        assert_clean_environment();
+        let args = parse(&[
+            "liquidator",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "http://rpc",
+        ]);
+
+        let keys = args
+            .signing_keys(
+                Some(FILLER_SEED.to_string()),
+                Some(AUCTIONEER_SEED.to_string()),
+            )
+            .expect("keys");
+        let filler = crate::chain::Signer::from_secret(FILLER_SEED).expect("filler");
+        let auctioneer = crate::chain::Signer::from_secret(AUCTIONEER_SEED).expect("auctioneer");
+        assert_ne!(
+            filler.address(),
+            auctioneer.address(),
+            "the two seeds must differ, or this test proves nothing"
+        );
+
+        let own = keys.own_addresses();
+        assert_eq!(own.len(), 2, "both keys, not just the one that signs");
+        assert!(own.contains(filler.address()), "the filler's address");
+        assert!(
+            own.contains(auctioneer.address()),
+            "the auctioneer's address"
+        );
+        assert_eq!(
+            keys.into_auctioneer_signer()
+                .expect("a key is configured")
+                .address(),
+            auctioneer.address(),
+            "and the auctioneer's key is still the one that signs"
+        );
+
+        // One key configured is one address; none is none, which excludes
+        // nothing rather than everything.
+        assert_eq!(
+            args.signing_keys(Some(FILLER_SEED.to_string()), None)
+                .expect("keys")
+                .own_addresses()
+                .len(),
+            1
+        );
+        assert!(args
+            .signing_keys(None, None)
+            .expect("keys")
+            .own_addresses()
+            .is_empty());
+    }
+
+    /// A secret never renders, whichever key it is.
+    #[test]
+    fn the_auctioneer_signer_renders_as_its_address() {
+        let signer = crate::chain::signer::Signer::from_secret(
+            "SAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC5MY",
+        )
+        .expect("signer");
+        let rendered = format!("{signer:?}");
+        assert!(
+            rendered.contains(signer.address()),
+            "the address, not the seed: {rendered}"
+        );
+        assert!(!rendered.contains("SAAQCAIBAEAQ"), "the seed never renders");
+    }
+
+    /// A malformed auctioneer key is a configuration error, not a panic,
+    /// and the error text never carries the secret.
+    #[test]
+    fn a_bad_auctioneer_key_is_a_config_error_that_never_echoes_it() {
+        assert_clean_environment();
+        let args = parse(&[
+            "liquidator",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "http://rpc",
+        ]);
+        let error = args
+            .signing_keys(None, Some("not-a-valid-key".to_string()))
+            .expect_err("a malformed key is refused");
+        let rendered = error.to_string();
+        assert!(!rendered.contains("not-a-valid-key"), "{rendered}");
+        assert!(
+            rendered.contains("AUCTIONEER_SECRET_KEY"),
+            "the message names the variable: {rendered}"
+        );
+        assert!(matches!(error, LiquidatorError::Config(_)));
+
+        // The filler's key is parsed too, even when the auctioneer's is
+        // what would sign: an address the bot must not act on is worth a
+        // startup error rather than a key that quietly does not exist.
+        let error = args
+            .signing_keys(
+                Some("also-not-a-key".to_string()),
+                Some(AUCTIONEER_SEED.to_string()),
+            )
+            .expect_err("a malformed filler key is refused too");
+        let rendered = error.to_string();
+        assert!(!rendered.contains("also-not-a-key"), "{rendered}");
+        assert!(
+            rendered.contains("FILLER_SECRET_KEY"),
+            "the message names the variable: {rendered}"
+        );
+    }
+
+    /// The five thresholds and cadence knobs, plus the startup delay, all
+    /// reach `ServiceConfig` unchanged.
+    #[test]
+    fn the_auctioneer_knobs_reach_the_service_configuration() {
+        assert_clean_environment();
+        let args = parse(&[
+            "liquidator",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "http://rpc",
+            "--pools-toml",
+            POOLS,
+            "--liq-hf-threshold",
+            "0.99",
+            "--target-hf",
+            "1.1",
+            "--oracle-scan-ledgers",
+            "30",
+            "--price-delta-bps",
+            "100",
+            "--plan-iterations",
+            "3",
+            "--startup-delay-ledgers",
+            "12",
+        ]);
+        let config = args
+            .service_with_secrets(Some("postgres://x".to_string()), None)
+            .expect("configuration");
+        assert_eq!(config.liquidation_health_factor, 9_900_000);
+        assert_eq!(config.target_health_factor, 11_000_000);
+        assert_eq!(config.oracle_scan_ledgers, 30);
+        assert_eq!(config.price_delta_bps, 100);
+        assert_eq!(config.plan_iterations, 3);
+        assert_eq!(config.startup_delay_ledgers, 12);
+    }
+
+    /// `PLAN_ITERATIONS=0` is not "adjust nothing", it is "attempt
+    /// nothing": the auctioneer's walk runs `0..plan_iterations`, so zero
+    /// would skip every liquidation while logging that it had exhausted its
+    /// iterations — a bot that looks busy and does nothing. Refusing it at
+    /// parse time means the failure is a startup error, not that silent
+    /// bot.
+    #[test]
+    fn a_zero_plan_iterations_is_refused_at_parse() {
+        assert!(Args::try_parse_from(["liquidator", "--plan-iterations", "0"]).is_err());
+    }
+
+    /// `scan_due` never fires for a zero period, so a zero here would not
+    /// mean "every ledger" — it would switch the oracle scan off for the
+    /// life of the process, silently. Refused at parse like every other
+    /// cadence knob.
+    #[test]
+    fn a_zero_oracle_scan_ledgers_is_refused_at_parse() {
+        assert!(Args::try_parse_from(["liquidator", "--oracle-scan-ledgers", "0"]).is_err());
+    }
+
+    /// `PRICE_DELTA_BPS=0` is not "recheck on any move", it is "recheck on
+    /// no move at all": an unchanged price computes a delta of `0`, which
+    /// fails the "moved at least this much" test and falls through to the
+    /// direction branch, where `price > reference` is false on equality —
+    /// reporting a spurious `Down` and flagging every borrower on every
+    /// scan, forever. Refusing it at parse time means the failure is a
+    /// startup error, not that silent every-scan flood.
+    #[test]
+    fn a_zero_price_delta_bps_is_refused_at_parse() {
+        assert!(Args::try_parse_from(["liquidator", "--price-delta-bps", "0"]).is_err());
     }
 }
