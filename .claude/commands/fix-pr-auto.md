@@ -632,7 +632,7 @@ duplicate from a second bot is not extra evidence), then classify:
   cargo clippy --all-targets -- -D warnings
   cargo test --lib --bins
   RUSTDOCFLAGS='-D warnings' cargo doc --no-deps
-  ./scripts/check-repo-invariants.sh   # Cargo.toml / rust-toolchain.toml / Dockerfile / sandbox.yml touched
+  ./scripts/check-repo-invariants.sh   # Cargo.toml / Cargo.lock / rust-toolchain.toml / Dockerfile / sandbox.yml touched
   shellcheck --severity=error scripts/*.sh .devcontainer/*.sh   # shell touched
   ```
 

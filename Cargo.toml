@@ -56,6 +56,8 @@ sqlx = { version = "0.9", default-features = false, features = [
 ] }
 # Decodes an S… secret. The version stellar-xdr already depends on, so no
 # second copy; public keys parse through stellar-xdr's own FromStr impls.
+# Bump it only with stellar-xdr: Dependabot ignores it, and
+# scripts/check-repo-invariants.sh fails on a second copy in Cargo.lock.
 stellar-strkey = "0.0.13"
 # XDR types plus base64 for RPC payloads. No `soroban-sdk`: the handful of
 # pool types the bot touches are encoded and decoded by hand in
