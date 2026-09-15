@@ -8,10 +8,12 @@
 use ed25519_dalek::{Signer as _, SigningKey};
 use sha2::{Digest, Sha256};
 use stellar_xdr::{
-    AccountId, DecoratedSignature, MuxedAccount, PublicKey, Signature, SignatureHint, Transaction,
-    TransactionEnvelope, TransactionV1Envelope, Uint256, VecM,
+    AccountId, Asset, ContractIdPreimage, DecoratedSignature, Hash, HashIdPreimage,
+    HashIdPreimageContractId, MuxedAccount, PublicKey, Signature, SignatureHint, Transaction,
+    TransactionEnvelope, TransactionV1Envelope, Uint256, VecM, WriteXdr,
 };
 
+use crate::chain::xdr::encode::XDR_LIMITS;
 use crate::chain::xdr::XdrError;
 use crate::chain::ChainError;
 use crate::config::{ChainConfig, NetworkName};
@@ -52,6 +54,23 @@ impl Network {
     #[must_use]
     pub fn from_config(config: &ChainConfig) -> Self {
         Self::from_passphrase(&config.network_passphrase)
+    }
+
+    /// The native asset's (XLM's) Stellar Asset Contract on this network:
+    /// `sha256` of the network id and the native asset, as the protocol
+    /// derives it. Derived rather than configured, so a wrong address cannot
+    /// be typed in — it is where the filler's fee reserve is held back from.
+    ///
+    /// # Errors
+    ///
+    /// Only if the fixed preimage fails to encode, which is a bug.
+    pub fn native_asset_contract(&self) -> Result<String, ChainError> {
+        let preimage = HashIdPreimage::ContractId(HashIdPreimageContractId {
+            network_id: Hash(self.id),
+            contract_id_preimage: ContractIdPreimage::Asset(Asset::Native),
+        });
+        let bytes = preimage.to_xdr(XDR_LIMITS).map_err(XdrError::Xdr)?;
+        Ok(stellar_strkey::Contract(Sha256::digest(&bytes).into()).to_string())
     }
 }
 
@@ -165,6 +184,33 @@ mod tests {
         assert_eq!(
             Network::from_passphrase("Test SDF Network ; September 2015"),
             Network::testnet()
+        );
+    }
+
+    /// Derived from the network id, never configured, so it cannot be typed
+    /// in wrong. The two published addresses pin the derivation.
+    #[test]
+    fn the_native_asset_contract_is_derived_from_the_network() {
+        assert_eq!(
+            Network::mainnet().native_asset_contract().unwrap(),
+            "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA"
+        );
+        assert_eq!(
+            Network::testnet().native_asset_contract().unwrap(),
+            "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"
+        );
+    }
+
+    /// The contract-attested half of the check above: the mainnet fixture's
+    /// first reserve is the native asset.
+    #[test]
+    fn the_fixtures_first_reserve_is_mainnets_native_asset() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/mainnet-fixed-v2.json"))
+                .unwrap();
+        assert_eq!(
+            fixture["reserves"][0]["asset"],
+            Network::mainnet().native_asset_contract().unwrap()
         );
     }
 

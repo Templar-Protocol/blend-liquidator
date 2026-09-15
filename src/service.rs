@@ -1407,7 +1407,7 @@ impl SigningContext {
         Self {
             network: Network::from_config(&config.chain),
             tx_config: TxConfig::from_config(&config.chain),
-            signer: keys.into_auctioneer_signer().map(Arc::new),
+            signer: keys.into_signers().auctioneer,
             own_addresses,
         }
     }
