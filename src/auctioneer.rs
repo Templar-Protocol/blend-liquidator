@@ -3,9 +3,12 @@
 //!
 //! The arithmetic is [`crate::math::liquidation`]'s; this module is the I/O
 //! around it. [`Auctioneer::decide`] reads one snapshot per batch and values
-//! each borrower at the tick's close time — the same instant the tracker
-//! valued them at, so the decision and the stored health factor cannot
-//! disagree — and answers with a [`Decision`] per user. [`Auctioneer::act`]
+//! each borrower at the later of the tick's close time and the newest
+//! reserve entry that snapshot holds — the clamp
+//! [`crate::tracker::Tracker::refresh`] applies, so the decision and the
+//! stored health factor cannot disagree, and a snapshot the chain has
+//! already moved past is valued rather than refused — and answers with a
+//! [`Decision`] per user. [`Auctioneer::act`]
 //! turns one decision into an operation, lets the contract judge it through
 //! simulation, records what was decided, and — only when a submission queue
 //! is given — sends it.
@@ -98,6 +101,13 @@ pub struct AuctioneerConfig {
     /// resimulated before it is returned. `act`'s percent-adjustment loop is
     /// what bounds itself by it.
     pub plan_iterations: u32,
+    /// The bot's configured `DRY_RUN` mode, recorded on every `creations`
+    /// row as the spec's `dry_run` column. It is *not* what decides whether
+    /// `act` submits — that is whether a queue is given — so an armed bot
+    /// with no key, or one inside its startup delay, records `false` here
+    /// and no hash: what an operator reconciling the audit needs to see,
+    /// rather than a `true` that hides why nothing was sent.
+    pub dry_run: bool,
     /// Every account this bot holds a key for — the auctioneer's, the
     /// filler's, or both when the two keys differ. The contract refuses to
     /// let the bot liquidate itself, but in dry-run there is no contract to
@@ -220,13 +230,30 @@ pub enum ActOutcome {
 
 impl ActOutcome {
     /// Whether this borrower is settled for now, so its recheck flag may be
-    /// cleared. `false` for [`ActOutcome::Refused`] alone: a refusal is the
-    /// one answer that leaves work outstanding, so the flag moves forward —
-    /// behind everything flagged earlier, which bounds the retry to one
-    /// batch slot per pass — rather than being dropped.
+    /// cleared. `false` for [`ActOutcome::Refused`], and for a recorded
+    /// creation whose submission came back as anything but
+    /// [`TxOutcome::Succeeded`]: both leave work outstanding, so the flag
+    /// moves forward — behind everything flagged earlier, which bounds the
+    /// retry to one batch slot per pass — rather than being dropped.
     #[must_use]
     pub fn settled(&self) -> bool {
-        !matches!(self, Self::Refused)
+        match self {
+            Self::Skipped(_) => true,
+            Self::Refused => false,
+            // Recorded is settled by what the chain made of it, not by the
+            // row existing: `Failed` charged a fee and created no auction,
+            // `Expired` provably never applied, and `Unknown` may or may
+            // not have. None of those is a borrower to forget. If the
+            // auction did land, the next decision sees it in the store —
+            // the tracker writes it from the pool's own event — and skips;
+            // if it did not, the borrower is still owed one. Nothing sent
+            // (dry-run, or no queue) is settled: the decision was the whole
+            // action.
+            Self::Recorded(outcome) => outcome
+                .submission
+                .as_ref()
+                .is_none_or(|submission| matches!(submission, TxOutcome::Succeeded { .. })),
+        }
     }
 
     /// The creation this became, if it became one.
@@ -310,7 +337,7 @@ fn moved_direction(
 /// cadence regardless of whether the oracle scan ever noticed a move. Do not
 /// "fix" this by adding a table — the durability belongs to the full scan,
 /// not to this watch.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PriceWatch {
     /// Basis points a price must move from its reference to be reported.
     delta_bps: u32,
@@ -454,6 +481,28 @@ fn accrue_reserves(
     Ok(reserves)
 }
 
+/// The instant a batch is valued at: the later of the tick's close time and
+/// the newest reserve entry the snapshot holds.
+///
+/// `PoolReader::snapshot` reads at the RPC's head, which is at or past the
+/// tick the auctioneer was woken for, so on an active pool a reserve
+/// touched since that tick carries a `last_time` the tick's close time
+/// precedes — and `Reserve::accrue` refuses to run backwards rather than
+/// clamp. Valuing at the tick alone would fail the whole batch exactly when
+/// the pool is busy, which is exactly when the auctioneer is needed. This is
+/// the clamp `Tracker::refresh` applies for the same reason, and it must
+/// stay the same one: the position values fed to the selection and the
+/// health factor they are compared against both come from it.
+fn valued_at(snapshot: &PoolSnapshot, tick: LedgerTick) -> u64 {
+    snapshot
+        .reserves
+        .values()
+        .map(|reserve| reserve.data.last_time)
+        .max()
+        .unwrap_or(0)
+        .max(tick.close_time)
+}
+
 impl<'a> Auctioneer<'a> {
     /// An auctioneer reading through `rpc`, checking open auctions against
     /// `store`, judging against `config`, and — when `submitter` is given —
@@ -498,12 +547,13 @@ impl<'a> Auctioneer<'a> {
         }
         let accounts: Vec<&str> = users.iter().map(|user| user.account.as_str()).collect();
         let snapshot = PoolReader::new(self.rpc, pool).snapshot(&accounts).await?;
-        let reserves = accrue_reserves(&snapshot, tick.close_time)?;
+        let valued_at = valued_at(&snapshot, tick);
+        let reserves = accrue_reserves(&snapshot, valued_at)?;
 
         let mut decisions = Vec::with_capacity(users.len());
         for user in users {
             match self
-                .decide_one(pool, &user.account, &snapshot, &reserves, tick)
+                .decide_one(pool, &user.account, &snapshot, &reserves, valued_at)
                 .await
             {
                 Ok(decision) => decisions.push((user.account.clone(), decision)),
@@ -522,15 +572,17 @@ impl<'a> Auctioneer<'a> {
     }
 
     /// One borrower's decision against an already-read `snapshot` and its
-    /// already-accrued `reserves`. The six steps are the module's whole
-    /// policy; see the module doc for why each exists.
+    /// already-accrued `reserves`, both at `valued_at` — the one instant
+    /// [`valued_at`] chose for the whole batch, which the position values
+    /// and the health factor must share. The six steps are the module's
+    /// whole policy; see the module doc for why each exists.
     async fn decide_one(
         &self,
         pool: &str,
         account: &str,
         snapshot: &PoolSnapshot,
         reserves: &BTreeMap<u32, Reserve>,
-        tick: LedgerTick,
+        valued_at: u64,
     ) -> Result<Decision, AuctioneerError> {
         if self.config.own_addresses.contains(account) {
             return Ok(Decision::Skip(SkipReason::OwnAccount));
@@ -546,7 +598,7 @@ impl<'a> Auctioneer<'a> {
         {
             return Ok(Decision::Skip(SkipReason::AuctionOpen));
         }
-        let Some(data) = snapshot.position_data(account, tick.close_time)? else {
+        let Some(data) = snapshot.position_data(account, valued_at)? else {
             return Ok(Decision::Skip(SkipReason::NoLiabilities));
         };
         if data.liability_base > 0 && data.collateral_base == 0 {
@@ -641,6 +693,17 @@ impl<'a> Auctioneer<'a> {
         tick: LedgerTick,
         submit: Option<&SubmissionQueue>,
     ) -> Result<ActOutcome, AuctioneerError> {
+        // The two capabilities are coupled: a queue means "send this", and
+        // sending anything the contract was never asked about is the one
+        // thing this module exists to prevent. `Service::run` never
+        // constructs that combination, but a public method must not permit
+        // it either.
+        if submit.is_some() && self.submitter.is_none() {
+            return Err(AuctioneerError::Chain(ChainError::Config(
+                "a submission queue was given to an auctioneer with no signer, so nothing \
+                 could be judged before it was sent",
+            )));
+        }
         let (kind, percent, bid, lot, operation, simulated) = match decision {
             Decision::Skip(reason) => {
                 tracing::debug!(pool, account, reason = ?reason, "skip: no action taken");
@@ -681,12 +744,12 @@ impl<'a> Auctioneer<'a> {
         // to survive a database loss, so the row and the log line carry the
         // same fields, and both precede the submission they describe.
         //
-        // `dry_run = submit.is_none()` is the audit predicate "nothing was
-        // sent", which is what reconciliation needs and is exact for it. It
-        // is not a report of the bot's mode: `submit` is also `None` with
-        // no key configured, and on an armed bot whose
-        // `STARTUP_DELAY_LEDGERS` has not elapsed. See
-        // `CreationRecord::dry_run`.
+        // `dry_run` is the bot's configured mode — the spec's meaning of
+        // the column — and never "whether this row was sent"; that is
+        // `tx_hash`. So an armed bot that could not submit (no key, or a
+        // startup delay still running) records `false` and no hash, and the
+        // `armed` field on the log line says which. See
+        // `CreationRecord::dry_run` for the four states that leaves.
         let record = CreationRecord {
             kind,
             pool: pool.to_string(),
@@ -695,7 +758,7 @@ impl<'a> Auctioneer<'a> {
             bid,
             lot,
             ledger: tick.sequence,
-            dry_run: submit.is_none(),
+            dry_run: self.config.dry_run,
             tx_hash: None,
         };
         let creation_id = self.store.record_creation(&record).await?;
@@ -709,6 +772,7 @@ impl<'a> Auctioneer<'a> {
             lot = ?record.lot,
             ledger = record.ledger,
             dry_run = record.dry_run,
+            armed = submit.is_some(),
             simulated,
             "creation recorded"
         );
@@ -1136,8 +1200,22 @@ mod tests {
             liquidation_health_factor: 9_980_000,
             target_health_factor: 10_600_000,
             plan_iterations: 5,
+            dry_run: true,
             own_addresses,
         }
+    }
+
+    /// The same for an armed bot — `DRY_RUN=false`, which is what a row
+    /// written by an `act` that was given a queue records.
+    fn armed_config() -> AuctioneerConfig {
+        AuctioneerConfig {
+            dry_run: false,
+            ..config(BTreeSet::new())
+        }
+    }
+
+    fn queue_capacity() -> std::num::NonZeroUsize {
+        std::num::NonZeroUsize::new(4).expect("a test capacity is never zero")
     }
 
     /// A `TrackedUser` naming only `account`: `decide` re-derives
@@ -2035,6 +2113,107 @@ mod tests {
         Ok(())
     }
 
+    /// `PoolReader::snapshot` reads at the RPC's head, which on an active
+    /// pool is past the tick the auctioneer was woken for, so a reserve
+    /// touched since then carries a `last_time` the tick's close time
+    /// precedes. `Reserve::accrue` refuses to run backwards, so without the
+    /// clamp the whole batch fails — exactly when the pool is busy. The
+    /// tick here is shaped like the tracker's own clamp test.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_snapshot_newer_than_the_tick_is_still_decided(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let account = synthetic_account(1);
+        // Once to learn the snapshot's newest reserve entry, once for `decide`.
+        for _ in 0..2 {
+            script_snapshot_with_positions(
+                &rpc,
+                &account,
+                &[(0, 100_000_000)],
+                &[(2, 50_000_000_000)],
+            );
+        }
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let snapshot = PoolReader::new(&client, POOL)
+            .snapshot(&[&account])
+            .await
+            .expect("snapshot");
+        let newest = snapshot
+            .reserves
+            .values()
+            .map(|reserve| reserve.data.last_time)
+            .max()
+            .expect("the fixture pool has reserves");
+        let fixture = harness::fixture_tick();
+        assert!(
+            newest < fixture.close_time,
+            "the fixture's newest reserve entry ({newest}) precedes its close time"
+        );
+
+        // A tick behind the chain, whose close time precedes that newest
+        // entry: valuing at the tick alone is a hard error.
+        let stale = LedgerTick {
+            sequence: fixture.sequence - 4,
+            close_time: newest - 1,
+        };
+        let auctioneer = Auctioneer::new(&client, &store, config(BTreeSet::new()), None);
+        let decisions = auctioneer
+            .decide(POOL, &[tracked_user(&account)], stale)
+            .await
+            .expect("a tick behind the chain still decides the batch");
+        assert_eq!(decisions.len(), 1);
+        assert!(
+            matches!(decisions[0].1, Decision::Liquidate(_)),
+            "valued at the snapshot's own newest entry, the borrower is still underwater: {:?}",
+            decisions[0].1
+        );
+        Ok(())
+    }
+
+    /// A queue handed to an auctioneer with no signer is refused before
+    /// anything is simulated or sent: sending an operation the contract
+    /// was never asked about is the one thing `act` exists to prevent.
+    /// `Service::run` never builds that combination; a public method must
+    /// not permit it either.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_queue_without_a_signer_is_refused_before_anything_is_sent(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let auctioneer = Auctioneer::new(&client, &store, armed_config(), None);
+        let (queue, _receiver) = SubmissionQueue::new(queue_capacity());
+        let account = synthetic_account(96);
+
+        let outcome = auctioneer
+            .act(
+                POOL,
+                &account,
+                &Decision::BadDebt,
+                harness::fixture_tick(),
+                Some(&queue),
+            )
+            .await;
+        assert!(
+            matches!(outcome, Err(AuctioneerError::Chain(ChainError::Config(_)))),
+            "{outcome:?}"
+        );
+        assert!(
+            rpc.calls("simulateTransaction").is_empty() && rpc.calls("sendTransaction").is_empty(),
+            "refused before any chain call at all"
+        );
+        let rows = sqlx::query!(
+            "SELECT count(*) AS n FROM creations WHERE account = $1",
+            account.as_str(),
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("count");
+        assert_eq!(rows.n, Some(0), "nothing was recorded either");
+        Ok(())
+    }
+
     /// Armed, the creation goes through the queue and the recorded row
     /// carries the transaction it became.
     #[sqlx::test(migrations = "./migrations")]
@@ -2077,8 +2256,8 @@ mod tests {
 
         let client = RpcClient::new(&rpc.url(), None).expect("client");
         let submitter = Submitter::new(&client, &network, &signer, tx_config());
-        let auctioneer = Auctioneer::new(&client, &store, config(BTreeSet::new()), Some(submitter));
-        let (queue, receiver) = SubmissionQueue::new(4);
+        let auctioneer = Auctioneer::new(&client, &store, armed_config(), Some(submitter));
+        let (queue, receiver) = SubmissionQueue::new(queue_capacity());
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         let plan = LiquidationPlan {
@@ -2500,8 +2679,8 @@ mod tests {
 
         let client = RpcClient::new(&rpc.url(), None).expect("client");
         let submitter = Submitter::new(&client, &network, &signer, tx_config());
-        let auctioneer = Auctioneer::new(&client, &store, config(BTreeSet::new()), Some(submitter));
-        let (queue, receiver) = SubmissionQueue::new(4);
+        let auctioneer = Auctioneer::new(&client, &store, armed_config(), Some(submitter));
+        let (queue, receiver) = SubmissionQueue::new(queue_capacity());
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let tick = harness::fixture_tick();
 
@@ -2564,8 +2743,8 @@ mod tests {
 
         let client = RpcClient::new(&rpc.url(), None).expect("client");
         let submitter = Submitter::new(&client, &network, &signer, tx_config());
-        let auctioneer = Auctioneer::new(&client, &store, config(BTreeSet::new()), Some(submitter));
-        let (queue, receiver) = SubmissionQueue::new(4);
+        let auctioneer = Auctioneer::new(&client, &store, armed_config(), Some(submitter));
+        let (queue, receiver) = SubmissionQueue::new(queue_capacity());
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(true);
         let tick = harness::fixture_tick();
 

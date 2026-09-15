@@ -10,9 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - The auctioneer (`src/auctioneer.rs`, `Auctioneer`): `decide` reads one
-  snapshot per batch of tracked users, values each at the tick's own close
-  time — the instant the tracker already valued them at, so the decision
-  and the stored health factor cannot disagree — and answers with a
+  snapshot per batch of tracked users, values each at the later of the
+  tick's close time and the newest reserve entry the snapshot holds — the
+  clamp the tracker already applies, so the decision and the stored health
+  factor cannot disagree and a snapshot the chain has moved past is valued
+  rather than refused — and answers with a
   `Decision` per user: liquidate (via the new `math::liquidation`'s
   `plan_liquidation`, which selects the auction's bid and lot assets and
   the percent that closes the borrower's excess down to `TARGET_HF`,
@@ -30,9 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SubmissionQueue` only when one is configured. `act` answers an
   `ActOutcome`, which distinguishes a borrower it *skipped* (nothing was
   owed) from one it was *refused* (something was owed and could not be
-  done) — the caller clears the recheck flag only for the first, so a
-  borrower the contract refused is retried on a later pass instead of
-  being forgotten until the next full scan. `scan_oracle` is a third path
+  done, or whose submission failed, expired or was lost on chain) — the
+  caller clears the recheck flag only for the first, so a borrower the
+  contract refused is retried on a later pass instead of being forgotten
+  until the next full scan. A retry is re-flagged one ledger *past* the
+  tick that could not act on it, so it sorts behind everything flagged on
+  that tick rather than returning to the head of the next batch. `scan_oracle` is a third path
   that decides nothing itself: it compares a pool's current prices against
   a remembered reference and, via `Store::flag_exposed_to`, flags **every**
   borrower exposed to whichever asset moved past `PRICE_DELTA_BPS` for the

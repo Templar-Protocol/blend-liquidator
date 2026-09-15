@@ -17,7 +17,8 @@ health factors from chain — until it is shut down. Phase 4 landed the
 auctioneer (`auctioneer`, `queue`, `math::liquidation`): once a tick, it
 decides which tracked borrowers are liquidatable or owe bad debt, builds
 the auction the contract should accept, lets the contract judge the percent
-through simulation, records every decision — dry-run or not — and, only
+through simulation, records every creation it decides to make — dry-run
+or not — and, only
 when a signing key is configured and `DRY_RUN=false`, submits it through a
 per-key queue. It still fills no auction: nothing pays a bid or takes a
 lot yet, and no signer is wired in for anything but creating auctions. That
@@ -48,10 +49,12 @@ make help                           # Docker Compose lifecycle
   including the strict boolean parser behind `DRY_RUN`. The auctioneer's
   thresholds and cadence are here too: `LIQ_HF_THRESHOLD`, `TARGET_HF`,
   `ORACLE_SCAN_LEDGERS`, `PRICE_DELTA_BPS`, `PLAN_ITERATIONS` and
-  `STARTUP_DELAY_LEDGERS` are ordinary `clap` arguments, but its signing
-  key, `AUCTIONEER_SECRET_KEY`, is read from the environment only by
-  `Args::auctioneer_signer` and is never a clap field — like every other
-  secret, because argv is world-readable.
+  `STARTUP_DELAY_LEDGERS` are ordinary `clap` arguments, but its two
+  signing keys — `AUCTIONEER_SECRET_KEY`, and `FILLER_SECRET_KEY`, which it
+  falls back to — are read from the environment by `main.rs` and handed to
+  `Args::signing_keys`; neither is ever a clap field, like every other
+  secret, because argv is world-readable. Both are parsed at startup, so a
+  malformed value in either is a startup error.
 - `src/main.rs` — binary entry point: tracing setup, argument parsing, exit.
 - `src/math/` — the pure port of the pool contract's arithmetic: `fixed`
   (checked rounding), `reserve` (accrual and token conversions), `position`
@@ -111,8 +114,11 @@ make help                           # Docker Compose lifecycle
   caller's (`Auctioneer::act` today; Phase 5's filler will hold a second
   queue for its own key).
 - `src/auctioneer.rs` — the auctioneer. `Auctioneer::decide` reads one
-  snapshot per batch of tracked users, values each at the tick's own close
-  time — the same instant the tracker valued them at — and answers with a
+  snapshot per batch of tracked users, values each at the later of the
+  tick's close time and the newest reserve entry the snapshot holds — the
+  same clamp the tracker applies, so the two cannot disagree, and a snapshot
+  the chain has moved past since the tick is valued rather than refused —
+  and answers with a
   `Decision` per user: liquidate (a `LiquidationPlan`), move to bad debt, or
   skip with a `SkipReason` (healthy, an auction already open, no plan
   closes the excess, the bot's own account, or no liabilities left).
@@ -333,8 +339,11 @@ the operational surface.
   close time `position_data` used, or the two describe different ledgers
   and their numbers will not agree.
 - A borrower's `recheck_ledger` flag must be **moved forward**, never left
-  alone, when a pass cannot decide or act on it — re-raised at the current
-  tick's ledger (or the flag's own, if that is already newer).
+  alone, when a pass cannot decide or act on it — or when its submission
+  failed, expired or was lost on chain — re-raised one ledger *past* the
+  current tick's (or at the flag's own, if that is already newer). One past,
+  not at: the tracker raises flags at the very tick the pass runs on, so
+  re-raising at the tick would leave the row exactly where it was.
   `Store::users_needing_recheck` orders `recheck_ledger ASC, account ASC`,
   so an untouched flag stays the oldest in its pool and comes back at the
   head of every following batch: one borrower nothing can decide (an

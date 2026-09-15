@@ -256,11 +256,11 @@ fn selection_percent(
     if denominator <= 0 {
         return Ok(101);
     }
-    let percent = div_floor(
-        excess.checked_mul(100).ok_or(MathError::Overflow)?,
-        denominator,
-        1,
-    )?;
+    // `mul_floor` widens the product before dividing, so an excess above
+    // `i128::MAX / 100` — representable, and a small percent once divided
+    // by a large denominator — is not refused over an overflow that never
+    // has to happen. Same rounding as before: `floor(excess * 100 / d)`.
+    let percent = mul_floor(excess, 100, denominator)?;
     let percent = u32::try_from(percent).unwrap_or(u32::MAX);
     if percent > 100 {
         return Ok(percent);

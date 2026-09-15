@@ -600,7 +600,18 @@ pub struct Args {
 
     /// How often, in ledgers, prices are re-read and a significant move
     /// flags the borrowers it moved against.
-    #[arg(long, env = "ORACLE_SCAN_LEDGERS", default_value_t = 60)]
+    ///
+    /// Zero is refused at parse. `scan_due` never fires for a zero period,
+    /// so `0` would not mean "every ledger": it would silently switch the
+    /// oracle scan off for the life of the process, leaving a price crash
+    /// to be noticed by the full scan's cadence alone. A startup error is
+    /// the loud direction, the same posture as `FULL_SCAN_LEDGERS`.
+    #[arg(
+        long,
+        env = "ORACLE_SCAN_LEDGERS",
+        default_value_t = 60,
+        value_parser = clap::value_parser!(u32).range(1..),
+    )]
     pub oracle_scan_ledgers: u32,
 
     /// How far a price must move from its reference, in basis points, to be
@@ -772,16 +783,19 @@ impl Args {
         };
         // `TARGET_HF` is bounded by its own value parser; this one is a
         // relation between two knobs, which no single parser can see. The
-        // full scan flags borrowers below `SCAN_HF_THRESHOLD` and the
-        // auctioneer judges borrowers at or below `LIQ_HF_THRESHOLD`, so a
-        // liquidation threshold above the scan threshold names a band of
-        // borrowers the scan never flags: the bot would only ever reach
-        // them through an event or a price move, and silently.
-        if self.liq_hf_threshold > self.scan_hf_threshold {
+        // full scan flags borrowers *strictly* below `SCAN_HF_THRESHOLD`
+        // and the auctioneer judges borrowers *at or* below
+        // `LIQ_HF_THRESHOLD`, so the liquidation threshold must sit
+        // strictly below the scan threshold: at equality, a borrower
+        // exactly on it is liquidatable but is never flagged by the scan,
+        // and above it a whole band is — reachable only through an event
+        // or a price move, and silently.
+        if self.liq_hf_threshold >= self.scan_hf_threshold {
             return Err(LiquidatorError::Config(
-                "LIQ_HF_THRESHOLD is above SCAN_HF_THRESHOLD: the full scan only flags \
-                 borrowers below SCAN_HF_THRESHOLD, so a higher liquidation threshold \
-                 names borrowers nothing ever flags for a decision"
+                "LIQ_HF_THRESHOLD is at or above SCAN_HF_THRESHOLD: the full scan only \
+                 flags borrowers strictly below SCAN_HF_THRESHOLD, so a liquidation \
+                 threshold at or above it names borrowers nothing ever flags for a \
+                 decision"
                     .to_string(),
             ));
         }
@@ -960,8 +974,9 @@ mod tests {
     /// query macros can check themselves, which would make this assertion
     /// fail on every sanctioned way of running these tests.
     ///
-    /// `AUCTIONEER_SECRET_KEY` is excluded for the same reason: it too is
-    /// read straight from the environment (by `auctioneer_signer`), never
+    /// `AUCTIONEER_SECRET_KEY` and `FILLER_SECRET_KEY` are excluded for the
+    /// same reason: both are read straight from the environment by
+    /// `main.rs` and handed to [`Args::signing_keys`], and neither is ever
     /// declared as a clap argument.
     fn assert_clean_environment() {
         for name in [
@@ -1572,6 +1587,28 @@ supported_lot = ["*"]
             .service_with_secrets(Some("postgres://x".to_string()), None)
             .expect_err("refused");
         assert!(error.to_string().contains("LIQ_HF_THRESHOLD"), "{error}");
+
+        // Equality is refused too: the scan flags strictly below its
+        // threshold while the auctioneer liquidates at or below its own, so
+        // a borrower exactly on a shared value is liquidatable and never
+        // flagged.
+        let equal = parse(&[
+            "liquidator",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "http://rpc",
+            "--pools-toml",
+            POOLS,
+            "--scan-hf-threshold",
+            "1.2",
+            "--liq-hf-threshold",
+            "1.2",
+        ]);
+        let error = equal
+            .service_with_secrets(Some("postgres://x".to_string()), None)
+            .expect_err("equality refused");
+        assert!(error.to_string().contains("at or above"), "{error}");
     }
 
     /// The auctioneer's key is environment-only, like every other secret: a
@@ -1714,8 +1751,8 @@ supported_lot = ["*"]
         .expect("signer");
         let rendered = format!("{signer:?}");
         assert!(
-            rendered.starts_with('G') || rendered.contains('G'),
-            "the address, not the seed"
+            rendered.contains(signer.address()),
+            "the address, not the seed: {rendered}"
         );
         assert!(!rendered.contains("SAAQCAIBAEAQ"), "the seed never renders");
     }
@@ -1806,6 +1843,15 @@ supported_lot = ["*"]
     #[test]
     fn a_zero_plan_iterations_is_refused_at_parse() {
         assert!(Args::try_parse_from(["liquidator", "--plan-iterations", "0"]).is_err());
+    }
+
+    /// `scan_due` never fires for a zero period, so a zero here would not
+    /// mean "every ledger" — it would switch the oracle scan off for the
+    /// life of the process, silently. Refused at parse like every other
+    /// cadence knob.
+    #[test]
+    fn a_zero_oracle_scan_ledgers_is_refused_at_parse() {
+        assert!(Args::try_parse_from(["liquidator", "--oracle-scan-ledgers", "0"]).is_err());
     }
 
     /// `PRICE_DELTA_BPS=0` is not "recheck on any move", it is "recheck on

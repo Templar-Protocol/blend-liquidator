@@ -13,6 +13,8 @@
 //! The queue owns ordering, not policy: what to submit, at what priority,
 //! and what a failure means are the caller's.
 
+use std::num::NonZeroUsize;
+
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::chain::tx::{Priority, Submitter, TxOutcome};
@@ -48,7 +50,7 @@ pub struct QueuedSubmission {
     pub submission: Submission,
     /// Where the outcome goes. A dropped receiver means the caller gave up;
     /// the send fails and the queue moves on.
-    pub respond: oneshot::Sender<Result<TxOutcome, ChainError>>,
+    pub respond: oneshot::Sender<Result<TxOutcome, QueueError>>,
 }
 
 impl std::fmt::Debug for Submission {
@@ -75,6 +77,13 @@ pub enum QueueError {
     /// The queue's worker is gone, so nothing will ever be sent.
     #[error("the submission queue is closed")]
     Closed,
+    /// The bot is shutting down: this submission was dequeued after the
+    /// flag was set and was never attempted. Its own variant, rather than
+    /// a `ChainError` dressed up as one, because a caller must be able to
+    /// tell "the bot is stopping" from "this operation can never be built"
+    /// — the first is nothing to act on, the second is a bug.
+    #[error("the submission queue is shutting down; this submission was not attempted")]
+    ShuttingDown,
     /// The chain layer's own failure, passed through.
     #[error(transparent)]
     Chain(#[from] ChainError),
@@ -91,10 +100,13 @@ impl SubmissionQueue {
     /// A queue and the receiver its worker consumes. `capacity` bounds how
     /// many submissions may wait; a full queue makes `enqueue` wait, which
     /// is the backpressure that keeps a stalled chain from growing an
-    /// unbounded backlog of stale plans.
+    /// unbounded backlog of stale plans. It is `NonZeroUsize` because
+    /// tokio's bounded channel panics on a capacity of zero, and a type
+    /// that cannot hold zero is cheaper than a runtime assertion nobody
+    /// remembers.
     #[must_use]
-    pub fn new(capacity: usize) -> (Self, mpsc::Receiver<QueuedSubmission>) {
-        let (sender, receiver) = mpsc::channel(capacity);
+    pub fn new(capacity: NonZeroUsize) -> (Self, mpsc::Receiver<QueuedSubmission>) {
+        let (sender, receiver) = mpsc::channel(capacity.get());
         (Self { sender }, receiver)
     }
 
@@ -108,10 +120,7 @@ impl SubmissionQueue {
             })
             .await
             .map_err(|_| QueueError::Closed)?;
-        answer
-            .await
-            .map_err(|_| QueueError::Closed)?
-            .map_err(QueueError::from)
+        answer.await.map_err(|_| QueueError::Closed)?
     }
 }
 
@@ -128,16 +137,10 @@ impl SubmissionQueue {
 /// sent is waited for, because abandoning it would leave the account's
 /// sequence consumed by something the bot never saw the outcome of.
 ///
-/// The answer for a submission dequeued after shutdown is
-/// [`ChainError::Config`]: no other existing variant fits without being
-/// actively misleading. `Rejected` and `BadSequence` both carry specific
-/// recovery meaning elsewhere (an on-chain refusal, and "re-plan and
-/// resend") that a caller might reasonably act on; answering a submission
-/// that was never sent with either would be a false claim about what the
-/// chain did. `Config` already serves this crate as the catch-all for "an
-/// operational precondition this code needs is not met" — see its other
-/// call sites for `LedgerWindow` and the system clock — so labelling
-/// shutdown that way is consistent with, not a stretch of, its existing use.
+/// A submission dequeued after shutdown is answered
+/// [`QueueError::ShuttingDown`], which no chain outcome can be mistaken
+/// for: nothing was sent, so no `ChainError` — every one of which describes
+/// something the chain or the client did — would be true of it.
 pub async fn run_queue(
     submitter: &Submitter<'_>,
     mut receiver: mpsc::Receiver<QueuedSubmission>,
@@ -149,9 +152,7 @@ pub async fn run_queue(
                 label = queued.submission.label,
                 "queue is shutting down; refusing this submission"
             );
-            let _ = queued
-                .respond
-                .send(Err(ChainError::Config("shutting down")));
+            let _ = queued.respond.send(Err(QueueError::ShuttingDown));
             continue;
         }
         let QueuedSubmission {
@@ -161,7 +162,8 @@ pub async fn run_queue(
         tracing::info!(label = submission.label, "submitting");
         let outcome = submitter
             .submit(submission.operation, submission.priority)
-            .await;
+            .await
+            .map_err(QueueError::Chain);
         if let Err(error) = &outcome {
             tracing::warn!(label = submission.label, %error, "submission failed");
         }
@@ -179,6 +181,10 @@ mod tests {
     use std::time::Duration;
 
     const POOL: &str = "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD";
+
+    fn capacity(slots: usize) -> NonZeroUsize {
+        NonZeroUsize::new(slots).expect("a test capacity is never zero")
+    }
 
     fn operation() -> Operation {
         crate::chain::xdr::encode::invoke_contract_op(POOL, "bad_debt", vec![])
@@ -232,7 +238,7 @@ mod tests {
     /// labels-only assertion could not.
     #[tokio::test]
     async fn submissions_are_serialised_in_order() {
-        let (queue, receiver) = SubmissionQueue::new(8);
+        let (queue, receiver) = SubmissionQueue::new(capacity(8));
         let events = Arc::new(Mutex::new(Vec::new()));
         let recorder = Arc::clone(&events);
         // A worker that records entry and exit and answers, standing in for
@@ -278,7 +284,7 @@ mod tests {
         // The worker answers with an outcome carrying a hash derived from
         // the label it received, so a crossed wire is visible — a wrong
         // hash — rather than merely possible.
-        let (queue, receiver) = SubmissionQueue::new(8);
+        let (queue, receiver) = SubmissionQueue::new(capacity(8));
         let worker = tokio::spawn(async move {
             let mut receiver = receiver;
             while let Some(queued) = receiver.recv().await {
@@ -311,7 +317,7 @@ mod tests {
     /// auctioneer's tick forever.
     #[tokio::test]
     async fn a_closed_queue_does_not_hang_its_callers() {
-        let (queue, receiver) = SubmissionQueue::new(1);
+        let (queue, receiver) = SubmissionQueue::new(capacity(1));
         drop(receiver);
         assert!(matches!(
             queue.enqueue(submission("orphan")).await,
@@ -324,14 +330,16 @@ mod tests {
     /// bot's.
     #[tokio::test]
     async fn a_failed_submission_does_not_stop_the_queue() {
-        let (queue, receiver) = SubmissionQueue::new(8);
+        let (queue, receiver) = SubmissionQueue::new(capacity(8));
         let worker = tokio::spawn(async move {
             let mut receiver = receiver;
             let mut seen = 0_u32;
             while let Some(queued) = receiver.recv().await {
                 seen += 1;
                 let answer = if seen == 1 {
-                    Err(ChainError::Rejected("contract refused".to_string()))
+                    Err(QueueError::Chain(ChainError::Rejected(
+                        "contract refused".to_string(),
+                    )))
                 } else {
                     Ok(fake_outcome())
                 };
@@ -370,7 +378,7 @@ mod tests {
         let submitter = Submitter::new(&client, &network, &signer, config);
 
         let (_flag, shutdown) = watch::channel(true);
-        let (queue, receiver) = SubmissionQueue::new(1);
+        let (queue, receiver) = SubmissionQueue::new(capacity(1));
 
         let respond = async {
             let answer =
@@ -383,8 +391,8 @@ mod tests {
         let (answer, ()) = tokio::join!(respond, run_queue(&submitter, receiver, &shutdown));
 
         assert!(
-            matches!(answer, Err(QueueError::Chain(ChainError::Config(_)))),
-            "{answer:?}"
+            matches!(answer, Err(QueueError::ShuttingDown)),
+            "shutdown is its own answer, never a chain error: {answer:?}"
         );
         assert!(
             rpc.calls("getLedgerEntries").is_empty(),

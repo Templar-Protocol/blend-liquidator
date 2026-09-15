@@ -302,6 +302,13 @@ pub struct TrackedUser {
     /// know which method it came from. [`Store::clear_recheck`] is what
     /// needs the value back, but nothing about the field's meaning is
     /// specific to that one caller.
+    ///
+    /// The value is the ledger the flag *sorts at* in the recheck queue,
+    /// which is the ledger it was raised at except for one deliberate case:
+    /// a pass that could not decide or act on the borrower re-raises it one
+    /// ledger past the tick it ran at, so the retry sorts behind everything
+    /// flagged on that tick rather than tying with it and coming back at
+    /// the head of the next batch by account order.
     pub recheck_ledger: Option<u32>,
 }
 
@@ -694,15 +701,19 @@ pub struct CreationRecord {
     pub lot: Vec<String>,
     /// The ledger the decision was taken at.
     pub ledger: u32,
-    /// Whether nothing was sent — and only that.
+    /// The bot's configured `DRY_RUN` mode when this row was written — the
+    /// spec's meaning of the column, and only that.
     ///
-    /// It is an *audit predicate*, exact for reconciliation ("no
-    /// transaction exists for this row"), not a report of the bot's mode.
-    /// The auctioneer writes `submit.is_none()`, which is `true` for three
-    /// different causes: `DRY_RUN=true`, no signing key configured, and an
-    /// armed bot whose `STARTUP_DELAY_LEDGERS` has not yet elapsed. An
-    /// operator reading `dry_run = true` on an armed deployment is looking
-    /// at one of the last two, not at a mode that changed under them.
+    /// It is not "whether this row was sent": that is `tx_hash`. So the
+    /// four states an operator can read are exact. `dry_run = true` is a
+    /// dry-run bot, and never carries a hash. `dry_run = false` with a hash
+    /// is an armed submission the chain was asked about. `dry_run = false`
+    /// with no hash is an armed attempt whose transaction was never named:
+    /// no signing key was configured, `STARTUP_DELAY_LEDGERS` had not
+    /// elapsed, the queue refused it, or the bot died before the hash was
+    /// attached — each of which the log line beside the row names, and the
+    /// signing account's sequence number distinguishes from a submission
+    /// that landed unrecorded.
     pub dry_run: bool,
     /// The transaction, when the writer already has one. The auctioneer
     /// records the row before it submits, so it writes `None` here and

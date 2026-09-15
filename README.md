@@ -13,7 +13,8 @@ A liquidation bot for [Blend Protocol](https://blend.capital) lending pools on
 > Once a tick it now also decides which tracked borrowers are liquidatable
 > or owe bad debt, builds the auction the contract should accept, lets the
 > contract judge the percent through simulation, and records every
-> decision — and, only with a signing key configured and `DRY_RUN=false`,
+> creation it decides to make — and, only with a signing key configured
+> and `DRY_RUN=false`,
 > creates it on chain. It still fills no auction: nothing pays a bid or
 > takes a lot yet. What *is* complete is the scaffolding around it — CI
 > gates, lint posture, dev container, release preflight — so the
