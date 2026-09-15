@@ -219,8 +219,8 @@ and the rest of the operational surface.
   itself depends on — a `0.0.x` requirement, which cargo reads as that
   exact patch — so any other version is a second copy, not an upgrade.
   Dependabot ignores it for that reason, and `scripts/check-repo-invariants.sh`
-  fails while `Cargo.lock` holds two: when a `stellar-xdr` bump moves its
-  copy, bump this one in the same PR.
+  fails unless `Cargo.lock` holds exactly one. Two means a `stellar-xdr` bump
+  moved its copy: bump this one in the same PR.
 - `getLedgerEntries` omits absent keys rather than returning nulls, so a
   lookup must go by key, never by position, and "the RPC returned fewer
   entries than keys" is the normal shape of "some of these do not exist".

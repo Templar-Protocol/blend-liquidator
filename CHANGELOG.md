@@ -176,5 +176,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `scripts/check-repo-invariants.sh` also gates a single `stellar-strkey`.
   `Cargo.toml` pins it to the version `stellar-xdr` depends on and
   Dependabot ignores it, since a bump of it alone only adds a second copy;
-  the check fails while `Cargo.lock` holds two, which is the signal to bump
-  it in the same PR as a `stellar-xdr` that moves its own.
+  the check fails unless `Cargo.lock` holds exactly one — two is the signal
+  to bump it in the same PR as a `stellar-xdr` that moves its own.
