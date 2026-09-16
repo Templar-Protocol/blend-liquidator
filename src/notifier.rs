@@ -46,6 +46,10 @@ use tokio::sync::Semaphore;
 
 use crate::metrics::{DeliveryLabel, Metrics};
 
+/// The Telegram [`NotificationChannel`]: `sendMessage` for delivery, `getMe`
+/// to verify credentials at startup.
+pub mod telegram;
+
 /// How many deliveries may be in flight at once. Past this a notification
 /// is dropped rather than queued: a channel that has stopped answering must
 /// cost a bounded amount of memory and a bounded number of tasks, and a
