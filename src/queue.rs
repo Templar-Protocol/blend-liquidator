@@ -10,14 +10,25 @@
 //! a second queue for the filler's own key, and nothing here may assume
 //! there is only one.
 //!
-//! The queue owns ordering, not policy: what to submit, at what priority,
-//! and what a failure means are the caller's.
+//! The queue owns two things: the order submissions go out in, and the rule
+//! that nothing is prepared for a key while an earlier transaction's outcome
+//! is still unknown — an in-flight transaction may yet consume the sequence
+//! number the next `prepare` would read. What to submit, at what priority,
+//! and what a failure means stay the caller's.
+//!
+//! Only a failure that provably sent nothing is retried here, and only
+//! within the budget its [`Submission`] carries: a `prepare` that failed
+//! before any envelope left, or a send the RPC refused outright. A send
+//! whose *answer* was lost proves nothing — the RPC may have forwarded the
+//! envelope — so that one is resolved by the hash the queue already holds
+//! and never sent again.
 
 use std::num::NonZeroUsize;
+use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::chain::tx::{Priority, Submitter, TxOutcome};
+use crate::chain::tx::{Prepared, Priority, Submitter, TxOutcome};
 use crate::chain::ChainError;
 use stellar_xdr::Operation;
 
@@ -39,6 +50,10 @@ pub struct Submission {
     /// module logs it verbatim, and nothing in this module logs
     /// `operation`'s contents.
     pub label: String,
+    /// Further attempts after a failure that provably sent nothing; zero
+    /// for none. What each role gets is spec §8's: [`CREATION_RETRIES`],
+    /// [`FILL_RETRIES`].
+    pub retries: u32,
 }
 
 /// A submission paired with the channel its answer goes back on.
@@ -89,6 +104,34 @@ pub enum QueueError {
     Chain(#[from] ChainError),
 }
 
+/// Retries an auction creation gets after a failure that sent nothing
+/// (spec §8).
+pub const CREATION_RETRIES: u32 = 3;
+
+/// Retries a fill gets (spec §8): more than a creation, because a fill that
+/// lapses is money another bot takes.
+pub const FILL_RETRIES: u32 = 10;
+
+/// How the queue paces what a submission's budget allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicy {
+    /// The pause before the first retry; each later one doubles it.
+    pub initial: Duration,
+    /// The longest pause.
+    pub max: Duration,
+    /// The pause between two polls of an outcome still unknown.
+    pub resolve_pause: Duration,
+}
+
+impl RetryPolicy {
+    /// Spec §8's backoff: one second, doubling, to thirty.
+    pub const DEFAULT: Self = Self {
+        initial: Duration::from_secs(1),
+        max: Duration::from_secs(30),
+        resolve_pause: Duration::from_secs(1),
+    };
+}
+
 /// The caller's handle. Cloneable: several tasks may enqueue for one key,
 /// which is the point.
 #[derive(Debug, Clone)]
@@ -124,6 +167,15 @@ impl SubmissionQueue {
     }
 }
 
+/// [`run_queue_with`] under [`RetryPolicy::DEFAULT`].
+pub async fn run_queue(
+    submitter: &Submitter<'_>,
+    receiver: mpsc::Receiver<QueuedSubmission>,
+    shutdown: &watch::Receiver<bool>,
+) {
+    run_queue_with(submitter, receiver, shutdown, RetryPolicy::DEFAULT).await;
+}
+
 /// Drains `receiver` until every sender is dropped, submitting one at a
 /// time through `submitter`. Once `shutdown` is set, no further submission
 /// is attempted: each is answered with an error instead of being sent, so a
@@ -131,20 +183,28 @@ impl SubmissionQueue {
 /// will never be made — is released rather than left waiting on a tick that
 /// will never come.
 ///
+/// Every submission is answered only once its outcome is terminal
+/// ([`TxOutcome::Succeeded`], [`TxOutcome::Failed`], [`TxOutcome::Expired`]),
+/// or with [`TxOutcome::Unknown`] once shutdown interrupts the resolution —
+/// never while the next submission for this key could be prepared against a
+/// sequence number it may still consume.
+///
 /// A submission's failure is returned to its caller and never ends the
 /// queue: one borrower's contract error is not the bot's. The shutdown flag
 /// is checked between submissions, never during one — a transaction already
 /// sent is waited for, because abandoning it would leave the account's
-/// sequence consumed by something the bot never saw the outcome of.
+/// sequence consumed by something the bot never saw the outcome of — and
+/// while a retry's backoff is waiting, which it cuts short.
 ///
 /// A submission dequeued after shutdown is answered
 /// [`QueueError::ShuttingDown`], which no chain outcome can be mistaken
 /// for: nothing was sent, so no `ChainError` — every one of which describes
 /// something the chain or the client did — would be true of it.
-pub async fn run_queue(
+pub async fn run_queue_with(
     submitter: &Submitter<'_>,
     mut receiver: mpsc::Receiver<QueuedSubmission>,
     shutdown: &watch::Receiver<bool>,
+    policy: RetryPolicy,
 ) {
     while let Some(queued) = receiver.recv().await {
         if *shutdown.borrow() {
@@ -160,10 +220,7 @@ pub async fn run_queue(
             respond,
         } = queued;
         tracing::info!(label = submission.label, "submitting");
-        let outcome = submitter
-            .submit(submission.operation, submission.priority)
-            .await
-            .map_err(QueueError::Chain);
+        let outcome = submit_until_settled(submitter, &submission, shutdown, policy).await;
         if let Err(error) = &outcome {
             tracing::warn!(label = submission.label, %error, "submission failed");
         }
@@ -173,12 +230,131 @@ pub async fn run_queue(
     }
 }
 
+/// One submission, to an answer the caller can act on. Retries only what
+/// provably never reached the network, pausing between attempts.
+async fn submit_until_settled(
+    submitter: &Submitter<'_>,
+    submission: &Submission,
+    shutdown: &watch::Receiver<bool>,
+    policy: RetryPolicy,
+) -> Result<TxOutcome, QueueError> {
+    let mut retries_left = submission.retries;
+    let mut pause = policy.initial;
+    loop {
+        match attempt(submitter, submission, shutdown, policy).await {
+            Err(error) if sent_nothing(&error) && retries_left > 0 => {
+                retries_left -= 1;
+                tracing::warn!(
+                    label = submission.label,
+                    %error,
+                    retries_left,
+                    "nothing was sent; preparing again from fresh state"
+                );
+                if !pause_unless_shutdown(pause, shutdown).await {
+                    return Err(QueueError::Chain(error));
+                }
+                pause = pause.saturating_mul(2).min(policy.max);
+            }
+            outcome => return outcome.map_err(QueueError::Chain),
+        }
+    }
+}
+
+/// Prepare, send, and resolve. A send whose answer is lost is resolved by
+/// hash like any other — the RPC may have forwarded it.
+async fn attempt(
+    submitter: &Submitter<'_>,
+    submission: &Submission,
+    shutdown: &watch::Receiver<bool>,
+    policy: RetryPolicy,
+) -> Result<TxOutcome, ChainError> {
+    let prepared = submitter
+        .prepare(submission.operation.clone(), submission.priority)
+        .await?;
+    tracing::info!(
+        label = submission.label,
+        hash = %prepared.hash,
+        sequence = prepared.sequence,
+        max_ledger = prepared.window.max_ledger(),
+        fee = prepared.fee,
+        "sending transaction"
+    );
+    match submitter.send(&prepared).await {
+        Ok(()) => {}
+        Err(error @ (ChainError::BadSequence | ChainError::Rejected(_))) => return Err(error),
+        Err(error) => tracing::warn!(
+            label = submission.label,
+            hash = %prepared.hash,
+            %error,
+            "the send's answer was lost; resolving by hash rather than resending"
+        ),
+    }
+    resolve(submitter, &prepared, shutdown, policy).await
+}
+
+/// `wait_for` until the outcome is terminal. `Unknown` comes back only when
+/// shutdown has been requested.
+async fn resolve(
+    submitter: &Submitter<'_>,
+    prepared: &Prepared,
+    shutdown: &watch::Receiver<bool>,
+    policy: RetryPolicy,
+) -> Result<TxOutcome, ChainError> {
+    loop {
+        let outcome = submitter
+            .wait_for(prepared.hash, prepared.sequence, prepared.window)
+            .await?;
+        if !matches!(outcome, TxOutcome::Unknown { .. }) || *shutdown.borrow() {
+            return Ok(outcome);
+        }
+        tracing::warn!(
+            hash = %prepared.hash,
+            "the outcome is still unknown; nothing else is sent for this key until it is known"
+        );
+        if !pause_unless_shutdown(policy.resolve_pause, shutdown).await {
+            return Ok(outcome);
+        }
+    }
+}
+
+/// Whether `error` proves nothing of this submission reached the network: a
+/// `prepare` that failed before sending, or a send the RPC refused.
+/// Everything a send can fail with *after* the envelope left is handled in
+/// `attempt`, by hash, and never reaches this.
+fn sent_nothing(error: &ChainError) -> bool {
+    matches!(
+        error,
+        ChainError::Rejected(_)
+            | ChainError::Transport(_)
+            | ChainError::Http(_)
+            | ChainError::Rpc { .. }
+            | ChainError::LedgerMoved { .. }
+    )
+}
+
+/// Sleeps `pause`, cut short by a shutdown request. `false` when it was.
+async fn pause_unless_shutdown(pause: Duration, shutdown: &watch::Receiver<bool>) -> bool {
+    let mut requested = shutdown.clone();
+    tokio::select! {
+        () = tokio::time::sleep(pause) => !*shutdown.borrow(),
+        _ = requested.wait_for(|stopping| *stopping) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain::rpc::RpcClient;
+    use crate::chain::script::{
+        script_prepare_prelude, script_send, script_simulate_accepted, script_simulate_refused,
+        script_transaction_not_found, script_transaction_success, ScriptedRpc,
+    };
+    use crate::chain::signer::{Network, Signer};
+    use crate::chain::tx::TxConfig;
     use crate::chain::TxHash;
+    use serde_json::Value;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use stellar_xdr::TransactionResultResult;
 
     const POOL: &str = "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD";
 
@@ -196,6 +372,7 @@ mod tests {
             operation: operation(),
             priority: Priority::Normal,
             label: label.to_string(),
+            retries: 0,
         }
     }
 
@@ -397,6 +574,449 @@ mod tests {
         assert!(
             rpc.calls("getLedgerEntries").is_empty(),
             "a shutting-down queue must never attempt a submission"
+        );
+    }
+
+    /// A signing key for the queue's own submission tests: no real funds,
+    /// and no relation to any fixture account. Everything it signs is
+    /// signed against what the scripted RPC hands back for it.
+    fn signer() -> Signer {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[3_u8; 32]);
+        let secret = stellar_strkey::ed25519::PrivateKey(key.to_bytes()).to_string();
+        Signer::from_secret(&secret).expect("signer")
+    }
+
+    /// Millisecond timings, and a wait cap of zero so every `wait_for`
+    /// polls `getTransaction` exactly once before giving up as `Unknown`.
+    /// The repeated polling these tests observe is then the queue's own
+    /// resolution loop and never `wait_for`'s internal one, which is the
+    /// thing under test.
+    fn tx_config() -> TxConfig {
+        TxConfig {
+            poll_interval: Duration::from_millis(1),
+            send_retry_pause: Duration::ZERO,
+            wait_cap: Duration::ZERO,
+            ..TxConfig::new(100, 200, 3)
+        }
+    }
+
+    /// What a `Submitter` borrows, held together so a test can build one in
+    /// a line: the submitter borrows all three for as long as it lives.
+    struct Chain {
+        client: RpcClient,
+        network: Network,
+        signer: Signer,
+    }
+
+    impl Chain {
+        fn new(url: &str) -> Self {
+            Self {
+                client: RpcClient::new(url, None).expect("rpc client"),
+                network: Network::testnet(),
+                signer: signer(),
+            }
+        }
+
+        fn submitter(&self) -> Submitter<'_> {
+            Submitter::new(&self.client, &self.network, &self.signer, tx_config())
+        }
+    }
+
+    /// A policy fast enough for a test; the shape of `RetryPolicy::DEFAULT`.
+    fn quick() -> RetryPolicy {
+        RetryPolicy {
+            initial: Duration::from_millis(1),
+            max: Duration::from_millis(4),
+            resolve_pause: Duration::from_millis(1),
+        }
+    }
+
+    fn submission_with(label: &str, retries: u32) -> Submission {
+        Submission {
+            retries,
+            ..submission(label)
+        }
+    }
+
+    /// One submission through `run_queue_with`, bounded so a queue that
+    /// never settles fails the test instead of hanging it. The queue is
+    /// dropped the moment the answer arrives, which is what ends the
+    /// worker.
+    async fn run_one(
+        submitter: &Submitter<'_>,
+        shutdown: &watch::Receiver<bool>,
+        policy: RetryPolicy,
+        retries: u32,
+    ) -> Result<TxOutcome, QueueError> {
+        let (queue, receiver) = SubmissionQueue::new(capacity(1));
+        let enqueue = async {
+            let answer = queue.enqueue(submission_with("creation", retries)).await;
+            drop(queue);
+            answer
+        };
+        let worker = run_queue_with(submitter, receiver, shutdown, policy);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (answer, ()) = tokio::join!(enqueue, worker);
+            answer
+        })
+        .await
+        .expect("the queue must settle a submission rather than hang on it")
+    }
+
+    /// The JSON-RPC method of every request the scripted server saw, in the
+    /// order it saw them: `calls` groups by method and so cannot say which
+    /// of two different methods came first.
+    async fn methods_in_order(rpc: &ScriptedRpc) -> Vec<String> {
+        rpc.received()
+            .await
+            .iter()
+            .map(|request| {
+                let body: Value = serde_json::from_slice(&request.body).expect("a JSON body");
+                body["method"].as_str().expect("a method").to_string()
+            })
+            .collect()
+    }
+
+    /// Every index in `methods` holding `method`.
+    fn positions_of(methods: &[String], method: &str) -> Vec<usize> {
+        methods
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| name.as_str() == method)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// A send whose answer was lost may still have been forwarded, so the
+    /// queue asks the chain about the hash it holds — and finds it landed.
+    /// Resending would have been a second transaction for one plan.
+    #[tokio::test]
+    async fn a_send_whose_answer_was_lost_is_resolved_by_hash_never_resent() {
+        let rpc = ScriptedRpc::start().await;
+        let chain = Chain::new(&rpc.url());
+        script_prepare_prelude(&rpc, &chain.signer, 10, 100);
+        script_simulate_accepted(&rpc, 100);
+        // The RPC never answered this send. It may have forwarded the
+        // envelope all the same, so the only safe question is what became
+        // of the hash — not whether to send it again.
+        rpc.expect_http("sendTransaction", 500);
+        script_transaction_success(&rpc, 101);
+
+        let (_flag, shutdown) = watch::channel(false);
+        let answer = run_one(&chain.submitter(), &shutdown, quick(), 3).await;
+
+        assert!(
+            matches!(answer, Ok(TxOutcome::Succeeded { .. })),
+            "the transaction landed under the hash the queue held: {answer:?}"
+        );
+        assert_eq!(
+            rpc.calls("sendTransaction").len(),
+            1,
+            "a send whose answer was lost is never sent again"
+        );
+        assert_eq!(
+            rpc.calls("simulateTransaction").len(),
+            1,
+            "and nothing is prepared again either"
+        );
+        assert_eq!(rpc.remaining(), 0);
+    }
+
+    /// An outcome the RPC cannot yet name is polled until it can be named.
+    /// Moving on would let the next submission for this key be prepared
+    /// against a sequence number this transaction may still consume.
+    #[tokio::test]
+    async fn an_unknown_outcome_is_polled_until_it_is_terminal() {
+        let rpc = ScriptedRpc::start().await;
+        let chain = Chain::new(&rpc.url());
+        script_prepare_prelude(&rpc, &chain.signer, 10, 100);
+        script_simulate_accepted(&rpc, 100);
+        script_send(&rpc, "PENDING", None, 100);
+        // The RPC's latest ledger stays far under the window's max ledger
+        // of 104, so none of these proves the transaction expired: each
+        // `wait_for` gives up as `Unknown` at the wait cap, and the queue
+        // must ask again rather than call the submission done.
+        for _ in 0..3 {
+            script_transaction_not_found(&rpc, 100, 1);
+        }
+        script_transaction_success(&rpc, 101);
+
+        let (_flag, shutdown) = watch::channel(false);
+        let answer = run_one(&chain.submitter(), &shutdown, quick(), 3).await;
+
+        assert!(
+            matches!(answer, Ok(TxOutcome::Succeeded { .. })),
+            "the queue waited for the terminal outcome: {answer:?}"
+        );
+        assert_eq!(
+            rpc.calls("getTransaction").len(),
+            4,
+            "three unknown answers were polled past, not accepted"
+        );
+        assert_eq!(rpc.calls("sendTransaction").len(), 1);
+        assert_eq!(rpc.remaining(), 0);
+    }
+
+    /// A second submission is not prepared while the first is unresolved.
+    #[tokio::test]
+    async fn nothing_else_is_sent_for_the_key_until_the_first_is_settled() {
+        let rpc = ScriptedRpc::start().await;
+        let chain = Chain::new(&rpc.url());
+        // The first submission: prepared, sent, unknown twice, then landed.
+        script_prepare_prelude(&rpc, &chain.signer, 10, 100);
+        script_simulate_accepted(&rpc, 100);
+        script_send(&rpc, "PENDING", None, 100);
+        script_transaction_not_found(&rpc, 100, 1);
+        script_transaction_not_found(&rpc, 100, 1);
+        script_transaction_success(&rpc, 101);
+        // The second: a fresh account read — at the sequence the first one
+        // consumed — and its own send.
+        script_prepare_prelude(&rpc, &chain.signer, 11, 100);
+        script_simulate_accepted(&rpc, 100);
+        script_send(&rpc, "PENDING", None, 100);
+        script_transaction_success(&rpc, 101);
+
+        let (_flag, shutdown) = watch::channel(false);
+        let submitter = chain.submitter();
+        let (queue, receiver) = SubmissionQueue::new(capacity(2));
+        let enqueue_both = async {
+            let first = queue.enqueue(submission_with("first", 0));
+            let second = queue.enqueue(submission_with("second", 0));
+            let answers = tokio::join!(first, second);
+            drop(queue);
+            answers
+        };
+        let ((first, second), ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                enqueue_both,
+                run_queue_with(&submitter, receiver, &shutdown, quick())
+            )
+        })
+        .await
+        .expect("both submissions must settle");
+
+        assert!(
+            matches!(first, Ok(TxOutcome::Succeeded { .. })),
+            "{first:?}"
+        );
+        assert!(
+            matches!(second, Ok(TxOutcome::Succeeded { .. })),
+            "{second:?}"
+        );
+        let methods = methods_in_order(&rpc).await;
+        let account_reads = positions_of(&methods, "getLedgerEntries");
+        let polls = positions_of(&methods, "getTransaction");
+        assert_eq!(account_reads.len(), 2, "{methods:?}");
+        assert_eq!(polls.len(), 4, "{methods:?}");
+        assert!(
+            account_reads[1] > polls[2],
+            "the second submission read this key's sequence number before \
+             the first submission's outcome was known: {methods:?}"
+        );
+        assert_eq!(rpc.remaining(), 0);
+    }
+
+    /// The RPC refusing the envelope proves nothing landed, so the queue
+    /// prepares again from fresh state — a new sequence read and a new
+    /// simulation — within the submission's budget.
+    #[tokio::test]
+    async fn a_refused_send_is_retried_with_a_fresh_prepare() {
+        let rpc = ScriptedRpc::start().await;
+        let chain = Chain::new(&rpc.url());
+        script_prepare_prelude(&rpc, &chain.signer, 10, 100);
+        script_simulate_accepted(&rpc, 100);
+        script_send(
+            &rpc,
+            "ERROR",
+            Some(TransactionResultResult::TxInsufficientFee),
+            100,
+        );
+        script_prepare_prelude(&rpc, &chain.signer, 10, 100);
+        script_simulate_accepted(&rpc, 100);
+        script_send(&rpc, "PENDING", None, 100);
+        script_transaction_success(&rpc, 101);
+
+        let (_flag, shutdown) = watch::channel(false);
+        let answer = run_one(&chain.submitter(), &shutdown, quick(), 3).await;
+
+        assert!(
+            matches!(answer, Ok(TxOutcome::Succeeded { .. })),
+            "the retry landed: {answer:?}"
+        );
+        assert_eq!(rpc.calls("sendTransaction").len(), 2);
+        assert_eq!(
+            rpc.calls("simulateTransaction").len(),
+            2,
+            "the retry is a fresh prepare, never the same envelope again"
+        );
+        assert_eq!(rpc.calls("getLedgerEntries").len(), 2);
+        assert_eq!(rpc.remaining(), 0);
+    }
+
+    /// The budget is a bound: `retries: 2` is three attempts in all.
+    #[tokio::test]
+    async fn retries_stop_at_the_submissions_budget() {
+        let rpc = ScriptedRpc::start().await;
+        let chain = Chain::new(&rpc.url());
+        for _ in 0..3 {
+            script_prepare_prelude(&rpc, &chain.signer, 10, 100);
+            script_simulate_accepted(&rpc, 100);
+            script_send(
+                &rpc,
+                "ERROR",
+                Some(TransactionResultResult::TxInsufficientFee),
+                100,
+            );
+        }
+
+        let (_flag, shutdown) = watch::channel(false);
+        let answer = run_one(&chain.submitter(), &shutdown, quick(), 2).await;
+
+        assert!(
+            matches!(answer, Err(QueueError::Chain(ChainError::Rejected(_)))),
+            "the budget ran out and the failure went back to the caller: {answer:?}"
+        );
+        assert_eq!(
+            rpc.calls("sendTransaction").len(),
+            3,
+            "two retries after the first attempt, and no more"
+        );
+        assert_eq!(rpc.remaining(), 0);
+    }
+
+    /// A bad sequence means the plan is stale: it goes back to the caller to
+    /// be rebuilt, however much budget is left.
+    #[tokio::test]
+    async fn a_bad_sequence_goes_back_to_the_caller() {
+        let rpc = ScriptedRpc::start().await;
+        let chain = Chain::new(&rpc.url());
+        script_prepare_prelude(&rpc, &chain.signer, 10, 100);
+        script_simulate_accepted(&rpc, 100);
+        script_send(&rpc, "ERROR", Some(TransactionResultResult::TxBadSeq), 100);
+
+        let (_flag, shutdown) = watch::channel(false);
+        let answer = run_one(&chain.submitter(), &shutdown, quick(), 5).await;
+
+        assert!(
+            matches!(answer, Err(QueueError::Chain(ChainError::BadSequence))),
+            "a stale plan is the caller's to rebuild: {answer:?}"
+        );
+        assert_eq!(
+            rpc.calls("sendTransaction").len(),
+            1,
+            "five retries left, and none of them used on a stale plan"
+        );
+        assert_eq!(rpc.remaining(), 0);
+    }
+
+    /// A contract refusal at prepare cannot change on a retry.
+    #[tokio::test]
+    async fn a_contract_refusal_goes_back_to_the_caller() {
+        let rpc = ScriptedRpc::start().await;
+        let chain = Chain::new(&rpc.url());
+        // The signing path's prelude: `prepare` reads the fee stats before
+        // it simulates, so a simulate-only prelude would fail this on the
+        // fee read rather than on the contract's answer.
+        script_prepare_prelude(&rpc, &chain.signer, 10, 100);
+        script_simulate_refused(&rpc, 1_205, 100);
+
+        let (_flag, shutdown) = watch::channel(false);
+        let answer = run_one(&chain.submitter(), &shutdown, quick(), 5).await;
+
+        assert!(
+            matches!(
+                answer,
+                Err(QueueError::Chain(ChainError::Simulation {
+                    contract_error: Some(1_205),
+                    ..
+                }))
+            ),
+            "a refusal is an answer, not a transient failure: {answer:?}"
+        );
+        assert_eq!(
+            rpc.calls("simulateTransaction").len(),
+            1,
+            "nothing a retry could change, so nothing was retried"
+        );
+        assert!(
+            rpc.calls("sendTransaction").is_empty(),
+            "a refused simulation is never sent"
+        );
+        assert_eq!(rpc.remaining(), 0);
+    }
+
+    /// An expired transaction never landed; whether to try again is the
+    /// caller's decision, made against fresh state (spec §8).
+    #[tokio::test]
+    async fn an_expired_transaction_goes_back_to_the_caller() {
+        let rpc = ScriptedRpc::start().await;
+        let chain = Chain::new(&rpc.url());
+        script_prepare_prelude(&rpc, &chain.signer, 10, 100);
+        script_simulate_accepted(&rpc, 100);
+        script_send(&rpc, "PENDING", None, 100);
+        // 105 is past the window's max ledger of 104 and the retention
+        // still reaches back to its min ledger of 100, so this `NOT_FOUND`
+        // is proof the transaction never applied.
+        script_transaction_not_found(&rpc, 105, 1);
+
+        let (_flag, shutdown) = watch::channel(false);
+        let answer = run_one(&chain.submitter(), &shutdown, quick(), 5).await;
+
+        assert!(
+            matches!(answer, Ok(TxOutcome::Expired { .. })),
+            "expiry is a terminal outcome the caller re-plans from: {answer:?}"
+        );
+        assert_eq!(
+            rpc.calls("sendTransaction").len(),
+            1,
+            "an expired transaction is not resent behind the caller's back"
+        );
+        assert_eq!(rpc.calls("getTransaction").len(), 1);
+        assert_eq!(rpc.remaining(), 0);
+    }
+
+    /// Shutdown cuts a backoff short: the caller hears the failure at once.
+    #[tokio::test]
+    async fn shutdown_cuts_a_backoff_short() {
+        let rpc = ScriptedRpc::start().await;
+        let chain = Chain::new(&rpc.url());
+        script_prepare_prelude(&rpc, &chain.signer, 10, 100);
+        script_simulate_accepted(&rpc, 100);
+        script_send(
+            &rpc,
+            "ERROR",
+            Some(TransactionResultResult::TxInsufficientFee),
+            100,
+        );
+
+        let (flag, shutdown) = watch::channel(false);
+        // An hour before the retry: nothing but the shutdown request can
+        // end this wait inside a test.
+        let policy = RetryPolicy {
+            initial: Duration::from_hours(1),
+            ..quick()
+        };
+        let raise_once_sent = async {
+            while rpc.calls("sendTransaction").is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            flag.send(true).expect("the queue still holds a receiver");
+        };
+        let submitter = chain.submitter();
+        let (answer, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(run_one(&submitter, &shutdown, policy, 5), raise_once_sent)
+        })
+        .await
+        .expect("shutdown must cut the backoff short, not wait it out");
+
+        assert!(
+            matches!(answer, Err(QueueError::Chain(ChainError::Rejected(_)))),
+            "the caller hears the failure that was waiting to be retried: {answer:?}"
+        );
+        assert_eq!(
+            rpc.calls("sendTransaction").len(),
+            1,
+            "the backoff was cut short, so the retry never happened"
         );
     }
 }

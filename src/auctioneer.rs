@@ -45,7 +45,7 @@ use crate::chain::{ChainError, TxHash, TxOutcome};
 use crate::ledger::LedgerTick;
 use crate::math::liquidation::{plan_liquidation, position_values, LiquidationPlan};
 use crate::math::{div_floor, mul_floor, MathError, OraclePrices, Reserve, SCALAR_7};
-use crate::queue::{QueueError, Submission, SubmissionQueue};
+use crate::queue::{QueueError, Submission, SubmissionQueue, CREATION_RETRIES};
 use crate::store::{CreationKind, CreationRecord, Side, Store, StoreError, TrackedUser};
 
 /// `PoolError::InvalidLiqTooLarge`: the liquidation would leave the
@@ -906,6 +906,7 @@ impl<'a> Auctioneer<'a> {
                 operation,
                 priority: Priority::Normal,
                 label,
+                retries: CREATION_RETRIES,
             })
             .await?;
         let hash = outcome_hash(&outcome).to_hex();
@@ -1181,15 +1182,15 @@ mod tests {
     use serde_json::{json, Value};
     use stellar_xdr::{
         ContractDataDurability, ContractDataEntry, ExtensionPoint, InvokeHostFunctionResult,
-        LedgerEntryData, LedgerKey, LedgerKeyAccount, OperationResult, OperationResultTr, ScVal,
-        TransactionResultResult, VecM,
+        LedgerEntryData, OperationResult, OperationResultTr, ScVal, TransactionResultResult, VecM,
     };
 
     use super::*;
     use crate::chain::rpc::RpcClient;
     use crate::chain::script::{
-        account_entry_b64, diagnostic_error_b64, meta_v4_b64, result_b64, scval_b64,
-        transaction_data_b64, ScriptedRpc,
+        diagnostic_error_b64, meta_v4_b64, result_b64, script_prepare_prelude,
+        script_simulate_accepted, script_simulate_needs_restore, script_simulate_prelude,
+        script_simulate_refused, ScriptedRpc,
     };
     use crate::chain::signer::{Network, Signer};
     use crate::chain::tx::TxConfig;
@@ -1528,82 +1529,6 @@ mod tests {
             wait_cap: std::time::Duration::from_millis(200),
             ..TxConfig::new(100, 200, 3)
         }
-    }
-
-    /// One `Submitter::simulate_only` attempt's prelude: the source
-    /// account's entry, and nothing else. A simulate-only call needs no fee
-    /// stats — it never assembles a transaction to pay for — so a test that
-    /// scripts one and sees it consumed would be scripting the signing path
-    /// by mistake.
-    fn script_simulate_prelude(rpc: &ScriptedRpc, signer: &Signer, sequence: i64, ledger: u32) {
-        let key = LedgerKey::Account(LedgerKeyAccount {
-            account_id: signer.account_id(),
-        });
-        rpc.expect(
-            "getLedgerEntries",
-            json!({"latestLedger": ledger, "entries": [
-                {"key": to_base64(&key).expect("key"),
-                 "xdr": account_entry_b64(signer.address(), sequence),
-                 "lastModifiedLedgerSeq": 1}
-            ]}),
-        );
-    }
-
-    /// One `Submitter::prepare` attempt's prelude: the account read above,
-    /// plus the fee stats a transaction that will actually be signed and
-    /// paid for needs. Only the queue's own submission path takes this
-    /// route.
-    fn script_prepare_prelude(rpc: &ScriptedRpc, signer: &Signer, sequence: i64, ledger: u32) {
-        script_simulate_prelude(rpc, signer, sequence, ledger);
-        rpc.expect(
-            "getFeeStats",
-            json!({"sorobanInclusionFee": {"p70": "100", "p90": "100"},
-                   "inclusionFee": {"p70": "100", "p90": "100"}, "latestLedger": ledger}),
-        );
-    }
-
-    /// The `simulateTransaction` answer for an attempt the contract accepts.
-    fn script_simulate_accepted(rpc: &ScriptedRpc, ledger: u32) {
-        rpc.expect(
-            "simulateTransaction",
-            json!({"transactionData": transaction_data_b64(10),
-                   "events": [],
-                   "minResourceFee": "10",
-                   "results": [{"auth": [], "xdr": scval_b64(&stellar_xdr::ScVal::Void)}],
-                   "latestLedger": ledger}),
-        );
-    }
-
-    /// The `simulateTransaction` answer for an attempt the contract refuses
-    /// with `code`, both in the diagnostic events and the error message —
-    /// exactly the two places `contract_error_in_events` and
-    /// `contract_error_in_message` read it from.
-    fn script_simulate_refused(rpc: &ScriptedRpc, code: u32, ledger: u32) {
-        rpc.expect(
-            "simulateTransaction",
-            json!({"error": format!("HostError: Error(Contract, #{code})"),
-                   "events": [diagnostic_error_b64(code)],
-                   "latestLedger": ledger}),
-        );
-    }
-
-    /// The `simulateTransaction` answer for an operation whose footprint
-    /// holds archived entries: a simulation that succeeded as far as it
-    /// could, carrying a `restorePreamble` the caller would have to submit a
-    /// `RestoreFootprint` transaction for before the call itself can be
-    /// judged. This is what a mainnet pool answers when a reserve or
-    /// positions entry has fallen out of the live state.
-    fn script_simulate_needs_restore(rpc: &ScriptedRpc, ledger: u32) {
-        rpc.expect(
-            "simulateTransaction",
-            json!({"transactionData": transaction_data_b64(10),
-                   "events": [],
-                   "minResourceFee": "10",
-                   "results": [{"auth": [], "xdr": scval_b64(&stellar_xdr::ScVal::Void)}],
-                   "restorePreamble": {"minResourceFee": "7",
-                                       "transactionData": transaction_data_b64(7)},
-                   "latestLedger": ledger}),
-        );
     }
 
     /// A borrower above the threshold is left alone. The threshold sits
