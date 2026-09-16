@@ -47,6 +47,7 @@ pub mod chain;
 pub mod config;
 pub mod executor;
 pub mod filler;
+pub mod http;
 pub mod inventory;
 pub mod ledger;
 pub mod math;

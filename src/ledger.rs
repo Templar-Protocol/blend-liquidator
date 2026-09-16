@@ -108,7 +108,27 @@ impl PollerConfig {
             max_backoff: Duration::from_secs(30),
         }
     }
+
+    /// How long `/livez` (see [`crate::http`]) waits without a heartbeat
+    /// before declaring this pool's poller dead.
+    ///
+    /// A healthy poller heartbeats roughly every `poll_interval`, but an
+    /// RPC outage backs its loop off up to `max_backoff` between attempts
+    /// (see the module doc), and a gap or a transient store error can cost
+    /// another interval or two before the next heartbeat lands. Spec §7:
+    /// an RPC outage must not by itself fail `/livez` — only a poller that
+    /// has stopped making progress entirely should. `LIVENESS_INTERVALS`
+    /// intervals plus one worst-case backoff is generous enough to absorb
+    /// that without also absorbing a genuinely stuck poller.
+    #[must_use]
+    pub fn liveness_deadline(&self) -> Duration {
+        self.poll_interval * LIVENESS_INTERVALS + self.max_backoff
+    }
 }
+
+/// How many `poll_interval`s of silence [`PollerConfig::liveness_deadline`]
+/// tolerates before a missing heartbeat fails `/livez`.
+pub const LIVENESS_INTERVALS: u32 = 5;
 
 /// A failure in the poller.
 #[derive(Debug, thiserror::Error)]
@@ -1039,5 +1059,11 @@ mod tests {
              {seen_third:?}"
         );
         Ok(())
+    }
+
+    #[test]
+    fn liveness_deadline_is_five_intervals_plus_the_max_backoff() {
+        let config = PollerConfig::new(Duration::from_secs(1));
+        assert_eq!(config.liveness_deadline(), Duration::from_secs(35));
     }
 }
