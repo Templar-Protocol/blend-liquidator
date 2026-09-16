@@ -687,7 +687,8 @@ impl<'a> Auctioneer<'a> {
         // The other half of the same coupling: a queue means "send this",
         // and dry-run means nothing is sent, so the two cannot both be true
         // of one call. `Service::run` builds no queue at all in dry-run
-        // (`spawn_submission_queue` answers `None`), so this is unreachable
+        // (`spawn_queues` starts no worker and answers `None` for both
+        // roles), so this is unreachable
         // from the binary; it is refused here so that the public pieces
         // composed by hand cannot make a dry-run that submits — the silent
         // direction `DRY_RUN`'s strict parser exists to close.
@@ -2368,7 +2369,8 @@ mod tests {
     /// A queue handed to a dry-run auctioneer is refused the same way: a
     /// queue means "send this" and dry-run means nothing is sent, so the
     /// two cannot both be true of one call. `Service::run` builds no queue
-    /// at all in dry-run (`spawn_submission_queue` answers `None`); the
+    /// at all in dry-run (`spawn_queues` starts no worker and answers
+    /// `None` for both roles); the
     /// public pieces composed by hand must not be able to make a dry-run
     /// that submits, which is the silent direction `DRY_RUN`'s strict
     /// parser exists to close.

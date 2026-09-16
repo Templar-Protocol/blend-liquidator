@@ -301,7 +301,9 @@ async fn validate_filler(
             &mut warnings,
             format!(
                 "the filler account {address} holds {native_balance} stroops of the native \
-                 asset, below XLM_FEE_RESERVE ({}): it could not pay for the fills it plans",
+                 asset, below the {} stroops XLM_FEE_RESERVE asks for (XLM_FEE_RESERVE is set \
+                 in decimal XLM, i.e. XLM_FEE_RESERVE × 10^7 stroops): it could not pay for \
+                 the fills it plans",
                 config.xlm_fee_reserve
             ),
         )?;
@@ -318,6 +320,12 @@ async fn validate_filler(
             .snapshot(std::slice::from_ref(&address))
             .await?;
         match filler_primary_collateral(&snapshot, address, &pool.primary_asset) {
+            // The subtraction cannot go negative or overflow: the guard
+            // gives `held < min_primary_collateral`, `held` is
+            // non-negative because it is a b-token balance through
+            // `to_asset_from_b_token`, and `parse_pools` refuses a
+            // negative `min_primary_collateral` — so the difference lies
+            // in `1..=min_primary_collateral`.
             Ok(held) if held < pool.min_primary_collateral => warnings.push(format!(
                 "pool {}: the filler holds {held} of its primary asset {}, {} short of \
                  min_primary_collateral ({})",
@@ -1316,6 +1324,12 @@ async fn move_flag_forward(
     Ok(ledger)
 }
 
+/// The two role names a [`StartupGate`] logs under, so the one "startup
+/// delay has elapsed" line each task prints says which of them unlocked.
+const AUCTIONEER_ROLE: &str = "auctioneer";
+/// The filler's, for the same line.
+const FILLER_ROLE: &str = "filler";
+
 /// One task's share of `STARTUP_DELAY_LEDGERS`: whether the chain has
 /// moved far enough past the first tick this task saw for it to be
 /// allowed to submit anything.
@@ -1323,8 +1337,14 @@ async fn move_flag_forward(
 /// One per task, never shared: the auctioneer and the filler each start
 /// at whatever tick they first observe, each answers for its own key, and
 /// a gate shared between them would have one task's first tick decide
-/// when the other may spend.
-#[derive(Debug, Default)]
+/// when the other may spend. Each therefore carries the role it logs
+/// under, so the two unlock lines are told apart rather than read as one
+/// line printed twice.
+///
+/// No `Default`: a gate with no role would log an unnamed one, and the
+/// whole point of the field is that it is set deliberately at each of the
+/// two construction sites.
+#[derive(Debug)]
 struct StartupGate {
     /// The ledger of the first tick this task observed, which the startup
     /// delay is measured from. `None` until that first tick: there is no
@@ -1347,9 +1367,23 @@ struct StartupGate {
     /// measured from startup, never re-armed — so the "submissions are
     /// now possible" log line fires at most once per task.
     unlocked: bool,
+    /// Which task this gate belongs to, on that one log line. Two tasks
+    /// unlock independently and a line with no role would read as a
+    /// duplicate of the other's rather than as the second of two.
+    role: &'static str,
 }
 
 impl StartupGate {
+    /// A locked gate for `role`, which is what its one log line is named
+    /// with: [`AUCTIONEER_ROLE`] or [`FILLER_ROLE`].
+    fn new(role: &'static str) -> Self {
+        Self {
+            first_tick_ledger: None,
+            unlocked: false,
+            role,
+        }
+    }
+
     /// Observes `tick` and answers whether this task may submit.
     ///
     /// The elapsed distance cannot underflow: the watch these tasks read
@@ -1367,6 +1401,7 @@ impl StartupGate {
         if !self.unlocked && elapsed >= delay_ledgers {
             self.unlocked = true;
             tracing::info!(
+                role = self.role,
                 ledger = tick.sequence,
                 first_ledger,
                 elapsed,
@@ -1382,7 +1417,7 @@ impl StartupGate {
 /// state. Bundled into one struct, rather than four `&mut` parameters on
 /// [`auctioneer_tick`], for the same reason [`LoopState`] exists for the
 /// tracker.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct AuctioneerState {
     /// Each pool's oracle-scan reference prices.
     price_watches: BTreeMap<String, PriceWatch>,
@@ -1392,6 +1427,20 @@ struct AuctioneerState {
     last_full_scan: BTreeMap<String, u32>,
     /// Whether this task may submit yet.
     gate: StartupGate,
+}
+
+impl Default for AuctioneerState {
+    /// Every cadence map empty and the gate the auctioneer's own: only
+    /// this task ever builds one, and [`StartupGate`] has no `Default` of
+    /// its own precisely so the role cannot be left unset.
+    fn default() -> Self {
+        Self {
+            price_watches: BTreeMap::new(),
+            last_oracle_scan: BTreeMap::new(),
+            last_full_scan: BTreeMap::new(),
+            gate: StartupGate::new(AUCTIONEER_ROLE),
+        }
+    }
 }
 
 /// What one auctioneer task holds for its whole life: the pieces
@@ -1582,7 +1631,7 @@ async fn filler_loop(
     shutdown: &watch::Receiver<bool>,
 ) -> Result<(), LiquidatorError> {
     let mut state = FillerState::default();
-    let mut gate = StartupGate::default();
+    let mut gate = StartupGate::new(FILLER_ROLE);
     while tick_rx.changed().await.is_ok() {
         if *shutdown.borrow() {
             return Ok(());
