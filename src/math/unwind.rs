@@ -514,17 +514,20 @@ fn withdraw_candidate(
     partial(terms, bounds, inputs, positions, actions, data, index)
 }
 
-/// The largest partial withdrawal of `index` the floor allows, by formula
+/// The largest partial withdrawal of `index` [`Bounds`] allows, by formula
 /// and then by projection.
 ///
-/// The floor is charged to the *whole* position, never to this candidate
-/// alone: the collateral base it requires is `mul_ceil(liability_base,
-/// min_health_factor, SCALAR_7)`, what may go is `collateral_base` less
-/// that, and what must stay of this asset is its own contribution — valued
-/// exactly as `calculate_position_data` values it — less what may go,
-/// floored at zero. Charging the whole floor to one candidate throws away
-/// every other remaining collateral's base, which leaves the position
-/// untouched whenever no single asset could carry the floor by itself.
+/// The bounds are charged to the *whole* position, never to this candidate
+/// alone. The collateral base they require is the larger of what the
+/// health margin asks for and what the pool's own collateral minimum does
+/// — `mul_ceil(liability_base, margin, SCALAR_7).max(min_collateral)`,
+/// exactly the pair [`Bounds::accepts`] then verifies the projection
+/// against. What may go is `collateral_base` less that, and what must stay
+/// of this asset is its own contribution — valued exactly as
+/// `calculate_position_data` values it — less what may go, floored at
+/// zero. Charging the whole requirement to one candidate throws away every
+/// other remaining collateral's base, which leaves the position untouched
+/// whenever no single asset could carry it by itself.
 ///
 /// That base then converts back, every step rounded so what stays is never
 /// a unit short of what the floor asks for: effective underlying through
@@ -579,6 +582,12 @@ fn partial(
         reserve.to_effective_asset_from_b_token(held)?,
         reserve.scalar,
     )?;
+    // `may_go` is negative when the position is already under what the
+    // bounds require — `min_collateral` above `collateral_base` is the
+    // reachable way — and subtracting it then asks this candidate to keep
+    // *more* base than it carries, so `stays` exceeds `held`, `goes` comes
+    // out at or under zero and nothing moves. Which is the right answer:
+    // every withdrawal takes the position further under the bound.
     let stays_base = carries
         .checked_sub(may_go)
         .ok_or(MathError::Overflow)?
