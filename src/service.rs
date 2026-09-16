@@ -594,11 +594,13 @@ async fn seed_pools_needing_it(
                 )
                 .await?;
         }
-        // This pool's seed gauge, and only it: the tracked-user count
-        // read at the top of this loop was read *before* the seed, so
-        // publishing it as `users_tracked` here would report the very zero
-        // that sent this pool to be seeded. `full_scan` sets that gauge
-        // from a count taken after the seed, within one scan period.
+        // This pool's seed gauge, and only it: the tracked-user count at
+        // the top of this loop was read *before* the seed, so it is stale
+        // by the time the seed finishes — a pool with users but no cursor
+        // is seeded on a count that was never zero, and one seeded from
+        // empty has stopped being zero by here. `full_scan` sets
+        // `users_tracked` from a count taken after the seed, within one
+        // scan period.
         instruments
             .metrics
             .seed_accounts_loaded(&pool.address, outcome.refresh.tracked);
@@ -1519,6 +1521,14 @@ async fn recheck_batch(
 /// brings the borrower back on a later pass. Every other answer — a skip,
 /// a refusal, a store, chain or math failure — is the caller's to log as
 /// it already does.
+///
+/// A dropped creation counts *both* `attempted` and `failed`, for the same
+/// reason [`note_creation`] counts `attempted` on a creation the chain
+/// failed: [`Auctioneer::act`] writes the `creations` row before it hands
+/// anything to the queue, so by the time the queue answers, the bot has
+/// decided to act and recorded the decision. Counting only `failed` would
+/// leave `creations_total{result="failed"}` above the `attempted` it is
+/// meant to be a fraction of.
 fn note_act(
     instruments: &Instruments,
     pool: &str,
@@ -1528,6 +1538,7 @@ fn note_act(
     match acted {
         Ok(ActOutcome::Recorded(outcome)) => note_creation(instruments, pool, outcome),
         Err(AuctioneerError::Queue(QueueError::Chain(error))) => {
+            instruments.metrics.creation(Attempt::Attempted);
             instruments.metrics.creation(Attempt::Failed);
             instruments.notifier.notify(Notification {
                 kind: NotificationKind::SubmissionDropped,
@@ -4150,6 +4161,7 @@ mod tests {
             harness::USER_ONE
         ));
         let sources = vec![SeedSource::File(FileSeed::load(&file).expect("loads"))];
+        let instruments = Instruments::for_tests();
 
         let incomplete = seed_pools_needing_it(
             &client,
@@ -4158,12 +4170,20 @@ mod tests {
             &sources,
             20,
             &shutdown,
-            &Instruments::for_tests(),
+            &instruments,
         )
         .await
         .expect("seeding succeeds");
 
         assert!(incomplete.is_empty(), "the one source answered");
+        let rendered = instruments.metrics.render();
+        assert!(
+            rendered.contains(&format!(
+                "seed_accounts_loaded{{pool=\"{}\"}} 1",
+                harness::POOL
+            )),
+            "the seed publishes what it loaded, for this pool: {rendered}"
+        );
         let cursor = store
             .cursor(&events_cursor(harness::POOL))
             .await
@@ -5865,6 +5885,11 @@ mod tests {
              being cleared"
         );
         let rendered = instruments.metrics.render();
+        assert!(
+            rendered.contains("creations_total{result=\"attempted\"} 1"),
+            "the `creations` row was written before the queue was asked, so the bot did \
+             attempt this one: {rendered}"
+        );
         assert!(
             rendered.contains("creations_total{result=\"failed\"} 1"),
             "{rendered}"

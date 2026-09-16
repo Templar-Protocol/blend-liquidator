@@ -547,7 +547,13 @@ impl Metrics {
         header(
             &mut out,
             "fills_total",
-            "Fill attempts, by result.",
+            // The executor writes a fill's audit row before it enqueues
+            // anything, so a fill the queue's prepare refused or found
+            // stale leaves a row that was never counted here: the fills
+            // table can hold more rows than this counts attempts. See
+            // `Filler::note_recorded`.
+            "Fill attempts handed to the chain, by result. A fill refused or found stale when \
+             it was prepared leaves a fills row this does not count.",
             "counter",
         );
         for attempt in Attempt::ALL {
