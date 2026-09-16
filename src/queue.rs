@@ -239,7 +239,10 @@ async fn submit_until_settled(
     policy: RetryPolicy,
 ) -> Result<TxOutcome, QueueError> {
     let mut retries_left = submission.retries;
-    let mut pause = policy.initial;
+    // `max` is the longest pause, the first one included: a policy whose
+    // `initial` is longer than its `max` is a misconfiguration, not a
+    // licence to wait past the ceiling.
+    let mut pause = policy.initial.min(policy.max);
     loop {
         match attempt(submitter, submission, shutdown, policy).await {
             Err(error) if sent_nothing(&error) && retries_left > 0 => {
@@ -311,6 +314,12 @@ async fn resolve(
             hash = %prepared.hash,
             "the outcome is still unknown; nothing else is sent for this key until it is known"
         );
+        // `pause_unless_shutdown` answers the flag itself, so an unknown
+        // outcome goes back only for a shutdown that was actually
+        // requested. Anything looser — a dropped sender read as one —
+        // would free this key while the transaction is still in flight,
+        // and the next submission would be prepared against a sequence
+        // number it may yet consume.
         if !pause_unless_shutdown(policy.resolve_pause, shutdown).await {
             return Ok(outcome);
         }
@@ -332,13 +341,23 @@ fn sent_nothing(error: &ChainError) -> bool {
     )
 }
 
-/// Sleeps `pause`, cut short by a shutdown request. `false` when it was.
+/// Sleeps `pause`, cut short by a shutdown request. `false` when the bot is
+/// shutting down — the answer is the flag itself, read once the pause has
+/// ended, whichever arm ended it.
+///
+/// A dropped `watch::Sender` is **not** a shutdown: `wait_for` answers
+/// `RecvError` for it, and taking that for a request would end every pause
+/// the instant the sender went away — reporting "stopping" while the flag
+/// still reads `false`, and, for a caller pausing between polls, spinning
+/// instead of pausing at all. The `Ok(_)` pattern disables that arm rather
+/// than matching it, so the sleep runs its course and the flag decides.
 async fn pause_unless_shutdown(pause: Duration, shutdown: &watch::Receiver<bool>) -> bool {
     let mut requested = shutdown.clone();
     tokio::select! {
-        () = tokio::time::sleep(pause) => !*shutdown.borrow(),
-        _ = requested.wait_for(|stopping| *stopping) => false,
+        () = tokio::time::sleep(pause) => {}
+        Ok(_) = requested.wait_for(|stopping| *stopping) => {}
     }
+    !*shutdown.borrow()
 }
 
 #[cfg(test)]
@@ -990,10 +1009,11 @@ mod tests {
         );
 
         let (flag, shutdown) = watch::channel(false);
-        // An hour before the retry: nothing but the shutdown request can
-        // end this wait inside a test.
+        // An hour before the retry, and a ceiling that allows it: nothing
+        // but the shutdown request can end this wait inside a test.
         let policy = RetryPolicy {
             initial: Duration::from_hours(1),
+            max: Duration::from_hours(1),
             ..quick()
         };
         let raise_once_sent = async {
@@ -1018,5 +1038,76 @@ mod tests {
             1,
             "the backoff was cut short, so the retry never happened"
         );
+    }
+
+    /// A dropped shutdown sender is not a shutdown. `watch`'s wait answers
+    /// an error rather than a request once the last sender is gone, and
+    /// reading that as "stopping" would hand an `Unknown` outcome back
+    /// while the flag still says the bot is running — freeing this key for
+    /// a submission prepared against a sequence number the transaction in
+    /// flight may still consume, which is the race this queue exists to
+    /// close.
+    #[tokio::test]
+    async fn a_dropped_shutdown_sender_does_not_end_the_resolution() {
+        let rpc = ScriptedRpc::start().await;
+        let chain = Chain::new(&rpc.url());
+        script_prepare_prelude(&rpc, &chain.signer, 10, 100);
+        script_simulate_accepted(&rpc, 100);
+        script_send(&rpc, "PENDING", None, 100);
+        script_transaction_not_found(&rpc, 100, 1);
+        script_transaction_not_found(&rpc, 100, 1);
+        script_transaction_success(&rpc, 101);
+
+        let (flag, shutdown) = watch::channel(false);
+        // Nothing can ever request a shutdown from here on.
+        drop(flag);
+        let answer = run_one(&chain.submitter(), &shutdown, quick(), 0).await;
+
+        assert!(
+            matches!(answer, Ok(TxOutcome::Succeeded { .. })),
+            "the queue kept polling until the outcome was terminal: {answer:?}"
+        );
+        assert_eq!(
+            rpc.calls("getTransaction").len(),
+            3,
+            "two unknown answers were polled past, not read as a shutdown"
+        );
+        assert_eq!(rpc.remaining(), 0);
+    }
+
+    /// `max` is the longest pause, the first one included: a policy whose
+    /// `initial` sits above it waits `max`, not `initial`. Unclamped, this
+    /// test would wait an hour for a retry and fail on `run_one`'s bound.
+    #[tokio::test]
+    async fn the_first_backoff_is_clamped_to_the_policys_maximum() {
+        let rpc = ScriptedRpc::start().await;
+        let chain = Chain::new(&rpc.url());
+        script_prepare_prelude(&rpc, &chain.signer, 10, 100);
+        script_simulate_accepted(&rpc, 100);
+        script_send(
+            &rpc,
+            "ERROR",
+            Some(TransactionResultResult::TxInsufficientFee),
+            100,
+        );
+        script_prepare_prelude(&rpc, &chain.signer, 10, 100);
+        script_simulate_accepted(&rpc, 100);
+        script_send(&rpc, "PENDING", None, 100);
+        script_transaction_success(&rpc, 101);
+
+        let (_flag, shutdown) = watch::channel(false);
+        let policy = RetryPolicy {
+            initial: Duration::from_hours(1),
+            max: Duration::from_millis(1),
+            ..quick()
+        };
+        let answer = run_one(&chain.submitter(), &shutdown, policy, 3).await;
+
+        assert!(
+            matches!(answer, Ok(TxOutcome::Succeeded { .. })),
+            "the retry waited `max`, not `initial`: {answer:?}"
+        );
+        assert_eq!(rpc.calls("sendTransaction").len(), 2);
+        assert_eq!(rpc.remaining(), 0);
     }
 }
