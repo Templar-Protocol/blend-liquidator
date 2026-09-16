@@ -3080,9 +3080,13 @@ mod tests {
         );
 
         // Tick two: the tracker still lags, so the row still says the old
-        // auction and the entry is re-read — and found already recorded.
+        // auction and the entry is re-read — and found already recorded,
+        // after the pool's snapshot, which the walk reads before it tests
+        // any entry against the set. Scripted, so the pass reaches that
+        // test rather than bailing on an unscripted read.
         let second = later(tick, 1);
         harness::script_auction_entry(&rpc, harness::USER_ONE, &new, second.sequence);
+        harness::script_snapshot(&rpc, &[]);
         let summary = filler
             .tick(&mut state, second, true, None, &shutdown)
             .await
