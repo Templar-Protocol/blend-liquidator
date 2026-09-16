@@ -1758,7 +1758,7 @@ mod tests {
     /// accrued rates and prices is `44_955_547` of effective collateral
     /// against `19_399_598` of effective liability — under the pool's
     /// `50_000_000` ($5.00) minimum while comfortably over the health
-    /// margin's `29_244_396`. See
+    /// margin's `29_244_894`. See
     /// `the_pools_min_collateral_binds_the_filler_too`.
     const MIN_COLLATERAL_TRAPPED: i128 = 337_000_000;
     const MIN_COLLATERAL_DEBT: i128 = 15_000_000;
@@ -4769,7 +4769,7 @@ mod tests {
     /// fixture's own accrued rates and prices that values at
     /// `collateral_base = 44_955_547` and `liability_base = 19_399_598`,
     /// a health factor of 2.317 — far clear of the 1.5075 margin, which
-    /// asks for only `29_244_396` of base and would therefore allow
+    /// asks for only `29_244_894` of base and would therefore allow
     /// `117_774_301` XLM stroops out. The pool's $5 floor allows none: the
     /// position is already under it, so every projection a withdrawal
     /// could reach is further under, and the pass is idle with the debt
