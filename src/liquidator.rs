@@ -50,6 +50,7 @@ pub mod filler;
 pub mod inventory;
 pub mod ledger;
 pub mod math;
+pub mod metrics;
 pub mod notifier;
 pub mod queue;
 pub mod service;
