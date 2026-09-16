@@ -2285,11 +2285,12 @@ fn spawn_auctioneer(
 /// `xlm_fee_reserve` of the network's native asset, and runs
 /// [`filler_loop`] off `tick_rx` until the tracker task's sender drops.
 ///
-/// `notifier` is [`Service::run`]'s one instance, shared with the pollers
-/// and the watchdog: it is built there, before the first task that reports
-/// through it, and handed in here rather than constructed per task — the
-/// dedup its cooldown rests on is keyed by `(pool, account, kind)` and
-/// means nothing split across instances.
+/// `notifier` and `metrics` are [`Service::run`]'s one instance of each,
+/// shared with the pollers and the watchdog: both are built there, before
+/// the first task that reports or records through them, and handed in here
+/// rather than constructed per task — the dedup the notifier's cooldown
+/// rests on is keyed by `(pool, account, kind)` and a gauge means nothing
+/// split across recorders.
 #[allow(clippy::too_many_arguments)]
 fn spawn_filler(
     tasks: &mut JoinSet<Result<(), LiquidatorError>>,
@@ -2302,6 +2303,7 @@ fn spawn_filler(
     startup_delay_ledgers: u32,
     queue: Option<SubmissionQueue>,
     notifier: Arc<Notifier>,
+    metrics: Arc<Metrics>,
     tick_rx: watch::Receiver<LedgerTick>,
     shutdown: &watch::Receiver<bool>,
 ) {
@@ -2319,7 +2321,9 @@ fn spawn_filler(
             .map(|signer| Submitter::new(&rpc, &network, signer, tx_config));
         let executor = Executor::new(&store, submitter, dry_run);
         let inventory = Inventory::new(native_asset, xlm_fee_reserve);
-        let filler = Filler::new(&rpc, &store, &pools, config, executor, inventory, notifier);
+        let filler = Filler::new(
+            &rpc, &store, &pools, config, executor, inventory, notifier, metrics,
+        );
         filler_loop(
             &filler,
             startup_delay_ledgers,
@@ -2569,6 +2573,7 @@ impl Service {
             config.startup_delay_ledgers,
             queues.filler,
             notifier,
+            Arc::clone(&instruments.metrics),
             tick_rx,
             &shutdown_rx,
         );
@@ -6494,6 +6499,7 @@ mod tests {
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
             Arc::new(Notifier::log_only(std::time::Duration::from_hours(1))),
+            Arc::new(Metrics::new()),
         );
         let (flag_tx, flag_rx) = watch::channel(false);
         let (tick_tx, tick_rx) = watch::channel(LedgerTick {
@@ -6559,6 +6565,7 @@ mod tests {
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
             Arc::new(Notifier::log_only(std::time::Duration::from_hours(1))),
+            Arc::new(Metrics::new()),
         );
         let (flag_tx, flag_rx) = watch::channel(false);
         let (tick_tx, tick_rx) = watch::channel(LedgerTick {
@@ -6642,6 +6649,7 @@ mod tests {
             Executor::new(&store, Some(submitter), true),
             Inventory::new(XLM.to_string(), 0),
             Arc::new(Notifier::log_only(std::time::Duration::from_hours(1))),
+            Arc::new(Metrics::new()),
         );
         let (flag_tx, flag_rx) = watch::channel(false);
         let (tick_tx, tick_rx) = watch::channel(LedgerTick {

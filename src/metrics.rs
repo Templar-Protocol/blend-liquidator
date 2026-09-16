@@ -36,8 +36,11 @@ pub enum Attempt {
     Attempted,
     /// The attempt's transaction landed.
     Succeeded,
-    /// The attempt was refused, expired, or its outcome could not be
-    /// confirmed.
+    /// The attempt was refused, or provably expired. Never an attempt
+    /// whose outcome could not be confirmed: a
+    /// [`crate::chain::TxOutcome::Unknown`] may still land, and is
+    /// counted neither `succeeded` nor `failed` rather than guessed at
+    /// here — a counter that guessed would have to be un-counted.
     Failed,
 }
 
