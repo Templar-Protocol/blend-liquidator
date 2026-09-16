@@ -358,9 +358,7 @@ make help                           # Docker Compose lifecycle
 
 The module layout beyond this follows
 `docs/superpowers/specs/2026-09-04-blend-liquidator-bot-design.md`; what
-remains is Phase 6b's operational surface — Telegram delivery for
-`notifier`, its bounded in-flight semaphore and `drain()`, metrics, and
-`/healthz`/`/livez`/`/metrics`.
+remains is Phase 6b's operational surface (see Status above).
 
 ## Conventions
 
