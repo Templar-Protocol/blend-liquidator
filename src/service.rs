@@ -2530,6 +2530,13 @@ async fn drain_tasks(
 /// to affect: what it costs is a notification the operator reads in the
 /// log instead of in the channel, which [`Notifier`] has already written
 /// there.
+///
+/// Two exits skip this and leave whatever was in flight behind: the
+/// second `SIGINT`/`SIGTERM`, deliberately, per the paragraph above; and a
+/// task panic, which is not deliberate but has the same shape —
+/// `resume_on_panic` calls [`std::panic::resume_unwind`] from inside
+/// [`drain_tasks`], so the panic unwinds straight out of `Service::run`
+/// and never reaches this function at all.
 async fn finish_run(
     result: Result<(), LiquidatorError>,
     notifier: &Notifier,
@@ -7058,17 +7065,31 @@ mod tests {
     /// reports. What a test driving an entry point that takes a
     /// [`ServiceConfig`] needs, since those connect by URL rather than
     /// borrowing a pool.
+    ///
+    /// Read with `std::env::var`, the same source `#[sqlx::test]` itself
+    /// reads: `dotenvy` is only a transitive dependency here (`sqlx-macros`
+    /// and `sqlx-postgres` pull it), never declared in this crate's own
+    /// `Cargo.toml`, so `.env` parsing is not available to this crate's own
+    /// code and is out of scope for this helper.
     async fn test_database_url(store: &Store) -> String {
         let name: String = sqlx::query_scalar("SELECT current_database()")
             .fetch_one(store.pool())
             .await
             .expect("the test database names itself");
         let base = std::env::var("DATABASE_URL").expect("sqlx::test needs DATABASE_URL too");
-        let base = base.split('?').next().unwrap_or(&base);
-        let (server, _) = base
+        // The query string (`?sslmode=...`, say) is not part of the
+        // database path and must survive the rebuild, not just the split.
+        let (path, query) = match base.split_once('?') {
+            Some((path, query)) => (path, Some(query)),
+            None => (base.as_str(), None),
+        };
+        let (server, _) = path
             .rsplit_once('/')
             .expect("DATABASE_URL carries a database path");
-        format!("{server}/{name}")
+        match query {
+            Some(query) => format!("{server}/{name}?{query}"),
+            None => format!("{server}/{name}"),
+        }
     }
 
     /// The configured credentials decide the channel, and nothing else

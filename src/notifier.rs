@@ -328,8 +328,13 @@ impl Notifier {
         }
     }
 
-    /// A [`Notifier`] over [`LogChannel`] — what a deployment that
-    /// configures no Telegram credentials gets.
+    /// A [`Notifier`] over [`LogChannel`], with no [`Metrics`] recorder
+    /// installed. What a test builds when it needs a working `Notifier`
+    /// but is not asserting on delivery or its metrics; production never
+    /// calls this — `crate::service::build_notifier` always goes through
+    /// [`Notifier::new`] directly, choosing [`LogChannel`] itself when no
+    /// Telegram credentials are configured, so it can install a recorder
+    /// on the result the way this constructor does not.
     #[must_use]
     pub fn log_only(cooldown: Duration) -> Self {
         Self::new(Box::new(LogChannel), cooldown)

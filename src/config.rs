@@ -2622,6 +2622,11 @@ supported_lot = ["*"]
         let telegram = config.telegram.as_ref().expect("configured");
         assert_eq!(telegram.chat_id, "12345");
         assert_eq!(telegram.token.expose(), "123:abc");
+        // No argument or environment variable sets this: the token sits in
+        // the request *path* (`.../bot<TOKEN>/sendMessage`), so pointing a
+        // test at a mock server is a call to `TelegramChannel::with_base_url`,
+        // never a configuration field.
+        assert!(telegram.base_url.is_none());
         let rendered = format!("{config:?}");
         assert!(
             !rendered.contains("123:abc"),

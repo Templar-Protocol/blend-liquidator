@@ -1170,6 +1170,12 @@ impl<'a> Filler<'a> {
             Ok(priority) => priority,
             Err(error) => {
                 tracing::warn!(pool = %row.pool, account = %row.account, %error, "this fill's fee tier does not compute");
+                // Nothing chain-specific refused this fill — it never
+                // reached the chain — but `ContractError` is the label for
+                // exactly this: a refusal none of the other four reasons
+                // classifies more specifically.
+                self.metrics.skip(SkipLabel::ContractError);
+                pass.summary.skipped += 1;
                 return Ok(None);
             }
         };
@@ -3969,6 +3975,140 @@ mod tests {
             "and nothing was sent"
         );
         assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// The fee tier does not compute: `to_oracle_units` overflows on a
+    /// `HIGH_FEE_PROFIT_THRESHOLD` this large, `priority` answers `Err`,
+    /// and `execute_once` refuses before it ever asks the wallet or the
+    /// chain anything.
+    ///
+    /// `to_oracle_units` is `mul_floor(value, oracle_scalar, SCALAR_7)`,
+    /// and the fixture's own oracle is fixed at 7 decimals (`harness`'s
+    /// module doc), which makes `oracle_scalar == SCALAR_7` and the
+    /// conversion an identity no threshold can overflow — so this test
+    /// builds `PoolPass` directly, with a 30-decimal oracle, rather than
+    /// through `pool_context`/`PoolReader`: the only field `priority`
+    /// reads off it is `snapshot.prices`, and nothing else here needs a
+    /// chain read at all.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_fee_tier_that_overflows_skips_the_fill(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let auction = auction(tick.sequence - 300);
+        // Never dialed: `execute_once` touches neither `self.rpc` nor the
+        // network on this path.
+        let client = RpcClient::new("http://127.0.0.1:1", None).expect("client");
+        let inventory = Inventory::new(XLM.to_string(), 0);
+        inventory.record_balances(
+            BTreeMap::from([(USDC.to_string(), 10_000_000_000)]),
+            Instant::now(),
+        );
+        let metrics = metrics();
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            FillerConfig {
+                high_fee_profit_threshold: i128::MAX,
+                ..filler_config()
+            },
+            Executor::new(&store, None, true),
+            inventory,
+            notifier(),
+            Arc::clone(&metrics),
+        );
+        let snapshot = PoolSnapshot {
+            ledger: tick.sequence,
+            pool: harness::POOL.to_string(),
+            instance: crate::chain::xdr::decode::PoolInstance {
+                admin: String::new(),
+                backstop: String::new(),
+                blnd_token: String::new(),
+                name: String::new(),
+                config: crate::chain::xdr::decode::PoolConfig {
+                    oracle: String::new(),
+                    bstop_rate: 0,
+                    status: PoolStatus::Active,
+                    max_positions: 4,
+                    min_collateral: 0,
+                },
+            },
+            reserves: BTreeMap::new(),
+            asset_index: BTreeMap::new(),
+            prices: crate::math::OraclePrices::new(30, BTreeMap::new()).expect("30 decimals fit"),
+            price_timestamps: BTreeMap::new(),
+            positions: BTreeMap::new(),
+        };
+        let context = PoolPass {
+            pool: &pools[0],
+            earliest_ledger: tick.sequence + 1,
+            snapshot,
+            reserves: BTreeMap::new(),
+            filler: Positions::default(),
+            supply_allowed: false,
+            health_floor: 0,
+        };
+        let draft = FillDraft {
+            fill_ledger: tick.sequence + 1,
+            percent: FillPercent::try_from(WHOLE_AUCTION).expect("100 is in range"),
+            actions: vec![FillAction::Repay {
+                asset: USDC.to_string(),
+                amount: 10_000_000_000,
+            }],
+            to_fill: auction.clone(),
+            lot_value: 2,
+            bid_value: 1,
+            est_profit: 1,
+            spend: BTreeMap::from([(USDC.to_string(), 10_000_000_000)]),
+            projected_health: Some(20_000_000),
+        };
+        let mut state = FillerState::default();
+        let mut pass = Pass {
+            tick,
+            state: &mut state,
+            summary: TickSummary::default(),
+        };
+
+        let outcome = filler
+            .execute_once(
+                &context,
+                &tracked(harness::USER_ONE, &auction),
+                &draft,
+                None,
+                &mut pass,
+            )
+            .await
+            .expect("a fee tier that does not compute is not the tick's failure");
+
+        assert!(outcome.is_none(), "nothing was executed");
+        assert_eq!(
+            pass.summary,
+            TickSummary {
+                skipped: 1,
+                ..TickSummary::default()
+            },
+            "a refused fee tier is a decision, and it is counted as one"
+        );
+        assert_eq!(
+            skip_count(&metrics, SkipLabel::ContractError),
+            1,
+            "nothing here classifies a math overflow more specifically"
+        );
+        assert_eq!(
+            skip_count(&metrics, SkipLabel::Unfunded),
+            0,
+            "the wallet was never asked"
+        );
+        let fills = sqlx::query!("SELECT count(*) AS n FROM fills")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(
+            fills.n,
+            Some(0),
+            "nothing whose fee tier is unknown is recorded"
+        );
         Ok(())
     }
 
