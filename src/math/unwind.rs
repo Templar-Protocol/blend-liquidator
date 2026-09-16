@@ -137,8 +137,13 @@ pub struct UnwindPlan {
     /// The liability assets the wallet could not fully repay, in
     /// reserve-index order. What an idle pass notifies about.
     pub remaining_liabilities: Vec<String>,
-    /// The health factor the projection ends on, in the oracle's scale;
-    /// `None` when no liabilities remain and the contract checks nothing.
+    /// The health factor the plan's own projection ends on, in the oracle's
+    /// scale; `None` when no liabilities remain and the contract checks
+    /// nothing. For a repay the wallet capped below its allowance this is
+    /// the *conservative* figure the plan decided against — that repay is
+    /// projected to clear nothing, so the number is the one the floor was
+    /// held to and not what the contract will find once it lands (see
+    /// `repay`). `remaining_liabilities` names every such asset.
     pub projected_health: Option<i128>,
 }
 
@@ -247,13 +252,28 @@ fn repay(
             continue;
         }
         let owed = reserve.to_asset_from_d_token(owing)?;
-        let amount = owed
+        let wanted = owed
             .checked_add(mul_floor(owed, REPAY_ALLOWANCE_BPS, BPS)?)
             .and_then(|amount| amount.checked_add(1))
-            .ok_or(MathError::Overflow)?
-            .min(held);
+            .ok_or(MathError::Overflow)?;
+        let amount = wanted.min(held);
         let burnt = reserve.to_d_token_down(amount)?.min(owing);
         let left = owing.checked_sub(burnt).ok_or(MathError::Overflow)?;
+        // A repay the wallet capped below `wanted` clears the debt only at
+        // the `d_rate` this plan was built at: with the allowance trimmed
+        // away, any accrual between here and the ledger the repay lands in
+        // leaves a dust debt behind. Projecting that as cleared takes step
+        // 2, which withdraws every collateral without a health check at
+        // all — and the contract then refuses the whole transaction, a
+        // dust debt standing against nothing. So a capped repay is
+        // projected to clear nothing, step 3 keeps the health floor, and
+        // the next pass — planning against the debt the repay actually
+        // left — finishes.
+        let left = if left == 0 && amount < wanted {
+            owing
+        } else {
+            left
+        };
         if left > 0 {
             positions.liabilities.insert(index, left);
         } else {
@@ -430,13 +450,19 @@ fn withdraw_candidate(
 /// The largest partial withdrawal of `index` the floor allows, by formula
 /// and then by projection.
 ///
-/// The conversion chain, every step rounded so that what stays is never a
-/// unit short of what the floor asks for: the collateral base the floor
-/// requires — `mul_ceil(liability_base, min_health_factor, SCALAR_7)`, taken
-/// as carried by this asset alone, which is conservative wherever another
-/// reserve carries some of it — becomes effective underlying through the
-/// price (`mul_ceil(base, reserve.scalar, price)`), underlying through the
-/// collateral factor (`div_ceil(effective, c_factor, SCALAR_7)`), and
+/// The floor is charged to the *whole* position, never to this candidate
+/// alone: the collateral base it requires is `mul_ceil(liability_base,
+/// min_health_factor, SCALAR_7)`, what may go is `collateral_base` less
+/// that, and what must stay of this asset is its own contribution — valued
+/// exactly as `calculate_position_data` values it — less what may go,
+/// floored at zero. Charging the whole floor to one candidate throws away
+/// every other remaining collateral's base, which leaves the position
+/// untouched whenever no single asset could carry the floor by itself.
+///
+/// That base then converts back, every step rounded so what stays is never
+/// a unit short of what the floor asks for: effective underlying through
+/// the price (`mul_ceil(base, reserve.scalar, price)`), underlying through
+/// the collateral factor (`div_ceil(effective, c_factor, SCALAR_7)`), and
 /// b-tokens through `b_rate` (`to_b_token_up`). What goes is the position
 /// less that, never taking the primary below `to_b_token_up`'s image of its
 /// own floor, converted back to the request's underlying with
@@ -472,8 +498,24 @@ fn partial(
     }
     let price = inputs.prices.price(&reserve.asset)?;
     let required = mul_ceil(data.liability_base, terms.min_health_factor, SCALAR_7)?;
+    let may_go = data
+        .collateral_base
+        .checked_sub(required)
+        .ok_or(MathError::Overflow)?;
+    // This candidate's own contribution to `collateral_base`, by
+    // `calculate_position_data`'s rounding, so the two cannot disagree
+    // about what removing it would cost.
+    let carries = mul_floor(
+        price,
+        reserve.to_effective_asset_from_b_token(held)?,
+        reserve.scalar,
+    )?;
+    let stays_base = carries
+        .checked_sub(may_go)
+        .ok_or(MathError::Overflow)?
+        .max(0);
     let stays = reserve.to_b_token_up(div_ceil(
-        mul_ceil(required, reserve.scalar, price)?,
+        mul_ceil(stays_base, reserve.scalar, price)?,
         c_factor,
         SCALAR_7,
     )?)?;
@@ -725,23 +767,92 @@ mod tests {
             .collect()
     }
 
+    fn inputs<'a>(
+        pool: &'a Pool,
+        positions: &'a Positions,
+        wallet: &'a BTreeMap<String, i128>,
+    ) -> UnwindInputs<'a> {
+        UnwindInputs {
+            reserves: &pool.reserves,
+            asset_index: &pool.asset_index,
+            prices: &pool.prices,
+            positions,
+            wallet,
+        }
+    }
+
     fn plan(
         terms: &UnwindTerms,
         pool: &Pool,
         positions: &Positions,
         wallet: &BTreeMap<String, i128>,
     ) -> UnwindPlan {
-        plan_unwind(
-            terms,
-            &UnwindInputs {
-                reserves: &pool.reserves,
-                asset_index: &pool.asset_index,
-                prices: &pool.prices,
-                positions,
-                wallet,
-            },
-        )
-        .expect("no arithmetic failure")
+        plan_unwind(terms, &inputs(pool, positions, wallet)).expect("no arithmetic failure")
+    }
+
+    /// The health factor step 3 stops at, and the smallest withdrawal of
+    /// the primary worth sending — the two bounds the maximality clause
+    /// below is judged against, from the module's own constants.
+    fn margin(terms: &UnwindTerms) -> i128 {
+        mul_ceil(terms.min_health_factor, BPS + HEALTH_MARGIN_BPS, BPS).expect("a margin")
+    }
+
+    fn dust_floor(terms: &UnwindTerms) -> i128 {
+        mul_floor(terms.min_primary_collateral, DUST_FLOOR_BPS, BPS).expect("a dust floor")
+    }
+
+    /// The largest `Withdraw` of `index` from `positions` that holds both
+    /// floors — the health factor at or above `min_health_factor` and the
+    /// primary at or above `min_primary_collateral` — found by binary
+    /// search over the builder's own [`after_withdrawal`] and [`project`],
+    /// so the search and the plan cannot disagree about the contract's
+    /// rounding. Monotone, and so searchable: a larger amount burns no
+    /// fewer b-tokens, and the health factor never rises with it.
+    fn largest_withdrawal(
+        terms: &UnwindTerms,
+        inputs: &UnwindInputs<'_>,
+        positions: &Positions,
+        index: u32,
+    ) -> i128 {
+        let primary = inputs
+            .asset_index
+            .get(&terms.primary_asset)
+            .copied()
+            .expect("the primary asset");
+        let holds = |amount: i128| {
+            let next = after_withdrawal(inputs, positions, index, amount).expect("a projection");
+            if project(inputs, &next)
+                .expect("values")
+                .is_hf_under(terms.min_health_factor)
+                .expect("hf")
+            {
+                return false;
+            }
+            inputs
+                .reserves
+                .get(&primary)
+                .expect("the primary reserve")
+                .to_asset_from_b_token(next.collateral.get(&primary).copied().unwrap_or(0))
+                .expect("underlying")
+                >= terms.min_primary_collateral
+        };
+        let held = positions.collateral.get(&index).copied().unwrap_or(0);
+        let mut low = 0;
+        let mut high = inputs
+            .reserves
+            .get(&index)
+            .expect("a listed reserve")
+            .to_asset_from_b_token(held)
+            .expect("underlying");
+        while low < high {
+            let mid = low + (high - low + 1) / 2;
+            if holds(mid) {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        low
     }
 
     fn repay(asset: &str, amount: i128) -> UnwindAction {
@@ -907,6 +1018,107 @@ mod tests {
         assert_eq!(unwound.projected_health, None);
     }
 
+    /// The floor is carried by the whole position, not by one asset. 15,000
+    /// XLM (11_250_000_000 of base) and 500 USDC (4_750_000_000) against
+    /// 1,000 USDC of debt (liability base 10_526_315_790) is a health factor
+    /// of ⌊16e9 × 1e7 / 10_526_315_790⌋ = 15_199_999, clear of the
+    /// 15_075_000 margin, and the floor 1.5 requires ⌈10_526_315_790 ×
+    /// 1.5⌉ = 15_789_473_685 — so 210_526_315 of base may go. Charging the
+    /// whole 15_789_473_685 to a single candidate asks USDC to keep
+    /// ⌈15_789_473_685 / 0.95⌉ and XLM to keep ⌈157_894_736_850 / 0.75⌉,
+    /// both more than either position holds, and withdraws nothing at all.
+    ///
+    /// Charged correctly, the also-liability goes first (spec §5 step 3's
+    /// order) and spends the whole 210_526_315: USDC must keep
+    /// 4_750_000_000 − 210_526_315 = 4_539_473_685 of base, which is
+    /// ⌈4_539_473_685 / 0.95⌉ = 4_778_393_353 b-tokens, so 221_606_647 goes
+    /// and the projection lands on exactly 15_000_000. The primary is
+    /// then inside the margin and nothing more is sent — the same
+    /// 210_526_315 of base is worth ⌈110_394_736_850 / 0.75⌉ =
+    /// 147_192_982_467 b-tokens kept and 2_807_017_533 XLM out, which a
+    /// binary search over exact projections confirms is that candidate's
+    /// maximum to the unit, but the order spends the headroom before the
+    /// primary is reached.
+    #[test]
+    fn the_floor_is_charged_to_the_whole_position_not_to_one_asset() {
+        let pool = pool();
+        let terms = terms();
+        let held = positions(
+            &[(0, 150_000_000_000), (1, 5_000_000_000)],
+            &[(1, 10_000_000_000)],
+        );
+        let empty = BTreeMap::new();
+        let unwound = plan(&terms, &pool, &held, &empty);
+        assert_eq!(unwound.actions, vec![withdraw(USDC, 221_606_647)]);
+        assert_eq!(unwound.remaining_liabilities, vec![USDC.to_string()]);
+        assert_eq!(unwound.projected_health, Some(15_000_000));
+
+        // The same headroom, priced in the primary: what the reviewer's
+        // figure names, and what step 3's order spends before it gets there.
+        assert_eq!(
+            largest_withdrawal(&terms, &inputs(&pool, &held, &empty), &held, 0),
+            2_807_017_533
+        );
+        // And once the plan has spent it, nothing of the primary is left to
+        // take.
+        let end = apply(&pool, &held, unwound.actions.iter());
+        assert_eq!(
+            largest_withdrawal(&terms, &inputs(&pool, &end, &empty), &end, 0),
+            0
+        );
+    }
+
+    /// A wallet holding exactly the debt buys no headroom for `d_rate` to
+    /// grow in, so the debt is not projected as cleared: step 3 runs, not
+    /// step 2. The 1e10 repay leaves the position planned against its whole
+    /// 1e10 of debt (liability base 10_526_315_790) with 19_750_000_000 of
+    /// collateral base — a health factor of 18_762_499, clear of the margin
+    /// — and the floor wants 15_789_473_685, so 3_960_526_315 of base may
+    /// go. It comes from the also-liability: USDC keeps 4_750_000_000 −
+    /// 3_960_526_315 = 789_473_685 of base, or ⌈789_473_685 / 0.95⌉ =
+    /// 831_024_932 b-tokens, and 4_168_975_068 goes. The primary is left
+    /// untouched at 20,000 XLM rather than withdrawn entirely.
+    #[test]
+    fn a_repay_with_no_allowance_left_does_not_clear_the_debt() {
+        let pool = pool();
+        let unwound = plan(
+            &terms(),
+            &pool,
+            &positions(
+                &[(0, 200_000_000_000), (1, 5_000_000_000)],
+                &[(1, 10_000_000_000)],
+            ),
+            &wallet(&[(USDC, 10_000_000_000)]),
+        );
+        assert_eq!(
+            unwound.actions,
+            vec![repay(USDC, 10_000_000_000), withdraw(USDC, 4_168_975_068),]
+        );
+        assert_eq!(unwound.remaining_liabilities, vec![USDC.to_string()]);
+        assert_eq!(unwound.projected_health, Some(15_000_000));
+
+        // One stroop more in the wallet buys the allowance, and with it
+        // step 2: the debt is cleared and everything but the floor goes.
+        let funded = plan(
+            &terms(),
+            &pool,
+            &positions(
+                &[(0, 200_000_000_000), (1, 5_000_000_000)],
+                &[(1, 10_000_000_000)],
+            ),
+            &wallet(&[(USDC, 10_001_000_001)]),
+        );
+        assert_eq!(
+            funded.actions,
+            vec![
+                repay(USDC, 10_001_000_001),
+                withdraw_all(USDC),
+                withdraw(XLM, 100_000_000_000),
+            ]
+        );
+        assert!(funded.remaining_liabilities.is_empty());
+    }
+
     /// The dust rule binds the partial too, not only the excess. 12,070 XLM
     /// against 570 USDC of debt (liability base exactly 6e9) is a health
     /// factor of ⌊9_052_500_000 × 1e7 / 6e9⌋ = 15_087_500, just clear of the
@@ -1032,19 +1244,106 @@ mod tests {
         end
     }
 
+    /// One grid point of [`every_plan_holds_the_floors`]: plan it, apply
+    /// the plan the way the contract would, and assert everything the
+    /// builder promises of the result.
+    fn holds_the_floors(
+        terms: &UnwindTerms,
+        pool: &Pool,
+        start: &Positions,
+        purse: &BTreeMap<String, i128>,
+        case: &str,
+    ) {
+        let floor = terms.min_primary_collateral;
+        let primary = pool.reserves.get(&0).expect("the primary reserve");
+        let unwound = plan(terms, pool, start, purse);
+        for (asset, spent) in &unwound.spend {
+            assert!(
+                *spent <= purse.get(asset).copied().unwrap_or(0),
+                "{case}: spends {spent} of {asset}"
+            );
+        }
+        let repaid = apply(
+            pool,
+            start,
+            unwound
+                .actions
+                .iter()
+                .filter(|action| matches!(action, UnwindAction::Repay { .. })),
+        );
+        let end = apply(
+            pool,
+            &repaid,
+            unwound
+                .actions
+                .iter()
+                .filter(|action| !matches!(action, UnwindAction::Repay { .. })),
+        );
+        let data = calculate_position_data(&pool.reserves, &pool.prices, &end).expect("values");
+        assert!(
+            end.liabilities.is_empty()
+                || !data.is_hf_under(terms.min_health_factor).expect("hf")
+                || end == repaid,
+            "{case}: withdrew under the floor"
+        );
+        let before = primary
+            .to_asset_from_b_token(start.collateral.get(&0).copied().unwrap_or(0))
+            .expect("underlying");
+        let after = primary
+            .to_asset_from_b_token(end.collateral.get(&0).copied().unwrap_or(0))
+            .expect("underlying");
+        assert!(
+            after >= floor || before < floor,
+            "{case}: primary {before} → {after}, floor {floor}"
+        );
+
+        // A repay the wallet capped below its allowance is projected to
+        // clear nothing, so in that one window the plan's model and the
+        // contract's application above part company by construction: the
+        // plan names a liability the contract cleared. The floors are
+        // asserted on the contract's state either way, and it is strictly
+        // the healthier of the two — the two clauses below compare
+        // *models*, and
+        // `a_repay_with_no_allowance_left_does_not_clear_the_debt` pins
+        // that window exactly.
+        if !unwound.remaining_liabilities.is_empty() && end.liabilities.is_empty() {
+            return;
+        }
+        assert_eq!(
+            unwound.projected_health,
+            data.health_factor().expect("hf"),
+            "{case}: the plan's projection is the end state's"
+        );
+
+        // Maximality. Without it "withdrew nothing" and "stopped at the
+        // margin, correctly" are the same assertion, and a builder that
+        // moves nothing passes every grid point. When the pass began with
+        // room to move — a post-repay health factor at or above the margin
+        // — it must have moved all of it: no further withdrawal of the
+        // primary worth sending can still hold both floors.
+        let started =
+            calculate_position_data(&pool.reserves, &pool.prices, &repaid).expect("values");
+        if !started.is_hf_under(margin(terms)).expect("hf") {
+            let more = largest_withdrawal(terms, &inputs(pool, &end, purse), &end, 0);
+            assert!(
+                more < dust_floor(terms),
+                "{case}: {more} more of the primary would still hold the floors"
+            );
+        }
+    }
+
     /// Whatever the inputs, a plan holds the floors: re-projecting the
     /// plan's end state gives a health factor at or above the minimum (or
     /// no liabilities, or no withdrawal at all — a position already under
     /// the floor when the pass began is left exactly as the repays left
-    /// it), and the primary at or above its floor whenever it began there.
-    /// A grid over positions and wallets, including rates that are not one.
+    /// it), and the primary at or above its floor whenever it began there;
+    /// and where the pass had room to move, it moved all of it. A grid over
+    /// positions and wallets, including rates that are not one.
     #[test]
     fn every_plan_holds_the_floors() {
         let terms = terms();
-        let floor = terms.min_primary_collateral;
         for rate in [SCALAR_12, 1_000_022_300_000, 1_228_700_000_000] {
             let pool = pool_at(rate);
-            let primary = pool.reserves.get(&0).expect("the primary reserve");
             for collateral in [
                 100_000_000_000_i128,
                 150_000_000_000,
@@ -1069,54 +1368,7 @@ mod tests {
                             let case = format!(
                                 "rate {rate}, collateral {collateral}, debt {debt}, supplied {supplied}, wallet {held}"
                             );
-                            let unwound = plan(&terms, &pool, &start, &purse);
-                            for (asset, spent) in &unwound.spend {
-                                assert!(
-                                    *spent <= purse.get(asset).copied().unwrap_or(0),
-                                    "{case}: spends {spent} of {asset}"
-                                );
-                            }
-                            let repaid = apply(
-                                &pool,
-                                &start,
-                                unwound
-                                    .actions
-                                    .iter()
-                                    .filter(|action| matches!(action, UnwindAction::Repay { .. })),
-                            );
-                            let end = apply(
-                                &pool,
-                                &repaid,
-                                unwound
-                                    .actions
-                                    .iter()
-                                    .filter(|action| !matches!(action, UnwindAction::Repay { .. })),
-                            );
-                            let data = calculate_position_data(&pool.reserves, &pool.prices, &end)
-                                .expect("values");
-                            assert!(
-                                end.liabilities.is_empty()
-                                    || !data.is_hf_under(terms.min_health_factor).expect("hf")
-                                    || end == repaid,
-                                "{case}: withdrew under the floor"
-                            );
-                            let before = primary
-                                .to_asset_from_b_token(
-                                    start.collateral.get(&0).copied().unwrap_or(0),
-                                )
-                                .expect("underlying");
-                            let after = primary
-                                .to_asset_from_b_token(end.collateral.get(&0).copied().unwrap_or(0))
-                                .expect("underlying");
-                            assert!(
-                                after >= floor || before < floor,
-                                "{case}: primary {before} → {after}, floor {floor}"
-                            );
-                            assert_eq!(
-                                unwound.projected_health,
-                                data.health_factor().expect("hf"),
-                                "{case}: the plan's projection is the end state's"
-                            );
+                            holds_the_floors(&terms, &pool, &start, &purse, &case);
                         }
                     }
                 }
@@ -1128,28 +1380,18 @@ mod tests {
     #[test]
     fn an_unknown_asset_is_refused() {
         let pool = pool();
-        let inputs = |positions: &Positions| {
-            plan_unwind(
-                &terms(),
-                &UnwindInputs {
-                    reserves: &pool.reserves,
-                    asset_index: &pool.asset_index,
-                    prices: &pool.prices,
-                    positions,
-                    wallet: &BTreeMap::new(),
-                },
-            )
-        };
+        let empty = BTreeMap::new();
+        let refused = |held: &Positions| plan_unwind(&terms(), &inputs(&pool, held, &empty));
         assert_eq!(
-            inputs(&positions(&[], &[(9, 1_000_000)])),
+            refused(&positions(&[], &[(9, 1_000_000)])),
             Err(MathError::MissingReserve(9))
         );
         assert_eq!(
-            inputs(&positions(&[(9, 1_000_000)], &[])),
+            refused(&positions(&[(9, 1_000_000)], &[])),
             Err(MathError::MissingReserve(9))
         );
         assert_eq!(
-            inputs(&positions(
+            refused(&positions(
                 &[(0, 200_000_000_000), (9, 1_000_000)],
                 &[(1, 6_000_000_000)]
             )),
