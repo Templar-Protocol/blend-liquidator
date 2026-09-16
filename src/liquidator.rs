@@ -25,14 +25,17 @@
 //! auction its pool configuration supports, holds its own position at or
 //! above the pool's minimum health factor times `HF_SAFETY_MULTIPLIER`
 //! while taking one over, and — armed, and only on the filler key's own
-//! queue — submits it. Phase 6a lands the unwind (`math::unwind`, the
+//! queue — submits it. Phase 6a landed the unwind (`math::unwind`, the
 //! filler's unwind pass) and the notifier (`notifier`): a pool a fill
 //! landed in is repaid from the wallet and withdrawn down to its floors,
 //! pass after pass until one moves nothing, and what an unwind cannot
 //! finish reaches the operator through a deduplicating
-//! [`notifier::NotificationChannel`]. What is left is Phase 6b's
-//! operational surface: the Telegram channel, metrics, the HTTP endpoints
-//! and the sandbox integration tier.
+//! [`notifier::NotificationChannel`]. Phase 6b landed the rest of the
+//! operational surface: a Telegram [`notifier::NotificationChannel`]
+//! (`notifier::telegram`) behind that same trait, dependency-free
+//! Prometheus metrics (`metrics`), and the `/healthz`/`/livez`/`/metrics`
+//! server (`http`). What is left is Phase 7's sandbox integration tier
+//! and Phase 8's docs and first release.
 //!
 //! The repository scaffolding around it — CI gates, lint
 //! posture, dev container, release preflight — is complete and enforced

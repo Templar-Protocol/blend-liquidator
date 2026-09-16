@@ -1,11 +1,12 @@
 //! The run's counters and gauges, rendered as Prometheus text exposition
 //! format.
 //!
-//! [`Metrics`] is a pure, in-process recorder: every later Phase 6b task
-//! calls its methods as the corresponding event happens (a ledger read, a
-//! creation, a fill, a skip, a notification…) and the HTTP server's
-//! `/metrics` endpoint renders the accumulated state on demand through
-//! [`Metrics::render`]. Nothing here does I/O and nothing panics.
+//! [`Metrics`] is a pure, in-process recorder: the poller, the tracker, the
+//! auctioneer, the filler and the notifier each call its methods as the
+//! corresponding event happens (a ledger read, a creation, a fill, a skip,
+//! a notification…) and the HTTP server's `/metrics` endpoint renders the
+//! accumulated state on demand through [`Metrics::render`]. Nothing here
+//! does I/O and nothing panics.
 //!
 //! One `Mutex<Inner>` backs every recorder and [`Metrics::render`] alike.
 //! Every method that touches it is synchronous — there is no `.await`

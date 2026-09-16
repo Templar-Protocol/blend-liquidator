@@ -45,8 +45,8 @@ use crate::metrics::Metrics;
 use crate::store::Store;
 
 /// Everything a handler needs to answer a request. Built once by the
-/// caller (`service`, once Phase 6b wires it in) and shared behind an
-/// `Arc` for the life of the server.
+/// caller (`crate::service::Service::run`) and shared behind an `Arc` for
+/// the life of the server.
 pub struct HttpState {
     /// The run's counters and gauges.
     pub metrics: Arc<Metrics>,

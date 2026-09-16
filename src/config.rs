@@ -437,7 +437,8 @@ fn endpoint_origin(url: &str) -> String {
 
 /// The `/healthz`, `/livez` and `/metrics` server. Built by
 /// [`Args::service_with_secrets`] only when `PORT` or `HTTP_PORT` is set;
-/// unset leaves the server off, which is every deployment before Phase 6b.
+/// unset leaves the server off, which is every deployment that configures
+/// neither.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HttpConfig {
     /// Address and port the server listens on.
