@@ -100,6 +100,23 @@ pub enum QueueError {
     #[error("the submission queue is shutting down; this submission was not attempted")]
     ShuttingDown,
     /// The chain layer's own failure, passed through.
+    ///
+    /// This variant is answered **only for a failure that provably sent
+    /// nothing of this submission**: a `prepare` that failed before any
+    /// envelope of it left (including [`ChainError::RestoreUnknown`],
+    /// where the restore transaction of `prepare`'s own is what is
+    /// unresolved — it spends fees, never this submission's operation), a
+    /// send the RPC refused outright ([`ChainError::Rejected`]), or a
+    /// sequence number another transaction took first
+    /// ([`ChainError::BadSequence`]). A transaction that may be in flight
+    /// is never reported here: a send whose *answer* was lost is resolved
+    /// by the hash this queue already holds, and
+    /// [`Submitter::wait_for`] answers [`TxOutcome::Unknown`] rather than
+    /// an error while an outcome could still become terminal.
+    ///
+    /// A caller may therefore treat this as "nothing was spent" — the
+    /// executor releases its wallet reservation on it — and that stays
+    /// true only while this contract does.
     #[error(transparent)]
     Chain(#[from] ChainError),
 }

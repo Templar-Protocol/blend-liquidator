@@ -310,11 +310,11 @@ impl<'a> Executor<'a> {
     /// [`ExecutorError`] for one fill: a store write, a chain read that
     /// could not be made at all, an operation that would not encode, a
     /// queue that refused the submission, or a mode guard. A contract's
-    /// refusal is none of those — it is an [`ExecOutcome`]. A
-    /// [`ExecutorError::Store`] raised *after* a submission releases the
-    /// reservation the transaction may have spent; that is a fatal error
-    /// for the filler, whose process — and whose in-memory inventory —
-    /// ends with it.
+    /// refusal is none of those — it is an [`ExecOutcome`]. An error is
+    /// never a settlement of its own: a [`ExecutorError::Store`] raised
+    /// *after* the chain has answered — the hash write — settles by that
+    /// answer and then reports the failure, so a transaction that landed
+    /// leaves the wallet debited whether or not its row was ever named.
     pub async fn execute(
         &self,
         plan: &FillPlan,
@@ -353,34 +353,40 @@ impl<'a> Executor<'a> {
             ));
         }
 
-        match self.run(plan, queue).await {
-            Ok((outcome, Settle::Consume)) => {
+        // The one settlement point, and it applies to the failing answer
+        // too: what the reservation becomes is decided by what the *chain*
+        // did, never by whether this module then managed to write it down.
+        let (answer, settle) = self.run(plan, queue).await;
+        match settle {
+            Settle::Consume => {
                 if let Some(reservation) = reservation {
                     reservation.consume();
                 }
-                Ok(outcome)
             }
-            Ok((outcome, Settle::Release)) => {
-                release(reservation);
-                Ok(outcome)
-            }
-            Err(error) => {
-                release(reservation);
-                Err(error)
-            }
+            Settle::Release => release(reservation),
         }
+        answer
     }
 
     /// Steps 2 to 4, and what the reservation the caller still holds
-    /// becomes. Every path names a [`Settle`], so `execute` settles the
-    /// token exactly once whatever this answers.
+    /// becomes. The [`Settle`] is returned alongside the answer rather than
+    /// inside it, error included: a failure *after* the chain has answered
+    /// — the hash write that names a transaction already applied — must
+    /// still settle by that answer, or the wallet's ledger hands back
+    /// amounts the chain has spent.
     async fn run(
         &self,
         plan: &FillPlan,
         queue: Option<&SubmissionQueue>,
-    ) -> Result<(ExecOutcome, Settle), ExecutorError> {
-        let (operation, simulated) = match self.judge(plan, queue.is_some()).await? {
-            Judged::Refused(outcome) => return Ok((outcome, Settle::Release)),
+    ) -> (Result<ExecOutcome, ExecutorError>, Settle) {
+        // Nothing of this fill has been sent while steps 2 and 3 run, so
+        // every failure and every early answer in them releases.
+        let judged = match self.judge(plan, queue.is_some()).await {
+            Ok(judged) => judged,
+            Err(error) => return (Err(error), Settle::Release),
+        };
+        let (operation, simulated) = match judged {
+            Judged::Refused(outcome) => return (Ok(outcome), Settle::Release),
             Judged::Accepted(operation) => (Some(operation), true),
             Judged::Unsimulated => (None, false),
         };
@@ -399,7 +405,10 @@ impl<'a> Executor<'a> {
             est_profit: draft.est_profit,
             dry_run: self.dry_run,
         };
-        let fill_id = self.store.record_fill(&record).await?;
+        let fill_id = match self.store.record_fill(&record).await {
+            Ok(fill_id) => fill_id,
+            Err(error) => return (Err(ExecutorError::Store(error)), Settle::Release),
+        };
         tracing::info!(
             fill_id,
             pool = %record.pool,
@@ -418,14 +427,14 @@ impl<'a> Executor<'a> {
             "fill recorded"
         );
         let Some(queue) = queue else {
-            return Ok((self.recorded(fill_id, simulated, None), Settle::Release));
+            return (Ok(self.recorded(fill_id, simulated, None)), Settle::Release);
         };
         // The mode guards refuse a queue to an executor with no signer, so
         // an operation was built above. Recording without submitting is
         // the safe answer to a composition that somehow got past them, and
         // is never a panic.
         let Some(operation) = operation else {
-            return Ok((self.recorded(fill_id, simulated, None), Settle::Release));
+            return (Ok(self.recorded(fill_id, simulated, None)), Settle::Release);
         };
         self.submit_recorded(queue, plan, fill_id, simulated, operation)
             .await
@@ -463,7 +472,7 @@ impl<'a> Executor<'a> {
         fill_id: i64,
         simulated: bool,
         operation: Operation,
-    ) -> Result<(ExecOutcome, Settle), ExecutorError> {
+    ) -> (Result<ExecOutcome, ExecutorError>, Settle) {
         match queue
             .enqueue(Submission {
                 operation,
@@ -483,21 +492,26 @@ impl<'a> Executor<'a> {
                     status = outcome.status(),
                     "fill submitted"
                 );
-                if !self.store.attach_fill_tx(fill_id, &hash).await? {
-                    tracing::warn!(
-                        fill_id,
-                        tx_hash = %hash,
-                        "no fill row to attach this transaction to"
-                    );
-                }
-                // An `Unknown` may yet land and spend the wallet, so the
-                // ledger assumes it did until the next balance read says
-                // otherwise (ruling 14).
+                // Decided from the chain's answer, and decided *before*
+                // the hash is written: an `Unknown` may yet land and spend
+                // the wallet, so the ledger assumes it did until the next
+                // balance read says otherwise (ruling 14) — and a store
+                // failure below must not turn that into a release, which
+                // would hand the next plan amounts the chain has taken.
                 let settle = match outcome {
                     TxOutcome::Succeeded { .. } | TxOutcome::Unknown { .. } => Settle::Consume,
                     TxOutcome::Failed { .. } | TxOutcome::Expired { .. } => Settle::Release,
                 };
-                Ok((self.recorded(fill_id, simulated, Some(outcome)), settle))
+                match self.store.attach_fill_tx(fill_id, &hash).await {
+                    Ok(true) => {}
+                    Ok(false) => tracing::warn!(
+                        fill_id,
+                        tx_hash = %hash,
+                        "no fill row to attach this transaction to"
+                    ),
+                    Err(error) => return (Err(ExecutorError::Store(error)), settle),
+                }
+                (Ok(self.recorded(fill_id, simulated, Some(outcome))), settle)
             }
             Err(QueueError::Chain(ChainError::BadSequence)) => {
                 tracing::info!(
@@ -507,7 +521,7 @@ impl<'a> Executor<'a> {
                     "another transaction spent this key's sequence first; this plan is stale \
                      and is re-planned rather than resent"
                 );
-                Ok((ExecOutcome::Stale, Settle::Release))
+                (Ok(ExecOutcome::Stale), Settle::Release)
             }
             Err(QueueError::Chain(ChainError::Simulation {
                 contract_error,
@@ -521,9 +535,17 @@ impl<'a> Executor<'a> {
                     %message,
                     "the contract refused this fill when it was prepared"
                 );
-                Ok((refusal(contract_error), Settle::Release))
+                (Ok(refusal(contract_error)), Settle::Release)
             }
-            Err(error) => Err(ExecutorError::Queue(error)),
+            // Releasing is safe here because of the contract
+            // [`QueueError::Chain`] states: the queue answers it only for a
+            // failure that provably sent nothing of this submission — a
+            // `prepare` that failed, a send the RPC refused, a stale
+            // sequence — never for a transaction that may be in flight,
+            // which it resolves by hash instead. A queue that stopped
+            // honouring that would make this arm hand back a wallet the
+            // chain had already spent.
+            Err(error) => (Err(ExecutorError::Queue(error)), Settle::Release),
         }
     }
 
@@ -851,6 +873,12 @@ mod tests {
             rpc.calls("getFeeStats").is_empty(),
             "and never reaches the signing path, which is what pays a fee"
         );
+        assert_eq!(
+            rpc.remaining(),
+            0,
+            "every scripted answer was used: an over-scripted test would hide a chain call \
+             this module never made"
+        );
         Ok(())
     }
 
@@ -979,6 +1007,12 @@ mod tests {
             "consumed: the balance itself is down by the spend, not merely held"
         );
         assert_eq!(inventory.available()[XLM], 993);
+        assert_eq!(
+            rpc.remaining(),
+            0,
+            "every scripted answer was used: an over-scripted test would hide a chain call \
+             this module never made"
+        );
         Ok(())
     }
 
@@ -1051,6 +1085,75 @@ mod tests {
             "released: the fill failed, so the wallet never paid it"
         );
         assert_eq!(inventory.available()[XLM], 1_000);
+        assert_eq!(
+            rpc.remaining(),
+            0,
+            "every scripted answer was used: an over-scripted test would hide a chain call \
+             this module never made"
+        );
+        Ok(())
+    }
+
+    /// What the reservation becomes is the chain's answer, not this
+    /// module's bookkeeping: a hash write that fails after a transaction
+    /// landed still consumes, or the wallet's ledger would hand the next
+    /// plan amounts the chain has already spent.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_store_failure_after_a_success_still_consumes(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        script_simulate_prelude(&rpc, &signer, 10, 100);
+        script_simulate_accepted(&rpc, 100);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let executor = Executor::new(&store, Some(submitter), false);
+        let inventory = inventory();
+        let fill = plan(Priority::Normal);
+        let reservation = inventory.reserve(&fill.draft.spend).expect("reserve");
+
+        // The row is written before the submission; closing the pool
+        // between the submission and the hash write makes that second
+        // write fail for real. A deleted row would not do: `attach_fill_tx`
+        // answers `false` for one, which is a warning, not an error.
+        let pool = store.pool().clone();
+        let (queue, mut receiver) = SubmissionQueue::new(queue_capacity());
+        let worker = tokio::spawn(async move {
+            while let Some(queued) = receiver.recv().await {
+                pool.close().await;
+                let _ = queued.respond.send(Ok(TxOutcome::Succeeded {
+                    hash: TxHash([5_u8; 32]),
+                    ledger: 1,
+                    return_value: None,
+                }));
+            }
+        });
+
+        let error = executor
+            .execute(&fill, Settlement::Live(reservation), Some(&queue))
+            .await
+            .expect_err("the transaction could not be written onto its row");
+        drop(queue);
+        worker.await.expect("the worker ends with the queue");
+
+        assert!(matches!(error, ExecutorError::Store(_)), "got {error:?}");
+        assert!(
+            inventory.reserved().values().all(|held| *held == 0),
+            "settled, not left to the drop guard"
+        );
+        assert_eq!(
+            inventory.available()[USDC],
+            490,
+            "consumed: the fill landed, whatever became of its row"
+        );
+        assert_eq!(inventory.available()[XLM], 993);
+        assert_eq!(
+            rpc.remaining(),
+            0,
+            "every scripted answer was used: an over-scripted test would hide a chain call \
+             this module never made"
+        );
         Ok(())
     }
 
@@ -1103,6 +1206,12 @@ mod tests {
             Some(0),
             "a refusal is not an attempt: nothing reached the audit"
         );
+        assert_eq!(
+            rpc.remaining(),
+            0,
+            "every scripted answer was used: an over-scripted test would hide a chain call \
+             this module never made"
+        );
         Ok(())
     }
 
@@ -1140,6 +1249,12 @@ mod tests {
             .fetch_one(store.pool())
             .await?;
         assert_eq!(rows.n, Some(0));
+        assert_eq!(
+            rpc.remaining(),
+            0,
+            "every scripted answer was used: an over-scripted test would hide a chain call \
+             this module never made"
+        );
         Ok(())
     }
 
@@ -1195,6 +1310,12 @@ mod tests {
             "an armed attempt whose transaction was never named"
         );
         assert!(!row.dry_run);
+        assert_eq!(
+            rpc.remaining(),
+            0,
+            "every scripted answer was used: an over-scripted test would hide a chain call \
+             this module never made"
+        );
         Ok(())
     }
 
@@ -1347,6 +1468,12 @@ mod tests {
             vec![(Priority::High, FILL_RETRIES)],
             "a fill worth paying to land first, with the fill budget spec §8 gives it"
         );
+        assert_eq!(
+            rpc.remaining(),
+            0,
+            "every scripted answer was used: an over-scripted test would hide a chain call \
+             this module never made"
+        );
         Ok(())
     }
 
@@ -1389,6 +1516,12 @@ mod tests {
         assert!(
             rpc.calls("sendTransaction").is_empty(),
             "and restoring, which is a submission, is not this path's business"
+        );
+        assert_eq!(
+            rpc.remaining(),
+            0,
+            "every scripted answer was used: an over-scripted test would hide a chain call \
+             this module never made"
         );
         Ok(())
     }
