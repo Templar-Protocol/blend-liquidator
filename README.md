@@ -39,10 +39,11 @@ default for exactly that reason:
   `on` are refused at startup rather than guessed at, because the dangerous
   direction is silent: a value quietly read as false would arm the bot while
   looking, to the operator, like it had been disarmed.
-- `DRY_RUN=false` additionally requires `FILLER_SECRET_KEY`, and refuses it
-  if it is the same key as `AUCTIONEER_SECRET_KEY`. Both are read from the
-  environment only: a signing key passed on the command line is readable
-  from `/proc/<pid>/cmdline`, `ps` and `docker inspect`.
+- `DRY_RUN=false` additionally requires `FILLER_SECRET_KEY`. Separately, and
+  in every mode, `AUCTIONEER_SECRET_KEY` equal to `FILLER_SECRET_KEY` is
+  refused at startup — share one key by leaving the auctioneer's unset. Both
+  are read from the environment only: a signing key passed on the command
+  line is readable from `/proc/<pid>/cmdline`, `ps` and `docker inspect`.
 
 **Phase 5 does not unwind.** A live fill pays the auction's bid and takes
 its lot, which leaves the position *in the pool* — the lot as collateral,

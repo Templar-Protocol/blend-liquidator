@@ -111,10 +111,15 @@ pub struct PoolSnapshot {
 }
 
 impl PoolSnapshot {
-    /// Values `user`'s positions at `close_time`: accrues a copy of the
-    /// reserves to it with the pool's backstop rate, then computes the
-    /// effective and raw totals. `None` when the user was not requested or
-    /// holds no positions.
+    /// Values `user`'s positions at [`PoolSnapshot::valued_at`] of
+    /// `close_time`: accrues a copy of the reserves to that instant with the
+    /// pool's backstop rate, then computes the effective and raw totals.
+    /// `None` when the user was not requested or holds no positions.
+    ///
+    /// The clamp is applied here, not left to the caller: a `close_time`
+    /// older than the newest reserve entry would otherwise fail accrual
+    /// (see `valued_at`), and a caller that has already clamped passes a
+    /// value the clamp leaves alone.
     pub fn position_data(
         &self,
         user: &str,
@@ -159,21 +164,23 @@ impl PoolSnapshot {
             .max(close_time)
     }
 
-    /// A clone of this snapshot's reserves accrued to `at`, once for a
-    /// whole batch.
+    /// A clone of this snapshot's reserves accrued to
+    /// [`PoolSnapshot::valued_at`] of `at`, once for a whole batch.
     ///
     /// [`PoolSnapshot::reserves`] is stored, not accrued. Anything that
     /// prices positions itself — the auctioneer's `position_values`, the
     /// filler's planner — needs the accrued numbers, at the same instant
     /// [`PoolSnapshot::position_data`] accrues its own clone to for the
-    /// health factor: accruing here, to the same `at`, is what keeps the
-    /// two agreeing.
+    /// health factor: accruing here, through the same clamp, is what keeps
+    /// the two agreeing. The clamp is idempotent, so a caller that passes
+    /// what `valued_at` already answered gets exactly that instant.
     ///
     /// # Errors
     ///
-    /// [`MathError`] when a reserve cannot be accrued to `at` — an `at`
-    /// before its `last_time`, or arithmetic no real reserve reaches.
+    /// [`MathError`] for arithmetic no real reserve reaches; the clamp
+    /// makes "an `at` before a reserve's `last_time`" unreachable.
     pub fn accrued_reserves(&self, at: u64) -> Result<BTreeMap<u32, Reserve>, MathError> {
+        let at = self.valued_at(at);
         let mut reserves = self.reserves.clone();
         for reserve in reserves.values_mut() {
             reserve.accrue(self.instance.config.bstop_rate, at)?;
@@ -673,6 +680,26 @@ mod tests {
             .position_data("GA…unknown", close_time)
             .unwrap()
             .is_none());
+        // The clamp lives inside the snapshot: a close time older than the
+        // newest reserve entry is valued at that entry, not refused —
+        // `Reserve::accrue` will not run backwards, and a caller that has
+        // not clamped must not fail exactly when the pool is busy.
+        let newest = snapshot
+            .reserves
+            .values()
+            .map(|reserve| reserve.data.last_time)
+            .max()
+            .unwrap();
+        assert_eq!(snapshot.valued_at(newest - 1), newest);
+        assert_eq!(
+            snapshot.position_data(users[0], newest - 1).unwrap(),
+            snapshot.position_data(users[0], newest).unwrap(),
+            "an older close time is valued at the newest reserve entry"
+        );
+        assert_eq!(
+            snapshot.accrued_reserves(newest - 1).unwrap(),
+            snapshot.accrued_reserves(newest).unwrap()
+        );
         // The oracle was asked for decimals, then one lastprice per reserve, in list order.
         let simulations = rpc.calls("simulateTransaction");
         assert_eq!(simulations.len(), 4);

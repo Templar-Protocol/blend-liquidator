@@ -885,7 +885,7 @@ impl<'a> Auctioneer<'a> {
             tracing::warn!(
                 creation_id,
                 tx_hash = %hash,
-                "no creation row to attach this transaction to"
+                "no creation row to attach this transaction to, or the row already names one"
             );
         }
         Ok(outcome)

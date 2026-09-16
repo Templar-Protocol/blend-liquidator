@@ -100,14 +100,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shares the filler's whenever it falls back to the filler's key, since two
   queues on one key is the sequence race `queue.rs` exists to make
   unreachable.
-- Migration `0003`: a `fills` table auditing every fill the filler
-  executed, dry-run or not, written before anything is submitted with the
-  transaction's hash attached once there is one — so `dry_run` records the
-  mode the bot was configured in and `tx_hash` records whether anything was
-  sent, and a row with `dry_run = false` and no hash is an armed attempt
-  whose transaction was never named. A dry-run fill is recorded once per
-  auction per process, keyed by pool, account and start ledger, rather than
-  once per tick for as long as nobody else fills it.
+- Migration `0003`: a `fills` table auditing every fill attempt the
+  executor recorded, dry-run or not: a row is written before anything is
+  submitted and the transaction's hash is attached — once, never replaced —
+  when there is one. So `dry_run` records the mode the bot was configured
+  in, `tx_hash` is the evidence that a transaction was named, and a row
+  with `dry_run = false` and no hash is an armed attempt whose transaction
+  never was. A dry-run fill is recorded once per version of an auction the
+  chain held — keyed by pool, account, start ledger and the ledger the
+  tracker last rewrote the row at — rather than once per tick for as long
+  as nobody else fills it; a partial fill by someone else leaves a
+  remainder the tracker rewrites the row with, and that remainder is
+  recorded afresh.
 - The auctioneer now adopts an auction the chain already holds and the
   store does not. An auction opened before this bot's events cursor
   produced no `NewAuction` for the tracker to apply, so the filler — which

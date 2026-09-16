@@ -775,12 +775,15 @@ impl Store {
     /// apart takes an out-of-band check: the signing account's sequence
     /// number.
     ///
-    /// `false` means no row has that `id`. Nothing in this crate deletes a
-    /// creation, so the caller logs it rather than failing a submission that
-    /// has already happened.
+    /// A hash is attached once: the write is guarded by `tx_hash IS NULL`,
+    /// so a repeated attachment can never replace the transaction the audit
+    /// already names. `false` means no row has that `id`, or the row already
+    /// names a transaction. Nothing in this crate deletes a creation, so the
+    /// caller logs it rather than failing a submission that has already
+    /// happened.
     pub async fn attach_creation_tx(&self, id: i64, tx_hash: &str) -> Result<bool, StoreError> {
         let done = sqlx::query!(
-            "UPDATE creations SET tx_hash = $2 WHERE id = $1",
+            "UPDATE creations SET tx_hash = $2 WHERE id = $1 AND tx_hash IS NULL",
             id,
             tx_hash
         )
@@ -1058,13 +1061,20 @@ impl Store {
     /// `tx_hash IS NULL` with `dry_run = false` is an armed attempt whose
     /// transaction was never named.
     ///
-    /// `false` means no row has that `id`. Nothing in this crate deletes a
-    /// fill, so the caller logs it rather than failing a submission that has
-    /// already happened.
+    /// A hash is attached once: the write is guarded by `tx_hash IS NULL`,
+    /// so a repeated attachment — a completion handled twice — can never
+    /// replace the transaction the audit already names. `false` means no
+    /// row has that `id`, or the row already names a transaction. Nothing
+    /// in this crate deletes a fill, so the caller logs it rather than
+    /// failing a submission that has already happened.
     pub async fn attach_fill_tx(&self, id: i64, tx_hash: &str) -> Result<bool, StoreError> {
-        let done = sqlx::query!("UPDATE fills SET tx_hash = $2 WHERE id = $1", id, tx_hash)
-            .execute(&self.pool)
-            .await?;
+        let done = sqlx::query!(
+            "UPDATE fills SET tx_hash = $2 WHERE id = $1 AND tx_hash IS NULL",
+            id,
+            tx_hash
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(done.rows_affected() == 1)
     }
 
@@ -2045,6 +2055,18 @@ mod tests {
                 .expect("a missing row is not an error"),
             "no row, no update — and not a failure either"
         );
+        assert!(
+            !store
+                .attach_creation_tx(id, "ef".repeat(32).as_str())
+                .await
+                .expect("a repeated attachment is not an error"),
+            "a row that already names a transaction keeps it"
+        );
+        let kept = sqlx::query!("SELECT tx_hash FROM creations WHERE id = $1", id)
+            .fetch_one(store.pool())
+            .await
+            .expect("the row still exists");
+        assert_eq!(kept.tx_hash, Some("cd".repeat(32)));
         Ok(())
     }
 
@@ -2093,7 +2115,9 @@ mod tests {
         Ok(())
     }
 
-    /// The hash is a second write; a missing row is `false`, not an error.
+    /// The hash is a second write; a missing row is `false`, not an error,
+    /// and so is a row that already names a transaction: the audit keeps
+    /// the first hash it was given, whatever a repeated completion says.
     #[sqlx::test(migrations = "./migrations")]
     async fn a_fills_transaction_is_attached_once_it_has_one(db: sqlx::PgPool) -> sqlx::Result<()> {
         let store = Store::from_pool(db);
@@ -2106,10 +2130,17 @@ mod tests {
             .attach_fill_tx(id + 1, &"cd".repeat(32))
             .await
             .expect("attach"));
+        assert!(
+            !store
+                .attach_fill_tx(id, &"ef".repeat(32))
+                .await
+                .expect("attach again"),
+            "a second attachment is refused, not applied"
+        );
         let hash = sqlx::query_scalar!("SELECT tx_hash FROM fills WHERE id = $1", id)
             .fetch_one(store.pool())
             .await?;
-        assert_eq!(hash, Some("ab".repeat(32)));
+        assert_eq!(hash, Some("ab".repeat(32)), "the first hash stands");
         Ok(())
     }
 

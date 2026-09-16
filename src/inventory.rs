@@ -158,11 +158,21 @@ impl Inventory {
     ///
     /// # Errors
     ///
-    /// [`InventoryError::Insufficient`] when some asset in `amounts` asks
+    /// [`InventoryError::InvalidAmount`] when some asset in `amounts` asks
+    /// for zero or less — a negative claim would *raise* what is available
+    /// and, on settlement, fabricate balance, so the ledger refuses it at
+    /// the boundary rather than trusting every caller to size a spend
+    /// positive — and [`InventoryError::Insufficient`] when some asset asks
     /// for more than is currently available.
     pub fn reserve(&self, amounts: &BTreeMap<String, i128>) -> Result<Reservation, InventoryError> {
         let mut ledger = lock(&self.ledger);
         for (asset, needed) in amounts {
+            if *needed <= 0 {
+                return Err(InventoryError::InvalidAmount {
+                    asset: asset.clone(),
+                    amount: *needed,
+                });
+            }
             let available = ledger.available(asset);
             if *needed > available {
                 return Err(InventoryError::Insufficient {
@@ -262,6 +272,17 @@ pub enum Settlement {
 /// A reservation this inventory refuses.
 #[derive(Debug, thiserror::Error)]
 pub enum InventoryError {
+    /// `asset` was asked for zero or less, which is not a claim at all: a
+    /// negative one would invert the ledger. No plan produces one — every
+    /// spend is a positive repay or supply — so this is a bug upstream,
+    /// refused here so it cannot become a phantom balance.
+    #[error("invalid reservation of {amount} {asset}: a claim is positive")]
+    InvalidAmount {
+        /// The asset.
+        asset: String,
+        /// What was asked for.
+        amount: i128,
+    },
     /// `asset` was asked for more than [`Inventory::available`] showed at
     /// the time.
     #[error("insufficient {asset}: needed {needed}, available {available}")]
@@ -365,6 +386,33 @@ mod tests {
         assert!(
             matches!(&error, InventoryError::Insufficient { asset, needed: 200, available: 100 } if asset == USDC)
         );
+    }
+
+    /// A claim is positive: zero and negative amounts are refused at the
+    /// boundary, and a refused reservation claims nothing — a negative one
+    /// let through would raise `available` now and fabricate balance on
+    /// settlement.
+    #[test]
+    fn a_non_positive_amount_is_refused() {
+        let inventory = inventory();
+        for amount in [0, -1, -700] {
+            let error = inventory
+                .reserve(&BTreeMap::from([
+                    (XLM.to_string(), 1),
+                    (USDC.to_string(), amount),
+                ]))
+                .expect_err("not a claim");
+            assert!(
+                matches!(&error, InventoryError::InvalidAmount { asset, amount: got } if asset == USDC && *got == amount),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            inventory.available()[XLM],
+            1_500_000_000,
+            "nothing was claimed"
+        );
+        assert!(inventory.reserved().values().all(|amount| *amount == 0));
     }
 
     /// The drop guard: a reservation nobody settled — an early return, a

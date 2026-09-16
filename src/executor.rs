@@ -517,7 +517,7 @@ impl<'a> Executor<'a> {
                     Ok(false) => tracing::warn!(
                         fill_id,
                         tx_hash = %hash,
-                        "no fill row to attach this transaction to"
+                        "no fill row to attach this transaction to, or the row already names one"
                     ),
                     Err(error) => return (Err(ExecutorError::Store(error)), settle),
                 }

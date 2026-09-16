@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "UPDATE fills SET tx_hash = $2 WHERE id = $1",
+  "query": "UPDATE fills SET tx_hash = $2 WHERE id = $1 AND tx_hash IS NULL",
   "describe": {
     "columns": [],
     "parameters": {
@@ -11,5 +11,5 @@
     },
     "nullable": []
   },
-  "hash": "e1ce04fad77c8c8fca3a25e8429f85d2c86f8ffb696a5693d469dc443a0a0e6a"
+  "hash": "a993818678a45d1f283066941f32dc2226d9e57b0a4f70318a41d3a9a259b064"
 }
