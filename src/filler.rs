@@ -1841,9 +1841,9 @@ mod tests {
 
     /// A partial fill by someone else keeps the auction's start ledger and
     /// leaves a remainder — which is what an armed filler would now fill,
-    /// so a dry run records the remainder afresh. The tracker rewrites the
-    /// row with the remainder at a later `updated_ledger`; that, not the
-    /// start ledger, is what tells the two versions apart.
+    /// so a dry run records the remainder afresh. The remainder's own
+    /// amounts, not the start ledger and not any ledger the row carries,
+    /// are what tell the two versions apart.
     #[sqlx::test(migrations = "./migrations")]
     async fn a_remainder_someone_else_left_is_recorded_again(db: sqlx::PgPool) -> sqlx::Result<()> {
         let store = Store::from_pool(db);
