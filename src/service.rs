@@ -27,11 +27,12 @@
 //! The run's one [`crate::metrics::Metrics`] and its one
 //! [`crate::notifier::Notifier`] — the latter built from
 //! `config.notification_cooldown`, log-only until a Telegram channel is
-//! configured — are both constructed before `spawn_pollers`, because the
-//! pollers are the first tasks to record and report through them; the
-//! watchdog and the filler are handed those same two instances rather
-//! than instances of their own, since dedup state and gauges mean nothing
-//! split across copies. Delivery is fire-and-forget: `notify` spawns
+//! configured — are both constructed before the seed pass, which is the
+//! first thing that records through them and runs before any task is
+//! spawned at all; every loop that needs both is handed them together as
+//! one `Instruments`, and the pollers, the watchdog and the filler are
+//! handed those same two instances rather than instances of their own,
+//! since dedup state and gauges mean nothing split across copies. Delivery is fire-and-forget: `notify` spawns
 //! behind a bounded semaphore and never awaits a channel, so no
 //! notification can delay a tick, a decision or a fill, and a channel
 //! that has stopped answering costs a bounded number of tasks and drops
@@ -86,22 +87,58 @@ use std::num::NonZeroUsize;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 
-use crate::auctioneer::{Auctioneer, AuctioneerConfig, AuctioneerError, PriceWatch};
+use crate::auctioneer::{
+    ActOutcome, Auctioneer, AuctioneerConfig, AuctioneerError, CreationOutcome, PriceWatch,
+};
 use crate::chain::pool::{PoolReader, PoolSnapshot};
 use crate::chain::rpc::RpcClient;
 use crate::chain::xdr::PoolStatus;
-use crate::chain::{ChainError, Network, Signer, Submitter, TxConfig};
+use crate::chain::{ChainError, Network, Signer, Submitter, TxConfig, TxOutcome};
 use crate::config::{PoolConfig, SeedConfig, ServiceConfig, Signers, SigningKeys};
 use crate::executor::Executor;
 use crate::filler::{Filler, FillerConfig, FillerState};
 use crate::inventory::Inventory;
 use crate::ledger::{LedgerPoller, LedgerTick, PollerConfig, PollerMessage};
-use crate::metrics::Metrics;
+use crate::metrics::{Attempt, Metrics};
 use crate::notifier::{Notification, NotificationKind, Notifier, Severity};
-use crate::queue::{run_queue, SubmissionQueue};
-use crate::store::{events_cursor, Cursor, Store, StoreError, TrackedUser};
+use crate::queue::{run_queue, QueueError, SubmissionQueue};
+use crate::store::{events_cursor, CreationKind, Cursor, Store, StoreError, TrackedUser};
 use crate::tracker::{AnalyticsSeed, FileSeed, SeedSource, Tracker, TrackerError};
 use crate::LiquidatorError;
+
+/// The run's instruments: the one [`Metrics`] every loop records into and
+/// the one [`Notifier`] every loop reports through, carried together so a
+/// loop that needs both takes one parameter rather than two.
+///
+/// Cloning clones the two handles and never the state behind them: a
+/// gauge means nothing split across recorders, and the notifier's dedup
+/// means nothing split across notifiers, which is why both are `Arc`s of
+/// the instances [`Service::run`] builds exactly once.
+///
+/// Nothing reached through here may affect trading (spec §8): recording
+/// is a lock and an integer, and [`Notifier::notify`] spawns its delivery
+/// rather than awaiting a channel, so no tick, decision or fill can be
+/// delayed or failed by an instrument.
+#[derive(Clone)]
+pub(crate) struct Instruments {
+    /// The run's counters and gauges.
+    pub metrics: Arc<Metrics>,
+    /// The run's notification channel.
+    pub notifier: Arc<Notifier>,
+}
+
+impl Instruments {
+    /// A fresh recorder and a log-only notifier whose cooldown no test
+    /// runs past: what the tests that call an instrumented loop but
+    /// assert on neither instrument pass.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        Self {
+            metrics: Arc::new(Metrics::new()),
+            notifier: Arc::new(Notifier::log_only(std::time::Duration::from_hours(1))),
+        }
+    }
+}
 
 /// What [`Service::check_config`] prints for one pool: how many reserves it
 /// has and which backstop it reports, once `validate` has confirmed every
@@ -453,6 +490,7 @@ async fn seed_pools_needing_it(
     sources: &[SeedSource],
     batch: u32,
     shutdown: &watch::Receiver<bool>,
+    instruments: &Instruments,
 ) -> Result<BTreeSet<String>, LiquidatorError> {
     let tracker = Tracker::new(rpc, store);
     let mut incomplete = BTreeSet::new();
@@ -524,6 +562,14 @@ async fn seed_pools_needing_it(
                 )
                 .await?;
         }
+        // This pool's seed gauge, and only it: the tracked-user count
+        // read at the top of this loop was read *before* the seed, so
+        // publishing it as `users_tracked` here would report the very zero
+        // that sent this pool to be seeded. `full_scan` sets that gauge
+        // from a count taken after the seed, within one scan period.
+        instruments
+            .metrics
+            .seed_accounts_loaded(&pool.address, outcome.refresh.tracked);
         tracing::info!(
             pool = pool.address,
             tracked = outcome.refresh.tracked,
@@ -632,12 +678,14 @@ struct LoopState {
 ///
 /// A tick is acknowledged only once its whole effect is in the store,
 /// because that acknowledgement is what commits the poller's cursor.
+#[allow(clippy::too_many_arguments)]
 async fn handle_message(
     tracker: &Tracker<'_>,
     seed_sources: &[SeedSource],
     cadence: Cadence,
     state: &mut LoopState,
     shutdown: &watch::Receiver<bool>,
+    instruments: &Instruments,
     tick_tx: &watch::Sender<LedgerTick>,
     message: PollerMessage,
 ) -> Result<(), TrackerError> {
@@ -647,7 +695,10 @@ async fn handle_message(
             ledger,
             event,
         } => match tracker.apply(&pool, ledger, &event).await {
-            Ok(accounts) => state.pending.entry(pool).or_default().extend(accounts),
+            Ok(accounts) => {
+                instruments.metrics.events_processed(&pool, 1);
+                state.pending.entry(pool).or_default().extend(accounts);
+            }
             Err(error) => {
                 // This event is not in the store, so the range it came
                 // from must be read again: poison the pool's next tick so
@@ -665,6 +716,7 @@ async fn handle_message(
                 cadence,
                 state,
                 shutdown,
+                instruments,
                 (&pool, &accounts, tick),
             )
             .await
@@ -683,6 +735,11 @@ async fn handle_message(
                     "an event in this range did not apply; leaving the range to be re-read"
                 );
             } else {
+                // The acknowledged path and nowhere else: this gauge is
+                // the cursor the poller commits, and a tick whose
+                // acknowledgement is declined leaves that cursor where it
+                // was, for the whole range to be read again.
+                instruments.metrics.ledger_processed(&pool, tick.sequence);
                 // Answering is the only thing that lets the cursor move.
                 let _ = ack.send(());
                 // Published only now: the auctioneer's whole input is
@@ -714,6 +771,17 @@ async fn handle_message(
         }
         PollerMessage::Gap { pool, from, oldest } => {
             tracing::warn!(pool, from, oldest, "reseeding after a gap");
+            // Reported before the reseed, not after it: reseeding a busy
+            // pool is tens of seconds of sequential round trips, and the
+            // operator should learn that a range of events was lost while
+            // it is being made good rather than once it has been.
+            instruments.notifier.notify(Notification {
+                kind: NotificationKind::EventGap,
+                severity: Severity::High,
+                pool: pool.clone(),
+                account: None,
+                message: format!("events from ledger {from} to {oldest} are gone; reseeding"),
+            });
             // Recorded before the attempt and cleared only by a seed that
             // reached every source, so a reseed that fails outright is
             // retried by the full scan rather than forgotten.
@@ -752,6 +820,7 @@ async fn apply_tick(
     cadence: Cadence,
     state: &mut LoopState,
     shutdown: &watch::Receiver<bool>,
+    instruments: &Instruments,
     subject: (&str, &[String], LedgerTick),
 ) -> Result<(), TrackerError> {
     let (pool, accounts, tick) = subject;
@@ -811,6 +880,7 @@ async fn apply_tick(
             cadence,
             state,
             shutdown,
+            instruments,
             (pool, tick),
         )
         .await
@@ -839,6 +909,7 @@ async fn full_scan(
     cadence: Cadence,
     state: &mut LoopState,
     shutdown: &watch::Receiver<bool>,
+    instruments: &Instruments,
     subject: (&str, LedgerTick),
 ) -> Result<(), TrackerError> {
     let (pool, tick) = subject;
@@ -852,6 +923,7 @@ async fn full_scan(
         )
         .await?;
     let user_count = store.count_users(pool).await?;
+    instruments.metrics.users_tracked(pool, user_count);
     tracing::info!(
         pool,
         user_count,
@@ -883,6 +955,13 @@ async fn full_scan(
             state.needs_reseed.remove(pool);
         }
     }
+    // Only a scan that reached the end of the function: an owed reseed
+    // that failed above propagates instead, and
+    // `last_successful_scan_timestamp_seconds` is what an operator alerts
+    // on when scans stop finishing.
+    instruments
+        .metrics
+        .scan_succeeded(std::time::SystemTime::now());
     Ok(())
 }
 
@@ -899,12 +978,14 @@ async fn full_scan(
 /// function returns is what lets the auctioneer task's own `changed()`
 /// end rather than wait forever once this loop has nothing further to
 /// send.
+#[allow(clippy::too_many_arguments)]
 async fn tracker_loop(
     tracker: &Tracker<'_>,
     seed_sources: &[SeedSource],
     cadence: Cadence,
     mut state: LoopState,
     shutdown: &watch::Receiver<bool>,
+    instruments: &Instruments,
     tick_tx: watch::Sender<LedgerTick>,
     mut receiver: mpsc::Receiver<PollerMessage>,
 ) -> Result<(), TrackerError> {
@@ -925,6 +1006,7 @@ async fn tracker_loop(
             cadence,
             &mut state,
             shutdown,
+            instruments,
             &tick_tx,
             message,
         )
@@ -1175,6 +1257,13 @@ async fn full_scan_and_flag(
 /// own doc. Only [`AuctioneerError::Store`] ends the pass early and
 /// propagates, for the reason it is fatal everywhere else in this module:
 /// the bot cannot trust what it reads.
+///
+/// `instruments` is read-only to all of that: what `act` answered is
+/// counted and, for a creation the chain landed or one the queue dropped,
+/// reported — ahead of the match that owns this borrower's flag, so that
+/// no arm of it moves, clears or keeps a flag differently for having been
+/// instrumented.
+#[allow(clippy::too_many_arguments)]
 async fn recheck_batch(
     auctioneer: &Auctioneer<'_>,
     store: &Store,
@@ -1183,6 +1272,7 @@ async fn recheck_batch(
     tick: LedgerTick,
     submit: Option<&SubmissionQueue>,
     shutdown: &watch::Receiver<bool>,
+    instruments: &Instruments,
 ) -> Result<(), LiquidatorError> {
     if batch.is_empty() {
         return Ok(());
@@ -1233,10 +1323,11 @@ async fn recheck_batch(
         if *shutdown.borrow() {
             return Ok(());
         }
-        match auctioneer
+        let acted = auctioneer
             .act(pool, &account, &decision, tick, submit)
-            .await
-        {
+            .await;
+        note_act(instruments, pool, &account, &acted);
+        match acted {
             // A refusal is not a skip, and neither is a submission the chain
             // failed, expired or lost: something was owed and was not done,
             // so the flag moves forward instead of being cleared — exactly
@@ -1297,6 +1388,96 @@ async fn recheck_batch(
         }
     }
     Ok(())
+}
+
+/// Instruments what [`Auctioneer::act`] answered for one borrower, and
+/// nothing else: it is called before the match that owns that borrower's
+/// recheck flag, so no arm of that match moves, clears or keeps a flag
+/// differently for having been instrumented.
+///
+/// Two answers are worth recording. A recorded creation is
+/// [`note_creation`]'s. A [`QueueError::Chain`] is the one failure the
+/// queue narrows to a submission that provably sent nothing and has spent
+/// its retry budget — the creation is gone rather than pending, which is
+/// worth saying out loud even though the flag the caller moves forward
+/// brings the borrower back on a later pass. Every other answer — a skip,
+/// a refusal, a store, chain or math failure — is the caller's to log as
+/// it already does.
+fn note_act(
+    instruments: &Instruments,
+    pool: &str,
+    account: &str,
+    acted: &Result<ActOutcome, AuctioneerError>,
+) {
+    match acted {
+        Ok(ActOutcome::Recorded(outcome)) => note_creation(instruments, pool, outcome),
+        Err(AuctioneerError::Queue(QueueError::Chain(error))) => {
+            instruments.metrics.creation(Attempt::Failed);
+            instruments.notifier.notify(Notification {
+                kind: NotificationKind::SubmissionDropped,
+                severity: Severity::High,
+                pool: pool.to_string(),
+                account: Some(account.to_string()),
+                message: format!("creation dropped by the queue: {error}"),
+            });
+        }
+        Ok(ActOutcome::Skipped(_) | ActOutcome::Refused) | Err(_) => {}
+    }
+}
+
+/// Counts one recorded creation and, when the chain landed it, reports it.
+///
+/// Called for every [`ActOutcome::Recorded`], settled or not: `attempted`
+/// means the bot decided to act and recorded the decision, which a dry
+/// run's creation, one the startup delay held back and one the chain
+/// failed all are. What tells them apart is the second count, which is
+/// the chain's answer and not the row's existence — so a
+/// [`TxOutcome::Failed`] (a fee charged and no auction) and a
+/// [`TxOutcome::Expired`] (provably never applied) are `failed`, while a
+/// [`TxOutcome::Unknown`] is neither: it may still land, and a counter
+/// that guessed would have to be un-counted.
+///
+/// Instrumenting only. [`Notifier::notify`] spawns its delivery rather
+/// than awaiting a channel, so nothing here can delay or fail the pass
+/// that called it (spec §8).
+fn note_creation(instruments: &Instruments, pool: &str, outcome: &CreationOutcome) {
+    instruments.metrics.creation(Attempt::Attempted);
+    match &outcome.submission {
+        Some(TxOutcome::Succeeded { ledger, .. }) => {
+            instruments.metrics.creation(Attempt::Succeeded);
+            let (kind, severity, message) = match outcome.kind {
+                CreationKind::Auction => {
+                    // Every auction creation names a percent; the fallback
+                    // is for the type, which allows `None` because bad
+                    // debt has none.
+                    let percent = outcome
+                        .percent
+                        .map_or_else(|| "?".to_string(), |percent| percent.get().to_string());
+                    (
+                        NotificationKind::AuctionCreated,
+                        Severity::Low,
+                        format!("liquidation auction created at {percent}% in ledger {ledger}"),
+                    )
+                }
+                CreationKind::BadDebt => (
+                    NotificationKind::BadDebtReported,
+                    Severity::Medium,
+                    format!("bad debt reported in ledger {ledger}"),
+                ),
+            };
+            instruments.notifier.notify(Notification {
+                kind,
+                severity,
+                pool: pool.to_string(),
+                account: Some(outcome.account.clone()),
+                message,
+            });
+        }
+        Some(TxOutcome::Failed { .. } | TxOutcome::Expired { .. }) => {
+            instruments.metrics.creation(Attempt::Failed);
+        }
+        Some(TxOutcome::Unknown { .. }) | None => {}
+    }
 }
 
 /// Re-raises one borrower's recheck flag one ledger past `tick`'s, so a
@@ -1475,6 +1656,7 @@ struct AuctioneerContext<'a> {
     cadence: AuctioneerCadence,
     submission_queue: Option<&'a SubmissionQueue>,
     shutdown: &'a watch::Receiver<bool>,
+    instruments: &'a Instruments,
 }
 
 /// One tick's whole effect for every configured pool: decide and act on
@@ -1577,6 +1759,7 @@ async fn auctioneer_tick(
             tick,
             submit,
             ctx.shutdown,
+            ctx.instruments,
         )
         .await?;
     }
@@ -1594,6 +1777,7 @@ async fn auctioneer_tick(
 /// gone — and this loop then has nothing further to do. A decision is not
 /// a stored effect of a ledger, so nothing this loop does ever reaches
 /// back to poison a tick already acknowledged.
+#[allow(clippy::too_many_arguments)]
 async fn auctioneer_loop(
     store: &Store,
     pools: &[String],
@@ -1602,6 +1786,7 @@ async fn auctioneer_loop(
     submission_queue: Option<&SubmissionQueue>,
     mut tick_rx: watch::Receiver<LedgerTick>,
     shutdown: &watch::Receiver<bool>,
+    instruments: &Instruments,
 ) -> Result<(), LiquidatorError> {
     let ctx = AuctioneerContext {
         store,
@@ -1610,6 +1795,7 @@ async fn auctioneer_loop(
         cadence,
         submission_queue,
         shutdown,
+        instruments,
     };
     let mut state = AuctioneerState::default();
     while tick_rx.changed().await.is_ok() {
@@ -2063,6 +2249,7 @@ fn spawn_auctioneer(
     cadence: AuctioneerCadence,
     pools: Vec<String>,
     submission_queue: Option<SubmissionQueue>,
+    instruments: Instruments,
     tick_rx: watch::Receiver<LedgerTick>,
     shutdown: &watch::Receiver<bool>,
 ) {
@@ -2085,6 +2272,7 @@ fn spawn_auctioneer(
             submission_queue.as_ref(),
             tick_rx,
             &shutdown,
+            &instruments,
         )
         .await
     });
@@ -2278,6 +2466,23 @@ impl Service {
         warnings.extend(validate_filler(&rpc, &config, &signing).await?);
         log_validation(&config, &validations, &warnings);
 
+        // The run's one recorder and its one notifier, both built before
+        // the first thing that records or reports through them — which is
+        // the seed pass below, before any task is spawned at all — rather
+        // than beside whichever task happens to be their last caller. The
+        // notifier is log-only until a Telegram channel is configured;
+        // every delivery it makes is spawned behind its own semaphore
+        // rather than awaited in a tick (spec §8).
+        let metrics = Arc::new(Metrics::new());
+        let notifier = Arc::new(Notifier::log_only(config.notification_cooldown));
+        // The pair every loop that needs both is handed. The pollers and
+        // the watchdog take the two `Arc`s themselves: each uses one of
+        // them the way its own constructor already spells it.
+        let instruments = Instruments {
+            metrics: Arc::clone(&metrics),
+            notifier: Arc::clone(&notifier),
+        };
+
         let seed_sources = build_seed_sources(&config.seed)?;
         let needs_reseed = seed_pools_needing_it(
             &rpc,
@@ -2286,21 +2491,13 @@ impl Service {
             &seed_sources,
             config.refresh_batch,
             &shutdown_rx,
+            &instruments,
         )
         .await?;
 
         let (message_tx, message_rx) = mpsc::channel(1_024);
         let poller_config = PollerConfig::new(config.poll_interval);
         let mut tasks = JoinSet::new();
-        // The run's one recorder and its one notifier, both built before
-        // the first task that records or reports through them — which is
-        // the pollers, so both are constructed here rather than beside
-        // the task that happens to be their last caller. The notifier is
-        // log-only until a Telegram channel is configured; every delivery
-        // it makes is spawned behind its own semaphore rather than
-        // awaited in a tick (spec §8).
-        let metrics = Arc::new(Metrics::new());
-        let notifier = Arc::new(Notifier::log_only(config.notification_cooldown));
         spawn_pollers(
             &mut tasks,
             &rpc,
@@ -2357,6 +2554,7 @@ impl Service {
             auctioneer_cadence,
             pool_addresses,
             queues.auctioneer,
+            instruments.clone(),
             tick_rx.clone(),
             &shutdown_rx,
         );
@@ -2389,6 +2587,7 @@ impl Service {
                 cadence,
                 state,
                 &shutdown,
+                &instruments,
                 tick_tx,
                 message_rx,
             )
@@ -2413,11 +2612,11 @@ mod tests {
     use crate::chain::rpc::RpcClient;
     use crate::chain::script::{scval_b64, transaction_data_b64, ScriptedRpc};
     use crate::chain::xdr::encode::{
-        address, i128_val, map, sc_address, symbol, to_base64, vec as sc_vec,
+        address, i128_val, map, sc_address, symbol, to_base64, vec as sc_vec, FillPercent,
     };
     use crate::chain::xdr::keys;
     use crate::chain::xdr::{AuctionType, PoolEvent};
-    use crate::chain::{TxHash, TxOutcome};
+    use crate::chain::{LedgerWindow, TxHash, TxOutcome};
     use crate::config::{ChainConfig, RunMode, Secret};
     use crate::fixture::{mainnet_fixed_v2, text};
     use crate::harness;
@@ -2988,6 +3187,24 @@ mod tests {
         }
     }
 
+    /// Instruments whose notifier records every delivery instead of
+    /// logging it, and the channel to read them back off once
+    /// [`Notifier::drain`] has let the spawned deliveries finish. The
+    /// cooldown is an hour, so a second notification of the same
+    /// `(pool, account, kind)` inside one test is a deduplication a test
+    /// can assert on rather than a race.
+    fn recording_instruments() -> (Instruments, Arc<harness::RecordingChannel>) {
+        let recording = Arc::new(harness::RecordingChannel::new(false));
+        let instruments = Instruments {
+            metrics: Arc::new(Metrics::new()),
+            notifier: Arc::new(Notifier::new(
+                Box::new(Arc::clone(&recording)),
+                std::time::Duration::from_hours(1),
+            )),
+        };
+        (instruments, recording)
+    }
+
     /// A `borrow` event for `account`, which names it and nothing else.
     fn borrow(pool: &str, account: &str) -> PollerMessage {
         PollerMessage::Event {
@@ -3074,6 +3291,7 @@ mod tests {
         let (_flag, shutdown) = watch::channel(false);
         let (tick_tx, tick_rx) = tick_watch();
         let mut state = LoopState::default();
+        let instruments = Instruments::for_tests();
 
         handle_message(
             &tracker,
@@ -3081,6 +3299,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &instruments,
             &tick_tx,
             borrow(harness::POOL, harness::USER_ONE),
         )
@@ -3095,6 +3314,22 @@ mod tests {
             0,
             "an event writes no user row: valuing is the tick's job"
         );
+        assert!(
+            instruments.metrics.render().contains(&format!(
+                "events_processed_total{{pool=\"{}\"}} 1",
+                harness::POOL
+            )),
+            "the event it applied is counted, once"
+        );
+        assert_eq!(
+            instruments
+                .metrics
+                .pool_status(harness::POOL)
+                .and_then(|status| status.processed),
+            None,
+            "and no ledger is processed yet: that gauge is the cursor the poller commits, \
+             which only an acknowledged tick moves"
+        );
 
         let tick = harness::fixture_tick();
         let (message, applied) = tick_message(harness::POOL, tick);
@@ -3104,6 +3339,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &instruments,
             &tick_tx,
             message,
         )
@@ -3136,6 +3372,14 @@ mod tests {
             Some(tick.sequence),
             "the account this tick's event named is flagged for an auctioneer decision"
         );
+        assert_eq!(
+            instruments
+                .metrics
+                .pool_status(harness::POOL)
+                .and_then(|status| status.processed),
+            Some(tick.sequence),
+            "the acknowledged tick is the ledger this pool has fully applied"
+        );
         Ok(())
     }
 
@@ -3164,6 +3408,7 @@ mod tests {
                 quiet_cadence(),
                 &mut state,
                 &shutdown,
+                &Instruments::for_tests(),
                 &tick_tx,
                 message,
             )
@@ -3178,6 +3423,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &Instruments::for_tests(),
             &tick_tx,
             message,
         )
@@ -3239,6 +3485,7 @@ mod tests {
             cadence,
             &mut state,
             &shutdown,
+            &Instruments::for_tests(),
             &tick_tx,
             message,
         )
@@ -3298,6 +3545,7 @@ mod tests {
         let (_flag, shutdown) = watch::channel(false);
         let (tick_tx, _tick_rx) = tick_watch();
         let mut state = LoopState::default();
+        let (instruments, recording) = recording_instruments();
 
         let file = write_temp_seed_file(&format!(
             "[accounts]\n\"{}\" = [\"{}\"]\n",
@@ -3320,6 +3568,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &instruments,
             &tick_tx,
             PollerMessage::Gap {
                 pool: harness::POOL.to_string(),
@@ -3351,7 +3600,14 @@ mod tests {
         };
         let (message, applied) = tick_message(harness::POOL, tick);
         handle_message(
-            &tracker, &sources, cadence, &mut state, &shutdown, &tick_tx, message,
+            &tracker,
+            &sources,
+            cadence,
+            &mut state,
+            &shutdown,
+            &instruments,
+            &tick_tx,
+            message,
         )
         .await
         .expect("the scanning tick");
@@ -3359,6 +3615,49 @@ mod tests {
         assert!(
             !state.needs_reseed.contains(harness::POOL),
             "a seed that reached every source clears the mark"
+        );
+
+        assert!(
+            instruments
+                .notifier
+                .drain(std::time::Duration::from_secs(5))
+                .await,
+            "every delivery this test's notifier spawned finished"
+        );
+        let sent = recording.sent();
+        assert_eq!(
+            sent.len(),
+            1,
+            "the gap is reported, and the reseed and the tick that followed report nothing: \
+             {sent:?}"
+        );
+        assert_eq!(sent[0].kind, NotificationKind::EventGap);
+        assert_eq!(sent[0].severity, Severity::High);
+        assert_eq!(sent[0].pool, harness::POOL);
+        assert_eq!(
+            sent[0].account, None,
+            "a gap is the pool's, never one borrower's"
+        );
+        assert!(
+            sent[0].message.contains("10") && sent[0].message.contains("400000"),
+            "the message names the range that is gone: {}",
+            sent[0].message
+        );
+        assert!(
+            instruments
+                .metrics
+                .render()
+                .contains(&format!("users_tracked{{pool=\"{}\"}} 1", harness::POOL)),
+            "the full scan published the count it read"
+        );
+        assert!(
+            instruments
+                .metrics
+                .render()
+                .lines()
+                .any(|line| line
+                    .starts_with("blend_liquidator_last_successful_scan_timestamp_seconds ")),
+            "and stamped itself as a scan that finished"
         );
         let _ = std::fs::remove_file(&file);
         Ok(())
@@ -3379,6 +3678,7 @@ mod tests {
         let (_flag, shutdown) = watch::channel(false);
         let (tick_tx, tick_rx) = tick_watch();
         let mut state = LoopState::default();
+        let instruments = Instruments::for_tests();
         state.pending.insert(
             harness::POOL.to_string(),
             BTreeSet::from([harness::USER_ONE.to_string()]),
@@ -3391,6 +3691,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &instruments,
             &tick_tx,
             message,
         )
@@ -3413,6 +3714,14 @@ mod tests {
                 close_time: 0
             },
             "a tick that never acknowledged is never published to the auctioneer either"
+        );
+        assert_eq!(
+            instruments
+                .metrics
+                .pool_status(harness::POOL)
+                .and_then(|status| status.processed),
+            None,
+            "nor recorded as processed: the range it covers will be read again"
         );
         Ok(())
     }
@@ -3440,6 +3749,7 @@ mod tests {
         let (_flag, shutdown) = watch::channel(false);
         let (tick_tx, _tick_rx) = tick_watch();
         let mut state = LoopState::default();
+        let instruments = Instruments::for_tests();
 
         let failing_fill = PollerMessage::Event {
             pool: harness::POOL.to_string(),
@@ -3458,6 +3768,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &instruments,
             &tick_tx,
             failing_fill,
         )
@@ -3479,6 +3790,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &instruments,
             &tick_tx,
             other_message,
         )
@@ -3499,6 +3811,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &instruments,
             &tick_tx,
             message,
         )
@@ -3512,6 +3825,15 @@ mod tests {
             !state.unapplied.contains(harness::POOL),
             "the mark is cleared once it has declined a tick"
         );
+        assert_eq!(
+            instruments
+                .metrics
+                .pool_status(harness::POOL)
+                .and_then(|status| status.processed),
+            None,
+            "a tick that declined its acknowledgement commits no cursor, so nothing records \
+             it as this pool's last processed ledger"
+        );
 
         // A second tick, with no failure in between, is acknowledged
         // normally. A flag that latched instead of clearing would stall
@@ -3523,6 +3845,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &instruments,
             &tick_tx,
             message,
         )
@@ -3531,6 +3854,14 @@ mod tests {
         assert!(
             applied.await.is_ok(),
             "with the mark cleared, a tick with no failure ahead of it is acknowledged"
+        );
+        assert_eq!(
+            instruments
+                .metrics
+                .pool_status(harness::POOL)
+                .and_then(|status| status.processed),
+            Some(harness::fixture_tick().sequence),
+            "and the acknowledged one is recorded"
         );
         Ok(())
     }
@@ -3568,6 +3899,7 @@ mod tests {
             quiet_cadence(),
             LoopState::default(),
             &shutdown,
+            &Instruments::for_tests(),
             tick_tx,
             receiver,
         )
@@ -3633,6 +3965,7 @@ mod tests {
             &sources,
             20,
             &shutdown,
+            &Instruments::for_tests(),
         )
         .await
         .expect("seeding succeeds");
@@ -3688,7 +4021,14 @@ mod tests {
 
         let (message, applied) = tick_message(harness::POOL, tick);
         handle_message(
-            &tracker, &sources, cadence, &mut state, &shutdown, &tick_tx, message,
+            &tracker,
+            &sources,
+            cadence,
+            &mut state,
+            &shutdown,
+            &Instruments::for_tests(),
+            &tick_tx,
+            message,
         )
         .await
         .expect("a failing scan is not a failing tick");
@@ -3714,7 +4054,14 @@ mod tests {
         };
         let (message, applied) = tick_message(harness::POOL, next);
         handle_message(
-            &tracker, &sources, cadence, &mut state, &shutdown, &tick_tx, message,
+            &tracker,
+            &sources,
+            cadence,
+            &mut state,
+            &shutdown,
+            &Instruments::for_tests(),
+            &tick_tx,
+            message,
         )
         .await
         .expect("the following tick");
@@ -3776,6 +4123,7 @@ mod tests {
             &sources,
             20,
             &shutdown,
+            &Instruments::for_tests(),
         )
         .await
         .expect("a source that does not answer is not fatal");
@@ -3830,6 +4178,7 @@ mod tests {
             &sources,
             20,
             &shutdown,
+            &Instruments::for_tests(),
         )
         .await
         .expect("a chain failure while seeding is not fatal");
@@ -4069,6 +4418,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &Instruments::for_tests(),
             &tick_tx,
             borrow(harness::POOL, harness::USER_ONE),
         )
@@ -4091,6 +4441,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &Instruments::for_tests(),
             &tick_tx,
             message,
         )
@@ -4172,6 +4523,7 @@ mod tests {
             tick,
             None,
             &shutdown,
+            &Instruments::for_tests(),
         )
         .await
         .expect("a healthy borrower's pass never fails");
@@ -4200,6 +4552,7 @@ mod tests {
             tick,
             None,
             &shutdown,
+            &Instruments::for_tests(),
         )
         .await
         .expect("a second pass");
@@ -4282,6 +4635,7 @@ mod tests {
             tick,
             None,
             &shutdown,
+            &Instruments::for_tests(),
         )
         .await
         .expect("one undecidable borrower does not fail the pass");
@@ -4371,6 +4725,7 @@ mod tests {
             tick,
             None,
             &shutdown,
+            &Instruments::for_tests(),
         )
         .await
         .expect("pass one");
@@ -4396,6 +4751,7 @@ mod tests {
             next_tick,
             None,
             &shutdown,
+            &Instruments::for_tests(),
         )
         .await
         .expect("pass two");
@@ -4469,6 +4825,7 @@ mod tests {
             tick,
             None,
             &shutdown,
+            &Instruments::for_tests(),
         )
         .await
         .expect("a failed action is this borrower's failure, not the pass's");
@@ -4554,6 +4911,7 @@ mod tests {
             tick,
             None,
             &shutdown,
+            &Instruments::for_tests(),
         )
         .await
         .expect("a refusal is this borrower's answer, not the pass's failure");
@@ -4625,6 +4983,7 @@ mod tests {
             tick,
             None,
             &shutdown,
+            &Instruments::for_tests(),
         )
         .await
         .expect("a healthy borrower's pass never fails");
@@ -4837,6 +5196,7 @@ mod tests {
             }
         });
 
+        let (instruments, recording) = recording_instruments();
         let cadence = AuctioneerCadence {
             refresh_batch: 10,
             oracle_scan_ledgers: 0,
@@ -4855,6 +5215,7 @@ mod tests {
             cadence,
             submission_queue: Some(&queue),
             shutdown: &shutdown,
+            instruments: &instruments,
         };
         let mut state = AuctioneerState::default();
         let tick = harness::fixture_tick();
@@ -4900,6 +5261,34 @@ mod tests {
             recorded[0].tx_hash.is_none(),
             "but nothing was sent: the startup delay has not elapsed, so the row names no \
              transaction"
+        );
+        // Counted the same way the row reads: the bot decided and
+        // recorded, which is an attempt, and nothing was sent, which is
+        // no result at all — not a failure.
+        let rendered = instruments.metrics.render();
+        assert!(
+            rendered.contains("creations_total{result=\"attempted\"} 1"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("creations_total{result=\"succeeded\"} 0"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("creations_total{result=\"failed\"} 0"),
+            "a creation the delay held back failed at nothing: {rendered}"
+        );
+        assert!(
+            instruments
+                .notifier
+                .drain(std::time::Duration::from_secs(5))
+                .await
+        );
+        assert_eq!(
+            recording.sent_count(),
+            0,
+            "and nothing is reported for a creation that never reached the chain: {:?}",
+            recording.sent()
         );
 
         // Held back, not settled: the bot still believes this is bad debt
@@ -4948,6 +5337,44 @@ mod tests {
             None,
             "sent and succeeded, the borrower is settled and its flag cleared"
         );
+        let rendered = instruments.metrics.render();
+        assert!(
+            rendered.contains("creations_total{result=\"attempted\"} 2"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("creations_total{result=\"succeeded\"} 1"),
+            "the transaction the chain applied is the one that succeeded: {rendered}"
+        );
+        assert!(
+            rendered.contains("creations_total{result=\"failed\"} 0"),
+            "and it is not also counted as a failure: {rendered}"
+        );
+        assert!(
+            instruments
+                .notifier
+                .drain(std::time::Duration::from_secs(5))
+                .await
+        );
+        let sent = recording.sent();
+        assert_eq!(
+            sent.len(),
+            1,
+            "the creation that landed is reported, and only it: {sent:?}"
+        );
+        assert_eq!(sent[0].kind, NotificationKind::BadDebtReported);
+        assert_eq!(
+            sent[0].severity,
+            Severity::Medium,
+            "bad debt is worth looking at, not worth waking anyone"
+        );
+        assert_eq!(sent[0].pool, harness::POOL);
+        assert_eq!(sent[0].account.as_deref(), Some(account.as_str()));
+        assert!(
+            sent[0].message.contains("bad debt reported in ledger 1"),
+            "the message names the ledger it landed in: {}",
+            sent[0].message
+        );
 
         drop(queue);
         worker.await.expect("worker");
@@ -4984,6 +5411,7 @@ mod tests {
                 quiet_cadence(),
                 &mut state,
                 &shutdown,
+                &Instruments::for_tests(),
                 &tick_tx,
                 message,
             )
@@ -5048,6 +5476,7 @@ mod tests {
             tick,
             None,
             &shutdown,
+            &Instruments::for_tests(),
         )
         .await
         .expect("one undecidable borrower does not fail the pass");
@@ -5135,6 +5564,7 @@ mod tests {
             tick,
             Some(&queue),
             &shutdown,
+            &Instruments::for_tests(),
         )
         .await
         .expect("a failed submission is one borrower's, not the pass's");
@@ -5163,6 +5593,297 @@ mod tests {
             "with the hash of the transaction that failed"
         );
         Ok(())
+    }
+
+    /// A creation the queue could not carry through at all is counted as
+    /// a failure and reported. [`QueueError::Chain`] is narrowed to a
+    /// submission that provably sent nothing and has spent its retry
+    /// budget, so this creation is gone rather than pending — while the
+    /// borrower keeps its flag exactly as every other unsettled one does,
+    /// because the report is instrumenting and never a decision.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_creation_the_queue_dropped_notifies_submission_dropped(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let account = synthetic_debtor();
+        let signer = test_signer();
+        script_snapshot_bad_debt(&rpc, &account);
+        script_account_entry(&rpc, &signer);
+        script_simulate_accepted(&rpc);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let network = Network::testnet();
+        let submitter = Submitter::new(&client, &network, &signer, test_tx_config());
+        let auctioneer = Auctioneer::new(&client, &store, armed_config(), Some(submitter));
+        let (_flag, shutdown) = watch::channel(false);
+        let (instruments, recording) = recording_instruments();
+        let tick = harness::fixture_tick();
+
+        // The shape `run_queue` answers when the send was refused
+        // outright: no envelope reached the chain, and the budget this
+        // submission carried is spent.
+        let (queue, mut queue_rx) = SubmissionQueue::new(NonZeroUsize::new(8).expect("non-zero"));
+        let worker = tokio::spawn(async move {
+            while let Some(queued) = queue_rx.recv().await {
+                let _ = queued
+                    .respond
+                    .send(Err(QueueError::Chain(ChainError::Rejected(
+                        "tx_insufficient_fee".to_string(),
+                    ))));
+            }
+        });
+
+        store
+            .upsert_user(&tracked_user(&account, tick.sequence))
+            .await
+            .expect("seed the row");
+        store
+            .flag_recheck(harness::POOL, &account, tick.sequence)
+            .await
+            .expect("flag");
+        let batch = store
+            .users_needing_recheck(harness::POOL, 1)
+            .await
+            .expect("read the recheck queue");
+        recheck_batch(
+            &auctioneer,
+            &store,
+            harness::POOL,
+            &batch,
+            tick,
+            Some(&queue),
+            &shutdown,
+            &instruments,
+        )
+        .await
+        .expect("a dropped creation is one borrower's, not the pass's");
+        drop(queue);
+        worker.await.expect("worker");
+
+        assert_eq!(
+            store
+                .user(harness::POOL, &account)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            Some(tick.sequence + 1),
+            "the borrower is still owed a creation, so its flag moves forward rather than \
+             being cleared"
+        );
+        let rendered = instruments.metrics.render();
+        assert!(
+            rendered.contains("creations_total{result=\"failed\"} 1"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("creations_total{result=\"succeeded\"} 0"),
+            "{rendered}"
+        );
+        assert!(
+            instruments
+                .notifier
+                .drain(std::time::Duration::from_secs(5))
+                .await
+        );
+        let sent = recording.sent();
+        assert_eq!(sent.len(), 1, "one dropped creation, one report: {sent:?}");
+        assert_eq!(sent[0].kind, NotificationKind::SubmissionDropped);
+        assert_eq!(
+            sent[0].severity,
+            Severity::High,
+            "a creation this bot decided on and never made is money at stake"
+        );
+        assert_eq!(sent[0].pool, harness::POOL);
+        assert_eq!(sent[0].account.as_deref(), Some(account.as_str()));
+        assert!(
+            sent[0].message.contains("rejected at send"),
+            "the queue's own error says what happened: {}",
+            sent[0].message
+        );
+        assert_eq!(
+            rpc.remaining(),
+            0,
+            "every scripted answer was used: the decision and the simulation both ran"
+        );
+        Ok(())
+    }
+
+    /// A [`CreationOutcome`] shaped as [`Auctioneer::act`] answers one.
+    /// `seed` gives each case its own account, because the notifier
+    /// deduplicates by `(pool, account, kind)` and a shared account would
+    /// silence the second case of a kind rather than test it.
+    fn creation_outcome(
+        kind: CreationKind,
+        seed: u8,
+        percent: Option<u32>,
+        submission: Option<TxOutcome>,
+    ) -> CreationOutcome {
+        CreationOutcome {
+            kind,
+            account: synthetic_account(seed),
+            percent: percent.map(|value| FillPercent::try_from(value).expect("1..=100")),
+            simulated: true,
+            creation_id: 1,
+            dry_run: false,
+            submission,
+        }
+    }
+
+    /// The submission a queue answers for a transaction the chain applied
+    /// in `ledger`.
+    fn landed(ledger: u32) -> TxOutcome {
+        TxOutcome::Succeeded {
+            hash: TxHash([9_u8; 32]),
+            ledger,
+            return_value: None,
+        }
+    }
+
+    /// A creation the chain landed is counted as an attempt *and* a
+    /// success, and reported under the kind spec §7 names for it — an
+    /// auction at its percent, bad debt at the severity its own kind
+    /// carries.
+    #[tokio::test]
+    async fn a_landed_creation_counts_and_notifies() {
+        let (instruments, recording) = recording_instruments();
+        note_creation(
+            &instruments,
+            harness::POOL,
+            &creation_outcome(CreationKind::Auction, 1, Some(42), Some(landed(7))),
+        );
+        note_creation(
+            &instruments,
+            harness::POOL,
+            &creation_outcome(CreationKind::BadDebt, 2, None, Some(landed(9))),
+        );
+        note_creation(
+            &instruments,
+            harness::POOL,
+            &creation_outcome(CreationKind::Auction, 3, None, Some(landed(11))),
+        );
+
+        let rendered = instruments.metrics.render();
+        assert!(
+            rendered.contains("creations_total{result=\"attempted\"} 3"),
+            "every recorded creation is an attempt: {rendered}"
+        );
+        assert!(
+            rendered.contains("creations_total{result=\"succeeded\"} 3"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("creations_total{result=\"failed\"} 0"),
+            "a transaction the chain applied is not also a failure: {rendered}"
+        );
+
+        assert!(
+            instruments
+                .notifier
+                .drain(std::time::Duration::from_secs(5))
+                .await
+        );
+        let sent = recording.sent();
+        assert_eq!(sent.len(), 3, "one report each: {sent:?}");
+        let about = |seed: u8| {
+            let account = synthetic_account(seed);
+            sent.iter()
+                .find(|notification| notification.account.as_deref() == Some(account.as_str()))
+                .cloned()
+                .unwrap_or_else(|| panic!("a notification about {account}: {sent:?}"))
+        };
+        let auction = about(1);
+        assert_eq!(auction.kind, NotificationKind::AuctionCreated);
+        assert_eq!(auction.severity, Severity::Low);
+        assert_eq!(auction.pool, harness::POOL);
+        assert_eq!(
+            auction.message,
+            "liquidation auction created at 42% in ledger 7"
+        );
+        let bad_debt = about(2);
+        assert_eq!(bad_debt.kind, NotificationKind::BadDebtReported);
+        assert_eq!(
+            bad_debt.severity,
+            Severity::Medium,
+            "bad debt is worth looking at, not worth waking anyone"
+        );
+        assert_eq!(bad_debt.message, "bad debt reported in ledger 9");
+        assert_eq!(
+            about(3).message,
+            "liquidation auction created at ?% in ledger 11",
+            "the percent is optional on the type, and its absence is said rather than guessed"
+        );
+    }
+
+    /// A creation the chain did not land is still an attempt, and is
+    /// reported to nobody: only what landed is worth a notification.
+    ///
+    /// The split between the two counted results is the chain's answer,
+    /// never the row's existence. `Failed` charged a fee and created no
+    /// auction and `Expired` provably never applied, so both are
+    /// failures; `Unknown` may still land, and a counter that guessed
+    /// would have to be un-counted; `None` was never sent at all — a dry
+    /// run's creation, or an armed bot holding fire.
+    #[tokio::test]
+    async fn a_creation_the_chain_did_not_land_counts_but_notifies_nobody() {
+        let (instruments, recording) = recording_instruments();
+        let window = LedgerWindow::try_new(1, 100).expect("a window");
+        for submission in [
+            Some(TxOutcome::Failed {
+                hash: TxHash([1_u8; 32]),
+                ledger: 12,
+                contract_error: Some(1_205),
+                result: TransactionResult {
+                    fee_charged: 100,
+                    result: TransactionResultResult::TxFailed(VecM::default()),
+                    ext: TransactionResultExt::V0,
+                },
+            }),
+            Some(TxOutcome::Expired {
+                hash: TxHash([2_u8; 32]),
+                window,
+                latest_ledger: 13,
+            }),
+            Some(TxOutcome::Unknown {
+                hash: TxHash([3_u8; 32]),
+                sequence: 5,
+                window,
+            }),
+            None,
+        ] {
+            note_creation(
+                &instruments,
+                harness::POOL,
+                &creation_outcome(CreationKind::Auction, 4, Some(50), submission),
+            );
+        }
+
+        let rendered = instruments.metrics.render();
+        assert!(
+            rendered.contains("creations_total{result=\"attempted\"} 4"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("creations_total{result=\"succeeded\"} 0"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("creations_total{result=\"failed\"} 2"),
+            "the failed and the expired one; the unresolved one and the one nothing sent are \
+             neither: {rendered}"
+        );
+        assert!(
+            instruments
+                .notifier
+                .drain(std::time::Duration::from_secs(5))
+                .await
+        );
+        assert_eq!(
+            recording.sent_count(),
+            0,
+            "nothing landed, so nothing is reported: {:?}",
+            recording.sent()
+        );
     }
 
     /// The auctioneer failing does not stall the cursor: a decision is not
@@ -5206,6 +5927,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &Instruments::for_tests(),
             &tick_tx,
             borrow(harness::POOL, harness::USER_ONE),
         )
@@ -5220,6 +5942,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &Instruments::for_tests(),
             &tick_tx,
             message,
         )
@@ -5276,6 +5999,7 @@ mod tests {
             tick,
             None,
             &shutdown,
+            &Instruments::for_tests(),
         )
         .await;
         assert!(
@@ -5308,6 +6032,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &Instruments::for_tests(),
             &tick_tx,
             message,
         )
