@@ -17,6 +17,7 @@ pub mod fixed;
 pub mod liquidation;
 pub mod position;
 pub mod reserve;
+pub mod unwind;
 
 pub use auction::{scale_auction, AuctionData, ScaledAuction};
 pub use fixed::{
