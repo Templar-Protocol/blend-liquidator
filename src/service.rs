@@ -5321,6 +5321,7 @@ mod tests {
             xlm_fee_reserve,
             high_fee_profit_threshold: 1_000_000_000_000_000,
             inventory_refresh: std::time::Duration::from_secs(30),
+            notification_cooldown: std::time::Duration::from_hours(24),
         }
     }
 
