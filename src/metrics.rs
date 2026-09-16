@@ -101,21 +101,20 @@ impl SkipLabel {
     }
 }
 
-/// What became of one notification handed to the delivery layer above
-/// [`crate::notifier::Notifier`]. Distinct from
+/// What became of one notification. Distinct from
 /// [`crate::notifier::Delivery`]: that type is `Notifier::notify`'s
-/// synchronous answer (sent, deduplicated, or failed), while this one
-/// also covers a notification dropped before it ever reached the
-/// notifier — a full in-flight bound, for instance — which is why it
-/// carries a fourth member `Delivery` does not.
+/// immediate answer (queued, deduplicated, or dropped), while this one
+/// also covers what became of a delivery *after* that answer — a channel
+/// that refused it — which is why it carries a fourth member `Delivery`
+/// does not, recorded from inside the delivery task rather than by the
+/// caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DeliveryLabel {
-    /// Handed to the notifier's delivery channel.
+    /// Handed to a delivery task for the notifier's channel.
     Queued,
     /// Suppressed: the same notification was sent within its cooldown.
     Deduplicated,
-    /// Discarded before it reached the notifier — an in-flight bound was
-    /// full.
+    /// Never handed to the channel: every in-flight permit was taken.
     Dropped,
     /// Handed to the channel, which failed to deliver it.
     Failed,

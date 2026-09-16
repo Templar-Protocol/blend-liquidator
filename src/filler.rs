@@ -1397,7 +1397,7 @@ impl Filler<'_> {
             }
         };
         if plan.is_idle() {
-            self.note_idle(pool, &plan, pass).await;
+            self.note_idle(pool, &plan, pass);
             return Ok(());
         }
         if !execute {
@@ -1417,7 +1417,7 @@ impl Filler<'_> {
     /// it stops being pending. Ruling 11's notification is here, because an
     /// idle pass is the only one that can tell leftover debt from debt the
     /// next pass will repay.
-    async fn note_idle(&self, pool: &PoolConfig, plan: &UnwindPlan, pass: &mut Pass<'_>) {
+    fn note_idle(&self, pool: &PoolConfig, plan: &UnwindPlan, pass: &mut Pass<'_>) {
         pass.state.unwind_pending.remove(&pool.address);
         clear_setback(&pool.address, pass);
         if plan.remaining_liabilities.is_empty() {
@@ -1439,24 +1439,31 @@ impl Filler<'_> {
             );
             return;
         }
-        let delivery = self
-            .notifier
-            .notify(Notification {
-                kind: NotificationKind::UnwindLeftovers,
-                severity: Severity::High,
-                pool: pool.address.clone(),
-                account: None,
-                message: format!(
-                    "debt the wallet cannot repay remains in {}: {assets}",
-                    pool.address
-                ),
-            })
-            .await;
-        // A channel that failed rolls its own dedup entry back, and this
-        // one must roll back with it: suppressing the next pass on the
-        // strength of a send that never happened would lose a high-severity
-        // alert until some later pass found the pool clean.
-        if delivery == Delivery::Failed {
+        let delivery = self.notifier.notify(Notification {
+            kind: NotificationKind::UnwindLeftovers,
+            severity: Severity::High,
+            pool: pool.address.clone(),
+            account: None,
+            message: format!(
+                "debt the wallet cannot repay remains in {}: {assets}",
+                pool.address
+            ),
+        });
+        // A notification the notifier never handed to its channel rolls its
+        // own dedup entry back, and this one must roll back with it:
+        // suppressing the next pass on the strength of a send that never
+        // happened would lose a high-severity alert until some later pass
+        // found the pool clean.
+        //
+        // A delivery that fails *inside* the notifier's task is not this:
+        // `notify` has already answered `Queued`, the notifier logs the
+        // failure, writes the notification to the log itself and rolls its
+        // own entry back, and this pool stays marked as notified until a
+        // later pass finds it clean. The filler does not retry it — a
+        // notification must never affect trading (spec §8), and an alert
+        // the operator can read in the log is not worth a second pass's
+        // worth of bookkeeping.
+        if delivery == Delivery::Dropped {
             pass.state.leftovers_notified.remove(&pool.address);
         }
     }
@@ -1513,19 +1520,18 @@ impl Filler<'_> {
                     %error,
                     "this unwind could not be executed; it stays pending"
                 );
-                self.note_setback(pool, filler, &format!("the executor failed: {error}"), pass)
-                    .await;
+                self.note_setback(pool, filler, &format!("the executor failed: {error}"), pass);
                 return Ok(());
             }
         };
-        self.note_unwound(pool, filler, &outcome, pass).await;
+        self.note_unwound(pool, filler, &outcome, pass);
         Ok(())
     }
 
     /// What one [`UnwindOutcome`] means for the pending set, the tick's
     /// counts and the pool's setback run — the four arms that are
     /// setbacks, and the two that end one.
-    async fn note_unwound(
+    fn note_unwound(
         &self,
         pool: &PoolConfig,
         filler: &str,
@@ -1591,8 +1597,7 @@ impl Filler<'_> {
                     filler,
                     &format!("the submission did not land: {}", outcome.status()),
                     pass,
-                )
-                .await;
+                );
             }
             UnwindOutcome::Refused { contract_error } => {
                 tracing::info!(
@@ -1605,7 +1610,7 @@ impl Filler<'_> {
                     || "the contract refused it without a code".to_string(),
                     |code| format!("the contract refused it with error {code}"),
                 );
-                self.note_setback(pool, filler, &cause, pass).await;
+                self.note_setback(pool, filler, &cause, pass);
             }
             UnwindOutcome::Stale => {
                 tracing::warn!(
@@ -1618,8 +1623,7 @@ impl Filler<'_> {
                     filler,
                     "stale: another transaction took this key's sequence first",
                     pass,
-                )
-                .await;
+                );
             }
         }
     }
@@ -1635,13 +1639,7 @@ impl Filler<'_> {
     /// the count is the guard, and [`Notifier`]'s cooldown is the other —
     /// and a delivery that fails is the notifier's to log, because a
     /// notification must never affect trading (spec §8).
-    async fn note_setback(
-        &self,
-        pool: &PoolConfig,
-        filler: &str,
-        cause: &str,
-        pass: &mut Pass<'_>,
-    ) {
+    fn note_setback(&self, pool: &PoolConfig, filler: &str, cause: &str, pass: &mut Pass<'_>) {
         let setback = pass
             .state
             .unwind_setbacks
@@ -1665,19 +1663,17 @@ impl Filler<'_> {
         if count != UNWIND_SETBACK_ALERT {
             return;
         }
-        self.notifier
-            .notify(Notification {
-                kind: NotificationKind::SubmissionDropped,
-                severity: Severity::High,
-                pool: pool.address.clone(),
-                account: Some(filler.to_string()),
-                message: format!(
-                    "{count} unwind passes in {} have moved nothing ({cause}); the position \
-                     stays pending and the pass is backing off to every {backoff} ledgers",
-                    pool.address
-                ),
-            })
-            .await;
+        self.notifier.notify(Notification {
+            kind: NotificationKind::SubmissionDropped,
+            severity: Severity::High,
+            pool: pool.address.clone(),
+            account: Some(filler.to_string()),
+            message: format!(
+                "{count} unwind passes in {} have moved nothing ({cause}); the position stays \
+                 pending and the pass is backing off to every {backoff} ledgers",
+                pool.address
+            ),
+        });
     }
 }
 
@@ -1773,7 +1769,7 @@ mod tests {
     };
     use crate::math::fill::FillAction;
     use crate::math::unwind::UnwindAction;
-    use crate::notifier::{NotificationChannel, NotifyError};
+    use crate::notifier::{NotificationChannel, NotifyError, NOTIFY_IN_FLIGHT};
     use crate::queue::QueueError;
     use stellar_xdr::ScVal;
 
@@ -1862,26 +1858,49 @@ mod tests {
     }
 
     /// A [`NotificationChannel`] that keeps what it was handed, so a test
-    /// can count what the filler actually decided to send. The first send
-    /// fails when `fail_once` is set, which is how a transient channel
-    /// failure is put in front of the filler's own dedup.
+    /// can count what the filler actually decided to send — and that can
+    /// be made to hold every send (which is how a test takes all of the
+    /// notifier's in-flight permits) or to fail the next one (which is how
+    /// a transient channel failure is put in front of the filler's own
+    /// dedup). Both are off by default.
     #[derive(Debug, Default)]
     struct Recorded {
         sent: std::sync::Mutex<Vec<Notification>>,
         fail_once: std::sync::atomic::AtomicBool,
+        held: std::sync::atomic::AtomicBool,
+        gate: tokio::sync::Notify,
     }
 
     impl Recorded {
-        /// A channel whose first delivery fails.
-        fn failing_once() -> Self {
-            Self {
-                sent: std::sync::Mutex::new(Vec::new()),
-                fail_once: std::sync::atomic::AtomicBool::new(true),
-            }
+        /// Holds every send from here on, so each one keeps its notifier
+        /// permit until [`Recorded::release`].
+        fn hold(&self) {
+            self.held.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Lets every held send finish, and every later one through.
+        fn release(&self) {
+            self.held.store(false, std::sync::atomic::Ordering::SeqCst);
+            self.gate.notify_waiters();
+        }
+
+        /// Fails the next send, once.
+        fn fail_next(&self) {
+            self.fail_once
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
         fn sent(&self) -> Vec<Notification> {
             self.sent.lock().expect("the recorder mutex").clone()
+        }
+
+        /// What it was handed of one kind, which is how the leftovers a
+        /// test is counting are told from the sends holding its permits.
+        fn sent_of(&self, kind: NotificationKind) -> Vec<Notification> {
+            self.sent()
+                .into_iter()
+                .filter(|notification| notification.kind == kind)
+                .collect()
         }
     }
 
@@ -1896,6 +1915,18 @@ mod tests {
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), NotifyError>> + Send + 'a>>
         {
             Box::pin(async move {
+                loop {
+                    // Registered *before* the flag is re-read, so a release
+                    // that lands between the two is never missed and this
+                    // send cannot hang a test.
+                    let notified = self.gate.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if !self.held.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    notified.await;
+                }
                 if self
                     .fail_once
                     .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -4899,10 +4930,17 @@ mod tests {
     /// clean. The [`Notifier`]'s cooldown is zero here so that what is being
     /// counted is the filler's own set and not the notifier's dedup.
     ///
-    /// The first delivery fails, which must not count as having notified:
-    /// the notifier rolls its own dedup entry back on a failure, and the
-    /// filler's set has to roll back with it or a high-severity alert is
-    /// lost until some later pass happens to find the pool clean.
+    /// Two notifications that never reach the channel are in the middle of
+    /// it, and the filler answers them differently on purpose. The first
+    /// pass finds every in-flight permit taken, so its notification is
+    /// *dropped*: the notifier rolls its own dedup entry back and the
+    /// filler's set has to roll back with it, or a high-severity alert is
+    /// lost until some later pass happens to find the pool clean. The
+    /// second pass's delivery *fails*, inside the notifier's task and after
+    /// `notify` has already answered `Queued`: the filler keeps the pool
+    /// marked and does not retry it, which is what the channel's own count
+    /// — taken after a `drain`, since nothing else says when the task has
+    /// run — proves.
     #[sqlx::test(migrations = "./migrations")]
     async fn leftover_debt_notifies_once_per_pool(db: sqlx::PgPool) -> sqlx::Result<()> {
         let store = Store::from_pool(db);
@@ -4922,7 +4960,7 @@ mod tests {
         script_unwind_position(&rpc, signer.address(), &[], &[(1, UNWIND_DEBT)]);
         let client = RpcClient::new(&rpc.url(), None).expect("client");
         let submitter = Submitter::new(&client, &network, &signer, tx_config());
-        let recorder = Arc::new(Recorded::failing_once());
+        let recorder = Arc::new(Recorded::default());
         let notifier = Arc::new(Notifier::new(
             Box::new(Arc::clone(&recorder)),
             Duration::ZERO,
@@ -4935,16 +4973,37 @@ mod tests {
             filler_config(),
             Executor::new(&store, Some(submitter), true),
             Inventory::new(XLM.to_string(), 0),
-            notifier,
+            Arc::clone(&notifier),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
+
+        // Every in-flight permit, taken by a send the channel is holding:
+        // the first pass's notification is the one that finds none left.
+        recorder.hold();
+        for i in 0..NOTIFY_IN_FLIGHT {
+            assert_eq!(
+                notifier.notify(Notification {
+                    kind: NotificationKind::FillConfirmed,
+                    severity: Severity::Low,
+                    pool: "pool-holding-a-permit".to_string(),
+                    account: Some(format!("acct-{i}")),
+                    message: "held until this test releases it".to_string(),
+                }),
+                Delivery::Queued
+            );
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(notifier.in_flight(), NOTIFY_IN_FLIGHT);
 
         // An idle pass clears the pool, so each tick after the first is
         // made pending again the way a landed fill would.
         for ledgers in 0..5 {
             if ledgers > 0 {
                 state.unwind_pending.insert(harness::POOL.to_string());
+            }
+            if ledgers == 1 {
+                recorder.fail_next();
             }
             let summary = filler
                 .tick(&mut state, later(tick, ledgers), true, None, &shutdown)
@@ -4956,10 +5015,47 @@ mod tests {
                 "tick {ledgers} moved nothing"
             );
             match ledgers {
-                0 => assert!(
-                    !state.leftovers_notified.contains(harness::POOL),
-                    "the delivery failed, so nothing was notified and nothing is suppressed"
-                ),
+                0 => {
+                    assert!(
+                        !state.leftovers_notified.contains(harness::POOL),
+                        "the notification was dropped, so nothing was notified and nothing is \
+                         suppressed"
+                    );
+                    // Let the held sends finish, so the next pass has a
+                    // permit to be queued on and the channel's count can be
+                    // read for what it did with each pass.
+                    recorder.release();
+                    assert!(notifier.drain(Duration::from_secs(5)).await);
+                    assert!(
+                        recorder
+                            .sent_of(NotificationKind::UnwindLeftovers)
+                            .is_empty(),
+                        "a dropped notification never reached the channel"
+                    );
+                }
+                1 => {
+                    assert!(
+                        state.leftovers_notified.contains(harness::POOL),
+                        "`notify` answered `Queued`, so this pass counts as having notified"
+                    );
+                    assert!(notifier.drain(Duration::from_secs(5)).await);
+                    assert!(
+                        recorder
+                            .sent_of(NotificationKind::UnwindLeftovers)
+                            .is_empty(),
+                        "the channel failed this one; the notifier logged it and the filler \
+                         does not retry it"
+                    );
+                }
+                2 => {
+                    assert!(state.leftovers_notified.contains(harness::POOL));
+                    assert!(
+                        recorder
+                            .sent_of(NotificationKind::UnwindLeftovers)
+                            .is_empty(),
+                        "the pool is still marked, so this pass notified nothing at all"
+                    );
+                }
                 3 => assert!(
                     !state.leftovers_notified.contains(harness::POOL),
                     "a clean pass ends the episode"
@@ -4967,13 +5063,18 @@ mod tests {
                 _ => assert!(state.leftovers_notified.contains(harness::POOL)),
             }
         }
+        assert!(notifier.drain(Duration::from_secs(5)).await);
 
-        let sent = recorder.sent();
+        let sent = recorder.sent_of(NotificationKind::UnwindLeftovers);
         assert_eq!(
             sent.len(),
-            2,
-            "the failed send did not suppress the retry, the repeat after it did not notify \
-             again, and the episode after the clean pass did: {sent:?}"
+            1,
+            "the episode after the clean pass is the only one the channel ever saw: {sent:?}"
+        );
+        assert_eq!(
+            recorder.sent().len(),
+            NOTIFY_IN_FLIGHT + 1,
+            "the sends holding the permits were delivered too"
         );
         for notification in &sent {
             assert_eq!(notification.kind, NotificationKind::UnwindLeftovers);
@@ -5156,7 +5257,7 @@ mod tests {
             },
             Executor::new(&store, Some(submitter), false),
             Inventory::new(XLM.to_string(), 0),
-            notifier,
+            Arc::clone(&notifier),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -5184,6 +5285,11 @@ mod tests {
             );
         }
 
+        assert!(
+            notifier.drain(Duration::from_secs(5)).await,
+            "the deliveries are spawned, so counting what the channel saw means nothing until \
+             they have finished"
+        );
         let sent = recorder.sent();
         assert_eq!(
             sent.len(),
@@ -5359,7 +5465,7 @@ mod tests {
             filler_config(),
             Executor::new(&store, Some(submitter), true),
             Inventory::new(XLM.to_string(), 0),
-            notifier,
+            Arc::clone(&notifier),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -5385,6 +5491,11 @@ mod tests {
             7,
             "the snapshot's four oracle reads and the wallet's three balances, and nothing \
              else — a withdrawal the health margin alone would allow was never planned"
+        );
+        assert!(
+            notifier.drain(Duration::from_secs(5)).await,
+            "the deliveries are spawned, so counting what the channel saw means nothing until \
+             they have finished"
         );
         let sent = recorder.sent();
         assert_eq!(
@@ -5442,7 +5553,7 @@ mod tests {
             filler_config(),
             Executor::new(&store, Some(submitter), true),
             Inventory::new(XLM.to_string(), 0),
-            notifier,
+            Arc::clone(&notifier),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -5461,6 +5572,11 @@ mod tests {
         assert!(
             state.unwind_setbacks.is_empty(),
             "and the refusal before it is forgotten with it"
+        );
+        assert!(
+            notifier.drain(Duration::from_secs(5)).await,
+            "the deliveries are spawned, so counting what the channel saw means nothing until \
+             they have finished"
         );
         assert!(
             recorder.sent().is_empty(),

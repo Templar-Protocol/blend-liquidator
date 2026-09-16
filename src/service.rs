@@ -20,9 +20,13 @@
 //! per key and never two, because a Soroban transaction is built against
 //! its source account's sequence number at prepare time. The filler task
 //! holds the run's one [`crate::notifier::Notifier`], built from
-//! `config.notification_cooldown` — log-only in this phase, since Telegram,
-//! the semaphore and `drain()` are Phase 6b's — and it is the notifier's
-//! only reader.
+//! `config.notification_cooldown` — log-only until a Telegram channel is
+//! configured — and it is the notifier's only caller. Delivery is
+//! fire-and-forget: `notify` spawns behind a bounded semaphore and never
+//! awaits a channel, so no notification can delay a tick, a decision or a
+//! fill, and a channel that has stopped answering costs a bounded number
+//! of tasks and drops what does not fit. What a shutdown owes the sends
+//! still in flight is [`crate::notifier::Notifier::drain`].
 //!
 //! # The deciding tasks are joined to the tracker by a tick
 //!
@@ -2204,9 +2208,10 @@ impl Service {
             tick_rx.clone(),
             &shutdown_rx,
         );
-        // One instance for the run, log-only in this phase: Telegram, the
-        // semaphore and `drain()` are Phase 6b's. The filler is its only
-        // reader.
+        // One instance for the run, log-only until a Telegram channel is
+        // configured. The filler is its only caller, and every delivery it
+        // makes is spawned behind the notifier's own semaphore rather than
+        // awaited in a tick.
         let notifier = Arc::new(Notifier::log_only(config.notification_cooldown));
         spawn_filler(
             &mut tasks,
