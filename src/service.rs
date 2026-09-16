@@ -296,7 +296,7 @@ async fn validate_filler(
     let (_, native_balance) = PoolReader::new(rpc, &any_pool.address)
         .balance(&signing.native_asset, address)
         .await?;
-    if native_balance < config.xlm_fee_reserve {
+    if native_balance < i128::from(config.xlm_fee_reserve) {
         refuse_or_warn(
             &mut warnings,
             format!(
@@ -1966,7 +1966,7 @@ fn spawn_filler(
     signing: &SigningContext,
     config: FillerConfig,
     pools: Vec<PoolConfig>,
-    xlm_fee_reserve: i128,
+    xlm_fee_reserve: u64,
     startup_delay_ledgers: u32,
     queue: Option<SubmissionQueue>,
     tick_rx: watch::Receiver<LedgerTick>,
@@ -5283,7 +5283,7 @@ mod tests {
     fn filler_service_config(
         pools: Vec<PoolConfig>,
         dry_run: bool,
-        xlm_fee_reserve: i128,
+        xlm_fee_reserve: u64,
     ) -> ServiceConfig {
         ServiceConfig {
             chain: ChainConfig {
@@ -5495,14 +5495,14 @@ mod tests {
     async fn an_armed_filler_short_of_its_fee_reserve_is_refused() {
         let signer = Arc::new(filler_signer());
         let pools = vec![filler_pool_config(0)];
-        let reserve: i128 = 100_000_000;
+        let reserve: u64 = 100_000_000;
         let rpc = ScriptedRpc::start().await;
         // The account exists; its native balance is one stroop short.
         for _ in 0..2 {
             script_account_entry(&rpc, &signer);
             rpc.expect(
                 "simulateTransaction",
-                simulation(&scval_b64(&i128_val(reserve - 1)), 1),
+                simulation(&scval_b64(&i128_val(i128::from(reserve) - 1)), 1),
             );
         }
         let client = RpcClient::new(&rpc.url(), None).expect("client");

@@ -96,15 +96,20 @@ impl Inventory {
     /// A wallet with no balances yet — [`Inventory::stale`] is `true`
     /// until the first [`Inventory::record_balances`] — withholding
     /// `fee_reserve` of `fee_asset` from what any plan may spend.
+    ///
+    /// The reserve is unsigned by type: a negative one would *raise* what
+    /// is available by its magnitude, and `XLM_FEE_RESERVE` is refused
+    /// negative at parse for the same reason, so no configuration path can
+    /// build one and no constructor call can either.
     #[must_use]
-    pub fn new(fee_asset: String, fee_reserve: i128) -> Self {
+    pub fn new(fee_asset: String, fee_reserve: u64) -> Self {
         Self {
             ledger: Arc::new(Mutex::new(Ledger {
                 balances: BTreeMap::new(),
                 reserved: BTreeMap::new(),
                 read_at: None,
                 fee_asset,
-                fee_reserve,
+                fee_reserve: i128::from(fee_reserve),
             })),
         }
     }

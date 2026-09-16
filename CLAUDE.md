@@ -291,8 +291,10 @@ make help                           # Docker Compose lifecycle
   transaction's hash attached — once, never replaced — when there is one:
   `dry_run` is the mode the bot was configured in, `tx_hash` is the
   evidence that a transaction was named, and a row with `dry_run = false`
-  and no hash is an armed attempt whose transaction never was. A new migration, never an amendment, once one is applied
-  anywhere. The
+  and no attached hash is an armed attempt that was never submitted, or
+  was submitted with its outcome unrecorded — the signing account's
+  sequence number tells the two apart, not the row. A new migration, never
+  an amendment, once one is applied anywhere. The
   `sqlx::query!` macros in `src/store.rs` are checked against it at compile
   time; see the query-macro gotcha below.
 - `examples/pool_snapshot.rs` — prints a live pool's reserves and users'
@@ -520,17 +522,22 @@ into realised profit — and the rest of the operational surface.
   `to_b_token_up(i64::MAX)` is `9.22e18 × 1e12 / b_rate`, far inside
   `i128`, so the contract's own arithmetic cannot overflow on it either.
 - A dry-run fill is recorded once per version of an auction the chain
-  held, keyed `(pool, account, start_ledger, updated_ledger)` in
-  `FillerState::recorded_dry_run` — not once per tick for as long as nobody
-  else fills it, which is what a dry run would otherwise do to the `fills`
-  table. The start ledger is in the key so a *new* auction for the same
-  account is a new fill; the `updated_ledger` is in it so a *changed* one
-  is too: a partial fill by someone else keeps the start ledger and leaves
-  a remainder the tracker rewrites the row with, and that remainder is what
-  an armed filler would now fill. `prune_recorded` drops keys the pool's
-  open rows no longer match — filled, replaced, or rewritten — so the set
-  cannot grow without bound. A restart may record one more row, and that is
-  the whole cost of keeping it in memory.
+  held, keyed by pool, account, start ledger **and the amounts the chain
+  held** (`RecordedFill` in `FillerState::recorded_dry_run`) — not once
+  per tick for as long as nobody else fills it, which is what a dry run
+  would otherwise do to the `fills` table. The start ledger is in the key
+  so a *new* auction for the same account is a new fill; the amounts are
+  in it so a *changed* one is too: a partial fill by someone else keeps the
+  start ledger and leaves a remainder, which is what an armed filler would
+  now fill. The amounts, not a ledger: the filler re-reads the chain's
+  entry, which can hold that remainder a tick before the tracker rewrites
+  the row with it, and keying on the row's `updated_ledger` or on the
+  ledger the entry was read at would record the same remainder twice. The
+  row's own amounts are the cheap test before any chain read; the entry's
+  are the definitive one before any plan. `prune_recorded` drops every
+  version of an auction the pool's open rows no longer name, so the set
+  cannot grow without bound. A restart may record one more row, and that
+  is the whole cost of keeping it in memory.
 - `DRY_RUN=false` with no `FILLER_SECRET_KEY` is a startup error, and so is
   `AUCTIONEER_SECRET_KEY` equal to `FILLER_SECRET_KEY`. The filler signs
   with its own key only — never the auctioneer's — so an armed bot without

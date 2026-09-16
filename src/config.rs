@@ -504,8 +504,10 @@ pub struct ServiceConfig {
     /// planned again on every ledger. Zero means only at the fill ledger.
     pub replan_near_ledgers: u32,
     /// XLM the filler never spends, kept back for transaction fees, in
-    /// stroops.
-    pub xlm_fee_reserve: i128,
+    /// stroops. Unsigned by type: `XLM_FEE_RESERVE` is refused negative at
+    /// parse, and the inventory a negative reserve would *widen* takes a
+    /// `u64` so nothing can hand it one.
+    pub xlm_fee_reserve: u64,
     /// The estimated profit, in the pool oracle's units (7 decimals), at or
     /// above which a fill pays the high fee tier rather than the base one.
     pub high_fee_profit_threshold: i128,
@@ -959,7 +961,11 @@ impl Args {
             hf_safety_multiplier: self.hf_safety_multiplier.get(),
             replan_ledgers: self.replan_ledgers,
             replan_near_ledgers: self.replan_near_ledgers,
-            xlm_fee_reserve: self.xlm_fee_reserve.get(),
+            xlm_fee_reserve: u64::try_from(self.xlm_fee_reserve.get()).map_err(|_| {
+                LiquidatorError::Config(
+                    "XLM_FEE_RESERVE is larger than any wallet can hold".to_string(),
+                )
+            })?,
             high_fee_profit_threshold: self.high_fee_profit_threshold.get(),
             inventory_refresh: std::time::Duration::from_secs(self.inventory_refresh_secs),
         })
@@ -2085,6 +2091,15 @@ supported_lot = ["*"]
         );
         assert_eq!(args.high_fee_profit_threshold.get(), 100_000_000, "10");
         assert_eq!(args.inventory_refresh_secs, 30);
+    }
+
+    /// A negative fee reserve would widen what the filler may spend by its
+    /// magnitude; `Decimal7` refuses the sign, so it never reaches the
+    /// inventory.
+    #[test]
+    fn a_negative_fee_reserve_is_refused_at_parse() {
+        assert!(Args::try_parse_from(["liquidator", "--xlm-fee-reserve", "-1"]).is_err());
+        assert!(Args::try_parse_from(["liquidator", "--xlm-fee-reserve", "0"]).is_ok());
     }
 
     /// Under one, the filler's floor would sit under the pool's own

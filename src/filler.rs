@@ -116,6 +116,52 @@ pub struct FillerConfig {
     pub native_asset: String,
 }
 
+/// One version of an auction a dry run has recorded a fill for: the pool,
+/// the account, the start ledger, and the amounts the chain held.
+///
+/// The amounts are the version. A partial fill by someone else keeps the
+/// start ledger and leaves a remainder — a different fill, and the one an
+/// armed filler would now make — so the remainder is recorded afresh; the
+/// same remainder is one version whether the filler saw it from the chain
+/// before the tracker applied that fill or from the store after it, so it
+/// is recorded once. Keying on a ledger instead — the row's
+/// `updated_ledger`, or the ledger an entry was read at — would make those
+/// two sightings two versions and record the same fill twice.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RecordedFill {
+    pool: String,
+    account: String,
+    start_ledger: u32,
+    bid: BTreeMap<String, i128>,
+    lot: BTreeMap<String, i128>,
+}
+
+impl RecordedFill {
+    /// The version the store's row describes — what the tracker last
+    /// wrote, which may lag the chain by the events it has not applied.
+    fn of_row(row: &TrackedAuction) -> Self {
+        Self {
+            pool: row.pool.clone(),
+            account: row.account.clone(),
+            start_ledger: row.start_ledger,
+            bid: row.bid.clone(),
+            lot: row.lot.clone(),
+        }
+    }
+
+    /// The version the chain holds now, which is what a plan is made
+    /// against and what a recorded fill is keyed by.
+    fn of_entry(row: &TrackedAuction, auction: &AuctionData) -> Self {
+        Self {
+            pool: row.pool.clone(),
+            account: row.account.clone(),
+            start_ledger: auction.block,
+            bid: auction.bid.clone(),
+            lot: auction.lot.clone(),
+        }
+    }
+}
+
 /// What one run of the filler remembers between ticks.
 ///
 /// All of it is in memory on purpose. Losing them on a restart costs one
@@ -127,16 +173,9 @@ pub struct FillerConfig {
 pub struct FillerState {
     /// Pool and account to the ledger this process last planned it at.
     last_planned: BTreeMap<(String, String), u32>,
-    /// Pool, account, start ledger and `updated_ledger` of every auction
-    /// row this process has recorded a dry-run fill for (ruling 8). The
-    /// start ledger is in the key so that a *new* auction for the same
-    /// account — a different liquidation — is recorded again; the
-    /// `updated_ledger` is in it so that a *changed* one is too. The
-    /// tracker rewrites a row only when the chain's entry changed — a
-    /// partial fill by someone else leaves a remainder with the same start
-    /// ledger and a later `updated_ledger` — and that remainder is what an
-    /// armed filler would now fill, so a dry run records it afresh.
-    recorded_dry_run: BTreeSet<(String, String, u32, u32)>,
+    /// Every version of an auction this process has recorded a dry-run
+    /// fill for (ruling 8), by content: see [`RecordedFill`].
+    recorded_dry_run: BTreeSet<RecordedFill>,
     /// Set by a submission that landed or may have landed, so the next
     /// pool pass re-reads the wallet however fresh its balances look.
     inventory_stale: bool,
@@ -168,33 +207,31 @@ impl FillerState {
     fn closed(&mut self, pool: &str, account: &str) {
         self.forget(pool, account);
         self.recorded_dry_run
-            .retain(|(recorded_pool, recorded_account, _, _)| {
-                recorded_pool != pool || recorded_account != account
-            });
+            .retain(|recorded| recorded.pool != pool || recorded.account != account);
     }
 
     /// Drops every `recorded_dry_run` key of `pool` that `rows` — the
     /// pool's open auctions, read at the start of this pool's walk — no
     /// longer names.
     ///
-    /// Ruling 8's set suppresses an auction row by `(pool, account, start
-    /// ledger, updated ledger)`, and that suppression is what keeps the
-    /// filler from ever re-reading its entry: nothing else would notice the
-    /// row going away, or being rewritten. So the walk that already holds
-    /// the open rows is where a key whose row has been filled, replaced by
-    /// a new auction at a later start ledger, or rewritten with a
-    /// remainder at a later `updated_ledger`, is dropped — otherwise the
-    /// set only ever grows, for as long as the process runs.
+    /// Ruling 8's set suppresses an auction by its content, and that
+    /// suppression is what keeps the filler from ever re-reading its entry:
+    /// nothing else would notice the row going away. So the walk that
+    /// already holds the open rows is where every version of an auction
+    /// that has been filled, or replaced by a new one at a later start
+    /// ledger, is dropped — otherwise the set only ever grows, for as long
+    /// as the process runs. Older versions of an auction still open stay
+    /// until it closes: a handful of entries per auction, bounded by how
+    /// many partial fills it took.
     fn prune_recorded(&mut self, pool: &str, rows: &[TrackedAuction]) {
-        let open: BTreeSet<(&str, u32, u32)> = rows
+        let open: BTreeSet<(&str, u32)> = rows
             .iter()
-            .map(|row| (row.account.as_str(), row.start_ledger, row.updated_ledger))
+            .map(|row| (row.account.as_str(), row.start_ledger))
             .collect();
-        self.recorded_dry_run
-            .retain(|(recorded_pool, account, start_ledger, updated_ledger)| {
-                recorded_pool != pool
-                    || open.contains(&(account.as_str(), *start_ledger, *updated_ledger))
-            });
+        self.recorded_dry_run.retain(|recorded| {
+            recorded.pool != pool
+                || open.contains(&(recorded.account.as_str(), recorded.start_ledger))
+        });
     }
 }
 
@@ -400,6 +437,21 @@ impl<'a> Filler<'a> {
             if *shutdown.borrow() {
                 return Ok(());
             }
+            // The definitive dry-run test, on the version the chain holds:
+            // the row's own may lag it by a fill the tracker has not yet
+            // applied, and this is the version any record would be keyed by.
+            if pass
+                .state
+                .recorded_dry_run
+                .contains(&RecordedFill::of_entry(&row, &auction))
+            {
+                tracing::debug!(
+                    pool = %pool.address,
+                    account = %row.account,
+                    "a dry-run fill of this version of the auction is already recorded"
+                );
+                continue;
+            }
             if self
                 .plan_and_act(&context, &row, &auction, execute, queue, pass)
                 .await?
@@ -435,15 +487,17 @@ impl<'a> Filler<'a> {
         if !pool.supports(&bid, &lot) {
             return false;
         }
-        let key = (row.pool.clone(), row.account.clone());
-        if pass.state.recorded_dry_run.contains(&(
-            key.0.clone(),
-            key.1.clone(),
-            row.start_ledger,
-            row.updated_ledger,
-        )) {
+        // On the row's own version: the cheap test, before any chain read.
+        // A row the tracker has not yet rewritten can pass it once; the
+        // definitive test is against the chain's entry, in `tick_pool`.
+        if pass
+            .state
+            .recorded_dry_run
+            .contains(&RecordedFill::of_row(row))
+        {
             return false;
         }
+        let key = (row.pool.clone(), row.account.clone());
         due(
             row,
             pass.state.last_planned.get(&key).copied(),
@@ -797,7 +851,7 @@ impl<'a> Filler<'a> {
             return Ok(false);
         };
         match outcome {
-            ExecOutcome::Recorded(recorded) => Ok(note_recorded(row, &recorded, pass)),
+            ExecOutcome::Recorded(recorded) => Ok(note_recorded(row, auction, &recorded, pass)),
             ExecOutcome::Replan { contract_error } => {
                 tracing::info!(
                     pool = %row.pool,
@@ -874,7 +928,7 @@ impl<'a> Filler<'a> {
             return Ok(false);
         };
         Ok(match outcome {
-            ExecOutcome::Recorded(recorded) => note_recorded(row, &recorded, pass),
+            ExecOutcome::Recorded(recorded) => note_recorded(row, auction, &recorded, pass),
             ExecOutcome::Stale => {
                 self.clear_plan(row).await?;
                 pass.state.forget(&row.pool, &row.account);
@@ -972,15 +1026,17 @@ impl<'a> Filler<'a> {
 /// why the wallet is re-read and why the rest of this pool's auctions are
 /// left for the next tick: they were projected against the borrower's
 /// positions and the filler's own as this fill has just changed them.
-fn note_recorded(row: &TrackedAuction, recorded: &FillRecorded, pass: &mut Pass<'_>) -> bool {
+fn note_recorded(
+    row: &TrackedAuction,
+    auction: &AuctionData,
+    recorded: &FillRecorded,
+    pass: &mut Pass<'_>,
+) -> bool {
     pass.summary.executed += 1;
     if recorded.dry_run {
-        pass.state.recorded_dry_run.insert((
-            row.pool.clone(),
-            row.account.clone(),
-            row.start_ledger,
-            row.updated_ledger,
-        ));
+        pass.state
+            .recorded_dry_run
+            .insert(RecordedFill::of_entry(row, auction));
     }
     let landed = matches!(
         recorded.submission,
@@ -1854,8 +1910,10 @@ mod tests {
         );
         assert_eq!(
             state.recorded_dry_run.len(),
-            1,
-            "and the record of the fill that no longer exists was pruned"
+            2,
+            "both versions stay recorded while the auction is open: a version is pruned by \
+             the row's content only when the auction closes, because the row can lag the \
+             chain by a fill the tracker has not applied yet"
         );
         let fills = sqlx::query!("SELECT count(*) AS n FROM fills")
             .fetch_one(store.pool())
@@ -1865,6 +1923,96 @@ mod tests {
             Some(2),
             "one per version of the auction the chain held"
         );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// The version is the content, not the ledger: a remainder the filler
+    /// sees on chain one tick before the tracker rewrites the row is
+    /// recorded once, under the amounts the chain held — and when the
+    /// tracker's rewrite arrives with those same amounts, the row is
+    /// recognised as recorded and costs no chain read.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_remainder_seen_before_the_tracker_rewrote_the_row_is_recorded_once(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let opened = auction(tick.sequence - 300);
+        // The store still holds the auction as opened: the tracker has not
+        // applied the competitor's 40% fill yet.
+        store
+            .upsert_auction(&tracked(harness::USER_ONE, &opened))
+            .await
+            .expect("seed the auction");
+        let remainder = AuctionData {
+            bid: BTreeMap::from([(USDC.to_string(), BID * 6 / 10)]),
+            lot: BTreeMap::from([(XLM.to_string(), LOT * 6 / 10)]),
+            block: opened.block,
+        };
+        let rpc = ScriptedRpc::start().await;
+        // But the chain already holds the remainder.
+        harness::script_auction_entry(&rpc, harness::USER_ONE, &remainder, tick.sequence);
+        harness::script_snapshot(&rpc, &[]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            filler_config(),
+            Executor::new(&store, None, true),
+            Inventory::new(XLM.to_string(), 0),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+
+        let first = filler
+            .tick(&mut state, tick, true, None, &shutdown)
+            .await
+            .expect("the first tick");
+        assert_eq!(
+            first,
+            TickSummary {
+                planned: 1,
+                executed: 1,
+                ..TickSummary::default()
+            },
+            "the remainder the chain holds is what was planned and recorded"
+        );
+        let reads = rpc.calls("getLedgerEntries").len();
+
+        // The tracker catches up and rewrites the row with the same
+        // remainder. Nothing is scripted for this tick: the row is now
+        // recognised as recorded without a chain read.
+        let second = later(tick, 1);
+        store
+            .upsert_auction(&TrackedAuction {
+                updated_ledger: second.sequence,
+                ..tracked(harness::USER_ONE, &remainder)
+            })
+            .await
+            .expect("the tracker rewrites the row");
+        let summary = filler
+            .tick(&mut state, second, true, None, &shutdown)
+            .await
+            .expect("the second tick");
+
+        assert_eq!(
+            summary,
+            TickSummary::default(),
+            "the same version is not recorded twice"
+        );
+        assert_eq!(
+            rpc.calls("getLedgerEntries").len(),
+            reads,
+            "and costs no chain read"
+        );
+        assert_eq!(state.recorded_dry_run.len(), 1);
+        let fills = sqlx::query!("SELECT count(*) AS n FROM fills")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(fills.n, Some(1));
         assert_eq!(rpc.remaining(), 0);
         Ok(())
     }

@@ -105,13 +105,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   submitted and the transaction's hash is attached — once, never replaced —
   when there is one. So `dry_run` records the mode the bot was configured
   in, `tx_hash` is the evidence that a transaction was named, and a row
-  with `dry_run = false` and no hash is an armed attempt whose transaction
-  never was. A dry-run fill is recorded once per version of an auction the
-  chain held — keyed by pool, account, start ledger and the ledger the
-  tracker last rewrote the row at — rather than once per tick for as long
-  as nobody else fills it; a partial fill by someone else leaves a
-  remainder the tracker rewrites the row with, and that remainder is
-  recorded afresh.
+  with `dry_run = false` and no attached hash is an armed attempt that was
+  never submitted, or was submitted with its outcome unrecorded — the
+  signing account's sequence number tells the two apart, not the row. A
+  dry-run fill is recorded once per version of an auction the chain held —
+  keyed by pool, account, start ledger and the amounts the chain held —
+  rather than once per tick for as long as nobody else fills it; a partial
+  fill by someone else leaves a remainder, and that remainder is recorded
+  afresh, once, whether the filler first saw it from the chain or from the
+  store.
 - The auctioneer now adopts an auction the chain already holds and the
   store does not. An auction opened before this bot's events cursor
   produced no `NewAuction` for the tracker to apply, so the filler — which
