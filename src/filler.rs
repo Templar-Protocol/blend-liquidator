@@ -57,8 +57,17 @@
 //! balances for and nothing to simulate as, so a dry run plans against an
 //! empty position and an empty wallet and the executor records what it
 //! would have done, unsimulated (ruling 4).
+//!
+//! Then, once the whole walk is done, the tick's seventh step: one
+//! **unwind pass** per pool a fill landed in — and, on the first tick,
+//! per configured pool. It repays the debt the filler took over and
+//! withdraws the collateral it received, and it repeats every tick until
+//! a pass has nothing left to move. The second `impl Filler` block below
+//! is where it lives and what its rulings are; the requests it sends are
+//! built by [`crate::math::unwind`].
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
@@ -69,13 +78,17 @@ use crate::chain::tx::Priority;
 use crate::chain::xdr::{AuctionType, FillPercent, PoolStatus};
 use crate::chain::TxOutcome;
 use crate::config::PoolConfig;
-use crate::executor::{ExecOutcome, Executor, ExecutorError, FillPlan, FillRecorded};
+use crate::executor::{
+    ExecOutcome, Executor, ExecutorError, FillPlan, FillRecorded, UnwindOutcome,
+};
 use crate::inventory::{read_balances, Inventory, Settlement};
 use crate::ledger::LedgerTick;
 use crate::math::fill::{
     health_floor, plan_fill, to_oracle_units, FillDraft, FillInputs, FillTerms, PlannedFill,
 };
+use crate::math::unwind::{plan_unwind, UnwindInputs, UnwindPlan, UnwindTerms};
 use crate::math::{AuctionData, MathError, Positions, Reserve};
+use crate::notifier::{Delivery, Notification, NotificationKind, Notifier, Severity};
 use crate::queue::SubmissionQueue;
 use crate::store::{Store, StoreError, TrackedAuction};
 
@@ -83,6 +96,33 @@ use crate::store::{Store, StoreError, TrackedAuction};
 /// The executor's one re-plan is the only thing that lowers it (ruling
 /// 12), and it lowers it from whatever the contract refused.
 const WHOLE_AUCTION: u32 = 100;
+
+/// The longest an unwind pass that keeps making no progress is held off
+/// for, in ledgers. The backoff doubles from two, so this is reached on
+/// the sixth consecutive setback and never exceeded.
+///
+/// It is a bound on cost, never on attempts: the pool stays pending
+/// however long the backoff grows, because nothing else schedules the
+/// position's unwind and a cause that is structural today (a reserve
+/// pinned at `max_util`, a `min_collateral` a price move put the position
+/// under) stops being structural the moment the chain moves. Sixty-four
+/// ledgers is roughly five minutes — often enough that a transient cause
+/// is retried while it still matters, rare enough that a permanent one
+/// costs a snapshot and a simulation every five minutes rather than every
+/// five seconds.
+pub const UNWIND_BACKOFF_MAX_LEDGERS: u32 = 64;
+
+/// How many consecutive non-progressing unwind passes one pool takes
+/// before the operator is told.
+///
+/// Exactly this many, not at least: the notification fires on the pass
+/// whose count *reaches* it, so one episode raises one alert however long
+/// it then goes on. [`Notifier`]'s cooldown is the second guard; the count
+/// is the first. Three is the smallest number that is not a coincidence —
+/// one refusal is ordinary (the state a plan was built against moved), two
+/// can be the same ledger's bad luck seen twice, and three means the cause
+/// has outlived six ledgers of backoff.
+pub const UNWIND_SETBACK_ALERT: u32 = 3;
 
 /// What the filler is configured with, beyond the pools themselves.
 #[derive(Debug, Clone)]
@@ -191,6 +231,76 @@ pub struct FillerState {
     /// naming an asset outside it is read for, however fresh the balances
     /// look.
     covered_assets: BTreeSet<String>,
+    /// The pools an unwind pass has still to find idle (rulings 3 and 4):
+    /// a fill in one landed, or the run has not yet made its startup pass
+    /// over it.
+    unwind_pending: BTreeSet<String>,
+    /// Whether the startup seed has been made. The seed is once per run,
+    /// not once per tick: a pool an idle pass has cleared must stay
+    /// cleared until a fill in it lands.
+    unwind_seeded: bool,
+    /// The pools an `UnwindLeftovers` notification is outstanding for
+    /// (ruling 11). Cleared by the first later pass that finds the pool
+    /// clean, which is what makes the next episode notify again.
+    leftovers_notified: BTreeSet<String>,
+    /// Per pool, the run of unwind passes that moved nothing and the
+    /// ledger it is not planned again before. An entry exists only while
+    /// such a run is open: a pass that landed, a pass that found the pool
+    /// idle, and a pool that stops being pending all drop it, so the next
+    /// episode starts at full cadence rather than inheriting the last
+    /// one's backoff.
+    unwind_setbacks: BTreeMap<String, Setback>,
+    /// Per pool, the least ledger every later snapshot must reach before
+    /// this pool's unwind is planned against it — `None` for a
+    /// [`TxOutcome::Unknown`], whose ledger is not known and which
+    /// therefore holds the pool indefinitely.
+    ///
+    /// A high-water mark, not a one-shot. Proving one snapshot holds the
+    /// submission does not clear it: `latestLedger` is not monotonic
+    /// across calls, and most of what a pass does after the gate can
+    /// return having sent nothing while the pool stays pending, so the
+    /// pass after that one can be served an older ledger by a lagging
+    /// node and see the position as it stood before the submission. The
+    /// entry is raised by the next submission that lands and dropped only
+    /// where the pool itself is cleared — a pass that finds nothing left
+    /// to unwind, and a run with no filler key to hold a position at all.
+    ///
+    /// Both a fill and an unwind write it, because both move the
+    /// filler's own position, and a pass reads its own snapshot, which
+    /// need not hold either: an `Unknown` has not been applied at all,
+    /// and a `Succeeded` one has not if the RPC serving the snapshot is a
+    /// ledger or two behind the one that confirmed it. Planning against a
+    /// snapshot without it is wrong in both directions — it clears a pool
+    /// whose position has not arrived yet, stranding the lot and the debt
+    /// with nothing to schedule a pass again but a restart or another
+    /// landed fill; and, where the filler already held a position, it
+    /// re-plans the withdrawal or the repay the outstanding submission is
+    /// about to make, which the contract's own caps then apply to what is
+    /// left rather than to what was read — taking the primary collateral
+    /// under the floor [`crate::math::unwind::plan_unwind`] promises never
+    /// to cross.
+    ///
+    /// So the pass is held on the evidence rather than on the shape of
+    /// what it read: a pool whose entry is `None`, or whose snapshot is
+    /// older than the ledger the entry names, is left pending and
+    /// untouched. This lives here rather than on [`Pass`] because a
+    /// submission that landed at one tick is not a fact about that tick:
+    /// the snapshot two ticks later can still be behind it. An `Unknown`
+    /// reaches the filler only at shutdown — [`crate::queue`] resolves
+    /// every other one to a terminal outcome before it takes the next —
+    /// so a pool held on one is a pool held until the next run.
+    unwind_after: BTreeMap<String, Option<u32>>,
+}
+
+/// One pool's open run of unwind passes that moved nothing.
+#[derive(Debug, Default, Clone, Copy)]
+struct Setback {
+    /// Consecutive passes that neither landed nor found the pool idle.
+    count: u32,
+    /// The first tick this pool's pass may be planned at again. The pool
+    /// stays pending throughout: this delays the pass, it never abandons
+    /// it.
+    retry_at: u32,
 }
 
 impl FillerState {
@@ -254,14 +364,27 @@ pub struct TickSummary {
     /// Executions the executor answered [`ExecOutcome::Recorded`] to,
     /// dry-run or not.
     pub executed: u32,
-    /// Auctions nothing was done about *by decision*: a planner skip, a
+    /// An auction nothing was done about *by decision*: a planner skip, a
     /// refusal, a stale plan, a re-plan that could not be drafted, or a
     /// wallet that could not fund the spend. A chain read that simply
     /// failed is not counted here — it is not a decision, and the next
     /// tick reads it again.
+    ///
+    /// The unwind pass reaches this for one of those alone: a wallet that
+    /// could not fund its repays. A pass the contract refused, whose
+    /// submission did not land, or whose plan went stale is counted
+    /// nowhere — it is tracked per pool instead, in [`FillerState`]'s
+    /// `unwind_setbacks`, because what matters about those is how many in
+    /// a row a single pool has had rather than how many happened this
+    /// tick.
     pub skipped: u32,
     /// Rows closed because the chain no longer holds their auction.
     pub closed: u32,
+    /// Unwind passes that submitted a plan that moves something or, in
+    /// dry-run, planned one. A pass that found nothing to move, was held
+    /// back by the startup delay, was refused, or could not be read or
+    /// planned is not counted: nothing of it reached the chain.
+    pub unwound: u32,
 }
 
 /// The one failure that ends a tick.
@@ -332,11 +455,13 @@ pub struct Filler<'a> {
     config: FillerConfig,
     executor: Executor<'a>,
     inventory: Inventory,
+    notifier: Arc<Notifier>,
 }
 
 impl<'a> Filler<'a> {
     /// A filler reading `pools` through `rpc`, planning against `store`
-    /// and `inventory`, and executing through `executor`.
+    /// and `inventory`, executing through `executor`, and reporting what
+    /// an unwind cannot finish through `notifier`.
     #[must_use]
     pub fn new(
         rpc: &'a RpcClient,
@@ -345,6 +470,7 @@ impl<'a> Filler<'a> {
         config: FillerConfig,
         executor: Executor<'a>,
         inventory: Inventory,
+        notifier: Arc<Notifier>,
     ) -> Self {
         Self {
             rpc,
@@ -353,6 +479,7 @@ impl<'a> Filler<'a> {
             config,
             executor,
             inventory,
+            notifier,
         }
     }
 
@@ -360,7 +487,11 @@ impl<'a> Filler<'a> {
     /// out: keep the rows worth reading, re-read each one's auction entry,
     /// read one snapshot for the pool, plan every live entry against it,
     /// execute the ones whose ledger has come when `execute` says it may,
-    /// and carry on past anything but a store failure.
+    /// and carry on past anything but a store failure. Then, after the
+    /// whole walk, one unwind pass per pending pool — the seventh step the
+    /// second `impl` block below documents. The startup seed is taken here
+    /// rather than in [`Filler::new`] so a [`FillerState`] the caller built
+    /// itself carries it too.
     ///
     /// `execute` is the startup delay's gate (ruling 9) and `queue` the
     /// arming: a dry run is given no queue, and neither is an armed pass
@@ -380,6 +511,12 @@ impl<'a> Filler<'a> {
         queue: Option<&SubmissionQueue>,
         shutdown: &watch::Receiver<bool>,
     ) -> Result<TickSummary, FillerError> {
+        if !state.unwind_seeded {
+            state.unwind_seeded = true;
+            state
+                .unwind_pending
+                .extend(self.pools.iter().map(|pool| pool.address.clone()));
+        }
         let mut pass = Pass {
             tick,
             state,
@@ -392,6 +529,8 @@ impl<'a> Filler<'a> {
             self.tick_pool(pool, &mut pass, execute, queue, shutdown)
                 .await?;
         }
+        self.unwind_passes(&mut pass, execute, queue, shutdown)
+            .await?;
         Ok(pass.summary)
     }
 
@@ -1028,6 +1167,529 @@ impl<'a> Filler<'a> {
     }
 }
 
+/// The unwind pass (spec §5, "Unwind"): the tick's seventh step, run in
+/// this same task once the fill walk has finished.
+///
+/// **Ruling 2 — an unwind is not a queued operation.** Spec §8 says an
+/// `Unwind { pool }` "is queued behind pending fills". An operation built
+/// and queued behind a fill would be planned from the very state that fill
+/// is about to change, which is the one thing the executor's own rule for
+/// fills forbids. Planning here, after the tick's fills, and submitting on
+/// the same per-key [`SubmissionQueue`] puts the unwind behind them by the
+/// queue's own ordering — which is what "behind" is for — and lets it share
+/// the filler's wallet, its reservations and its snapshot machinery.
+///
+/// **Ruling 3 — what makes a pool pending.** A fill in it landed, or may
+/// have ([`note_recorded`]); or this is the run's first tick, which seeds
+/// every configured pool once. A restart between a fill and its unwind must
+/// not strand the position, and an idle pass costs one snapshot and one
+/// wallet read and sends nothing. Because spec §5's step 2 withdraws the
+/// primary down to `min_primary_collateral`, that startup pass also trims
+/// any primary collateral above the floor to the wallet — the capital model
+/// of spec §1, "unwind to the wallet and hold".
+///
+/// **Ruling 4 — it repeats while it moves something.** A pass that
+/// submitted leaves its pool pending and the next tick plans it again from
+/// a fresh snapshot; the first pass that builds no requests clears it. A
+/// refusal, a failed or expired submission, a stale plan, a read that could
+/// not be made and a plan that would not compute all leave it pending too:
+/// none of them is a reason to believe the position is unwound.
+///
+/// **Ruling 9 — the startup delay gates the submission, not the plan.**
+/// Inside it the pass still reads, still plans and still says at debug what
+/// it would do, and sends nothing.
+///
+/// **Ruling 10 — the repays reserve as a fill's do.** A live pass takes a
+/// [`Settlement::Live`] reservation for the plan's `spend` before anything
+/// is simulated, and the executor settles it by what the chain did;
+/// dry-run carries [`Settlement::DryRun`] and reserves nothing.
+///
+/// **Ruling 11 — leftovers notify once per pool.** An idle pass that leaves
+/// debt the wallet cannot repay sends one
+/// [`NotificationKind::UnwindLeftovers`] at [`Severity::High`], and not
+/// again until a later pass finds the pool clean and a subsequent one finds
+/// leftovers anew. [`Notifier`]'s own cooldown is the second guard, not
+/// this one.
+///
+/// **Ruling 14 — a submission that may have landed counts as landed.** The
+/// wallet is marked stale and the pool stays pending, because planning the
+/// next pass against a position the chain is about to change is exactly
+/// what must not happen. The same uncertainty runs the other way, which is
+/// what [`FillerState`]'s `unwind_after` is for: a pool a fill — or a pass
+/// of this very kind — made pending is passed over entirely until a
+/// snapshot provably holds that submission, its ledger at or past the one
+/// the submission landed in, and never for an `Unknown`, which has landed
+/// in no ledger yet. What the position then looks like is not evidence
+/// either way, and neither is how many ticks have gone by.
+///
+/// **Ruling 15 — this lives here.** The pass shares the filler's inventory,
+/// executor, wallet refresh and per-tick state, so it is an `impl Filler`
+/// block rather than a module of its own; the pure builder it calls is
+/// [`crate::math::unwind`]. Nothing here writes any store table: spec §4
+/// lists no unwind row, and the executor's structured events are the record
+/// (ruling 9 of the executor's own set).
+impl Filler<'_> {
+    /// Every pending pool's pass, in configured order, checking the
+    /// shutdown flag between them.
+    ///
+    /// With no filler key there is no account to hold a position or a
+    /// balance, so there is nothing to unwind at all: that is said once and
+    /// the pending set is dropped rather than re-read every tick.
+    ///
+    /// # Errors
+    ///
+    /// [`FillerError::Store`] only, as the fill walk: one pool's chain
+    /// read, plan, simulation or submission failing is that pool's, and it
+    /// stays pending for the next tick.
+    async fn unwind_passes(
+        &self,
+        pass: &mut Pass<'_>,
+        execute: bool,
+        queue: Option<&SubmissionQueue>,
+        shutdown: &watch::Receiver<bool>,
+    ) -> Result<(), FillerError> {
+        let Some(filler) = self.executor.filler() else {
+            if !pass.state.unwind_pending.is_empty() {
+                pass.state.unwind_pending.clear();
+                pass.state.unwind_after.clear();
+                tracing::debug!("no filler key: nothing to unwind");
+            }
+            return Ok(());
+        };
+        for pool in self.pools {
+            // Between pools, never inside a submission: the fill walk's
+            // rule, and for its reason — a transaction whose outcome this
+            // bot never saw has still spent its key's sequence number.
+            if *shutdown.borrow() {
+                return Ok(());
+            }
+            if !pass.state.unwind_pending.contains(&pool.address) {
+                continue;
+            }
+            // Backing off keeps the pool pending: a pass that made no
+            // progress three times running is very likely to make none on
+            // the next ledger either, and a snapshot and a simulation per
+            // tick is what that costs.
+            if let Some(setback) = pass.state.unwind_setbacks.get(&pool.address) {
+                if setback.retry_at > pass.tick.sequence {
+                    tracing::debug!(
+                        pool = %pool.address,
+                        setbacks = setback.count,
+                        retry_at = setback.retry_at,
+                        "this pool's unwind is backing off; it stays pending and is planned \
+                         again at that ledger"
+                    );
+                    continue;
+                }
+            }
+            self.unwind_pool(pool, filler, pass, execute, queue).await?;
+        }
+        Ok(())
+    }
+
+    /// One pool's pass: its own snapshot (ruling 14 — the fill walk's was
+    /// read before the fill that changed the position), the filler's
+    /// wallet, the plan, and what the plan's answer means for the pending
+    /// set.
+    async fn unwind_pool(
+        &self,
+        pool: &PoolConfig,
+        filler: &str,
+        pass: &mut Pass<'_>,
+        execute: bool,
+        queue: Option<&SubmissionQueue>,
+    ) -> Result<(), FillerError> {
+        let reader = PoolReader::new(self.rpc, &pool.address);
+        let snapshot = match reader.snapshot(&[filler]).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(
+                    pool = %pool.address,
+                    %error,
+                    "could not read this pool for its unwind; it stays pending for the next tick"
+                );
+                return Ok(());
+            }
+        };
+        // Before the position is looked at at all: what this snapshot
+        // shows of a pool a fill or an earlier pass has just changed means
+        // nothing until the snapshot is known to hold that submission.
+        //
+        // The entry survives the snapshot that proves it. Most of what
+        // follows can return having sent nothing while the pool stays
+        // pending — reserves that will not accrue, a plan that cannot be
+        // built, a wallet that no longer covers the repays, an executor
+        // failure, a contract refusal — and `latestLedger` is not
+        // monotonic across calls: `same_ledger` makes one snapshot's own
+        // parts agree, nothing makes the next snapshot newer than the
+        // last. A gate that disarmed on proof would let the pass after
+        // any of those plan against an older ledger from a lagging node,
+        // which is the pre-withdrawal position again. So it is a
+        // high-water mark, raised by the next submission that lands and
+        // dropped only when the pool is cleared.
+        if let Some(landed) = pass.state.unwind_after.get(&pool.address).copied() {
+            let holds_it = landed.is_some_and(|ledger| snapshot.ledger >= ledger);
+            if !holds_it {
+                tracing::debug!(
+                    pool = %pool.address,
+                    snapshot = snapshot.ledger,
+                    landed,
+                    "this snapshot does not hold the submission this pool's pass is owed; it \
+                     stays pending for the next tick"
+                );
+                return Ok(());
+            }
+        }
+        let positions = snapshot.positions.get(filler).cloned().unwrap_or_default();
+        if nothing_to_unwind(&positions) {
+            tracing::debug!(
+                pool = %pool.address,
+                "the filler holds no position in this pool; its unwind is done"
+            );
+            pass.state.unwind_pending.remove(&pool.address);
+            pass.state.leftovers_notified.remove(&pool.address);
+            // The pool is done, so there is no submission left for a
+            // later snapshot to have to hold.
+            pass.state.unwind_after.remove(&pool.address);
+            clear_setback(&pool.address, pass);
+            return Ok(());
+        }
+        // A landed fill has already set the stale flag, so this reads; an
+        // ordinary startup pass reads only when the balances have aged out.
+        self.refresh_inventory(&reader, &snapshot, pass.state).await;
+        // The same clamp `position_data` applies, so the reserves a plan is
+        // built against and the ones the position is valued with describe
+        // one instant.
+        let reserves = match snapshot.accrued_reserves(snapshot.valued_at(pass.tick.close_time)) {
+            Ok(reserves) => reserves,
+            Err(error) => {
+                tracing::warn!(
+                    pool = %pool.address,
+                    %error,
+                    "could not accrue this pool's reserves for its unwind; it stays pending"
+                );
+                return Ok(());
+            }
+        };
+        let terms = UnwindTerms {
+            primary_asset: pool.primary_asset.clone(),
+            min_primary_collateral: pool.min_primary_collateral,
+            min_health_factor: pool.min_health_factor,
+            min_collateral: snapshot.instance.config.min_collateral,
+        };
+        let wallet = self.inventory.available();
+        let inputs = UnwindInputs {
+            reserves: &reserves,
+            asset_index: &snapshot.asset_index,
+            prices: &snapshot.prices,
+            positions: &positions,
+            wallet: &wallet,
+        };
+        let plan = match plan_unwind(&terms, &inputs) {
+            Ok(plan) => plan,
+            Err(error) => {
+                tracing::warn!(
+                    pool = %pool.address,
+                    %error,
+                    "this pool's unwind could not be planned; it stays pending"
+                );
+                return Ok(());
+            }
+        };
+        if plan.is_idle() {
+            self.note_idle(pool, &plan, pass).await;
+            return Ok(());
+        }
+        if !execute {
+            tracing::debug!(
+                pool = %pool.address,
+                actions = plan.actions.len(),
+                spend = ?plan.spend,
+                "the startup delay holds this unwind back; it stays pending and is planned \
+                 again once the delay has passed"
+            );
+            return Ok(());
+        }
+        self.execute_unwind(pool, filler, &plan, queue, pass).await
+    }
+
+    /// An idle pass (ruling 4): the pool is unwound as far as it can be, so
+    /// it stops being pending. Ruling 11's notification is here, because an
+    /// idle pass is the only one that can tell leftover debt from debt the
+    /// next pass will repay.
+    async fn note_idle(&self, pool: &PoolConfig, plan: &UnwindPlan, pass: &mut Pass<'_>) {
+        pass.state.unwind_pending.remove(&pool.address);
+        clear_setback(&pool.address, pass);
+        if plan.remaining_liabilities.is_empty() {
+            // Clean: the next episode of leftovers in this pool notifies
+            // again rather than being suppressed by the last one's entry.
+            pass.state.leftovers_notified.remove(&pool.address);
+            tracing::debug!(
+                pool = %pool.address,
+                "this pool's unwind has nothing left to move"
+            );
+            return;
+        }
+        let assets = plan.remaining_liabilities.join(", ");
+        if !pass.state.leftovers_notified.insert(pool.address.clone()) {
+            tracing::debug!(
+                pool = %pool.address,
+                remaining_liabilities = %assets,
+                "debt the wallet cannot repay still remains here; already notified"
+            );
+            return;
+        }
+        let delivery = self
+            .notifier
+            .notify(Notification {
+                kind: NotificationKind::UnwindLeftovers,
+                severity: Severity::High,
+                pool: pool.address.clone(),
+                account: None,
+                message: format!(
+                    "debt the wallet cannot repay remains in {}: {assets}",
+                    pool.address
+                ),
+            })
+            .await;
+        // A channel that failed rolls its own dedup entry back, and this
+        // one must roll back with it: suppressing the next pass on the
+        // strength of a send that never happened would lose a high-severity
+        // alert until some later pass found the pool clean.
+        if delivery == Delivery::Failed {
+            pass.state.leftovers_notified.remove(&pool.address);
+        }
+    }
+
+    /// The settlement this mode demands (ruling 10) and one call to the
+    /// executor, and what its answer means for the pending set and the
+    /// pool's setback run.
+    ///
+    /// Four answers are setbacks — a refusal, a stale plan, a submission
+    /// that did not land, and an executor failure that is not the store's
+    /// — because each leaves the position exactly as it was; the pool
+    /// stays pending and its next pass is backed off. A pass that landed,
+    /// or that was planned and held, resets the run: the position moved,
+    /// or nothing about the pass failed.
+    ///
+    /// # Errors
+    ///
+    /// [`FillerError::Store`] only. Every other executor failure is this
+    /// pool's: it is logged and the pool stays pending.
+    async fn execute_unwind(
+        &self,
+        pool: &PoolConfig,
+        filler: &str,
+        plan: &UnwindPlan,
+        queue: Option<&SubmissionQueue>,
+        pass: &mut Pass<'_>,
+    ) -> Result<(), FillerError> {
+        let settlement = if self.config.dry_run {
+            Settlement::DryRun
+        } else {
+            match self.inventory.reserve(&plan.spend) {
+                Ok(reservation) => Settlement::Live(reservation),
+                Err(error) => {
+                    tracing::warn!(
+                        pool = %pool.address,
+                        %error,
+                        "the wallet cannot fund this unwind's repays; skipping it this tick"
+                    );
+                    pass.summary.skipped += 1;
+                    return Ok(());
+                }
+            }
+        };
+        let outcome = match self
+            .executor
+            .unwind(&pool.address, plan, settlement, queue)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(ExecutorError::Store(error)) => return Err(FillerError::Store(error)),
+            Err(error) => {
+                tracing::warn!(
+                    pool = %pool.address,
+                    %error,
+                    "this unwind could not be executed; it stays pending"
+                );
+                self.note_setback(pool, filler, &format!("the executor failed: {error}"), pass)
+                    .await;
+                return Ok(());
+            }
+        };
+        self.note_unwound(pool, filler, &outcome, pass).await;
+        Ok(())
+    }
+
+    /// What one [`UnwindOutcome`] means for the pending set, the tick's
+    /// counts and the pool's setback run — the four arms that are
+    /// setbacks, and the two that end one.
+    async fn note_unwound(
+        &self,
+        pool: &PoolConfig,
+        filler: &str,
+        outcome: &UnwindOutcome,
+        pass: &mut Pass<'_>,
+    ) {
+        match outcome {
+            // Nothing was sent, so nothing moved: in dry-run, planning it
+            // again on every tick would say the same thing at the same
+            // cost, and the next landed fill makes the pool pending again.
+            // An *armed* pass reaching here was handed no queue, which
+            // `Service::run` never does — clearing the pool on that would
+            // silently drop a position nothing else schedules a pass for.
+            UnwindOutcome::Planned { simulated } if self.config.dry_run => {
+                pass.state.unwind_pending.remove(&pool.address);
+                clear_setback(&pool.address, pass);
+                pass.summary.unwound += 1;
+                tracing::debug!(
+                    pool = %pool.address,
+                    simulated,
+                    "unwind planned and not sent"
+                );
+            }
+            UnwindOutcome::Planned { simulated } => {
+                clear_setback(&pool.address, pass);
+                tracing::warn!(
+                    pool = %pool.address,
+                    simulated,
+                    "this armed pass was given no queue to send its unwind on; it stays \
+                     pending, and nothing will send it until one is"
+                );
+            }
+            UnwindOutcome::Submitted(submitted) if outcome.landed() => {
+                pass.state.inventory_stale = true;
+                // The requests this pass sent moved the very position the
+                // next one is planned from, and `landed()` is exactly the
+                // two outcomes that may have applied them. An `Unknown`
+                // carries no ledger, so it holds the pool until the next
+                // run rather than until a ledger that can be named.
+                let landed = match submitted {
+                    TxOutcome::Succeeded { ledger, .. } => Some(*ledger),
+                    _ => None,
+                };
+                pass.state.unwind_after.insert(pool.address.clone(), landed);
+                clear_setback(&pool.address, pass);
+                pass.summary.unwound += 1;
+                tracing::info!(
+                    pool = %pool.address,
+                    landed,
+                    "this unwind landed, or may have; the pool stays pending and is not \
+                     planned again until a snapshot holds it"
+                );
+            }
+            UnwindOutcome::Submitted(outcome) => {
+                tracing::warn!(
+                    pool = %pool.address,
+                    outcome = ?outcome,
+                    "this unwind did not land; it stays pending and is planned again from \
+                     fresh state rather than resent"
+                );
+                self.note_setback(
+                    pool,
+                    filler,
+                    &format!("the submission did not land: {}", outcome.status()),
+                    pass,
+                )
+                .await;
+            }
+            UnwindOutcome::Refused { contract_error } => {
+                tracing::info!(
+                    pool = %pool.address,
+                    contract_error,
+                    "the contract refused this unwind; it stays pending and is planned again \
+                     from fresh state"
+                );
+                let cause = contract_error.map_or_else(
+                    || "the contract refused it without a code".to_string(),
+                    |code| format!("the contract refused it with error {code}"),
+                );
+                self.note_setback(pool, filler, &cause, pass).await;
+            }
+            UnwindOutcome::Stale => {
+                tracing::warn!(
+                    pool = %pool.address,
+                    "another transaction took this key's sequence first; this unwind stays \
+                     pending and is planned again from fresh state"
+                );
+                self.note_setback(
+                    pool,
+                    filler,
+                    "stale: another transaction took this key's sequence first",
+                    pass,
+                )
+                .await;
+            }
+        }
+    }
+
+    /// One unwind pass that left the position exactly as it was: the
+    /// pool's run of them grows, its next pass is held off for twice as
+    /// long as the last (from two ledgers, capped at
+    /// [`UNWIND_BACKOFF_MAX_LEDGERS`]), and the pass whose count *reaches*
+    /// [`UNWIND_SETBACK_ALERT`] tells the operator once.
+    ///
+    /// Once, and only on that pass: an episode that goes on raises one
+    /// alert, not one per pass. The filler keeps no second set for it —
+    /// the count is the guard, and [`Notifier`]'s cooldown is the other —
+    /// and a delivery that fails is the notifier's to log, because a
+    /// notification must never affect trading (spec §8).
+    async fn note_setback(
+        &self,
+        pool: &PoolConfig,
+        filler: &str,
+        cause: &str,
+        pass: &mut Pass<'_>,
+    ) {
+        let setback = pass
+            .state
+            .unwind_setbacks
+            .entry(pool.address.clone())
+            .or_default();
+        setback.count = setback.count.saturating_add(1);
+        // Two ledgers, then four, then eight: `saturating_pow` is what
+        // makes a count no realistic run reaches arithmetically harmless.
+        let backoff = 2_u32
+            .saturating_pow(setback.count)
+            .min(UNWIND_BACKOFF_MAX_LEDGERS);
+        setback.retry_at = pass.tick.sequence.saturating_add(backoff);
+        let Setback { count, retry_at } = *setback;
+        tracing::warn!(
+            pool = %pool.address,
+            setbacks = count,
+            retry_at,
+            cause,
+            "this unwind pass moved nothing; it stays pending and is backed off"
+        );
+        if count != UNWIND_SETBACK_ALERT {
+            return;
+        }
+        self.notifier
+            .notify(Notification {
+                kind: NotificationKind::SubmissionDropped,
+                severity: Severity::High,
+                pool: pool.address.clone(),
+                account: Some(filler.to_string()),
+                message: format!(
+                    "{count} unwind passes in {} have moved nothing ({cause}); the position \
+                     stays pending and the pass is backing off to every {backoff} ledgers",
+                    pool.address
+                ),
+            })
+            .await;
+    }
+}
+
+/// Ends a pool's run of setbacks: its pass landed, found the pool idle, or
+/// found nothing to unwind at all. The entry is dropped rather than zeroed
+/// so a pool that is not backing off costs nothing to check, and so the
+/// next episode of trouble starts at full cadence instead of inheriting
+/// the last one's.
+fn clear_setback(pool: &str, pass: &mut Pass<'_>) {
+    pass.state.unwind_setbacks.remove(pool);
+}
+
 /// What a recorded fill leaves behind: ruling 8's "recorded once" for a
 /// dry run, and a wallet to re-read when the chain may have spent it
 /// (ruling 14 — an `Unknown` may still land).
@@ -1048,14 +1710,39 @@ fn note_recorded(
             .recorded_dry_run
             .insert(RecordedFill::of_entry(row, auction));
     }
-    let landed = matches!(
-        recorded.submission,
-        Some(TxOutcome::Succeeded { .. } | TxOutcome::Unknown { .. })
-    );
-    if landed {
+    // The ledger an `Unknown` will land in is not known, which is exactly
+    // why it carries `None` rather than the window's own bounds: a pass
+    // may not act on a snapshot until the fill is provably in it.
+    let landed = match recorded.submission {
+        Some(TxOutcome::Succeeded { ledger, .. }) => Some(Some(ledger)),
+        Some(TxOutcome::Unknown { .. }) => Some(None),
+        _ => None,
+    };
+    if let Some(at) = landed {
         pass.state.inventory_stale = true;
+        // Ruling 3: the fill handed this pool's position to the filler, so
+        // an unwind pass is owed one — even for an `Unknown` outcome, which
+        // may yet land. `unwind_after` is what keeps every pass until one
+        // of them, this tick's included, from planning against a snapshot
+        // that does not hold the fill.
+        pass.state.unwind_pending.insert(row.pool.clone());
+        pass.state.unwind_after.insert(row.pool.clone(), at);
+        // And whatever the last passes could not do, they were refused
+        // against a position this fill has changed — new collateral, new
+        // debt. A backoff measured against the old one would hold the new
+        // one unwound for as long as `UNWIND_BACKOFF_MAX_LEDGERS`, which
+        // is exactly what a fill must never be able to buy.
+        clear_setback(&row.pool, pass);
     }
-    landed
+    landed.is_some()
+}
+
+/// Whether an unwind could move anything at all here: something to
+/// withdraw, or something to repay. `supply` is not collateral and no
+/// request an unwind sends touches it, so a position of supply alone is
+/// nothing for this pass to do.
+fn nothing_to_unwind(positions: &Positions) -> bool {
+    positions.collateral.is_empty() && positions.liabilities.is_empty()
 }
 
 #[cfg(test)]
@@ -1064,29 +1751,197 @@ mod tests {
     use std::num::NonZeroUsize;
     use std::time::Duration;
 
-    use serde_json::{json, Value};
+    use serde_json::json;
     use tokio::sync::watch;
 
     use super::*;
     use crate::chain::rpc::RpcClient;
     use crate::chain::script::{
         script_simulate_accepted, script_simulate_prelude, script_simulate_refused, scval_b64,
-        transaction_data_b64, ScriptedRpc,
+        ScriptedRpc,
     };
-    use crate::chain::signer::{Network, Signer};
-    use crate::chain::tx::{Submitter, TxConfig};
+    use crate::chain::signer::Network;
+    use crate::chain::tx::Submitter;
     use crate::chain::xdr::encode::{
-        address, from_base64, i128_val, map, sc_address, symbol, to_base64, vec as sc_vec,
+        address, from_base64, i128_val, map, sc_address, symbol, vec as sc_vec,
     };
     use crate::chain::xdr::keys;
-    use crate::chain::{ChainError, TxHash, TxOutcome};
-    use crate::fixture::{mainnet_fixed_v2, text};
-    use crate::harness;
-    use crate::math::fill::FillAction;
-    use crate::queue::QueueError;
-    use stellar_xdr::{
-        ContractDataDurability, ContractDataEntry, ExtensionPoint, LedgerEntryData, ScVal,
+    use crate::chain::{ChainError, LedgerWindow, TxHash, TxOutcome};
+    use crate::harness::{
+        self, contract_entry_xdr, entry, filler_signer, instance_entry_xdr, positions_entry_xdr,
+        script_empty_wallet, script_snapshot_positions, simulation, tx_config, BLND, POOL_TWO,
     };
+    use crate::math::fill::FillAction;
+    use crate::math::unwind::UnwindAction;
+    use crate::notifier::{NotificationChannel, NotifyError};
+    use crate::queue::QueueError;
+    use stellar_xdr::ScVal;
+
+    /// A log-only notifier with a cooldown longer than any test's run:
+    /// every test but `leftover_debt_notifies_once_per_pool` is about what
+    /// the filler decides to notify about, not about what the [`Notifier`]
+    /// then deduplicates.
+    fn notifier() -> Arc<Notifier> {
+        Arc::new(Notifier::log_only(Duration::from_hours(1)))
+    }
+
+    /// The filler's position after a fill of the fixture's pool: b-tokens
+    /// of the primary XLM reserve, and the USDC debt the fill took on.
+    /// 5e12 b-tokens is 500,011 XLM of underlying at the fixture's own
+    /// `b_rate`; 1e9 d-tokens of USDC is 100.16 USDC.
+    const UNWIND_COLLATERAL: i128 = 5_000_000_000_000;
+    /// `plan_unwind` repays it with 1_228_866_615 — the debt in underlying
+    /// at the fixture's own `d_rate`, plus the planner's 1 bp allowance and
+    /// one unit.
+    const UNWIND_DEBT: i128 = 1_000_000_000;
+    /// A wallet that covers `UNWIND_REPAY` many times over.
+    const WALLET_USDC: i128 = 1_000_000_000_000;
+    /// A primary-collateral floor for the pools that keep one: 100,000 XLM,
+    /// which `UNWIND_COLLATERAL` is far above and 5e11 b-tokens (500,011
+    /// XLM-stroops short of it) is under.
+    const UNWIND_FLOOR: i128 = 1_000_000_000_000;
+
+    /// A position the fixture pool's own `min_collateral` traps: 33.7 XLM
+    /// of b-tokens against 1.84 USDC of d-tokens, which at the fixture's
+    /// accrued rates and prices is `44_955_547` of effective collateral
+    /// against `19_399_598` of effective liability — under the pool's
+    /// `50_000_000` ($5.00) minimum while comfortably over the health
+    /// margin's `29_244_894`. See
+    /// `the_pools_min_collateral_binds_the_filler_too`.
+    const MIN_COLLATERAL_TRAPPED: i128 = 337_000_000;
+    const MIN_COLLATERAL_DEBT: i128 = 15_000_000;
+
+    /// One inventory refresh answering `balances` for the pool's three
+    /// reserves in the order the filler asks for them — XLM, USDC, EURC,
+    /// which is their strkey order and also the whole asset set, the
+    /// configured native asset being the fixture's own XLM.
+    fn script_wallet(rpc: &ScriptedRpc, ledger: u32, balances: [i128; 3]) {
+        for balance in balances {
+            rpc.expect(
+                "simulateTransaction",
+                simulation(&scval_b64(&i128_val(balance)), ledger),
+            );
+        }
+    }
+
+    /// One snapshot of the fixture's pool in which `account` holds exactly
+    /// these positions: what an unwind pass reads.
+    fn script_unwind_position(
+        rpc: &ScriptedRpc,
+        account: &str,
+        collateral: &[(u32, i128)],
+        liabilities: &[(u32, i128)],
+    ) {
+        script_snapshot_positions(
+            rpc,
+            &[(
+                account,
+                positions_entry_xdr(account, collateral, liabilities),
+            )],
+        );
+    }
+
+    /// The same, reported at `ledger` rather than at the fixture's own:
+    /// a snapshot the chain has already moved past, or one taken late
+    /// enough to hold a submission an earlier tick sent.
+    fn script_unwind_position_at(
+        rpc: &ScriptedRpc,
+        ledger: u32,
+        account: &str,
+        collateral: &[(u32, i128)],
+        liabilities: &[(u32, i128)],
+    ) {
+        harness::script_snapshot_positions_at(
+            rpc,
+            ledger,
+            &[(
+                account,
+                positions_entry_xdr(account, collateral, liabilities),
+            )],
+        );
+    }
+
+    /// A [`NotificationChannel`] that keeps what it was handed, so a test
+    /// can count what the filler actually decided to send. The first send
+    /// fails when `fail_once` is set, which is how a transient channel
+    /// failure is put in front of the filler's own dedup.
+    #[derive(Debug, Default)]
+    struct Recorded {
+        sent: std::sync::Mutex<Vec<Notification>>,
+        fail_once: std::sync::atomic::AtomicBool,
+    }
+
+    impl Recorded {
+        /// A channel whose first delivery fails.
+        fn failing_once() -> Self {
+            Self {
+                sent: std::sync::Mutex::new(Vec::new()),
+                fail_once: std::sync::atomic::AtomicBool::new(true),
+            }
+        }
+
+        fn sent(&self) -> Vec<Notification> {
+            self.sent.lock().expect("the recorder mutex").clone()
+        }
+    }
+
+    impl NotificationChannel for Arc<Recorded> {
+        fn name(&self) -> &'static str {
+            "recorded"
+        }
+
+        fn send<'a>(
+            &'a self,
+            notification: &'a Notification,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), NotifyError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                if self
+                    .fail_once
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(NotifyError::Channel("the channel is down".to_string()));
+                }
+                self.sent
+                    .lock()
+                    .expect("the recorder mutex")
+                    .push(notification.clone());
+                Ok(())
+            })
+        }
+    }
+
+    /// A stand-in queue worker that answers every submission `Succeeded`
+    /// and records its label, so a test can say what reached the queue and
+    /// in what order. What this proves is the filler's ordering, not the
+    /// queue's sending.
+    fn recording_worker(
+        capacity: usize,
+    ) -> (
+        SubmissionQueue,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let labels = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&labels);
+        let (queue, mut receiver) = SubmissionQueue::new(
+            NonZeroUsize::new(capacity).expect("a test capacity is never zero"),
+        );
+        let worker = tokio::spawn(async move {
+            while let Some(queued) = receiver.recv().await {
+                recorder
+                    .lock()
+                    .expect("the recorder mutex")
+                    .push(queued.submission.label.clone());
+                let _ = queued.respond.send(Ok(TxOutcome::Succeeded {
+                    hash: TxHash([3_u8; 32]),
+                    ledger: 1,
+                    return_value: None,
+                }));
+            }
+        });
+        (queue, labels, worker)
+    }
 
     /// The fixture's XLM and USDC reserves. Real strkeys: every address
     /// here round-trips through the encoder on its way into a scripted
@@ -1150,46 +2005,6 @@ mod tests {
         }
     }
 
-    /// The filler's key, for the two tests that need an account to
-    /// simulate and sign as. Copied from `executor.rs`'s test module: a
-    /// test signer is scaffolding, not an interface.
-    fn filler_signer() -> Signer {
-        let key = ed25519_dalek::SigningKey::from_bytes(&[11_u8; 32]);
-        let secret = stellar_strkey::ed25519::PrivateKey(key.to_bytes()).to_string();
-        Signer::from_secret(&secret).expect("signer")
-    }
-
-    /// Fee and polling policy short enough that nothing here waits on a
-    /// real interval. Copied from `executor.rs`'s test module.
-    fn tx_config() -> TxConfig {
-        TxConfig {
-            poll_interval: Duration::from_millis(1),
-            send_retry_pause: Duration::from_millis(1),
-            wait_cap: Duration::from_millis(200),
-            ..TxConfig::new(100, 200, 3)
-        }
-    }
-
-    /// A bare `simulateTransaction` answer carrying one return value, as
-    /// `chain::pool`'s and `inventory`'s own test helpers build it.
-    fn simulation(return_xdr: &str, ledger: u32) -> Value {
-        json!({"transactionData": transaction_data_b64(1), "events": [],
-               "minResourceFee": "1", "results": [{"auth": [], "xdr": return_xdr}],
-               "latestLedger": ledger})
-    }
-
-    /// One inventory refresh: a zero balance for each of the pool's three
-    /// reserves, which is also the whole asset set here because the
-    /// configured native asset is the fixture's own XLM.
-    fn script_empty_wallet(rpc: &ScriptedRpc, ledger: u32) {
-        for _ in 0..3 {
-            rpc.expect(
-                "simulateTransaction",
-                simulation(&scval_b64(&i128_val(0)), ledger),
-            );
-        }
-    }
-
     /// The auction as the chain holds it, starting at `block`.
     fn auction(block: u32) -> AuctionData {
         AuctionData {
@@ -1236,100 +2051,6 @@ mod tests {
             .expect("read the auction row")
     }
 
-    /// A `Positions` ledger entry for `account`, by reserve index.
-    /// Copied from `service.rs`'s test module and widened to carry
-    /// collateral as well as liabilities: the filler's own position is
-    /// what makes a lower percent *worse* than a higher one, and the
-    /// fixture holds no position for the filler's key.
-    fn positions_entry_xdr(
-        account: &str,
-        collateral: &[(u32, i128)],
-        liabilities: &[(u32, i128)],
-    ) -> String {
-        let side = |amounts: &[(u32, i128)]| {
-            map(amounts
-                .iter()
-                .map(|(index, amount)| (ScVal::U32(*index), i128_val(*amount)))
-                .collect())
-            .expect("positions side")
-        };
-        let value = map(vec![
-            (symbol("collateral").expect("symbol"), side(collateral)),
-            (symbol("liabilities").expect("symbol"), side(liabilities)),
-            (symbol("supply").expect("symbol"), side(&[])),
-        ])
-        .expect("positions map");
-        let entry = LedgerEntryData::ContractData(ContractDataEntry {
-            ext: ExtensionPoint::V0,
-            contract: sc_address(harness::POOL).expect("pool"),
-            key: sc_vec(vec![
-                symbol("Positions").expect("symbol"),
-                address(account).expect("account"),
-            ])
-            .expect("positions key"),
-            durability: ContractDataDurability::Persistent,
-            val: value,
-        });
-        to_base64(&entry).expect("positions entry")
-    }
-
-    /// `harness::script_snapshot`'s reserves and oracle reads, with
-    /// hand-built positions entries instead of the fixture's. Copied from
-    /// `service.rs`'s test module.
-    fn script_snapshot_positions(rpc: &ScriptedRpc, positions: &[(&str, String)]) {
-        let fixture = mainnet_fixed_v2();
-        let ledger = fixture["ledger"].as_u64().expect("ledger");
-        rpc.expect(
-            "getLedgerEntries",
-            json!({"latestLedger": ledger, "entries": [
-                entry(&keys::instance(harness::POOL).expect("key"), text(&fixture, &["instance_entry_xdr"])),
-                entry(&keys::reserve_list(harness::POOL).expect("key"), text(&fixture, &["res_list_entry_xdr"])),
-            ]}),
-        );
-        let mut entries = Vec::new();
-        for reserve in fixture["reserves"].as_array().expect("reserves") {
-            let asset = reserve["asset"].as_str().expect("asset");
-            entries.push(entry(
-                &keys::reserve_config(harness::POOL, asset).expect("key"),
-                reserve["config_entry_xdr"].as_str().expect("config"),
-            ));
-            entries.push(entry(
-                &keys::reserve_data(harness::POOL, asset).expect("key"),
-                reserve["data_entry_xdr"].as_str().expect("data"),
-            ));
-        }
-        for (account, positions_xdr) in positions {
-            entries.push(entry(
-                &keys::positions(harness::POOL, account).expect("key"),
-                positions_xdr,
-            ));
-        }
-        rpc.expect(
-            "getLedgerEntries",
-            json!({"latestLedger": ledger, "entries": entries}),
-        );
-        let ledger = u32::try_from(ledger).expect("ledger fits");
-        rpc.expect(
-            "simulateTransaction",
-            simulation(text(&fixture, &["oracle_decimals_return_xdr"]), ledger),
-        );
-        for reserve in fixture["reserves"].as_array().expect("reserves") {
-            rpc.expect(
-                "simulateTransaction",
-                simulation(
-                    reserve["lastprice_return_xdr"].as_str().expect("price"),
-                    ledger,
-                ),
-            );
-        }
-    }
-
-    /// An entry answer, as `harness`'s own private helper builds it.
-    fn entry(key: &stellar_xdr::LedgerKey, xdr: &str) -> Value {
-        json!({"key": to_base64(key).expect("key"), "xdr": xdr,
-               "lastModifiedLedgerSeq": 1, "liveUntilLedgerSeq": 99_999_999_u32})
-    }
-
     /// The filler's own starting position: 15.9 billion b-tokens of the
     /// fixture's third reserve (about $20,031 of effective collateral at
     /// its 0.95 factor) against 38.7 billion d-tokens of USDC (about
@@ -1339,18 +2060,8 @@ mod tests {
     const FILLER_COLLATERAL: i128 = 15_900_000_000;
     const FILLER_LIABILITIES: i128 = 38_700_000_000;
 
-    /// A second pool, built here rather than captured: the fixture holds
-    /// one pool, and the wallet a multi-pool tick plans against is exactly
-    /// what a second one is needed to pin.
-    const POOL_TWO: &str = "CAQQR5SWBXKIGZKPBZDH3KM5GQ5GUTPKB7JAFCINLZBC5WXPJKRG3IM7";
-    /// An asset of `POOL_TWO` that the fixture's pool does not list.
-    const BLND: &str = "CD25MNVTZDL4Y3XBCPCJXGXATV5WUHHOWMYFF4YBEGU5FCPGMYTVG5JY";
     /// The fixture's third reserve, which `POOL_TWO` does not list.
     const EURC: &str = "CDTKPWPLOURQA2SGTKTUQOWRCBZEORB4BWBOMJ3D3ZTQQSGE5F6JBQLV";
-    /// The fixture's oracle and admin, reused so `POOL_TWO`'s entries
-    /// decode against real strkeys.
-    const ORACLE: &str = "CCVTVW2CVA7JLH4ROQGP3CU4T3EXVCK66AZGSM4MUQPXAI4QHCZPOATS";
-    const ADMIN: &str = "GDAWX4KV5EQLP5W44HE5AA5QN5QRBJOVQIAI5OXOH5FW2ENT5PXN33DE";
 
     /// One reserve of the synthetic second pool. Rates are 1.0, so no
     /// accrual moves them and every amount below is also its underlying.
@@ -1360,67 +2071,6 @@ mod tests {
         c_factor: u32,
         l_factor: u32,
         price: i128,
-    }
-
-    /// The instance entry of a synthetic pool: the five config fields
-    /// `decode::pool_instance` reads, and the four storage keys around
-    /// them. Modelled on `service.rs`'s test module.
-    fn instance_entry_xdr(pool: &str) -> String {
-        let config = map(vec![
-            (symbol("bstop_rate").expect("symbol"), ScVal::U32(2_000_000)),
-            (symbol("max_positions").expect("symbol"), ScVal::U32(6)),
-            (symbol("min_collateral").expect("symbol"), i128_val(0)),
-            (
-                symbol("oracle").expect("symbol"),
-                address(ORACLE).expect("oracle"),
-            ),
-            (symbol("status").expect("symbol"), ScVal::U32(1)),
-        ])
-        .expect("config map");
-        let ScVal::Map(Some(config)) = config else {
-            panic!("map returns a map")
-        };
-        let storage = stellar_xdr::ScMap::sorted_from(vec![
-            (
-                symbol("Admin").expect("symbol"),
-                address(ADMIN).expect("admin"),
-            ),
-            (
-                symbol("BLNDTkn").expect("symbol"),
-                address(BLND).expect("blnd"),
-            ),
-            (
-                symbol("Backstop").expect("symbol"),
-                address(POOL_TWO).expect("backstop"),
-            ),
-            (symbol("Config").expect("symbol"), ScVal::Map(Some(config))),
-            (
-                symbol("Name").expect("symbol"),
-                ScVal::String(
-                    stellar_xdr::ScString::try_from(b"Second Pool".to_vec()).expect("name"),
-                ),
-            ),
-        ])
-        .expect("storage map");
-        let instance = ScVal::ContractInstance(stellar_xdr::ScContractInstance {
-            executable: stellar_xdr::ContractExecutable::StellarAsset,
-            storage: Some(storage),
-        });
-        contract_entry_xdr(pool, ScVal::LedgerKeyContractInstance, instance)
-    }
-
-    /// A `ContractData` entry of `pool` holding `value`. The scripted RPC
-    /// answers by the key it is asked for, so the entry's own key field
-    /// only has to decode.
-    fn contract_entry_xdr(pool: &str, key: ScVal, value: ScVal) -> String {
-        let entry = LedgerEntryData::ContractData(ContractDataEntry {
-            ext: ExtensionPoint::V0,
-            contract: sc_address(pool).expect("pool"),
-            key,
-            durability: ContractDataDurability::Persistent,
-            val: value,
-        });
-        to_base64(&entry).expect("entry")
     }
 
     /// Scripts one complete `PoolReader::snapshot` of a synthetic pool:
@@ -1584,6 +2234,10 @@ mod tests {
         // halved plan was sent before its ledger.
         script_simulate_prelude(&rpc, &signer, 10, tick.sequence);
         script_simulate_refused(&rpc, 1_205, tick.sequence);
+        // Ruling 3 makes every configured pool unwind-pending on the first
+        // tick, so the pass reads its own snapshot after the walk. This key
+        // holds no position in the fixture, so it is idle and sends nothing.
+        harness::script_snapshot(&rpc, &[]);
         let client = RpcClient::new(&rpc.url(), None).expect("client");
         let submitter = Submitter::new(&client, &network, &signer, tx_config());
         let pools = vec![pool_config()];
@@ -1594,6 +2248,7 @@ mod tests {
             filler_config(),
             Executor::new(&store, Some(submitter), true),
             Inventory::new(XLM.to_string(), 0),
+            notifier(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -1629,8 +2284,10 @@ mod tests {
         );
         assert_eq!(
             rpc.calls("getLedgerEntries").len(),
-            4,
-            "the auction entry, the snapshot's two reads, and one source-account read: a              second account read would mean the re-plan was simulated, which is the first              step of sending it"
+            6,
+            "the auction entry, the snapshot's two reads, one source-account read, and the \
+             unwind pass's own two: a second account read would mean the re-plan was \
+             simulated, which is the first step of sending it"
         );
         assert_eq!(rpc.remaining(), 0);
         Ok(())
@@ -1696,6 +2353,29 @@ mod tests {
                 simulation(&scval_b64(&i128_val(0)), tick.sequence),
             );
         }
+        // Ruling 3 makes every configured pool unwind-pending on the first
+        // tick, so the pass reads its own snapshot after the walk. This key
+        // holds no position in the fixture, so it is idle and sends nothing.
+        harness::script_snapshot(&rpc, &[]);
+        script_second_pool(
+            &rpc,
+            &[
+                SyntheticReserve {
+                    asset: XLM,
+                    c_factor: 7_500_000,
+                    l_factor: 7_500_000,
+                    price: 1_778_617,
+                },
+                SyntheticReserve {
+                    asset: BLND,
+                    c_factor: 9_500_000,
+                    l_factor: 9_500_000,
+                    price: 10_000_000,
+                },
+            ],
+            tick.close_time,
+            tick.sequence,
+        );
         let client = RpcClient::new(&rpc.url(), None).expect("client");
         let submitter = Submitter::new(&client, &network, &signer, tx_config());
         let pools = vec![
@@ -1712,6 +2392,7 @@ mod tests {
             filler_config(),
             Executor::new(&store, Some(submitter), true),
             Inventory::new(XLM.to_string(), 0),
+            notifier(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -1784,6 +2465,7 @@ mod tests {
             filler_config(),
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
+            notifier(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -1875,6 +2557,7 @@ mod tests {
             filler_config(),
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
+            notifier(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -1973,6 +2656,7 @@ mod tests {
             filler_config(),
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
+            notifier(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -2052,6 +2736,7 @@ mod tests {
             filler_config(),
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
+            notifier(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -2111,6 +2796,7 @@ mod tests {
             filler_config(),
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
+            notifier(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -2187,6 +2873,7 @@ mod tests {
             filler_config(),
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
+            notifier(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -2242,6 +2929,7 @@ mod tests {
             filler_config(),
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
+            notifier(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -2310,6 +2998,7 @@ mod tests {
             config,
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
+            notifier(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -2363,6 +3052,7 @@ mod tests {
             filler_config(),
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
+            notifier(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -2445,6 +3135,7 @@ mod tests {
             filler_config(),
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
+            notifier(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -2502,6 +3193,10 @@ mod tests {
         script_simulate_refused(&rpc, 1_205, tick.sequence);
         script_simulate_prelude(&rpc, &signer, 10, tick.sequence);
         script_simulate_accepted(&rpc, tick.sequence);
+        // Ruling 3 makes every configured pool unwind-pending on the first
+        // tick, so the pass reads its own snapshot after the walk. This key
+        // holds no position in the fixture, so it is idle and sends nothing.
+        harness::script_snapshot(&rpc, &[]);
         let client = RpcClient::new(&rpc.url(), None).expect("client");
         let submitter = Submitter::new(&client, &network, &signer, tx_config());
         let pools = vec![pool_config()];
@@ -2512,6 +3207,7 @@ mod tests {
             filler_config(),
             Executor::new(&store, Some(submitter), true),
             Inventory::new(XLM.to_string(), 0),
+            notifier(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -2574,6 +3270,10 @@ mod tests {
         script_empty_wallet(&rpc, tick.sequence);
         script_simulate_prelude(&rpc, &signer, 10, tick.sequence);
         script_simulate_accepted(&rpc, tick.sequence);
+        // Ruling 3 makes every configured pool unwind-pending on the first
+        // tick, so the pass reads its own snapshot after the walk. This key
+        // holds no position in the fixture, so it is idle and sends nothing.
+        harness::script_snapshot(&rpc, &[]);
         let client = RpcClient::new(&rpc.url(), None).expect("client");
         let submitter = Submitter::new(&client, &network, &signer, tx_config());
         let pools = vec![pool_config()];
@@ -2587,6 +3287,7 @@ mod tests {
             },
             Executor::new(&store, Some(submitter), false),
             Inventory::new(XLM.to_string(), 0),
+            notifier(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -2650,6 +3351,8 @@ mod tests {
         harness::script_snapshot(&rpc, &[]);
         script_simulate_prelude(&rpc, &signer, 11, second_tick.sequence);
         script_simulate_accepted(&rpc, second_tick.sequence);
+        // The fill landed this time, so the pool is pending again.
+        harness::script_snapshot(&rpc, &[]);
 
         let second = filler
             .tick(&mut state, second_tick, true, Some(&queue), &shutdown)
@@ -2722,6 +3425,7 @@ mod tests {
             filler_config(),
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
+            notifier(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -2793,6 +3497,10 @@ mod tests {
         // and it would answer HTTP 500 here.
         script_simulate_prelude(&rpc, &signer, 10, tick.sequence);
         script_simulate_accepted(&rpc, tick.sequence);
+        // Ruling 3 makes every configured pool unwind-pending on the first
+        // tick, so the pass reads its own snapshot after the walk. This key
+        // holds no position in the fixture, so it is idle and sends nothing.
+        harness::script_snapshot(&rpc, &[]);
         let client = RpcClient::new(&rpc.url(), None).expect("client");
         let submitter = Submitter::new(&client, &network, &signer, tx_config());
         let pools = vec![pool_config()];
@@ -2806,6 +3514,7 @@ mod tests {
             },
             Executor::new(&store, Some(submitter), false),
             Inventory::new(XLM.to_string(), 0),
+            notifier(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -2899,6 +3608,7 @@ mod tests {
             // asked anything at all, which is the point.
             Executor::new(&store, None, false),
             inventory,
+            notifier(),
         );
         let context = filler
             .pool_context(&pools[0], snapshot, tick)
@@ -2990,6 +3700,7 @@ mod tests {
             filler_config(),
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
+            notifier(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -3062,6 +3773,7 @@ mod tests {
             filler_config(),
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
+            notifier(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -3119,6 +3831,1801 @@ mod tests {
             .fetch_one(store.pool())
             .await?;
         assert_eq!(fills.n, Some(1), "recorded once across the tracker's lag");
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// Ruling 3: a fill that landed makes its pool unwind-pending, and the
+    /// pass that follows in the same tick repays the debt the fill took on
+    /// and takes the collateral out. Ruling 2 is what the labels show: the
+    /// unwind reaches the same per-key queue, behind the fill it follows.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_landed_fill_queues_an_unwind_of_its_pool(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let auction = auction(tick.sequence - 300);
+        store
+            .upsert_auction(&tracked(harness::USER_ONE, &auction))
+            .await
+            .expect("seed the auction");
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        // The fill walk: the entry, the pool as it stands before the fill —
+        // this key holds nothing in it yet — and an empty wallet.
+        harness::script_auction_entry(&rpc, harness::USER_ONE, &auction, tick.sequence);
+        harness::script_snapshot(&rpc, &[]);
+        script_empty_wallet(&rpc, tick.sequence);
+        script_simulate_prelude(&rpc, &signer, 10, tick.sequence);
+        script_simulate_accepted(&rpc, tick.sequence);
+        // The unwind pass, on its own snapshot (ruling 14): the fill has
+        // left this key the lot as collateral and the bid as debt, and the
+        // wallet it is re-read from now holds the USDC to repay with.
+        script_unwind_position(
+            &rpc,
+            signer.address(),
+            &[(0, UNWIND_COLLATERAL)],
+            &[(1, UNWIND_DEBT)],
+        );
+        script_wallet(&rpc, tick.sequence, [0, WALLET_USDC, 0]);
+        script_simulate_prelude(&rpc, &signer, 11, tick.sequence);
+        script_simulate_accepted(&rpc, tick.sequence);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            FillerConfig {
+                dry_run: false,
+                ..filler_config()
+            },
+            Executor::new(&store, Some(submitter), false),
+            Inventory::new(XLM.to_string(), 0),
+            notifier(),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+        let (queue, labels, worker) = recording_worker(4);
+
+        let summary = filler
+            .tick(&mut state, tick, true, Some(&queue), &shutdown)
+            .await
+            .expect("tick");
+        drop(queue);
+        worker.await.expect("the worker ends with the queue");
+
+        assert_eq!(
+            summary,
+            TickSummary {
+                planned: 1,
+                executed: 1,
+                unwound: 1,
+                ..TickSummary::default()
+            }
+        );
+        let labels = labels.lock().expect("the recorder mutex").clone();
+        assert_eq!(labels.len(), 2, "the fill and then the unwind: {labels:?}");
+        assert!(
+            labels[0].starts_with("fill") && labels[1].starts_with("unwind"),
+            "the unwind is queued behind the fill it follows: {labels:?}"
+        );
+        assert!(
+            state.unwind_pending.contains(harness::POOL),
+            "a submission that landed leaves the pool pending: the next tick plans it again \
+             from a snapshot that holds it"
+        );
+        assert!(
+            state.inventory_stale,
+            "and the wallet it repaid from is re-read before anything else plans against it"
+        );
+        let fills = sqlx::query!("SELECT count(*) AS n FROM fills")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(fills.n, Some(1), "an unwind writes no row of its own");
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// A fill the chain never confirmed makes its pool pending, and every
+    /// pass it is owed is passed over entirely — the one in its own tick
+    /// and the ones after it: an `Unknown` has landed in no ledger, so no
+    /// snapshot can ever be shown to hold it. What a pass would have read
+    /// — nothing at all here, the handed-over position a tick later — is
+    /// not what decides that; the fill's own outcome is, and it does not
+    /// improve with time.
+    ///
+    /// Clearing the pool would strand the lot and the debt the fill hands
+    /// over two ledgers later, with nothing to schedule a pass again but a
+    /// restart or another landed fill; planning against a snapshot that
+    /// cannot be shown to hold it would size a withdrawal against
+    /// liabilities the fill is about to raise. So the pool is held until
+    /// the next run — which costs this one nothing, because the queue
+    /// resolves every outcome it can and hands an `Unknown` back only at
+    /// shutdown.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_unresolved_fills_pool_is_held_until_the_next_run(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let auction = auction(tick.sequence - 300);
+        store
+            .upsert_auction(&tracked(harness::USER_ONE, &auction))
+            .await
+            .expect("seed the auction");
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        // Tick one: the fill walk, then a pass whose snapshot still shows
+        // this key holding nothing at all.
+        harness::script_auction_entry(&rpc, harness::USER_ONE, &auction, tick.sequence);
+        harness::script_snapshot(&rpc, &[]);
+        script_empty_wallet(&rpc, tick.sequence);
+        script_simulate_prelude(&rpc, &signer, 10, tick.sequence);
+        script_simulate_accepted(&rpc, tick.sequence);
+        harness::script_snapshot(&rpc, &[]);
+        // Tick two: the fill has been applied, and the snapshot shows the
+        // position it handed over — which is still not evidence that it
+        // landed. Nothing past that snapshot is scripted: an unscripted
+        // read answers HTTP 500, so a pass that plans on the shape of what
+        // it read shows up in the counts below.
+        let second = later(tick, 1);
+        script_unwind_position(&rpc, signer.address(), &[(0, UNWIND_COLLATERAL)], &[]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            FillerConfig {
+                dry_run: false,
+                ..filler_config()
+            },
+            Executor::new(&store, Some(submitter), false),
+            Inventory::new(XLM.to_string(), 0),
+            notifier(),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+
+        // A stand-in worker whose every answer is the one the queue gives
+        // back only when it has run out of chances to resolve it.
+        let (queue, mut receiver) =
+            SubmissionQueue::new(NonZeroUsize::new(4).expect("a test capacity is never zero"));
+        let worker = tokio::spawn(async move {
+            while let Some(queued) = receiver.recv().await {
+                let _ = queued.respond.send(Ok(TxOutcome::Unknown {
+                    hash: TxHash([5_u8; 32]),
+                    sequence: 11,
+                    window: LedgerWindow::try_new(100, 120).expect("a window ends after it opens"),
+                }));
+            }
+        });
+
+        let first = filler
+            .tick(&mut state, tick, true, Some(&queue), &shutdown)
+            .await
+            .expect("the first tick");
+
+        assert_eq!(
+            first,
+            TickSummary {
+                planned: 1,
+                executed: 1,
+                ..TickSummary::default()
+            },
+            "the fill was sent and its outcome is unresolved; the pass found nothing to move"
+        );
+        assert!(
+            state.unwind_pending.contains(harness::POOL),
+            "a pool whose fill landed in no ledger anyone can name is passed over, not \
+             cleared by a snapshot that cannot be holding it"
+        );
+
+        // The tracker, applying the fill that closed the auction: the row
+        // goes, so the second tick's walk reads nothing and the pass is all
+        // that is left of it.
+        store
+            .delete_auction(
+                harness::POOL,
+                harness::USER_ONE,
+                AuctionType::UserLiquidation,
+            )
+            .await
+            .expect("close the auction");
+        let reads = rpc.calls("getLedgerEntries").len();
+        let simulations = rpc.calls("simulateTransaction").len();
+
+        let summary = filler
+            .tick(&mut state, second, true, Some(&queue), &shutdown)
+            .await
+            .expect("the second tick");
+        drop(queue);
+        worker.await.expect("the worker ends with the queue");
+
+        assert_eq!(
+            summary,
+            TickSummary::default(),
+            "a later tick is not evidence either: the fill is still in no ledger, so the \
+             pass is still owed one that holds it"
+        );
+        assert!(
+            state.unwind_pending.contains(harness::POOL),
+            "and the pool stays pending, for the run that can read the outcome of it"
+        );
+        assert_eq!(
+            rpc.calls("getLedgerEntries").len(),
+            reads + 2,
+            "the snapshot's two entry reads, and nothing past the gate"
+        );
+        assert_eq!(
+            rpc.calls("simulateTransaction").len(),
+            simulations + 4,
+            "its four oracle reads: no wallet read, and no judgment"
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// What one [`fill_then_unwind`] run leaves behind.
+    struct Unwound {
+        summary: TickSummary,
+        pending: bool,
+        /// The run's whole `FillerState::unwind_after`, so a test can say
+        /// both which ledger the pool is still owed a snapshot at and
+        /// that it is owed one at all.
+        unwind_after: BTreeMap<String, Option<u32>>,
+        entry_reads: usize,
+        simulations: usize,
+    }
+
+    /// One tick of a pool whose auction the filler fills and then owes an
+    /// unwind pass: the fill lands `ahead` ledgers past the ledger every
+    /// snapshot here is read at, and the filler *already holds a position*
+    /// in the pool, so nothing about the position's shape can tell the
+    /// pass whether the fill is in the snapshot it reads.
+    ///
+    /// Only the pass that can see the fill is scripted for anything past
+    /// its own snapshot: an unscripted read answers HTTP 500, so a pass
+    /// that plans when it should have waited is visible in the counts this
+    /// returns.
+    async fn fill_then_unwind(db: sqlx::PgPool, ahead: u32) -> Unwound {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let auction = auction(tick.sequence - 300);
+        store
+            .upsert_auction(&tracked(harness::USER_ONE, &auction))
+            .await
+            .expect("seed the auction");
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        // The fill walk: the entry, the pool before the fill, an empty
+        // wallet, and the judgment.
+        harness::script_auction_entry(&rpc, harness::USER_ONE, &auction, tick.sequence);
+        harness::script_snapshot(&rpc, &[]);
+        script_empty_wallet(&rpc, tick.sequence);
+        script_simulate_prelude(&rpc, &signer, 10, tick.sequence);
+        script_simulate_accepted(&rpc, tick.sequence);
+        // The unwind pass's own snapshot, in which this key already holds
+        // a position of its own.
+        script_unwind_position(&rpc, signer.address(), &[(0, UNWIND_COLLATERAL)], &[]);
+        if ahead == 0 {
+            script_wallet(&rpc, tick.sequence, [0, 0, 0]);
+            script_simulate_prelude(&rpc, &signer, 11, tick.sequence);
+            script_simulate_accepted(&rpc, tick.sequence);
+        }
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            FillerConfig {
+                dry_run: false,
+                ..filler_config()
+            },
+            Executor::new(&store, Some(submitter), false),
+            Inventory::new(XLM.to_string(), 0),
+            notifier(),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+        let (queue, mut receiver) =
+            SubmissionQueue::new(NonZeroUsize::new(4).expect("a test capacity is never zero"));
+        let landed = tick.sequence + ahead;
+        // Both runs share one database, and `fills.tx_hash` is unique: the
+        // offset is what keeps the second run's row from colliding with
+        // the first's.
+        let hash = TxHash([7 + u8::try_from(ahead).expect("a small offset"); 32]);
+        let worker = tokio::spawn(async move {
+            while let Some(queued) = receiver.recv().await {
+                let _ = queued.respond.send(Ok(TxOutcome::Succeeded {
+                    hash,
+                    ledger: landed,
+                    return_value: None,
+                }));
+            }
+        });
+
+        let summary = filler
+            .tick(&mut state, tick, true, Some(&queue), &shutdown)
+            .await
+            .expect("tick");
+        drop(queue);
+        worker.await.expect("the worker ends with the queue");
+
+        assert_eq!(rpc.remaining(), 0);
+        Unwound {
+            summary,
+            pending: state.unwind_pending.contains(harness::POOL),
+            unwind_after: state.unwind_after.clone(),
+            entry_reads: rpc.calls("getLedgerEntries").len(),
+            simulations: rpc.calls("simulateTransaction").len(),
+        }
+    }
+
+    /// The ledger gate, in the case the position's shape cannot decide:
+    /// the filler already holds a position in the pool, so an unwind pass
+    /// finds one whether or not the fill it is owed a pass for has been
+    /// applied yet. Planning against the pre-fill position would size the
+    /// withdrawal against liabilities the fill is about to raise, and the
+    /// queue applies it *after* that fill — leaving the filler's own
+    /// position under the very floor the plan was built to hold.
+    ///
+    /// So the pass compares the snapshot's ledger against the one the fill
+    /// landed in, and waits for a snapshot that holds it.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_pass_waits_for_a_snapshot_that_holds_the_fill(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let behind = fill_then_unwind(db.clone(), 1).await;
+        assert_eq!(
+            behind.summary,
+            TickSummary {
+                planned: 1,
+                executed: 1,
+                ..TickSummary::default()
+            },
+            "the fill landed a ledger past the snapshot, so the pass plans nothing"
+        );
+        assert!(
+            behind.pending,
+            "and the pool stays pending for the tick that can see it"
+        );
+        assert_eq!(
+            behind.unwind_after.get(harness::POOL),
+            Some(&Some(harness::fixture_tick().sequence + 1)),
+            "the evidence is the run's, not the tick's: it is what holds the pool at every \
+             later tick whose snapshot is still behind the fill"
+        );
+        assert_eq!(
+            behind.entry_reads, 6,
+            "the auction entry, the fill's snapshot, its source account, and the pass's own \
+             snapshot — no source account for a judgment that never happened"
+        );
+        assert_eq!(
+            behind.simulations, 12,
+            "four oracle reads and three balances for the fill, its judgment, and the pass's \
+             four oracle reads: no wallet read and no judgment past the gate"
+        );
+
+        let holds = fill_then_unwind(db, 0).await;
+        assert_eq!(
+            holds.summary,
+            TickSummary {
+                planned: 1,
+                executed: 1,
+                unwound: 1,
+                ..TickSummary::default()
+            },
+            "a snapshot at the ledger the fill landed in holds it, so the pass plans"
+        );
+        assert!(holds.pending, "a submission that landed leaves it pending");
+        assert_eq!(
+            holds.unwind_after.get(harness::POOL),
+            Some(&Some(harness::fixture_tick().sequence)),
+            "and it stays a high-water mark past the snapshot that proved it — raised \
+             again, to the same ledger, by the unwind this pass then landed: this run's \
+             worker answers every submission with it"
+        );
+        assert_eq!(
+            holds.entry_reads, 7,
+            "and one more source account, to judge"
+        );
+        assert_eq!(
+            holds.simulations, 16,
+            "and the pass's three balances and its own judgment"
+        );
+        Ok(())
+    }
+
+    /// The gate's other half: an *unwind* that landed moved the position
+    /// as surely as a fill did, and the pass that follows must not be
+    /// planned against a snapshot taken before it.
+    ///
+    /// Nothing about the position's shape says so. Step 2 of an unwind
+    /// withdraws an absolute amount of the primary asset, and a position
+    /// with no liabilities left gives the contract nothing to check: the
+    /// same withdrawal planned twice against the same pre-withdrawal
+    /// snapshot takes out what the first one already did, and
+    /// `WithdrawCollateral` caps that at the position — the whole of it,
+    /// leaving the primary collateral at zero, under the floor
+    /// `plan_unwind` promises never to cross.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_landed_unwind_holds_its_pool_until_a_snapshot_holds_it(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        // The ledger the unwind lands in: one past every snapshot but the
+        // last, so only the last can be holding it.
+        let landed = tick.sequence + 1;
+        // Tick one: the startup pass over a collateral-only position, its
+        // judgment, and the submission that lands.
+        script_unwind_position(&rpc, signer.address(), &[(0, UNWIND_COLLATERAL)], &[]);
+        script_wallet(&rpc, tick.sequence, [0, 0, 0]);
+        script_simulate_prelude(&rpc, &signer, 10, tick.sequence);
+        script_simulate_accepted(&rpc, tick.sequence);
+        // Tick two: one snapshot, a ledger behind the withdrawal and so
+        // still showing the collateral it took out. Nothing past it is
+        // scripted — an unscripted read answers HTTP 500 — so a pass that
+        // plans when it should have waited shows up in the counts below.
+        script_unwind_position(&rpc, signer.address(), &[(0, UNWIND_COLLATERAL)], &[]);
+        // Tick three: a snapshot at the ledger the withdrawal landed in,
+        // which is what it left behind.
+        harness::script_snapshot_positions_at(&rpc, landed, &[]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            FillerConfig {
+                dry_run: false,
+                ..filler_config()
+            },
+            Executor::new(&store, Some(submitter), false),
+            Inventory::new(XLM.to_string(), 0),
+            notifier(),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+        let (queue, mut receiver) =
+            SubmissionQueue::new(NonZeroUsize::new(4).expect("a test capacity is never zero"));
+        let worker = tokio::spawn(async move {
+            while let Some(queued) = receiver.recv().await {
+                let _ = queued.respond.send(Ok(TxOutcome::Succeeded {
+                    hash: TxHash([9_u8; 32]),
+                    ledger: landed,
+                    return_value: None,
+                }));
+            }
+        });
+
+        let first = filler
+            .tick(&mut state, tick, true, Some(&queue), &shutdown)
+            .await
+            .expect("the first tick");
+
+        assert_eq!(
+            first,
+            TickSummary {
+                unwound: 1,
+                ..TickSummary::default()
+            },
+            "the startup pass planned the withdrawal and the chain took it"
+        );
+        assert!(
+            state.unwind_pending.contains(harness::POOL),
+            "a submission that landed leaves the pool pending"
+        );
+        let reads = rpc.calls("getLedgerEntries").len();
+        let simulations = rpc.calls("simulateTransaction").len();
+
+        let second = filler
+            .tick(&mut state, later(tick, 1), true, Some(&queue), &shutdown)
+            .await
+            .expect("the second tick");
+
+        assert_eq!(
+            second,
+            TickSummary::default(),
+            "the snapshot predates the withdrawal, so this tick plans nothing"
+        );
+        assert!(
+            state.unwind_pending.contains(harness::POOL),
+            "and the pool stays pending for the tick that can see it"
+        );
+        assert_eq!(
+            rpc.calls("getLedgerEntries").len(),
+            reads + 2,
+            "the snapshot's two entry reads, and nothing past the gate"
+        );
+        assert_eq!(
+            rpc.calls("simulateTransaction").len(),
+            simulations + 4,
+            "its four oracle reads: no wallet read, and no second judgment"
+        );
+
+        let third = filler
+            .tick(&mut state, later(tick, 2), true, Some(&queue), &shutdown)
+            .await
+            .expect("the third tick");
+        drop(queue);
+        worker.await.expect("the worker ends with the queue");
+
+        assert_eq!(
+            third,
+            TickSummary::default(),
+            "this snapshot holds the withdrawal, and what it left is nothing to unwind"
+        );
+        assert!(
+            !state.unwind_pending.contains(harness::POOL),
+            "so the pool is cleared rather than withdrawn from a second time"
+        );
+        assert!(
+            !state.unwind_after.contains_key(harness::POOL),
+            "and the evidence goes with the pool: a pool with no position left has no \
+             submission outstanding for a later snapshot to have to hold"
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// The gate is a high-water mark, not a one-shot: proving a snapshot
+    /// holds the submission is not the same as having no submission
+    /// outstanding.
+    ///
+    /// Four of `unwind_pool`'s later paths — reserves that will not
+    /// accrue, a plan that cannot be built, a wallet that no longer
+    /// covers the repays, an executor that failed — and a contract
+    /// refusal all return having sent nothing while the pool stays
+    /// pending. `latestLedger` is not monotonic across calls, and
+    /// `same_ledger` only makes one snapshot's own parts agree, so the
+    /// next pass can read an older ledger from a node behind a load
+    /// balancer and see the pre-withdrawal position again. A gate that
+    /// disarmed on proof would re-plan step 2's absolute primary
+    /// `Withdraw` against it, which the contract caps at the position —
+    /// taking the primary collateral to zero.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_proven_gate_still_holds_a_snapshot_that_lags(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        // The ledger the withdrawal lands in: every snapshot below is at
+        // this or at the one before it.
+        let landed = tick.sequence + 1;
+        // Tick one: the startup pass, judged and submitted.
+        script_unwind_position(&rpc, signer.address(), &[(0, UNWIND_COLLATERAL)], &[]);
+        script_wallet(&rpc, tick.sequence, [0, 0, 0]);
+        script_simulate_prelude(&rpc, &signer, 10, tick.sequence);
+        script_simulate_accepted(&rpc, tick.sequence);
+        // Tick two: a snapshot a ledger behind it. Nothing past the
+        // snapshot is scripted — an unscripted read answers HTTP 500 — so
+        // a pass that plans when it should have waited shows up in the
+        // counts below.
+        script_unwind_position(&rpc, signer.address(), &[(0, UNWIND_COLLATERAL)], &[]);
+        // Tick three: a snapshot that holds the withdrawal, and a pass
+        // the contract then refuses — `InvalidUtilRate`, which a
+        // withdrawal draws when the reserve is fully lent out. It sent
+        // nothing, so the withdrawal of tick one is still the newest
+        // thing any snapshot must hold.
+        script_unwind_position_at(
+            &rpc,
+            landed,
+            signer.address(),
+            &[(0, UNWIND_COLLATERAL)],
+            &[],
+        );
+        script_wallet(&rpc, landed, [0, 0, 0]);
+        script_simulate_prelude(&rpc, &signer, 11, landed);
+        script_simulate_refused(&rpc, 1_207, landed);
+        // Tick four, past the setback's backoff: a lagging node answers
+        // with the ledger before the withdrawal, and the position it
+        // shows is the one the withdrawal already took out.
+        script_unwind_position(&rpc, signer.address(), &[(0, UNWIND_COLLATERAL)], &[]);
+        // Tick five: a snapshot that holds it again, and what it left.
+        harness::script_snapshot_positions_at(&rpc, landed, &[]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            FillerConfig {
+                dry_run: false,
+                ..filler_config()
+            },
+            Executor::new(&store, Some(submitter), false),
+            Inventory::new(XLM.to_string(), 0),
+            notifier(),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+        let (queue, mut receiver) =
+            SubmissionQueue::new(NonZeroUsize::new(4).expect("a test capacity is never zero"));
+        let worker = tokio::spawn(async move {
+            while let Some(queued) = receiver.recv().await {
+                let _ = queued.respond.send(Ok(TxOutcome::Succeeded {
+                    hash: TxHash([4_u8; 32]),
+                    ledger: landed,
+                    return_value: None,
+                }));
+            }
+        });
+
+        let first = filler
+            .tick(&mut state, tick, true, Some(&queue), &shutdown)
+            .await
+            .expect("the first tick");
+
+        assert_eq!(
+            first,
+            TickSummary {
+                unwound: 1,
+                ..TickSummary::default()
+            },
+            "the startup pass planned the withdrawal and the chain took it"
+        );
+
+        let second = filler
+            .tick(&mut state, later(tick, 1), true, Some(&queue), &shutdown)
+            .await
+            .expect("the second tick");
+
+        assert_eq!(second, TickSummary::default(), "this snapshot is behind it");
+
+        let third = filler
+            .tick(&mut state, later(tick, 2), true, Some(&queue), &shutdown)
+            .await
+            .expect("the third tick");
+
+        assert_eq!(
+            third,
+            TickSummary::default(),
+            "the snapshot held it, so the pass planned — and the contract refused it"
+        );
+        assert_eq!(
+            state.unwind_after.get(harness::POOL),
+            Some(&Some(landed)),
+            "a refusal sent nothing, so the withdrawal that did is still the least ledger \
+             any later snapshot has to reach: proving one snapshot is not the same as \
+             having nothing outstanding"
+        );
+        assert!(
+            state.unwind_pending.contains(harness::POOL),
+            "and the pool stays pending"
+        );
+        let reads = rpc.calls("getLedgerEntries").len();
+        let simulations = rpc.calls("simulateTransaction").len();
+
+        // The setback backed the next pass off by two ledgers.
+        let fourth = filler
+            .tick(&mut state, later(tick, 4), true, Some(&queue), &shutdown)
+            .await
+            .expect("the fourth tick");
+
+        assert_eq!(
+            fourth,
+            TickSummary::default(),
+            "the node that answered this one is behind the withdrawal again"
+        );
+        assert_eq!(
+            rpc.calls("getLedgerEntries").len(),
+            reads + 2,
+            "so it is gated: the snapshot's two entry reads, and nothing past them"
+        );
+        assert_eq!(
+            rpc.calls("simulateTransaction").len(),
+            simulations + 4,
+            "its four oracle reads: no wallet read, and no judgment"
+        );
+
+        let fifth = filler
+            .tick(&mut state, later(tick, 5), true, Some(&queue), &shutdown)
+            .await
+            .expect("the fifth tick");
+        drop(queue);
+        worker.await.expect("the worker ends with the queue");
+
+        assert_eq!(
+            fifth,
+            TickSummary::default(),
+            "a snapshot that holds the withdrawal again shows what it left: nothing"
+        );
+        assert!(
+            !state.unwind_pending.contains(harness::POOL),
+            "so the pool is cleared rather than withdrawn from a second time"
+        );
+        assert!(
+            !state.unwind_after.contains_key(harness::POOL),
+            "and the gate goes with it: a pool with no position left has no submission \
+             outstanding to hold a later snapshot against"
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// The same evidence, for a fill, one tick later: a fill that landed
+    /// at tick T is not a fact about tick T. An RPC a ledger or two behind
+    /// still serves a pre-fill snapshot at T+1, and a gate that lived on
+    /// the tick would have nothing left to hold it with.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_landed_fill_holds_its_pool_past_the_tick_it_landed_in(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let auction = auction(tick.sequence - 300);
+        store
+            .upsert_auction(&tracked(harness::USER_ONE, &auction))
+            .await
+            .expect("seed the auction");
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        let landed = tick.sequence + 1;
+        // Tick one: the fill walk, then a pass whose snapshot predates the
+        // ledger the fill landed in — and in which this key already holds
+        // a position, so nothing about the position's shape can decide.
+        harness::script_auction_entry(&rpc, harness::USER_ONE, &auction, tick.sequence);
+        harness::script_snapshot(&rpc, &[]);
+        script_empty_wallet(&rpc, tick.sequence);
+        script_simulate_prelude(&rpc, &signer, 10, tick.sequence);
+        script_simulate_accepted(&rpc, tick.sequence);
+        script_unwind_position(&rpc, signer.address(), &[(0, UNWIND_COLLATERAL)], &[]);
+        // Tick two: one snapshot, still a ledger behind the fill. Nothing
+        // past it is scripted.
+        script_unwind_position(&rpc, signer.address(), &[(0, UNWIND_COLLATERAL)], &[]);
+        // Tick three: a snapshot at the ledger the fill landed in, and the
+        // pass it finally allows.
+        script_unwind_position_at(
+            &rpc,
+            landed,
+            signer.address(),
+            &[(0, UNWIND_COLLATERAL)],
+            &[],
+        );
+        script_wallet(&rpc, landed, [0, 0, 0]);
+        script_simulate_prelude(&rpc, &signer, 11, landed);
+        script_simulate_accepted(&rpc, landed);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            FillerConfig {
+                dry_run: false,
+                ..filler_config()
+            },
+            Executor::new(&store, Some(submitter), false),
+            Inventory::new(XLM.to_string(), 0),
+            notifier(),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+        let (queue, mut receiver) =
+            SubmissionQueue::new(NonZeroUsize::new(4).expect("a test capacity is never zero"));
+        let worker = tokio::spawn(async move {
+            while let Some(queued) = receiver.recv().await {
+                let _ = queued.respond.send(Ok(TxOutcome::Succeeded {
+                    hash: TxHash([8_u8; 32]),
+                    ledger: landed,
+                    return_value: None,
+                }));
+            }
+        });
+
+        let first = filler
+            .tick(&mut state, tick, true, Some(&queue), &shutdown)
+            .await
+            .expect("the first tick");
+
+        assert_eq!(
+            first,
+            TickSummary {
+                planned: 1,
+                executed: 1,
+                ..TickSummary::default()
+            },
+            "the fill landed a ledger past the pass's own snapshot, so the pass waited"
+        );
+        // The tracker, applying the fill that closed the auction: the row
+        // goes, so the ticks that follow are the pass alone.
+        store
+            .delete_auction(
+                harness::POOL,
+                harness::USER_ONE,
+                AuctionType::UserLiquidation,
+            )
+            .await
+            .expect("close the auction");
+        let reads = rpc.calls("getLedgerEntries").len();
+        let simulations = rpc.calls("simulateTransaction").len();
+
+        let second = filler
+            .tick(&mut state, later(tick, 1), true, Some(&queue), &shutdown)
+            .await
+            .expect("the second tick");
+
+        assert_eq!(
+            second,
+            TickSummary::default(),
+            "a tick later the snapshot is still behind the fill, and the fill is still \
+             what the pass is owed"
+        );
+        assert!(
+            state.unwind_pending.contains(harness::POOL),
+            "so the pool stays pending"
+        );
+        assert_eq!(
+            rpc.calls("getLedgerEntries").len(),
+            reads + 2,
+            "the snapshot's two entry reads, and nothing past the gate"
+        );
+        assert_eq!(
+            rpc.calls("simulateTransaction").len(),
+            simulations + 4,
+            "its four oracle reads: no wallet read, and no judgment"
+        );
+
+        let third = filler
+            .tick(&mut state, later(tick, 2), true, Some(&queue), &shutdown)
+            .await
+            .expect("the third tick");
+        drop(queue);
+        worker.await.expect("the worker ends with the queue");
+
+        assert_eq!(
+            third,
+            TickSummary {
+                unwound: 1,
+                ..TickSummary::default()
+            },
+            "and a snapshot at the ledger the fill landed in is planned against"
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// Ruling 3's other half: every configured pool is unwind-pending once
+    /// at startup, so a position a previous run left behind is trimmed to
+    /// the wallet without waiting for a fill. Once, not once a tick — a
+    /// dry-run pass that has said what it would do is not repeated.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn every_pool_is_unwound_once_at_startup(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        // No auctions at all, so the fill walk reads nothing and what
+        // follows is the startup pass alone.
+        script_unwind_position(&rpc, signer.address(), &[(0, UNWIND_COLLATERAL)], &[]);
+        script_wallet(&rpc, tick.sequence, [0, 0, 0]);
+        script_simulate_prelude(&rpc, &signer, 10, tick.sequence);
+        script_simulate_accepted(&rpc, tick.sequence);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            filler_config(),
+            Executor::new(&store, Some(submitter), true),
+            Inventory::new(XLM.to_string(), 0),
+            notifier(),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+
+        let first = filler
+            .tick(&mut state, tick, true, None, &shutdown)
+            .await
+            .expect("the first tick");
+
+        assert_eq!(
+            first,
+            TickSummary {
+                unwound: 1,
+                ..TickSummary::default()
+            },
+            "the whole XLM position is above a floor of nothing, so the startup pass plans \
+             it out to the wallet"
+        );
+        assert!(
+            !state.unwind_pending.contains(harness::POOL),
+            "a dry run plans it once, not on every tick until a fill lands"
+        );
+        let reads = rpc.calls("getLedgerEntries").len();
+
+        // Nothing is scripted for the second tick: an unscripted read
+        // answers HTTP 500, and this pool must not make one.
+        let second = filler
+            .tick(&mut state, later(tick, 1), true, None, &shutdown)
+            .await
+            .expect("the second tick");
+
+        assert_eq!(second, TickSummary::default());
+        assert_eq!(
+            rpc.calls("getLedgerEntries").len(),
+            reads,
+            "the seed is once per run, so a pool no longer pending costs no chain read"
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// With no filler key there is no account to hold a position or a
+    /// balance in, so the startup seed is dropped rather than read for.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_keyless_dry_run_makes_no_unwind_read(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let rpc = ScriptedRpc::start().await;
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            filler_config(),
+            Executor::new(&store, None, true),
+            Inventory::new(XLM.to_string(), 0),
+            notifier(),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+
+        let summary = filler
+            .tick(&mut state, tick, true, None, &shutdown)
+            .await
+            .expect("tick");
+
+        assert_eq!(summary, TickSummary::default());
+        assert!(
+            rpc.received().await.is_empty(),
+            "no key, no position, no wallet: the pass costs no chain read at all"
+        );
+        assert!(
+            state.unwind_pending.is_empty(),
+            "and the seed is dropped rather than retried every tick"
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// Ruling 4: a pass that moved something leaves its pool pending and the
+    /// next tick plans it again from a fresh snapshot; the first pass that
+    /// builds no requests is what stops it. Here the floor is what ends it —
+    /// the third snapshot's position is under `min_primary_collateral`, so
+    /// there is no excess to withdraw.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_unwind_repeats_until_a_pass_is_idle(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        // Three passes over a position the withdrawals shrink, and the
+        // wallet re-read after each landed submission.
+        script_unwind_position(&rpc, signer.address(), &[(0, UNWIND_COLLATERAL)], &[]);
+        script_wallet(&rpc, tick.sequence, [0, 0, 0]);
+        script_simulate_prelude(&rpc, &signer, 10, tick.sequence);
+        script_simulate_accepted(&rpc, tick.sequence);
+        script_unwind_position(&rpc, signer.address(), &[(0, 3_000_000_000_000)], &[]);
+        script_wallet(&rpc, tick.sequence, [0, 0, 0]);
+        script_simulate_prelude(&rpc, &signer, 11, tick.sequence);
+        script_simulate_accepted(&rpc, tick.sequence);
+        // Under the floor: nothing left to take out.
+        script_unwind_position(&rpc, signer.address(), &[(0, 500_000_000_000)], &[]);
+        script_wallet(&rpc, tick.sequence, [0, 0, 0]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let pools = vec![PoolConfig {
+            min_primary_collateral: UNWIND_FLOOR,
+            ..pool_config()
+        }];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            FillerConfig {
+                dry_run: false,
+                ..filler_config()
+            },
+            Executor::new(&store, Some(submitter), false),
+            Inventory::new(XLM.to_string(), 0),
+            notifier(),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+        let (queue, labels, worker) = recording_worker(4);
+
+        let first = filler
+            .tick(&mut state, tick, true, Some(&queue), &shutdown)
+            .await
+            .expect("the first tick");
+        assert_eq!(first.unwound, 1);
+        assert!(state.unwind_pending.contains(harness::POOL));
+
+        let second = filler
+            .tick(&mut state, later(tick, 1), true, Some(&queue), &shutdown)
+            .await
+            .expect("the second tick");
+        assert_eq!(second.unwound, 1, "it moved something again");
+        assert!(state.unwind_pending.contains(harness::POOL));
+
+        let third = filler
+            .tick(&mut state, later(tick, 2), true, Some(&queue), &shutdown)
+            .await
+            .expect("the third tick");
+        drop(queue);
+        worker.await.expect("the worker ends with the queue");
+
+        assert_eq!(
+            third,
+            TickSummary::default(),
+            "the position is at its floor: this pass builds nothing"
+        );
+        assert!(
+            !state.unwind_pending.contains(harness::POOL),
+            "and an idle pass is what stops the repetition"
+        );
+        assert_eq!(
+            labels.lock().expect("the recorder mutex").len(),
+            2,
+            "two submissions, one per pass that moved something"
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// Ruling 11: debt the wallet cannot repay notifies once per pool, not
+    /// once per tick, and again only after a later pass has found the pool
+    /// clean. The [`Notifier`]'s cooldown is zero here so that what is being
+    /// counted is the filler's own set and not the notifier's dedup.
+    ///
+    /// The first delivery fails, which must not count as having notified:
+    /// the notifier rolls its own dedup entry back on a failure, and the
+    /// filler's set has to roll back with it or a high-severity alert is
+    /// lost until some later pass happens to find the pool clean.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn leftover_debt_notifies_once_per_pool(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        // A debt and no collateral, against an empty wallet: nothing to
+        // repay it with and nothing to withdraw, which is an idle pass with
+        // the debt named. Five of them, the fourth finding the position
+        // gone — which is the pool clean.
+        script_unwind_position(&rpc, signer.address(), &[], &[(1, UNWIND_DEBT)]);
+        script_wallet(&rpc, tick.sequence, [0, 0, 0]);
+        script_unwind_position(&rpc, signer.address(), &[], &[(1, UNWIND_DEBT)]);
+        script_unwind_position(&rpc, signer.address(), &[], &[(1, UNWIND_DEBT)]);
+        harness::script_snapshot(&rpc, &[]);
+        script_unwind_position(&rpc, signer.address(), &[], &[(1, UNWIND_DEBT)]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let recorder = Arc::new(Recorded::failing_once());
+        let notifier = Arc::new(Notifier::new(
+            Box::new(Arc::clone(&recorder)),
+            Duration::ZERO,
+        ));
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            filler_config(),
+            Executor::new(&store, Some(submitter), true),
+            Inventory::new(XLM.to_string(), 0),
+            notifier,
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+
+        // An idle pass clears the pool, so each tick after the first is
+        // made pending again the way a landed fill would.
+        for ledgers in 0..5 {
+            if ledgers > 0 {
+                state.unwind_pending.insert(harness::POOL.to_string());
+            }
+            let summary = filler
+                .tick(&mut state, later(tick, ledgers), true, None, &shutdown)
+                .await
+                .expect("tick");
+            assert_eq!(
+                summary,
+                TickSummary::default(),
+                "tick {ledgers} moved nothing"
+            );
+            match ledgers {
+                0 => assert!(
+                    !state.leftovers_notified.contains(harness::POOL),
+                    "the delivery failed, so nothing was notified and nothing is suppressed"
+                ),
+                3 => assert!(
+                    !state.leftovers_notified.contains(harness::POOL),
+                    "a clean pass ends the episode"
+                ),
+                _ => assert!(state.leftovers_notified.contains(harness::POOL)),
+            }
+        }
+
+        let sent = recorder.sent();
+        assert_eq!(
+            sent.len(),
+            2,
+            "the failed send did not suppress the retry, the repeat after it did not notify \
+             again, and the episode after the clean pass did: {sent:?}"
+        );
+        for notification in &sent {
+            assert_eq!(notification.kind, NotificationKind::UnwindLeftovers);
+            assert_eq!(notification.severity, Severity::High);
+            assert_eq!(notification.pool, harness::POOL);
+            assert_eq!(notification.account, None);
+            assert!(
+                notification.message.contains(harness::POOL) && notification.message.contains(USDC),
+                "the message names the pool and the debt left in it: {}",
+                notification.message
+            );
+        }
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// Ruling 9: inside the startup delay the pass still reads and still
+    /// plans, and nothing is simulated or sent. The pool stays pending, so
+    /// the first tick past the delay acts on it.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_unwind_inside_the_startup_delay_waits(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        script_unwind_position(&rpc, signer.address(), &[(0, UNWIND_COLLATERAL)], &[]);
+        script_wallet(&rpc, tick.sequence, [0, 0, 0]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            filler_config(),
+            Executor::new(&store, Some(submitter), true),
+            Inventory::new(XLM.to_string(), 0),
+            notifier(),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+
+        let summary = filler
+            .tick(&mut state, tick, false, None, &shutdown)
+            .await
+            .expect("tick");
+
+        assert_eq!(
+            summary,
+            TickSummary::default(),
+            "nothing was submitted, so nothing is counted"
+        );
+        assert!(
+            state.unwind_pending.contains(harness::POOL),
+            "and the pool waits for the first tick past the delay"
+        );
+        assert_eq!(
+            rpc.calls("simulateTransaction").len(),
+            7,
+            "the snapshot's four oracle reads and the wallet's three balances, and no \
+             judgment: a judgment is the first step of sending"
+        );
+        assert_eq!(
+            rpc.calls("getLedgerEntries").len(),
+            2,
+            "the snapshot's own two reads, and no source account read"
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// The contract refused the pass — here `InvalidUtilRate`, which a
+    /// withdrawal draws when the reserve is fully lent out. There is no
+    /// percent to lower, so the pool simply stays pending and the next tick
+    /// plans it again from fresh state.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_refused_unwind_stays_pending(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        script_unwind_position(&rpc, signer.address(), &[(0, UNWIND_COLLATERAL)], &[]);
+        script_wallet(&rpc, tick.sequence, [0, 0, 0]);
+        script_simulate_prelude(&rpc, &signer, 10, tick.sequence);
+        script_simulate_refused(&rpc, 1_207, tick.sequence);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            filler_config(),
+            Executor::new(&store, Some(submitter), true),
+            Inventory::new(XLM.to_string(), 0),
+            notifier(),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+
+        let summary = filler
+            .tick(&mut state, tick, true, None, &shutdown)
+            .await
+            .expect("a refusal is the contract's answer, not this tick's failure");
+
+        assert_eq!(
+            summary,
+            TickSummary::default(),
+            "a refusal moved nothing, so it is not counted as an unwind"
+        );
+        assert!(
+            state.unwind_pending.contains(harness::POOL),
+            "and the pool is planned again from fresh state next tick"
+        );
+        assert!(
+            rpc.calls("sendTransaction").is_empty(),
+            "nothing was sent: the refusal came from the simulation"
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// A pass that keeps being refused is backed off and, at the third
+    /// consecutive one, said out loud once. `InvalidUtilRate` here, whose
+    /// cause is the reserve's rather than the plan's: re-planning from
+    /// fresh state answers it no differently on the next ledger, and the
+    /// snapshot and the simulation it costs are what the backoff exists
+    /// to bound.
+    ///
+    /// The schedule the ticks below are chosen from is exactly the
+    /// doubling: a refusal at tick `t` plans the pool again at
+    /// `t + 2^setbacks`. So passes happen at 0, 2 and 6, and the four
+    /// ticks in between script *nothing* — an unscripted read answers HTTP
+    /// 500 and `remaining()` catches an answer nobody used, so a pass that
+    /// failed to back off cannot pass this test quietly. The landed pass
+    /// at 14 is the run's end, and the pool's tracking goes with it.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_repeatedly_refused_unwind_backs_off_and_notifies_once(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        // Ticks 0, 2 and 6: the pass reads, plans and is refused. Only the
+        // first reads the wallet — nothing lands, so nothing makes it
+        // stale.
+        script_unwind_position(&rpc, signer.address(), &[(0, UNWIND_COLLATERAL)], &[]);
+        script_wallet(&rpc, tick.sequence, [0, 0, 0]);
+        script_simulate_prelude(&rpc, &signer, 10, tick.sequence);
+        script_simulate_refused(&rpc, 1_207, tick.sequence);
+        for sequence in [11, 12] {
+            script_unwind_position(&rpc, signer.address(), &[(0, UNWIND_COLLATERAL)], &[]);
+            script_simulate_prelude(&rpc, &signer, sequence, tick.sequence);
+            script_simulate_refused(&rpc, 1_207, tick.sequence);
+        }
+        // Tick 14, where the third setback's eight ledgers are up: this
+        // one is accepted and lands.
+        script_unwind_position(&rpc, signer.address(), &[(0, UNWIND_COLLATERAL)], &[]);
+        script_simulate_prelude(&rpc, &signer, 13, tick.sequence);
+        script_simulate_accepted(&rpc, tick.sequence);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let recorder = Arc::new(Recorded::default());
+        let notifier = Arc::new(Notifier::new(
+            Box::new(Arc::clone(&recorder)),
+            Duration::from_hours(1),
+        ));
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            FillerConfig {
+                dry_run: false,
+                ..filler_config()
+            },
+            Executor::new(&store, Some(submitter), false),
+            Inventory::new(XLM.to_string(), 0),
+            notifier,
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+        let (queue, labels, worker) = recording_worker(4);
+
+        for ledgers in 0..=6 {
+            let summary = filler
+                .tick(
+                    &mut state,
+                    later(tick, ledgers),
+                    true,
+                    Some(&queue),
+                    &shutdown,
+                )
+                .await
+                .expect("a refusal is the contract's answer, not this tick's failure");
+            assert_eq!(
+                summary,
+                TickSummary::default(),
+                "tick {ledgers} moved nothing"
+            );
+            assert!(
+                state.unwind_pending.contains(harness::POOL),
+                "tick {ledgers}: backing off keeps the pool pending"
+            );
+        }
+
+        let sent = recorder.sent();
+        assert_eq!(
+            sent.len(),
+            1,
+            "three refusals in a row are one alert, not three: {sent:?}"
+        );
+        assert_eq!(sent[0].kind, NotificationKind::SubmissionDropped);
+        assert_eq!(sent[0].severity, Severity::High);
+        assert_eq!(sent[0].pool, harness::POOL);
+        assert_eq!(sent[0].account.as_deref(), Some(signer.address()));
+        assert!(
+            sent[0].message.contains("1207") && sent[0].message.contains("backing off"),
+            "the message names the cause and that the pass is backing off: {}",
+            sent[0].message
+        );
+        assert!(
+            labels.lock().expect("the recorder mutex").is_empty(),
+            "a refusal comes from the simulation: nothing reached the queue"
+        );
+
+        let landed = filler
+            .tick(&mut state, later(tick, 14), true, Some(&queue), &shutdown)
+            .await
+            .expect("the pass the backoff was waiting for");
+        drop(queue);
+        worker.await.expect("the worker ends with the queue");
+
+        assert_eq!(landed.unwound, 1, "the pass at 14 sent something");
+        assert!(
+            state.unwind_setbacks.is_empty(),
+            "and a pass that landed ends the run: the next episode starts at full cadence"
+        );
+        assert_eq!(recorder.sent().len(), 1, "and notifies nothing new");
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// A landed fill ends a backoff early. The pass that was refused was
+    /// refused against a position the fill has now materially changed —
+    /// new collateral, new debt — so waiting out a delay that was measured
+    /// against the old one would hold the *new* position unwound for up to
+    /// `UNWIND_BACKOFF_MAX_LEDGERS`, which is the one thing a fill must
+    /// never be able to buy.
+    ///
+    /// Tick 1 is inside the first refusal's two-ledger backoff, so with
+    /// the run left standing nothing of its pass would be read at all and
+    /// the scripting below would go unused.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_landed_fill_ends_a_backoff_early(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        // Tick 0: the startup pass, refused.
+        script_unwind_position(&rpc, signer.address(), &[(0, UNWIND_COLLATERAL)], &[]);
+        script_wallet(&rpc, tick.sequence, [0, 0, 0]);
+        script_simulate_prelude(&rpc, &signer, 10, tick.sequence);
+        script_simulate_refused(&rpc, 1_207, tick.sequence);
+        // Tick 1, inside that backoff: a fill lands, and the pass it owes
+        // runs in the same tick rather than waiting the delay out.
+        let auction = auction(tick.sequence - 300);
+        harness::script_auction_entry(&rpc, harness::USER_ONE, &auction, tick.sequence);
+        harness::script_snapshot(&rpc, &[]);
+        script_simulate_prelude(&rpc, &signer, 11, tick.sequence);
+        script_simulate_accepted(&rpc, tick.sequence);
+        script_unwind_position(&rpc, signer.address(), &[(0, UNWIND_COLLATERAL)], &[]);
+        script_wallet(&rpc, tick.sequence, [0, 0, 0]);
+        script_simulate_prelude(&rpc, &signer, 12, tick.sequence);
+        script_simulate_accepted(&rpc, tick.sequence);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            FillerConfig {
+                dry_run: false,
+                ..filler_config()
+            },
+            Executor::new(&store, Some(submitter), false),
+            Inventory::new(XLM.to_string(), 0),
+            notifier(),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+        let (queue, labels, worker) = recording_worker(4);
+
+        let first = filler
+            .tick(&mut state, tick, true, Some(&queue), &shutdown)
+            .await
+            .expect("a refusal is the contract's answer, not this tick's failure");
+        assert_eq!(first, TickSummary::default(), "the pass at 0 was refused");
+
+        // The tracker, opening the auction the fill then takes.
+        store
+            .upsert_auction(&tracked(harness::USER_ONE, &auction))
+            .await
+            .expect("seed the auction");
+        let second = filler
+            .tick(&mut state, later(tick, 1), true, Some(&queue), &shutdown)
+            .await
+            .expect("the tick the fill lands in");
+        drop(queue);
+        worker.await.expect("the worker ends with the queue");
+
+        assert_eq!(
+            second,
+            TickSummary {
+                planned: 1,
+                executed: 1,
+                unwound: 1,
+                ..TickSummary::default()
+            },
+            "the fill landed and the pass it owes ran in the same tick, backoff or not"
+        );
+        assert!(
+            state.unwind_setbacks.is_empty(),
+            "the run the fill interrupted is forgotten, not merely overridden once"
+        );
+        let labels = labels.lock().expect("the recorder mutex").clone();
+        assert_eq!(labels.len(), 2, "the fill and then the unwind: {labels:?}");
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// The pool's own `min_collateral`, as the filler wires it from the
+    /// snapshot's instance — the fixture's is `50_000_000`, $5.00 in the
+    /// oracle's seven decimals.
+    ///
+    /// The position is 337,000,000 XLM b-tokens against 15,000,000 USDC
+    /// d-tokens, and the wallet is empty, so the debt stays. At the
+    /// fixture's own accrued rates and prices that values at
+    /// `collateral_base = 44_955_547` and `liability_base = 19_399_598`,
+    /// a health factor of 2.317 — far clear of the 1.5075 margin, which
+    /// asks for only `29_244_894` of base and would therefore allow
+    /// `117_774_301` XLM stroops out. The pool's $5 floor allows none: the
+    /// position is already under it, so every projection a withdrawal
+    /// could reach is further under, and the pass is idle with the debt
+    /// named.
+    ///
+    /// Which makes this the test of the *wiring*: with
+    /// `min_collateral` read as zero the pass would plan that withdrawal
+    /// and judge it, and nothing past the snapshot and the wallet is
+    /// scripted here.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_pools_min_collateral_binds_the_filler_too(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        script_unwind_position(
+            &rpc,
+            signer.address(),
+            &[(0, MIN_COLLATERAL_TRAPPED)],
+            &[(1, MIN_COLLATERAL_DEBT)],
+        );
+        script_wallet(&rpc, tick.sequence, [0, 0, 0]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let recorder = Arc::new(Recorded::default());
+        let notifier = Arc::new(Notifier::new(
+            Box::new(Arc::clone(&recorder)),
+            Duration::from_hours(1),
+        ));
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            filler_config(),
+            Executor::new(&store, Some(submitter), true),
+            Inventory::new(XLM.to_string(), 0),
+            notifier,
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+
+        let summary = filler
+            .tick(&mut state, tick, true, None, &shutdown)
+            .await
+            .expect("tick");
+
+        assert_eq!(
+            summary,
+            TickSummary::default(),
+            "the $5 floor allows no withdrawal, so the pass moves nothing"
+        );
+        assert_eq!(
+            rpc.calls("getLedgerEntries").len(),
+            2,
+            "the snapshot's own two reads and no source account: an idle plan is judged by \
+             nobody"
+        );
+        assert_eq!(
+            rpc.calls("simulateTransaction").len(),
+            7,
+            "the snapshot's four oracle reads and the wallet's three balances, and nothing \
+             else — a withdrawal the health margin alone would allow was never planned"
+        );
+        let sent = recorder.sent();
+        assert_eq!(
+            sent.len(),
+            1,
+            "an idle pass with debt left names it: {sent:?}"
+        );
+        assert_eq!(sent[0].kind, NotificationKind::UnwindLeftovers);
+        assert!(
+            sent[0].message.contains(USDC),
+            "the debt the wallet cannot repay: {}",
+            sent[0].message
+        );
+        assert!(
+            !state.unwind_pending.contains(harness::POOL),
+            "and an idle pass leaves the pending set, however it got there"
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// The other way a run ends: an idle pass. Nothing is notified, since
+    /// the count never reaches the alert, and the pool's tracking goes
+    /// with the pool itself — the position is as unwound as it can be.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_refusal_an_idle_pass_ends_notifies_nothing(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        // Tick 0: refused. Tick 1: nothing at all, because two ledgers is
+        // the first backoff. Tick 2: a position already under the primary
+        // floor, which is an idle pass.
+        script_unwind_position(&rpc, signer.address(), &[(0, UNWIND_COLLATERAL)], &[]);
+        script_wallet(&rpc, tick.sequence, [0, 0, 0]);
+        script_simulate_prelude(&rpc, &signer, 10, tick.sequence);
+        script_simulate_refused(&rpc, 1_207, tick.sequence);
+        script_unwind_position(&rpc, signer.address(), &[(0, 500_000_000_000)], &[]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let recorder = Arc::new(Recorded::default());
+        let notifier = Arc::new(Notifier::new(
+            Box::new(Arc::clone(&recorder)),
+            Duration::from_hours(1),
+        ));
+        let pools = vec![PoolConfig {
+            min_primary_collateral: UNWIND_FLOOR,
+            ..pool_config()
+        }];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            filler_config(),
+            Executor::new(&store, Some(submitter), true),
+            Inventory::new(XLM.to_string(), 0),
+            notifier,
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+
+        for ledgers in 0..=2 {
+            filler
+                .tick(&mut state, later(tick, ledgers), true, None, &shutdown)
+                .await
+                .expect("tick");
+        }
+
+        assert!(
+            !state.unwind_pending.contains(harness::POOL),
+            "an idle pass clears the pool however it got there"
+        );
+        assert!(
+            state.unwind_setbacks.is_empty(),
+            "and the refusal before it is forgotten with it"
+        );
+        assert!(
+            recorder.sent().is_empty(),
+            "one refusal is not an alert: {:?}",
+            recorder.sent()
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// An armed pass handed no queue planned its unwind and could not send
+    /// it. The pool stays pending: a dry run that plans has said everything
+    /// it is going to say, but an armed bot that planned and sent nothing
+    /// still holds the position, and clearing it would leave nothing to
+    /// schedule another pass but a restart or another landed fill.
+    ///
+    /// `Service::run` never composes this — a live filler with a signer is
+    /// given its key's queue — so the assertion is about the shape being
+    /// unreachable by construction rather than about a path the bot walks.
+    /// Driven through `execute_unwind` for that reason.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_armed_pass_with_no_queue_stays_pending(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        script_simulate_prelude(&rpc, &signer, 10, tick.sequence);
+        script_simulate_accepted(&rpc, tick.sequence);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            FillerConfig {
+                dry_run: false,
+                ..filler_config()
+            },
+            Executor::new(&store, Some(submitter), false),
+            Inventory::new(XLM.to_string(), 0),
+            notifier(),
+        );
+        // Nothing to spend, so the reservation is not what this is about.
+        let plan = UnwindPlan {
+            actions: vec![UnwindAction::WithdrawAll {
+                asset: XLM.to_string(),
+            }],
+            spend: BTreeMap::new(),
+            remaining_liabilities: Vec::new(),
+            projected_health: None,
+        };
+        let mut state = FillerState::default();
+        state.unwind_pending.insert(harness::POOL.to_string());
+        let mut pass = Pass {
+            tick,
+            state: &mut state,
+            summary: TickSummary::default(),
+        };
+        let filler_address = signer.address().to_string();
+
+        filler
+            .execute_unwind(&pools[0], &filler_address, &plan, None, &mut pass)
+            .await
+            .expect("a pass with nowhere to send is not the tick's failure");
+
+        assert_eq!(
+            pass.summary,
+            TickSummary::default(),
+            "nothing was sent, so nothing is counted as unwound"
+        );
+        assert!(
+            pass.state.unwind_pending.contains(harness::POOL),
+            "and the position is still there: the pool stays pending"
+        );
+        assert!(
+            rpc.calls("sendTransaction").is_empty(),
+            "the contract judged it and nothing sent it"
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// The wallet cannot fund this pass's repays: it is skipped with a
+    /// warning and stays pending, and the executor is never asked anything.
+    ///
+    /// Driven through `execute_unwind` rather than `Filler::tick`, for the
+    /// reason `a_wallet_that_cannot_fund_a_fill_skips_it` gives: `plan_unwind`
+    /// caps every repay at the same `Inventory::available` the reservation
+    /// is then taken out of, and nothing inside a tick moves the wallet
+    /// between the two, so a tick cannot reach this refusal by itself. It is
+    /// the guard for a wallet that moved under a plan, and a test of it has
+    /// to hand the pass a spend the wallet no longer covers.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_unwind_the_wallet_cannot_fund_is_skipped_this_tick(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let rpc = ScriptedRpc::start().await;
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        // A tenth of what the plan below repays.
+        let inventory = Inventory::new(XLM.to_string(), 0);
+        inventory.record_balances(
+            BTreeMap::from([(USDC.to_string(), 1_000_000_000)]),
+            Instant::now(),
+        );
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            FillerConfig {
+                dry_run: false,
+                ..filler_config()
+            },
+            // Live and keyless: the refusal comes before the executor is
+            // asked anything at all, which is the point.
+            Executor::new(&store, None, false),
+            inventory,
+            notifier(),
+        );
+        let plan = UnwindPlan {
+            actions: vec![UnwindAction::Repay {
+                asset: USDC.to_string(),
+                amount: 10_000_000_000,
+            }],
+            spend: BTreeMap::from([(USDC.to_string(), 10_000_000_000)]),
+            remaining_liabilities: Vec::new(),
+            projected_health: None,
+        };
+        let mut state = FillerState::default();
+        state.unwind_pending.insert(harness::POOL.to_string());
+        let mut pass = Pass {
+            tick,
+            state: &mut state,
+            summary: TickSummary::default(),
+        };
+        // The executor holds no key, so the address a notification would
+        // name is supplied here rather than read back off it.
+        let filler_address = filler_signer().address().to_string();
+
+        filler
+            .execute_unwind(&pools[0], &filler_address, &plan, None, &mut pass)
+            .await
+            .expect("a wallet that cannot fund one unwind is not the tick's failure");
+
+        assert_eq!(
+            pass.summary,
+            TickSummary {
+                skipped: 1,
+                ..TickSummary::default()
+            },
+            "a refused reservation is a decision, and it is counted as one"
+        );
+        assert!(
+            pass.state.unwind_pending.contains(harness::POOL),
+            "and the pool stays pending: the next tick plans it against the wallet as it \
+             then stands"
+        );
+        assert!(
+            rpc.received().await.is_empty(),
+            "nothing was simulated and nothing was sent"
+        );
         assert_eq!(rpc.remaining(), 0);
         Ok(())
     }

@@ -26,7 +26,7 @@ use crate::chain::xdr::encode::FillPercent;
 pub const FORCE_FILL_MAX_DELAY: u32 = 350;
 
 /// Basis points in one.
-const BPS: i128 = 10_000;
+pub(crate) const BPS: i128 = 10_000;
 
 /// An auction's two sides as a position: the lot's b-tokens as collateral
 /// and the bid's d-tokens as liabilities, keyed by reserve index. That is
@@ -292,7 +292,7 @@ pub enum PlannedFill {
 /// The allowance a repay adds above the scaled bid, as a fraction of it:
 /// one basis point, which covers a few hours of interest at any rate the
 /// pool allows. The contract refunds the excess.
-const REPAY_ALLOWANCE_BPS: i128 = 1;
+pub(crate) const REPAY_ALLOWANCE_BPS: i128 = 1;
 
 /// Units added to a supply for the b-token round trip's two floors; the
 /// next projection verifies the result either way.
@@ -447,7 +447,10 @@ struct Projection {
 /// list is `InvalidInput` and an index with no reserve is `MissingReserve`:
 /// both mean the caller's view of the pool is incomplete, and neither is
 /// ever read as a zero.
-fn reserve_for<'a>(inputs: &FillInputs<'a>, asset: &str) -> Result<(u32, &'a Reserve), MathError> {
+pub(crate) fn reserve_for<'a>(
+    inputs: &FillInputs<'a>,
+    asset: &str,
+) -> Result<(u32, &'a Reserve), MathError> {
     let index = inputs
         .asset_index
         .get(asset)
@@ -464,7 +467,11 @@ fn reserve_for<'a>(inputs: &FillInputs<'a>, asset: &str) -> Result<(u32, &'a Res
 
 /// Adds `amount` to `key`'s entry, checked. A zero amount changes nothing
 /// and creates no entry, so it never counts against `max_positions`.
-fn add_to<K: Ord>(map: &mut BTreeMap<K, i128>, key: K, amount: i128) -> Result<(), MathError> {
+pub(crate) fn add_to<K: Ord>(
+    map: &mut BTreeMap<K, i128>,
+    key: K,
+    amount: i128,
+) -> Result<(), MathError> {
     if amount == 0 {
         return Ok(());
     }

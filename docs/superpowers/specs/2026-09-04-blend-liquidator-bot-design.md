@@ -502,10 +502,21 @@ fills and repeated until a pass produces no requests:
 2. If no liabilities remain, `WithdrawCollateral` everything except the
    primary asset, then the primary asset down to `min_primary_collateral`.
 3. Otherwise withdraw collateral while the projected health factor stays at
-   or above `min_health_factor`, taking assets that are also liabilities
-   first, then the smallest positions, the primary asset last and never below
-   its floor, and stopping when the health factor is within 0.5% of the
-   minimum or a withdrawal would be under 1% of the primary floor.
+   or above `min_health_factor` **and the projected effective collateral
+   stays at or above the pool's `min_collateral`** *(the second bound added
+   as a Phase 6a review correction: `validate_submit` checks
+   `collateral_base < pool.config.min_collateral` after every
+   health-checked request of a position that keeps liabilities, so a
+   withdrawal that leaves less is refused however healthy the result — the
+   check §5's fill path already honours. Step 2 is unaffected: with no
+   liabilities the contract checks neither bound)*, taking assets that are
+   also liabilities first, then the smallest positions, the primary asset
+   last and never below its floor, and stopping when the health factor is
+   within 0.5% of the minimum or a withdrawal would be under 1% of the
+   primary floor. *(Also corrected in Phase 6a review: that 0.5% is where
+   the withdrawal rests, not only where the walk stops starting
+   candidates — a plan resting exactly on `min_health_factor` is carried
+   under it by the next ledger's interest on the debt it left.)*
 
 Leftover liabilities after an idle pass raise one deduplicated high-severity
 notification per pool.

@@ -52,7 +52,7 @@ pub struct Submission {
     pub label: String,
     /// Further attempts after a failure that provably sent nothing; zero
     /// for none. What each role gets is spec §8's: [`CREATION_RETRIES`],
-    /// [`FILL_RETRIES`].
+    /// [`FILL_RETRIES`], [`UNWIND_RETRIES`].
     pub retries: u32,
 }
 
@@ -128,6 +128,13 @@ pub const CREATION_RETRIES: u32 = 3;
 /// Retries a fill gets (spec §8): more than a creation, because a fill that
 /// lapses is money another bot takes.
 pub const FILL_RETRIES: u32 = 10;
+
+/// Retries an unwind gets: fewer than either, because nothing is racing
+/// for it. The position it repays is the bot's own, no auction clock runs
+/// against it, and the next pass plans it again from fresh state — so a
+/// long budget spent resending a plan the chain has moved past buys
+/// nothing the next pass would not do better.
+pub const UNWIND_RETRIES: u32 = 2;
 
 /// How the queue paces what a submission's budget allows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

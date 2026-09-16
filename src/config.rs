@@ -514,6 +514,10 @@ pub struct ServiceConfig {
     /// The longest the filler's wallet balances go unread. Always at least
     /// one second.
     pub inventory_refresh: std::time::Duration,
+    /// How long a repeated notification of the same `(pool, account, kind)`
+    /// is suppressed for (spec §7's dedup cooldown). Always at least one
+    /// hour: `FAILURE_NOTIFICATION_COOLDOWN_HOURS` refuses zero at parse.
+    pub notification_cooldown: std::time::Duration,
 }
 
 #[derive(Debug, Parser)]
@@ -790,6 +794,21 @@ pub struct Args {
     )]
     pub inventory_refresh_secs: u64,
 
+    /// How long a repeated notification of the same `(pool, account, kind)`
+    /// is suppressed for, in hours (spec §7's dedup cooldown). Zero is
+    /// refused: it would dedup nothing, notifying on every tick — there is
+    /// no "no cooldown" spelling, only shorter ones. The upper bound is
+    /// [`std::time::Duration`]'s and not a policy: `Duration::from_hours`
+    /// panics above `u64::MAX / 3_600`, so a value that would panic is
+    /// refused at parse instead.
+    #[arg(
+        long,
+        env = "FAILURE_NOTIFICATION_COOLDOWN_HOURS",
+        default_value_t = 24,
+        value_parser = clap::value_parser!(u64).range(1..=u64::MAX / 3_600),
+    )]
+    pub failure_notification_cooldown_hours: u64,
+
     /// The analytics API the tracker seeds from. Empty disables it.
     #[arg(
         long,
@@ -968,6 +987,9 @@ impl Args {
             })?,
             high_fee_profit_threshold: self.high_fee_profit_threshold.get(),
             inventory_refresh: std::time::Duration::from_secs(self.inventory_refresh_secs),
+            notification_cooldown: std::time::Duration::from_hours(
+                self.failure_notification_cooldown_hours,
+            ),
         })
     }
 
@@ -1204,6 +1226,7 @@ mod tests {
             "XLM_FEE_RESERVE",
             "HIGH_FEE_PROFIT_THRESHOLD",
             "INVENTORY_REFRESH_SECS",
+            "FAILURE_NOTIFICATION_COOLDOWN_HOURS",
             "SEED_URL",
             "SEED_HF_MAX",
             "SEED_FILE",
@@ -2124,6 +2147,48 @@ supported_lot = ["*"]
             Args::try_parse_from(["liquidator", "--replan-near-ledgers", "0"]).is_ok(),
             "zero is meaningful here: re-plan only at the fill ledger itself"
         );
+    }
+
+    /// `FAILURE_NOTIFICATION_COOLDOWN_HOURS=0` would dedup nothing — every
+    /// tick renotifies — which is not "no cooldown", it is "notify on every
+    /// tick"; refused at parse rather than a silent notification flood.
+    ///
+    /// The other end is `Duration`'s, not a policy: `Duration::from_hours`
+    /// panics above `u64::MAX / 3_600`, so the last hour count that can be
+    /// turned into a `Duration` at all is the last one this accepts.
+    #[test]
+    fn a_zero_cooldown_is_refused_at_parse() {
+        assert!(
+            Args::try_parse_from(["liquidator", "--failure-notification-cooldown-hours", "0"])
+                .is_err()
+        );
+        assert!(
+            Args::try_parse_from(["liquidator", "--failure-notification-cooldown-hours", "1"])
+                .is_ok()
+        );
+        let highest = u64::MAX / 3_600;
+        let args = Args::try_parse_from([
+            "liquidator",
+            "--failure-notification-cooldown-hours",
+            &highest.to_string(),
+        ])
+        .expect("the highest hour count `Duration::from_hours` accepts parses");
+        assert_eq!(args.failure_notification_cooldown_hours, highest);
+        // And it is a `Duration`, rather than the panic the unbounded
+        // range let through.
+        let _ = std::time::Duration::from_hours(args.failure_notification_cooldown_hours);
+        assert!(
+            Args::try_parse_from([
+                "liquidator",
+                "--failure-notification-cooldown-hours",
+                &(highest + 1).to_string(),
+            ])
+            .is_err(),
+            "one hour past it is a panic, so it is refused at parse"
+        );
+        assert_clean_environment();
+        let args = Args::try_parse_from(["liquidator"]).unwrap();
+        assert_eq!(args.failure_notification_cooldown_hours, 24);
     }
 
     /// Spec §6: "Keys parse and differ when both are given." Two roles on one
