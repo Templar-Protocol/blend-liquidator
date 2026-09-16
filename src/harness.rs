@@ -276,8 +276,26 @@ pub(crate) fn positions_entry_xdr(
 /// hand-built positions entries instead of the fixture's. Copied from
 /// `service.rs`'s test module.
 pub(crate) fn script_snapshot_positions(rpc: &ScriptedRpc, positions: &[(&str, String)]) {
+    let ledger =
+        u32::try_from(mainnet_fixed_v2()["ledger"].as_u64().expect("ledger")).expect("ledger fits");
+    script_snapshot_positions_at(rpc, ledger, positions);
+}
+
+/// The same, reported at `ledger` rather than at the fixture's own.
+///
+/// `PoolReader::snapshot` refuses a read whose parts disagree about the
+/// ledger, so every answer here carries the one `ledger` — which is what
+/// the snapshot's own `ledger` then is. Only that field moves: the
+/// entries are the fixture's, so what the reserves accrue to and what the
+/// oracle prices are do not depend on it. A test that needs a snapshot
+/// the chain has moved past — or one past a ledger something else landed
+/// in — says so here.
+pub(crate) fn script_snapshot_positions_at(
+    rpc: &ScriptedRpc,
+    ledger: u32,
+    positions: &[(&str, String)],
+) {
     let fixture = mainnet_fixed_v2();
-    let ledger = fixture["ledger"].as_u64().expect("ledger");
     rpc.expect(
         "getLedgerEntries",
         json!({"latestLedger": ledger, "entries": [
@@ -307,7 +325,6 @@ pub(crate) fn script_snapshot_positions(rpc: &ScriptedRpc, positions: &[(&str, S
         "getLedgerEntries",
         json!({"latestLedger": ledger, "entries": entries}),
     );
-    let ledger = u32::try_from(ledger).expect("ledger fits");
     rpc.expect(
         "simulateTransaction",
         simulation(text(&fixture, &["oracle_decimals_return_xdr"]), ledger),

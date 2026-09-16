@@ -62,10 +62,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wallet. The pass reads its own snapshot even for a pool the fill walk
   just read this same tick, plans through `plan_unwind`, and repeats every
   tick while it moves something; the first pass that builds no requests
-  (`UnwindPlan::is_idle`) clears the pool. A pool whose fill landed this
-  same tick is passed over until a snapshot provably holds that fill — its
-  ledger at or past the fill's, and never for an unresolved `Unknown` —
-  rather than judged by what the position happens to look like. Leftover
+  (`UnwindPlan::is_idle`) clears the pool. A pool whose fill — or whose own
+  earlier unwind — landed, or may have, is passed over until a snapshot
+  provably holds that submission: its ledger at or past the one the
+  submission landed in, and never for an unresolved `Unknown`, which
+  landed in no ledger anyone can name. The evidence is the run's, not the
+  tick's, since a snapshot two ticks later can still be behind it, and
+  what the position happens to look like is not evidence either way. Leftover
   debt the wallet cannot repay notifies
   `NotificationKind::UnwindLeftovers` at `Severity::High` once per pool,
   not again until a later pass finds it clean. A pass that moves nothing —
