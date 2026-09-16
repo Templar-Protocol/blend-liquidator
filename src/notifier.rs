@@ -26,8 +26,14 @@ use std::time::{Duration, Instant};
 /// How urgently a notification should be surfaced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
+    /// Worth recording, not worth waking anyone: the bot did what it
+    /// meant to.
     Low,
+    /// Something did not go as planned and the bot handled it. Worth
+    /// looking at, not worth interrupting anything for.
     Medium,
+    /// Money or the bot's own position is at stake, or the bot has
+    /// stopped making progress at something it is meant to finish.
     High,
 }
 
@@ -72,8 +78,17 @@ impl NotificationKind {
 /// by: `(pool, account, kind)`.
 #[derive(Debug, Clone)]
 pub struct Notification {
+    /// What happened. Part of the dedup key, so two different kinds about
+    /// one account in one pool never suppress each other.
     pub kind: NotificationKind,
+    /// How urgently to surface it. Not part of the dedup key: the same
+    /// event is always sent at the same severity, and a channel that
+    /// routes by severity would otherwise see one kind arrive by two
+    /// routes.
     pub severity: Severity,
+    /// The pool it happened in. Always set — every kind this bot sends is
+    /// about one pool's chain state — and part of the dedup key, so one
+    /// pool's repeating failure never silences another's.
     pub pool: String,
     /// The borrower this notification is about, when it is about one —
     /// `PollerStalled`, `RpcFailing` and `EventGap` are pool-wide and carry

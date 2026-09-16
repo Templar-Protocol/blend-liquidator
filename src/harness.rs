@@ -197,9 +197,11 @@ pub(crate) const BLND: &str = "CD25MNVTZDL4Y3XBCPCJXGXATV5WUHHOWMYFF4YBEGU5FCPGM
 const ORACLE: &str = "CCVTVW2CVA7JLH4ROQGP3CU4T3EXVCK66AZGSM4MUQPXAI4QHCZPOATS";
 const ADMIN: &str = "GDAWX4KV5EQLP5W44HE5AA5QN5QRBJOVQIAI5OXOH5FW2ENT5PXN33DE";
 
-/// The filler's key, for the two tests that need an account to
-/// simulate and sign as. Copied from `executor.rs`'s test module: a
-/// test signer is scaffolding, not an interface.
+/// The filler's key: the account every test that simulates, signs or
+/// holds a position of its own does so as. Copied from `executor.rs`'s
+/// test module rather than shared with it, because a test signer is
+/// scaffolding and not an interface. Deterministic, so the address a
+/// scripted ledger entry is keyed by is the address the code derives.
 pub(crate) fn filler_signer() -> Signer {
     let key = ed25519_dalek::SigningKey::from_bytes(&[11_u8; 32]);
     let secret = stellar_strkey::ed25519::PrivateKey(key.to_bytes()).to_string();
@@ -229,11 +231,15 @@ pub(crate) fn script_empty_wallet(rpc: &ScriptedRpc, ledger: u32) {
     }
 }
 
-/// A `Positions` ledger entry for `account`, by reserve index.
+/// A `Positions` ledger entry for `account`, by reserve index: the
+/// three sides the contract's own map carries, with `supply` always
+/// empty.
+///
 /// Copied from `service.rs`'s test module and widened to carry
-/// collateral as well as liabilities: the filler's own position is
-/// what makes a lower percent *worse* than a higher one, and the
-/// fixture holds no position for the filler's key.
+/// collateral as well as liabilities. The fixture holds no position
+/// for [`filler_signer`]'s key at all, so any test about what the
+/// filler *itself* holds — a fill's projection of its own health, an
+/// unwind's whole subject — has to build one.
 pub(crate) fn positions_entry_xdr(
     account: &str,
     collateral: &[(u32, i128)],

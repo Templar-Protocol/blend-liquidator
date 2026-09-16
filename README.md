@@ -62,9 +62,17 @@ is an operator decision this bot does not make for you. The startup pass
 also means the wallet's stated floor, `min_primary_collateral`, doubles as
 the most primary collateral you should expect the bot to leave supplied to
 a pool — anything above it is trimmed back to the wallet on the very first
-tick of a run. A notification failure never blocks or delays this: debt
-the wallet cannot repay is reported once per pool and trading continues
-regardless of whether the report was delivered.
+tick of a run. Where debt is left behind, the withdrawal stops half a
+percent *above* `min_health_factor` rather than on it, so a ledger of
+interest on that debt does not carry the position under the minimum you
+set with nothing scheduled to look again. It also stops at the pool's own
+`min_collateral` — the least collateral the contract lets a position with
+debt keep, $5 on the mainnet pools — which can be the binding one when
+the debt left behind is small. An unwind that keeps being refused is
+backed off rather than retried every ledger, and the third refusal in a
+row is reported. A notification failure never blocks or delays any of
+this: debt the wallet cannot repay is reported once per pool and trading
+continues regardless of whether the report was delivered.
 
 ## Quickstart
 

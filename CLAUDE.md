@@ -105,11 +105,15 @@ make help                           # Docker Compose lifecycle
   fill has left it holding a position — `plan_unwind`'s three steps: repay
   each liability the wallet holds, then with none left withdraw every
   collateral but the primary and the primary down to
-  `min_primary_collateral`, else withdraw within `min_health_factor` —
-  `HEALTH_MARGIN_BPS` (50, stopping the walk within 0.5% of the floor) and
-  `DUST_FLOOR_BPS` (100, the smallest partial withdrawal of the primary
-  worth sending) bound it, and every withdrawal is verified by exact
-  projection, backing off when it disagrees).
+  `min_primary_collateral`, else withdraw only while the projection holds
+  the two bounds `validate_submit` applies to a position that keeps
+  liabilities: the health factor at or above `min_health_factor` plus
+  `HEALTH_MARGIN_BPS` — the margin is where an unwind *rests*, not merely
+  where it stops starting candidates — and the effective collateral at or
+  above the pool's own `min_collateral`, which binds step 3 wherever it is
+  the larger of the two. `DUST_FLOOR_BPS` (100) is the smallest partial
+  withdrawal of the primary worth sending, and every withdrawal is
+  verified by exact projection, backing off when it disagrees).
   Nothing here does I/O and nothing panics.
 - `src/chain/xdr/` — ScVal codecs for the pool: `encode` (values, operations,
   simulation envelopes), `keys` (ledger keys, durability included), `decode`
@@ -285,13 +289,26 @@ make help                           # Docker Compose lifecycle
   unwind must not strand the position, and an idle pass costs one snapshot
   and one wallet read. The pass reads its own snapshot even for a pool the
   fill walk just read in this same tick, since a fill may have changed the
-  position in between; plans it through `math::unwind::plan_unwind`; and
-  executes through `Executor::unwind` behind the same startup gate and
-  queue a fill uses. A pass that moves something leaves its pool pending
-  for the next tick's fresh plan; the first pass that builds no requests
-  (`UnwindPlan::is_idle`) clears it. Debt the wallet cannot repay notifies
+  position in between — and a pool whose fill landed *this* tick is passed
+  over entirely until a snapshot provably holds that fill (its ledger at or
+  past the fill's, and never for a `TxOutcome::Unknown`, which landed in no
+  ledger): what the position then looks like is not evidence either way,
+  and planning against a pre-fill snapshot sizes a withdrawal against
+  liabilities the fill is about to raise. It plans through
+  `math::unwind::plan_unwind` and executes through `Executor::unwind`
+  behind the same startup gate and queue a fill uses. A pass that moves
+  something leaves its pool pending for the next tick's fresh plan; the
+  first pass that builds no requests (`UnwindPlan::is_idle`) clears it.
+  Debt the wallet cannot repay notifies
   `NotificationKind::UnwindLeftovers` at `Severity::High` once per pool,
-  not again until a later pass finds the pool clean. There is no
+  not again until a later pass finds the pool clean. A pass that *moves
+  nothing* — refused, stale, a submission that did not land, or a non-store
+  executor failure — keeps the pool pending and backs it off by `2^n`
+  ledgers, capped at `UNWIND_BACKOFF_MAX_LEDGERS` (64); the pass whose run
+  reaches `UNWIND_SETBACK_ALERT` (3) raises one
+  `NotificationKind::SubmissionDropped` at `Severity::High` naming the
+  cause, and a pass that lands or finds the pool idle ends the run. There
+  is no
   top-level `unwind.rs`: the pass shares the filler's inventory, executor,
   wallet refresh and per-tick state closely enough that it lives here as a
   second `impl Filler` block, with the pure builder in `math::unwind`.
@@ -611,10 +628,19 @@ remains is Phase 6b's operational surface (see Status above).
   every open `Reservation` — the same rule a fill's repay uses. The
   contract refunds whatever a repay overshoots the debt by, but the wallet
   must hold all of it up front.
-- `min_health_factor` alone is the unwind's floor
-  (`UnwindTerms::min_health_factor` in `math::unwind`); `HF_SAFETY_MULTIPLIER`
-  only widens the *fill's* floor (`health_floor` in `math::fill`) and plays
-  no part in an unwind's projection.
+- `min_health_factor` plus `HEALTH_MARGIN_BPS` is where an unwind *rests*,
+  and the pool's `min_collateral` binds it as well
+  (`UnwindTerms::{min_health_factor, min_collateral}` in `math::unwind`).
+  The margin is not just a stop condition for starting another candidate:
+  a plan resting exactly on the operator's minimum is carried under it by
+  the next ledger's interest on the debt it left, and the pass that would
+  look again has gone idle and cleared the pool. `min_collateral` is the
+  contract's, checked after every health-checked request of a position
+  that keeps liabilities — the committed mainnet pool sets it to $5, which
+  is above the health target in exactly the leftover-debt case this phase
+  exists for. `HF_SAFETY_MULTIPLIER` only widens the *fill's* floor
+  (`health_floor` in `math::fill`) and plays no part in an unwind's
+  projection.
 - A notification failure never affects trading: `Notifier::notify` answers
   a `Delivery`, never a `Result`, so a channel outage cannot hold up or
   fail a liquidation, a fill or an unwind — it can only mean the operator

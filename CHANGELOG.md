@@ -20,11 +20,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   debt remains, so no projection is consulted. With liabilities left,
   withdraw candidate collateral — the ones that are also liabilities
   first, then the rest by ascending value, the primary last — only while
-  the projected health factor stays at or above `min_health_factor`:
-  `HEALTH_MARGIN_BPS` (50, 0.5%) stops the walk once the projection is
-  that close to the floor, and `DUST_FLOOR_BPS` (100, 1% of
-  `min_primary_collateral`) is the smallest partial withdrawal of the
-  primary worth sending, in the no-debt step as well as this one. Every
+  the projection holds the two bounds the contract's `validate_submit`
+  applies to a position that keeps liabilities. The health factor stays at
+  or above `min_health_factor` plus `HEALTH_MARGIN_BPS` (50, 0.5%): the
+  margin is where the withdrawal *rests*, not only where the walk stops
+  starting candidates, because a plan resting exactly on the operator's
+  minimum is carried under it by the next ledger's interest on the debt it
+  left. And the effective collateral stays at or above the pool's own
+  `min_collateral` (`UnwindTerms::min_collateral`), which binds wherever
+  it is the larger of the two — the mainnet pools set it to $5, above the
+  health target in exactly the leftover-debt case. `DUST_FLOOR_BPS` (100,
+  1% of `min_primary_collateral`) is the smallest partial withdrawal of
+  the primary worth sending, in the no-debt step as well as this one. Every
   withdrawal amount is found by formula and then verified by exact
   projection, backing off in bounded steps when the two disagree, so
   nothing reaches the plan unprojected. Pure: no I/O, nothing panics.
@@ -55,9 +62,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wallet. The pass reads its own snapshot even for a pool the fill walk
   just read this same tick, plans through `plan_unwind`, and repeats every
   tick while it moves something; the first pass that builds no requests
-  (`UnwindPlan::is_idle`) clears the pool. Leftover debt the wallet cannot
-  repay notifies `NotificationKind::UnwindLeftovers` at `Severity::High`
-  once per pool, not again until a later pass finds it clean.
+  (`UnwindPlan::is_idle`) clears the pool. A pool whose fill landed this
+  same tick is passed over until a snapshot provably holds that fill — its
+  ledger at or past the fill's, and never for an unresolved `Unknown` —
+  rather than judged by what the position happens to look like. Leftover
+  debt the wallet cannot repay notifies
+  `NotificationKind::UnwindLeftovers` at `Severity::High` once per pool,
+  not again until a later pass finds it clean. A pass that moves nothing —
+  refused, stale, a submission that did not land, or a non-store executor
+  failure — keeps its pool pending and backs the next one off by `2^n`
+  ledgers up to `UNWIND_BACKOFF_MAX_LEDGERS` (64), and the pass whose run
+  reaches `UNWIND_SETBACK_ALERT` (3) raises one
+  `NotificationKind::SubmissionDropped` at `Severity::High` naming the
+  cause; a pass that lands or finds the pool idle ends the run.
 - The filler (`src/filler.rs`, `Filler`): once a tick, per configured pool,
   `tick` keeps only the open-auction rows worth a chain read — a user
   liquidation, none of the bot's own accounts, every asset accepted by the

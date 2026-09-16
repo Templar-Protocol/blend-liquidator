@@ -19,10 +19,22 @@
 //! liquidatable, builds the auction the contract should accept, lets the
 //! contract judge the percent through simulation, records every creation
 //! it decides to make, and — only when `DRY_RUN=false` **and** a signing
-//! key is configured — signs and submits it through a per-key queue. That
-//! is the one write path so far: it still fills no auction, and the
-//! filler, executor, unwind and the rest of the operational surface are
-//! still to land. The repository scaffolding around it — CI gates, lint
+//! key is configured — signs and submits it through a per-key queue.
+//! Phase 5 landed the filler (`filler`, `executor`, `inventory`,
+//! `math::fill`): once a tick it plans a fill for every open liquidation
+//! auction its pool configuration supports, holds its own position at or
+//! above the pool's minimum health factor times `HF_SAFETY_MULTIPLIER`
+//! while taking one over, and — armed, and only on the filler key's own
+//! queue — submits it. Phase 6a lands the unwind (`math::unwind`, the
+//! filler's unwind pass) and the notifier (`notifier`): a pool a fill
+//! landed in is repaid from the wallet and withdrawn down to its floors,
+//! pass after pass until one moves nothing, and what an unwind cannot
+//! finish reaches the operator through a deduplicating
+//! [`notifier::NotificationChannel`]. What is left is Phase 6b's
+//! operational surface: the Telegram channel, metrics, the HTTP endpoints
+//! and the sandbox integration tier.
+//!
+//! The repository scaffolding around it — CI gates, lint
 //! posture, dev container, release preflight — is complete and enforced
 //! from the first commit, so the liquidation logic lands into a repo that
 //! already fails loudly.
