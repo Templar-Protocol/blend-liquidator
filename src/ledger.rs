@@ -27,11 +27,13 @@
 //! broken RPC stalls visibly instead of silently losing ledgers.
 //!
 //! What the loop reports about itself is instrumentation and nothing more:
-//! a heartbeat every iteration, the chain head every pass that read one,
-//! and one [`NotificationKind::RpcFailing`] per run of
-//! [`RPC_FAILING_AFTER`] failed passes. None of it is awaited, none of it
-//! can fail a pass, and a poller given neither recorder behaves exactly as
-//! one given both (spec §8).
+//! a heartbeat every iteration — and every `poll_interval` of a wait for a
+//! tracker that has not answered yet, because waiting for one is being
+//! alive — the chain head every pass that read one, and one
+//! [`NotificationKind::RpcFailing`] per run of [`RPC_FAILING_AFTER`]
+//! failed passes. None of it is awaited, none of it can fail a pass, and a
+//! poller given neither recorder behaves exactly as one given both
+//! (spec §8).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -281,6 +283,39 @@ impl<'a> LedgerPoller<'a> {
             account: None,
             message: format!("{failures} consecutive poll failures; last: {error}"),
         });
+    }
+
+    /// Waits for a tick's acknowledgement, heartbeating every
+    /// `poll_interval` for as long as it takes.
+    ///
+    /// **Waiting for the tracker is being alive.** The tracker answers a
+    /// tick only once that ledger's whole effect is in the store, and that
+    /// can legitimately take longer than
+    /// [`PollerConfig::liveness_deadline`]: a gap reseed walks every seed
+    /// source, and a full scan refreshes every tracked borrower. A poller
+    /// that recorded nothing while it waited would fail `/livez` (see
+    /// [`crate::http::liveness`]) and have a restart probe kill the bot in
+    /// the middle of the very seed it was waiting on — which, on restart,
+    /// it would begin again.
+    ///
+    /// Answers exactly what awaiting the receiver answers, and nothing
+    /// here touches what that means: a dropped sender is still "not
+    /// applied", and the cursor still moves only on an answer.
+    async fn await_ack(
+        &self,
+        applied: oneshot::Receiver<()>,
+    ) -> Result<(), oneshot::error::RecvError> {
+        tokio::pin!(applied);
+        loop {
+            tokio::select! {
+                result = &mut applied => return result,
+                () = tokio::time::sleep(self.config.poll_interval) => {
+                    if let Some(metrics) = &self.metrics {
+                        metrics.heartbeat(self.pool);
+                    }
+                }
+            }
+        }
     }
 
     /// Polls until `shutdown` flips, backing off on RPC failures. An RPC
@@ -534,7 +569,7 @@ impl<'a> LedgerPoller<'a> {
         // nothing re-reads them: `seed_pools_needing_it` reseeds only a
         // store that is empty or has no cursor, so a populated one never
         // recovers them.
-        if applied.await.is_err() {
+        if self.await_ack(applied).await.is_err() {
             return Err(LedgerError::NotApplied {
                 ledger: head.sequence,
             });
@@ -1175,6 +1210,91 @@ mod tests {
              gap rather than staying silent for the rest of the process: \
              {seen_third:?}"
         );
+        Ok(())
+    }
+
+    /// Waiting for a tracker that is busy — a gap reseed, a full scan —
+    /// is the poller being alive, not stuck: the wait heartbeats, so
+    /// `/livez` cannot answer 503 and have a restart probe kill the bot
+    /// in the middle of the very seed it is waiting on. The
+    /// acknowledgement itself is untouched: the cursor still moves only
+    /// once the tracker has answered.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_wait_for_an_acknowledgement_keeps_heartbeating(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let before_cursor = Cursor {
+            ledger: 100,
+            paging_token: None,
+        };
+        store
+            .set_cursor(&events_cursor(POOL), &before_cursor)
+            .await
+            .expect("cursor");
+        let rpc = ScriptedRpc::start().await;
+        rpc.expect("getHealth", health(103, 1));
+        rpc.expect("getLatestLedger", latest(103, 1_788_645_403));
+        rpc.expect(
+            "getEvents",
+            json!({"latestLedger": 103, "cursor": "103-1", "events": [borrow_event(101, 1)]}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let metrics = Arc::new(Metrics::new());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        let config = PollerConfig {
+            poll_interval: Duration::from_millis(5),
+            ..config()
+        };
+        // `poll_once` rather than `run`, so the only heartbeat this test
+        // can observe is one the wait itself recorded.
+        let mut poller =
+            LedgerPoller::new(&client, &store, POOL, config).with_metrics(Arc::clone(&metrics));
+
+        let before = std::time::Instant::now();
+        let poll = poller.poll_once(&sender);
+        let driver = async {
+            let mut held = None;
+            while let Some(message) = receiver.recv().await {
+                if let PollerMessage::Tick { ack, .. } = message {
+                    held = Some(ack);
+                    break;
+                }
+            }
+            let ack = held.expect("the pass sent a tick");
+            // Five poll intervals of a tracker that has not answered yet.
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let at = metrics
+                .pool_status(POOL)
+                .expect("a status")
+                .heartbeat
+                .expect("the wait recorded a heartbeat");
+            assert!(
+                at > before,
+                "the heartbeat advanced while the acknowledgement was held"
+            );
+            assert_eq!(
+                store.cursor(&events_cursor(POOL)).await.expect("cursor"),
+                Some(before_cursor),
+                "the cursor waits for the acknowledgement, heartbeat or not"
+            );
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            ack.send(()).expect("acknowledge the tick");
+        };
+        let (result, ()) = tokio::join!(poll, driver);
+        result.expect("poll").expect("a tick");
+
+        assert_eq!(
+            store
+                .cursor(&events_cursor(POOL))
+                .await
+                .expect("cursor")
+                .expect("set")
+                .ledger,
+            103,
+            "the acknowledgement, and only it, moved the cursor"
+        );
+        assert_eq!(rpc.remaining(), 0);
         Ok(())
     }
 

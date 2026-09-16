@@ -62,8 +62,8 @@ pub mod tracker;
 #[cfg(test)]
 pub(crate) mod fixture;
 
-/// Scripted-RPC and store scaffolding shared by the store, ledger and
-/// tracker tests.
+/// Scripted-RPC, store and notification-channel scaffolding shared by the
+/// store, ledger, tracker, notifier and service tests.
 #[cfg(test)]
 pub(crate) mod harness;
 

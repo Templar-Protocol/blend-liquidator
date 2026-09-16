@@ -6018,19 +6018,39 @@ mod tests {
 
         assert!(notifier.drain(std::time::Duration::from_secs(5)).await);
         let sent = recording.sent();
+        // Per pool, never by total count: a run of the alive pool's
+        // stamping task that the runner starved would then read as this
+        // test's own flake rather than as what it is.
+        let stalls = |pool: &str| -> Vec<Notification> {
+            sent.iter()
+                .filter(|notification| {
+                    notification.kind == NotificationKind::PollerStalled
+                        && notification.pool == pool
+                })
+                .cloned()
+                .collect()
+        };
+        let stalled = stalls(STALLED);
         assert_eq!(
-            sent.len(),
+            stalled.len(),
             1,
             "one stalled poller, and the cooldown suppresses every later pass: {sent:?}"
         );
-        assert_eq!(sent[0].kind, NotificationKind::PollerStalled);
-        assert_eq!(sent[0].severity, Severity::High);
-        assert_eq!(sent[0].pool, STALLED);
-        assert_eq!(sent[0].account, None);
+        assert_eq!(stalled[0].severity, Severity::High);
+        assert_eq!(stalled[0].account, None);
         assert!(
-            sent[0].message.contains("no poller heartbeat"),
+            stalled[0].message.contains("no poller heartbeat"),
             "the message says what is missing: {}",
-            sent[0].message
+            stalled[0].message
+        );
+        assert!(
+            stalls(ALIVE).is_empty(),
+            "a poller that keeps heartbeating is not stalled: {sent:?}"
+        );
+        assert!(
+            stalls(SILENT).is_empty(),
+            "a poller that has never heartbeated has not started, which is \
+             not the same as having stopped: {sent:?}"
         );
     }
 }
