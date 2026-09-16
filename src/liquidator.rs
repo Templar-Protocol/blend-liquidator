@@ -33,6 +33,7 @@
 pub mod auctioneer;
 pub mod chain;
 pub mod config;
+pub mod executor;
 pub mod inventory;
 pub mod ledger;
 pub mod math;

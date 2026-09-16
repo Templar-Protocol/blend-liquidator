@@ -191,7 +191,7 @@ impl CreationOutcome {
     /// whatever became of it.
     #[must_use]
     pub fn tx_hash(&self) -> Option<TxHash> {
-        self.submission.as_ref().map(outcome_hash)
+        self.submission.as_ref().map(TxOutcome::hash)
     }
 
     /// Whether the chain applied it and it succeeded. `false` for a
@@ -909,13 +909,13 @@ impl<'a> Auctioneer<'a> {
                 retries: CREATION_RETRIES,
             })
             .await?;
-        let hash = outcome_hash(&outcome).to_hex();
+        let hash = outcome.hash().to_hex();
         tracing::info!(
             creation_id,
             pool = %record.pool,
             account = %record.account,
             tx_hash = %hash,
-            status = outcome_status(&outcome),
+            status = outcome.status(),
             "creation submitted"
         );
         if !self.store.attach_creation_tx(creation_id, &hash).await? {
@@ -1148,30 +1148,6 @@ impl<'a> Auctioneer<'a> {
             flagged = flagged.saturating_add(count);
         }
         Ok(flagged)
-    }
-}
-
-/// What a submitted transaction's terminal state is called on a log line.
-/// A short label rather than `TxOutcome`'s `Debug`, whose `Failed` variant
-/// carries a whole decoded `TransactionResult`.
-fn outcome_status(outcome: &TxOutcome) -> &'static str {
-    match outcome {
-        TxOutcome::Succeeded { .. } => "succeeded",
-        TxOutcome::Failed { .. } => "failed",
-        TxOutcome::Expired { .. } => "expired",
-        TxOutcome::Unknown { .. } => "unknown",
-    }
-}
-
-/// The hash every [`TxOutcome`] variant carries, whatever the transaction's
-/// terminal state: even a failed, expired or unresolved transaction
-/// consumed a sequence number and is worth recording by its hash.
-fn outcome_hash(outcome: &TxOutcome) -> TxHash {
-    match outcome {
-        TxOutcome::Succeeded { hash, .. }
-        | TxOutcome::Failed { hash, .. }
-        | TxOutcome::Expired { hash, .. }
-        | TxOutcome::Unknown { hash, .. } => *hash,
     }
 }
 
