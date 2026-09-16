@@ -6,7 +6,7 @@
 A liquidation bot for [Blend Protocol](https://blend.capital) lending pools on
 [Stellar](https://stellar.org).
 
-> **Status: Phase 5.** The bot validates its configuration, seeds its
+> **Status: Phase 6a.** The bot validates its configuration, seeds its
 > tracked-user set from the [Blend analytics API](https://api.blend.templarfi.org)
 > or a static file, and follows every configured pool — applying pool events
 > and refreshing borrowers' health factors from chain into a Postgres store.
@@ -15,14 +15,20 @@ A liquidation bot for [Blend Protocol](https://blend.capital) lending pools on
 > contract judge the percent through simulation, and records every
 > creation it decides to make — and, only with a signing key configured
 > and `DRY_RUN=false`,
-> creates it on chain. It now also fills: once a tick it plans a fill for
+> creates it on chain. It also fills: once a tick it plans a fill for
 > every open liquidation auction whose assets its pool configuration
 > supports, works out the ledger at which the auction's lot first covers
 > its bid plus the pool's profit margin, keeps its own position at or above
 > `min_health_factor × HF_SAFETY_MULTIPLIER` while taking one over, records
 > every fill it executes — and, only with `DRY_RUN=false` *and*
-> `FILLER_SECRET_KEY`, submits it on chain. **Nothing unwinds a fill yet**
-> (see Safety below). What *is* complete is the scaffolding around it — CI
+> `FILLER_SECRET_KEY`, submits it on chain. And it now unwinds: after a
+> fill lands, and once at startup, it repays the debt it holds from its
+> wallet and withdraws collateral to the wallet — everything but the
+> primary asset, and the primary down to `min_primary_collateral` — while
+> keeping its health factor at or above the pool's `min_health_factor`
+> (see Safety below). What remains is Phase 6b: Telegram notifications,
+> metrics, and the `/healthz`/`/livez`/`/metrics` operational surface.
+> What *is* complete is the scaffolding around all of it — CI
 > gates, lint posture, dev container, release preflight — so the
 > liquidation logic lands into a repository that already fails loudly.
 
@@ -45,13 +51,20 @@ default for exactly that reason:
   are read from the environment only: a signing key passed on the command
   line is readable from `/proc/<pid>/cmdline`, `ps` and `docker inspect`.
 
-**Phase 5 does not unwind.** A live fill pays the auction's bid and takes
-its lot, which leaves the position *in the pool* — the lot as collateral,
-the bid as debt on the filler's own account — and nothing in this phase
-sells, repays or withdraws any of it. Profit is unrealised and the filler's
-own health factor is what carries the position until Phase 6 lands the
-unwind. Running live before then means choosing to hold and manage those
-positions by hand.
+**A fill unwinds to the wallet and holds; nothing is sold.** After a live
+fill lands — and once at startup, for whatever position is already
+there — the filler repays the debt it took from its own wallet and
+withdraws its collateral to that wallet: everything but the primary
+asset, and the primary down to `min_primary_collateral`. It never trades
+one asset for another, so profit sits in the wallet as whatever assets the
+position happened to hold, not as a single settled currency; converting it
+is an operator decision this bot does not make for you. The startup pass
+also means the wallet's stated floor, `min_primary_collateral`, doubles as
+the most primary collateral you should expect the bot to leave supplied to
+a pool — anything above it is trimmed back to the wallet on the very first
+tick of a run. A notification failure never blocks or delays this: debt
+the wallet cannot repay is reported once per pool and trading continues
+regardless of whether the report was delivered.
 
 ## Quickstart
 

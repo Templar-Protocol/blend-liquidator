@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The unwind builder (`src/math/unwind.rs`, `plan_unwind`): the
+  repay-and-withdraw request list for a position a fill has left the
+  filler holding, in three steps. First, repay each liability asset the
+  wallet holds — the debt in underlying plus a one-basis-point allowance
+  plus one unit, capped at what the wallet can spend, the same rule
+  `math::fill`'s repay uses. With no liability left, withdraw every
+  collateral but the primary entirely and the primary down to
+  `min_primary_collateral`; the contract health-checks nothing once no
+  debt remains, so no projection is consulted. With liabilities left,
+  withdraw candidate collateral — the ones that are also liabilities
+  first, then the rest by ascending value, the primary last — only while
+  the projected health factor stays at or above `min_health_factor`:
+  `HEALTH_MARGIN_BPS` (50, 0.5%) stops the walk once the projection is
+  that close to the floor, and `DUST_FLOOR_BPS` (100, 1% of
+  `min_primary_collateral`) is the smallest partial withdrawal of the
+  primary worth sending, in the no-debt step as well as this one. Every
+  withdrawal amount is found by formula and then verified by exact
+  projection, backing off in bounded steps when the two disagree, so
+  nothing reaches the plan unprojected. Pure: no I/O, nothing panics.
+- The notifier (`src/notifier.rs`): `NotificationKind`, `Severity`,
+  `Notification`, the `NotificationChannel` trait, `LogChannel`, and
+  `Notifier`, which deduplicates by `(pool, account, kind)` with a
+  cooldown — `FAILURE_NOTIFICATION_COOLDOWN_HOURS`, default 24 hours,
+  refused at zero since there is no "no cooldown" spelling, only shorter
+  ones — before handing what survives to one channel. `LogChannel`, the
+  only channel before Phase 6b's Telegram, logs at `WARN` for
+  `Severity::High` and `INFO` otherwise. A channel failure answers
+  `Delivery::Failed`, rolls back the dedup entry it optimistically
+  inserted, and never affects trading: `Notifier::notify` returns no
+  `Result`, only a `Delivery`.
+- The filler now unwinds. `Executor::unwind` (`src/executor.rs`) is
+  `Executor::execute`'s path for the requests `plan_unwind` builds: the
+  same mode guards, judged through `Submitter::simulate_only`, submitted
+  on the filler's queue with `UNWIND_RETRIES` (2, `src/queue.rs`) — but it
+  writes no audit row (there is no unwind table; the `unwind
+  planned`/`unwind submitted` log lines are the record) and never
+  re-plans, since an unwind has no percent to lower. `Filler::tick`
+  (`src/filler.rs`) runs one unwind pass per pool after its fill walk, as
+  a seventh step: a fill that landed or may have (`Succeeded` or
+  `Unknown`) makes its pool pending, and so does the run's very first
+  tick, for every configured pool — a restart between a fill and its
+  unwind must not strand the position, and that startup pass is also what
+  trims any primary collateral above `min_primary_collateral` back to the
+  wallet. The pass reads its own snapshot even for a pool the fill walk
+  just read this same tick, plans through `plan_unwind`, and repeats every
+  tick while it moves something; the first pass that builds no requests
+  (`UnwindPlan::is_idle`) clears the pool. Leftover debt the wallet cannot
+  repay notifies `NotificationKind::UnwindLeftovers` at `Severity::High`
+  once per pool, not again until a later pass finds it clean.
 - The filler (`src/filler.rs`, `Filler`): once a tick, per configured pool,
   `tick` keeps only the open-auction rows worth a chain read — a user
   liquidation, none of the bot's own accounts, every asset accepted by the
@@ -147,10 +196,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   two is a startup error; in dry-run each is a warning, and no
   `FILLER_SECRET_KEY` at all warns that the filler plans against an empty
   inventory and simulates nothing.
-- **Nothing unwinds a fill yet.** A live fill pays the auction's bid and
-  takes its lot, which leaves the position in the pool — the lot as
-  collateral, the bid as debt on the filler's own account — and nothing in
-  this phase sells, repays or withdraws it. That is Phase 6.
 - The auctioneer (`src/auctioneer.rs`, `Auctioneer`): `decide` reads one
   snapshot per batch of tracked users, values each at the later of the
   tick's close time and the newest reserve entry the snapshot holds — the

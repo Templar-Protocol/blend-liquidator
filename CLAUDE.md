@@ -6,7 +6,7 @@ A liquidation bot for [Blend Protocol](https://blend.capital) lending pools on
 Stellar. It is intended to repay the debt of underwater positions and receive
 their collateral at a discount.
 
-**Status: Phase 5.** Phase 1 landed the pure fixed-point math (`math`) and
+**Status: Phase 6a.** Phase 1 landed the pure fixed-point math (`math`) and
 the ScVal/ledger-entry codecs (`chain::xdr`); Phase 2 landed the chain layer
 (`chain::rpc`, `chain::pool`, `chain::signer`, `chain::tx`); Phase 3 landed
 the Postgres store, a per-pool ledger poller and a tracker (`store`,
@@ -26,9 +26,16 @@ liquidation auction whose assets its pool configuration supports, holds its
 own position at or above `min_health_factor × HF_SAFETY_MULTIPLIER` while
 taking one over, records every fill it executes — dry-run or not — and,
 only with `DRY_RUN=false` *and* `FILLER_SECRET_KEY`, submits it on the
-filler key's queue. **Nothing unwinds a fill yet:** a live fill leaves the
-taken position — the lot as collateral, the bid as debt — sitting in the
-pool, and nothing sells, repays or withdraws it. That is Phase 6. The
+filler key's queue. Phase 6a landed unwind (`math::unwind`, `notifier`,
+and the filler's unwind pass in `filler`/`executor`): after a fill lands,
+and once at startup, the filler repays the debt it holds from its wallet
+and withdraws collateral to the wallet — everything but the primary, and
+the primary down to `min_primary_collateral` — keeping its own health
+factor at or above the pool's `min_health_factor`; debt the wallet cannot
+repay notifies once per pool through the `Notifier`'s log channel, which
+is all that channel does before Phase 6b's Telegram lands. What remains
+for Phase 6b: Telegram delivery for `notifier`, its bounded in-flight
+semaphore and `drain()`, metrics, and `/healthz`/`/livez`/`/metrics`. The
 repository scaffolding is complete and enforced.
 
 **This bot is NOT non-custodial.** It is designed to hold a signing key and
@@ -93,7 +100,16 @@ make help                           # Docker Compose lifecycle
   by projecting the filler's own post-fill position exactly, and escalates
   supply → lower percent → later ledger when the projection is short,
   searching candidates exactly rather than estimating one a later round
-  would only have to correct).
+  would only have to correct), `unwind` (which of the filler's own debts
+  to repay from its wallet and which of its collateral to withdraw once a
+  fill has left it holding a position — `plan_unwind`'s three steps: repay
+  each liability the wallet holds, then with none left withdraw every
+  collateral but the primary and the primary down to
+  `min_primary_collateral`, else withdraw within `min_health_factor` —
+  `HEALTH_MARGIN_BPS` (50, stopping the walk within 0.5% of the floor) and
+  `DUST_FLOOR_BPS` (100, the smallest partial withdrawal of the primary
+  worth sending) bound it, and every withdrawal is verified by exact
+  projection, backing off when it disagrees).
   Nothing here does I/O and nothing panics.
 - `src/chain/xdr/` — ScVal codecs for the pool: `encode` (values, operations,
   simulation envelopes), `keys` (ledger keys, durability included), `decode`
@@ -153,7 +169,8 @@ make help                           # Docker Compose lifecycle
   while an earlier transaction's outcome on it is still unknown (see the
   invariant below). Only a failure that provably sent nothing is retried
   here, within the budget its `Submission` carries — `CREATION_RETRIES` is
-  3, `FILL_RETRIES` 10 — backing off from one second, doubling, to thirty;
+  3, `FILL_RETRIES` 10, `UNWIND_RETRIES` 2 — backing off from one second,
+  doubling, to thirty;
   that is exactly what `QueueError::Chain`'s doc comment narrows the
   variant to, and what lets `Executor::execute` release its wallet
   reservation on it without asking anything else. What to submit, at what
@@ -201,6 +218,19 @@ make help                           # Docker Compose lifecycle
   wallet rather than money on chain, so a drift it cannot lose a stroop to
   is repaired by the next read, whereas a checked subtraction would error a
   filler that has nothing wrong with the chain state it is about to act on.
+- `src/notifier.rs` — `Notifier` deduplicates a `Notification` by `(pool,
+  account, kind)` with a cooldown (`FAILURE_NOTIFICATION_COOLDOWN_HOURS`,
+  at least 1 hour and refused at zero) before handing what survives to one
+  `NotificationChannel`. `LogChannel` — the only channel before Phase 6b's
+  Telegram — is what every deployment gets; it logs at `WARN` for
+  `Severity::High` and `INFO` otherwise. A channel failure answers
+  `Delivery::Failed` and rolls back the dedup entry it optimistically
+  inserted, and never affects trading: `Notifier::notify` returns no
+  `Result`, so nothing upstream — a liquidation, a fill or an unwind
+  included — can make a decision depend on whether a notification was
+  delivered. `NotificationKind` already lists every kind spec §7 names, so
+  Phase 6b's bounded in-flight semaphore, `drain()` and Telegram channel
+  add no new variant.
 - `src/executor.rs` — one planned fill, from the contract's judgment to the
   audit row, the submission and the settled reservation. `Executor::execute`
   runs the mode guards first — a dry-run executor handed a live
@@ -218,6 +248,14 @@ make help                           # Docker Compose lifecycle
   other refusal is `Refused` with the code logged. The reservation is
   settled by value on every non-panicking path. No arithmetic on money
   happens here — every amount is `math::fill`'s, passed through unchanged.
+  `Executor::unwind` is the same path for `plan_unwind`'s requests — the
+  mode guards, `Submitter::simulate_only`'s judgment, submission on the
+  filler's queue with `UNWIND_RETRIES` — but it writes no audit row (there
+  is no unwind table; the `unwind planned`/`unwind submitted` log lines
+  are the record) and never re-plans, since an unwind has no percent to
+  lower: a refusal or a stale sequence is left for the next pass.
+  `UnwindOutcome::landed` answers whether the chain applied it or may yet
+  (`Succeeded` or `Unknown`), which is what keeps a pool unwind-pending.
 - `src/filler.rs` — the filler: the I/O around everything `math::fill`
   decides. Once a tick, per pool, `Filler::tick` keeps only the rows worth
   a chain read — a user liquidation, not one of the bot's own accounts,
@@ -240,7 +278,23 @@ make help                           # Docker Compose lifecycle
   auction's: everything but a `StoreError` is logged with its pool and
   account and the pass carries on, and a raised shutdown flag ends a tick
   *between* auctions, never inside a submission already waiting for its
-  outcome.
+  outcome. After the walk, one unwind pass runs per pool this run's
+  `FillerState` marks pending: a fill that landed or may have (`Succeeded`
+  or `Unknown`) makes its pool pending, and so does the run's very first
+  tick, for every configured pool — a restart between a fill and its
+  unwind must not strand the position, and an idle pass costs one snapshot
+  and one wallet read. The pass reads its own snapshot even for a pool the
+  fill walk just read in this same tick, since a fill may have changed the
+  position in between; plans it through `math::unwind::plan_unwind`; and
+  executes through `Executor::unwind` behind the same startup gate and
+  queue a fill uses. A pass that moves something leaves its pool pending
+  for the next tick's fresh plan; the first pass that builds no requests
+  (`UnwindPlan::is_idle`) clears it. Debt the wallet cannot repay notifies
+  `NotificationKind::UnwindLeftovers` at `Severity::High` once per pool,
+  not again until a later pass finds the pool clean. There is no
+  top-level `unwind.rs`: the pass shares the filler's inventory, executor,
+  wallet refresh and per-tick state closely enough that it lives here as a
+  second `impl Filler` block, with the pure builder in `math::unwind`.
 - `src/service.rs` — wiring: `Service::check_config` validates the
   configuration against the chain *and* the database (connect and ping, per
   the spec's deployment contract) and reports without following anything;
@@ -303,9 +357,10 @@ make help                           # Docker Compose lifecycle
   RPC through `curl`. See that directory's README.
 
 The module layout beyond this follows
-`docs/superpowers/specs/2026-09-04-blend-liquidator-bot-design.md`; the
-phases still to land are unwind — which is what makes a filled position
-into realised profit — and the rest of the operational surface.
+`docs/superpowers/specs/2026-09-04-blend-liquidator-bot-design.md`; what
+remains is Phase 6b's operational surface — Telegram delivery for
+`notifier`, its bounded in-flight semaphore and `drain()`, metrics, and
+`/healthz`/`/livez`/`/metrics`.
 
 ## Conventions
 
@@ -546,6 +601,26 @@ into realised profit — and the rest of the operational surface.
   make unreachable. Sharing a key is spelled by leaving
   `AUCTIONEER_SECRET_KEY` unset: the auctioneer then falls back to the
   filler's key and both roles submit through the one queue that key needs.
+- The startup unwind pass trims any primary collateral above
+  `min_primary_collateral` to the wallet, even when no fill triggered it —
+  spec §5 step 2's floor applies on the run's first pass over every pool,
+  by design (spec §1's capital model is "unwind to the wallet and hold").
+  Set `min_primary_collateral` to exactly what you mean the bot to keep
+  supplied in the pool: anything above it goes to the wallet on the first
+  tick.
+- An unwind's repay is capped at what the wallet can spend, never the raw
+  balance: `Inventory::available`'s figure, net of `XLM_FEE_RESERVE` and
+  every open `Reservation` — the same rule a fill's repay uses. The
+  contract refunds whatever a repay overshoots the debt by, but the wallet
+  must hold all of it up front.
+- `min_health_factor` alone is the unwind's floor
+  (`UnwindTerms::min_health_factor` in `math::unwind`); `HF_SAFETY_MULTIPLIER`
+  only widens the *fill's* floor (`health_floor` in `math::fill`) and plays
+  no part in an unwind's projection.
+- A notification failure never affects trading: `Notifier::notify` answers
+  a `Delivery`, never a `Result`, so a channel outage cannot hold up or
+  fail a liquidation, a fill or an unwind — it can only mean the operator
+  hears about one later than intended.
 
 ## Workflow
 
