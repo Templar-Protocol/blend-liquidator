@@ -23,6 +23,13 @@
 //! such combination, but the public pieces composed by hand must not be
 //! able to make a dry run that sends.
 //!
+//! [`Executor::unwind`] is the same path for a different operation: the
+//! requests [`crate::math::unwind::plan_unwind`] builds, judged, logged
+//! and submitted under those same guards. It writes no audit row — there
+//! is no unwind table, and its structured events are the record — and it
+//! re-plans nothing: a fill lowers its percent when the contract's own
+//! health check disagrees with it, and an unwind has no percent to lower.
+//!
 //! **The reservation is settled exactly once, on every non-panicking
 //! path.** [`crate::inventory::Reservation`] releases itself when dropped
 //! unsettled, and warns when it does; this module settles by value
@@ -38,7 +45,8 @@ use crate::chain::xdr::{AuctionType, XdrError};
 use crate::chain::{ChainError, TxOutcome};
 use crate::inventory::{Reservation, Settlement};
 use crate::math::fill::{FillAction, FillDraft};
-use crate::queue::{QueueError, Submission, SubmissionQueue, FILL_RETRIES};
+use crate::math::unwind::{UnwindAction, UnwindPlan};
+use crate::queue::{QueueError, Submission, SubmissionQueue, FILL_RETRIES, UNWIND_RETRIES};
 use crate::store::{FillRecord, Store, StoreError};
 
 /// `WithdrawCollateral`'s "all": the contract caps what it burns at the
@@ -130,6 +138,52 @@ pub enum ExecOutcome {
     Stale,
 }
 
+/// What [`Executor::unwind`] did with one unwind plan.
+///
+/// There is no `Replan`: a fill that the contract's health check refuses
+/// can be re-planned at a lower percent, and an unwind has no percent —
+/// the next pass plans it again from fresh state, or does not.
+#[derive(Debug)]
+pub enum UnwindOutcome {
+    /// The pass was planned and not sent: a dry run, or an armed executor
+    /// that was handed no queue.
+    Planned {
+        /// Whether the contract judged it. `false` when no filler key is
+        /// configured, which leaves no source account to simulate as.
+        simulated: bool,
+    },
+    /// It went out on the filler's queue, and this is what the chain made
+    /// of it.
+    Submitted(TxOutcome),
+    /// The contract refused it, or could not judge it at all. Nothing was
+    /// sent.
+    Refused {
+        /// The pool's error code, when the refusal carried one. `None`
+        /// for a footprint that needs restoring, which is not a judgment
+        /// on the plan at all.
+        contract_error: Option<u32>,
+    },
+    /// Another transaction consumed this key's sequence number first, so
+    /// the plan was built against state that has moved: it is planned
+    /// again from fresh state, never resent (spec §8).
+    Stale,
+}
+
+impl UnwindOutcome {
+    /// Whether the chain may have applied this pass — it succeeded, or its
+    /// outcome is unresolved and may yet land (ruling 14). The filler reads
+    /// this to decide whether the position it planned against has moved,
+    /// so an unresolved submission counts: repeating it would build the
+    /// next pass on a position the chain is about to change.
+    #[must_use]
+    pub fn landed(&self) -> bool {
+        matches!(
+            self,
+            Self::Submitted(TxOutcome::Succeeded { .. } | TxOutcome::Unknown { .. })
+        )
+    }
+}
+
 /// A failure that stopped one fill.
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutorError {
@@ -193,6 +247,39 @@ pub fn fill_requests(user: &str, draft: &FillDraft) -> Result<Vec<Request>, XdrE
     Ok(requests)
 }
 
+/// The `submit` requests one unwind plan becomes, in the order it planned
+/// them: the repays that free the position, then the withdrawals that take
+/// what they unlocked.
+///
+/// Unlike [`fill_requests`] this cannot fail — there is no percent to
+/// validate and no auction to name — so it answers the requests
+/// themselves. [`UnwindAction::WithdrawAll`] carries no amount because the
+/// contract's own cap is the amount: it sends [`WITHDRAW_ALL`], which is
+/// exact whatever the position has accrued to by the time it lands.
+#[must_use]
+pub fn unwind_requests(actions: &[UnwindAction]) -> Vec<Request> {
+    actions
+        .iter()
+        .map(|action| match action {
+            UnwindAction::Repay { asset, amount } => Request {
+                request_type: RequestType::Repay,
+                address: asset.clone(),
+                amount: *amount,
+            },
+            UnwindAction::Withdraw { asset, amount } => Request {
+                request_type: RequestType::WithdrawCollateral,
+                address: asset.clone(),
+                amount: *amount,
+            },
+            UnwindAction::WithdrawAll { asset } => Request {
+                request_type: RequestType::WithdrawCollateral,
+                address: asset.clone(),
+                amount: WITHDRAW_ALL,
+            },
+        })
+        .collect()
+}
+
 /// What becomes of the wallet reservation a plan was holding. Every path
 /// out of `Executor::run` names one, so the token is settled by value
 /// exactly once and never left to the drop guard.
@@ -205,21 +292,112 @@ enum Settle {
     Release,
 }
 
-/// What the contract made of the plan, and what is left to do with it.
+/// What the contract made of an operation: the half of a judgment that is
+/// the same whatever was submitted.
+///
+/// What a refusal *means* is not here, because it differs: a fill the
+/// contract's health check refuses is re-planned at a lower percent, and
+/// an unwind has no percent to lower. This carries the contract's own
+/// answer, and each path reads it.
 enum Judged {
     /// It accepted the operation.
     Accepted(Operation),
     /// Armed, and the footprint holds archived entries: the contract
-    /// judged nothing about the fill itself, and `Submitter::prepare`
-    /// restores them and simulates again on the way to sending. The
-    /// operation goes to the queue all the same, recorded unsimulated.
+    /// judged nothing about the operation itself, and `Submitter::prepare`
+    /// restores them and simulates again on the way to sending. It goes to
+    /// the queue all the same, unsimulated.
+    NeedsRestore(Operation),
+    /// There is no signer to simulate as, so nothing judged it. It is
+    /// never submitted: the mode guards refuse a queue to an executor with
+    /// no signer.
+    Unsimulated,
+    /// It refused, with the code and the diagnostic text it gave.
+    Refused {
+        /// The pool's error code, when the refusal carried one.
+        contract_error: Option<u32>,
+        /// The RPC's text, for the caller's log line.
+        message: String,
+    },
+    /// Dry-run, and the footprint holds archived entries: the contract
+    /// judged nothing, and restoring it is a submission this path does not
+    /// make. Both paths answer a refusal carrying no code, which is what
+    /// "not judged at all" is.
+    Unjudged,
+}
+
+/// What the contract made of a fill, read the way a fill reads it.
+enum JudgedFill {
+    /// It accepted the operation.
+    Accepted(Operation),
+    /// Armed, and the footprint holds archived entries: recorded
+    /// unsimulated, and submitted all the same.
     NeedsRestore(Operation),
     /// There is no signer to simulate as, so the plan is recorded
-    /// unsimulated. It is never submitted: the mode guards refuse a queue
-    /// to an executor with no signer.
+    /// unsimulated.
     Unsimulated,
     /// It refused: nothing is recorded, and this is the answer.
     Refused(ExecOutcome),
+}
+
+/// What the queue made of a submission, before either path says what that
+/// means for the thing submitted.
+enum Landed {
+    /// The chain answered, whatever the answer was.
+    Outcome(TxOutcome),
+    /// Another transaction spent this key's sequence number first, so
+    /// nothing of this submission was sent.
+    Stale,
+    /// The contract refused it when it was prepared.
+    Refused {
+        /// The pool's error code, when the refusal carried one.
+        contract_error: Option<u32>,
+        /// The RPC's text, for the caller's log line.
+        message: String,
+    },
+}
+
+/// Hands one submission to the queue and says what the reservation it was
+/// holding becomes.
+///
+/// The settlement is decided from the chain's answer, and decided *before*
+/// the caller writes anything down: an `Unknown` may yet land and spend the
+/// wallet, so the ledger assumes it did until the next balance read says
+/// otherwise (ruling 14), and a store failure in the caller must not turn
+/// that into a release — which would hand the next plan amounts the chain
+/// has taken.
+///
+/// Releasing on every failing arm is safe because of the contract
+/// [`QueueError::Chain`] states: the queue answers it only for a failure
+/// that provably sent nothing of this submission — a `prepare` that
+/// failed, a send the RPC refused, a stale sequence — never for a
+/// transaction that may be in flight, which it resolves by hash instead. A
+/// queue that stopped honouring that would make this hand back a wallet the
+/// chain had already spent.
+async fn enqueue(
+    queue: &SubmissionQueue,
+    submission: Submission,
+) -> (Result<Landed, ExecutorError>, Settle) {
+    match queue.enqueue(submission).await {
+        Ok(outcome) => {
+            let settle = match outcome {
+                TxOutcome::Succeeded { .. } | TxOutcome::Unknown { .. } => Settle::Consume,
+                TxOutcome::Failed { .. } | TxOutcome::Expired { .. } => Settle::Release,
+            };
+            (Ok(Landed::Outcome(outcome)), settle)
+        }
+        Err(QueueError::Chain(ChainError::BadSequence)) => (Ok(Landed::Stale), Settle::Release),
+        Err(QueueError::Chain(ChainError::Simulation {
+            contract_error,
+            message,
+        })) => (
+            Ok(Landed::Refused {
+                contract_error,
+                message,
+            }),
+            Settle::Release,
+        ),
+        Err(error) => (Err(ExecutorError::Queue(error)), Settle::Release),
+    }
 }
 
 /// `Replan` for the two errors that mean the contract's own health check
@@ -330,6 +508,37 @@ impl<'a> Executor<'a> {
         settlement: Settlement,
         queue: Option<&SubmissionQueue>,
     ) -> Result<ExecOutcome, ExecutorError> {
+        let reservation = self.guard(settlement, queue.is_some())?;
+
+        // The one settlement point, and it applies to the failing answer
+        // too: what the reservation becomes is decided by what the *chain*
+        // did, never by whether this module then managed to write it down.
+        let (answer, settled) = self.run(plan, queue).await;
+        settle(reservation, settled);
+        answer
+    }
+
+    /// Step 1 for every operation this module sends: the mode guards,
+    /// before anything touches the chain.
+    ///
+    /// A dry-run executor handed a [`Settlement::Live`] fails; a live one
+    /// handed [`Settlement::DryRun`] fails; and an `armed` call — one that
+    /// was given a submission queue — fails for an executor that is
+    /// dry-run, or has no signer to judge with. Every refusal releases the
+    /// reservation it was handed rather than leaving it to the drop guard,
+    /// whose warning is meant to be a bug's signature and not the sound of
+    /// a guard doing its job.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecutorError::Mode`] for a composition this executor may not
+    /// make. `Service::run` builds none of them; the public pieces
+    /// composed by hand must not be able to.
+    fn guard(
+        &self,
+        settlement: Settlement,
+        armed: bool,
+    ) -> Result<Option<Reservation>, ExecutorError> {
         let reservation = match settlement {
             Settlement::Live(reservation) if self.dry_run => {
                 reservation.release();
@@ -347,34 +556,21 @@ impl<'a> Executor<'a> {
             Settlement::Live(reservation) => Some(reservation),
             Settlement::DryRun => None,
         };
-        if queue.is_some() && self.dry_run {
+        if armed && self.dry_run {
             release(reservation);
             return Err(ExecutorError::Mode(
                 "a submission queue was given to a dry-run executor; dry-run sends nothing, \
                  so the queue is refused rather than used",
             ));
         }
-        if queue.is_some() && self.submitter.is_none() {
+        if armed && self.submitter.is_none() {
             release(reservation);
             return Err(ExecutorError::Mode(
                 "a submission queue was given to an executor with no signer, so nothing \
                  could be judged before it was sent",
             ));
         }
-
-        // The one settlement point, and it applies to the failing answer
-        // too: what the reservation becomes is decided by what the *chain*
-        // did, never by whether this module then managed to write it down.
-        let (answer, settle) = self.run(plan, queue).await;
-        match settle {
-            Settle::Consume => {
-                if let Some(reservation) = reservation {
-                    reservation.consume();
-                }
-            }
-            Settle::Release => release(reservation),
-        }
-        answer
+        Ok(reservation)
     }
 
     /// Steps 2 to 4, and what the reservation the caller still holds
@@ -395,10 +591,10 @@ impl<'a> Executor<'a> {
             Err(error) => return (Err(error), Settle::Release),
         };
         let (operation, simulated) = match judged {
-            Judged::Refused(outcome) => return (Ok(outcome), Settle::Release),
-            Judged::Accepted(operation) => (Some(operation), true),
-            Judged::NeedsRestore(operation) => (Some(operation), false),
-            Judged::Unsimulated => (None, false),
+            JudgedFill::Refused(outcome) => return (Ok(outcome), Settle::Release),
+            JudgedFill::Accepted(operation) => (Some(operation), true),
+            JudgedFill::NeedsRestore(operation) => (Some(operation), false),
+            JudgedFill::Unsimulated => (None, false),
         };
 
         let draft = &plan.draft;
@@ -483,16 +679,23 @@ impl<'a> Executor<'a> {
         simulated: bool,
         operation: Operation,
     ) -> (Result<ExecOutcome, ExecutorError>, Settle) {
-        match queue
-            .enqueue(Submission {
+        // `enqueue` decides the settlement from the chain's answer, and
+        // decides it *before* the hash below is written: a store failure
+        // there must not turn a transaction that may have landed into a
+        // release, which would hand the next plan amounts the chain has
+        // taken (ruling 14).
+        let (landed, settle) = enqueue(
+            queue,
+            Submission {
                 operation,
                 priority: plan.priority,
                 label: format!("fill {} on {}", plan.user, plan.pool),
                 retries: FILL_RETRIES,
-            })
-            .await
-        {
-            Ok(outcome) => {
+            },
+        )
+        .await;
+        match landed {
+            Ok(Landed::Outcome(outcome)) => {
                 let hash = outcome.hash().to_hex();
                 tracing::info!(
                     fill_id,
@@ -502,16 +705,6 @@ impl<'a> Executor<'a> {
                     status = outcome.status(),
                     "fill submitted"
                 );
-                // Decided from the chain's answer, and decided *before*
-                // the hash is written: an `Unknown` may yet land and spend
-                // the wallet, so the ledger assumes it did until the next
-                // balance read says otherwise (ruling 14) — and a store
-                // failure below must not turn that into a release, which
-                // would hand the next plan amounts the chain has taken.
-                let settle = match outcome {
-                    TxOutcome::Succeeded { .. } | TxOutcome::Unknown { .. } => Settle::Consume,
-                    TxOutcome::Failed { .. } | TxOutcome::Expired { .. } => Settle::Release,
-                };
                 match self.store.attach_fill_tx(fill_id, &hash).await {
                     Ok(true) => {}
                     Ok(false) => tracing::warn!(
@@ -523,7 +716,7 @@ impl<'a> Executor<'a> {
                 }
                 (Ok(self.recorded(fill_id, simulated, Some(outcome))), settle)
             }
-            Err(QueueError::Chain(ChainError::BadSequence)) => {
+            Ok(Landed::Stale) => {
                 tracing::info!(
                     fill_id,
                     pool = %plan.pool,
@@ -531,12 +724,12 @@ impl<'a> Executor<'a> {
                     "another transaction spent this key's sequence first; this plan is stale \
                      and is re-planned rather than resent"
                 );
-                (Ok(ExecOutcome::Stale), Settle::Release)
+                (Ok(ExecOutcome::Stale), settle)
             }
-            Err(QueueError::Chain(ChainError::Simulation {
+            Ok(Landed::Refused {
                 contract_error,
                 message,
-            })) => {
+            }) => {
                 tracing::warn!(
                     fill_id,
                     pool = %plan.pool,
@@ -545,44 +738,29 @@ impl<'a> Executor<'a> {
                     %message,
                     "the contract refused this fill when it was prepared"
                 );
-                (Ok(refusal(contract_error)), Settle::Release)
+                (Ok(refusal(contract_error)), settle)
             }
-            // Releasing is safe here because of the contract
-            // [`QueueError::Chain`] states: the queue answers it only for a
-            // failure that provably sent nothing of this submission — a
-            // `prepare` that failed, a send the RPC refused, a stale
-            // sequence — never for a transaction that may be in flight,
-            // which it resolves by hash instead. A queue that stopped
-            // honouring that would make this arm hand back a wallet the
-            // chain had already spent.
-            Err(error) => (Err(ExecutorError::Queue(error)), Settle::Release),
+            Err(error) => (Err(error), settle),
         }
     }
 
-    /// Step 2: the exact `submit` the queue would send, judged by the
-    /// contract through [`Submitter::simulate_only`].
-    ///
-    /// `armed` decides only what an archived footprint means: a submission
-    /// restores it on the way through [`Submitter::prepare`], and a dry run
-    /// has no business making that submission, so it refuses instead.
-    async fn judge(&self, plan: &FillPlan, armed: bool) -> Result<Judged, ExecutorError> {
+    /// Step 2 for a fill: [`Executor::judge_operation`], read the way a
+    /// fill reads it. `InvalidHf` and `MinCollateralNotMet` are the two
+    /// refusals a lower percent addresses, and they alone are not a
+    /// warning: the fill is re-planned, not skipped.
+    async fn judge(&self, plan: &FillPlan, armed: bool) -> Result<JudgedFill, ExecutorError> {
         let requests = fill_requests(&plan.user, &plan.draft)?;
-        let Some(submitter) = self.submitter.as_ref() else {
-            tracing::debug!(
-                pool = %plan.pool,
-                account = %plan.user,
-                "no filler key configured; recording the fill unsimulated"
-            );
-            return Ok(Judged::Unsimulated);
-        };
-        // The filler pays the bid from its own wallet, takes the lot into
-        // its own position, and acts for itself: one account in all three
-        // roles.
-        let filler = submitter.source();
-        let operation = submit_op(&plan.pool, filler, filler, filler, &requests)?;
-        match submitter.simulate_only(&operation).await? {
-            Judgment::Accepted => Ok(Judged::Accepted(operation)),
-            Judgment::Refused {
+        match self
+            .judge_operation(&plan.pool, Some(&plan.user), &requests, armed, "fill")
+            .await?
+        {
+            Judged::Accepted(operation) => Ok(JudgedFill::Accepted(operation)),
+            Judged::NeedsRestore(operation) => Ok(JudgedFill::NeedsRestore(operation)),
+            Judged::Unsimulated => Ok(JudgedFill::Unsimulated),
+            Judged::Unjudged => Ok(JudgedFill::Refused(ExecOutcome::Refused {
+                contract_error: None,
+            })),
+            Judged::Refused {
                 contract_error,
                 message,
             } => {
@@ -604,29 +782,262 @@ impl<'a> Executor<'a> {
                         "the contract refused this fill; skipping it this tick"
                     );
                 }
-                Ok(Judged::Refused(outcome))
+                Ok(JudgedFill::Refused(outcome))
             }
+        }
+    }
+
+    /// The exact `submit` the queue would send, judged by the contract
+    /// through [`Submitter::simulate_only`] — which builds unsigned and
+    /// neither signs, restores nor sends. Every operation this module
+    /// sends comes through here.
+    ///
+    /// `armed` decides only what an archived footprint means: a submission
+    /// restores it on the way through [`Submitter::prepare`], and anything
+    /// that may not send has no business making that submission, so it
+    /// answers [`Judged::Unjudged`] instead. `what` and `account` name the
+    /// operation on the lines this logs; the contract's own refusal is not
+    /// logged here, because only the caller knows whether it is one a
+    /// re-plan addresses.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecutorError::Xdr`] for requests that will not encode, and
+    /// [`ExecutorError::Chain`] for a simulation that could not be made at
+    /// all — never for one the contract refused, which is a [`Judged`].
+    async fn judge_operation(
+        &self,
+        pool: &str,
+        account: Option<&str>,
+        requests: &[Request],
+        armed: bool,
+        what: &'static str,
+    ) -> Result<Judged, ExecutorError> {
+        let Some(submitter) = self.submitter.as_ref() else {
+            tracing::debug!(
+                pool,
+                account,
+                what,
+                "no filler key configured; nothing judged this operation"
+            );
+            return Ok(Judged::Unsimulated);
+        };
+        // The filler pays from its own wallet, takes into its own
+        // position, and acts for itself: one account in all three roles.
+        let filler = submitter.source();
+        let operation = submit_op(pool, filler, filler, filler, requests)?;
+        match submitter.simulate_only(&operation).await? {
+            Judgment::Accepted => Ok(Judged::Accepted(operation)),
+            Judgment::Refused {
+                contract_error,
+                message,
+            } => Ok(Judged::Refused {
+                contract_error,
+                message,
+            }),
             Judgment::NeedsRestore if armed => {
                 tracing::info!(
-                    pool = %plan.pool,
-                    account = %plan.user,
-                    "this fill's footprint holds archived entries; the submission restores \
-                     them and judges it before it sends"
+                    pool,
+                    account,
+                    what,
+                    "this operation's footprint holds archived entries; the submission \
+                     restores them and judges it before it sends"
                 );
                 Ok(Judged::NeedsRestore(operation))
             }
             Judgment::NeedsRestore => {
                 tracing::info!(
-                    pool = %plan.pool,
-                    account = %plan.user,
-                    "this fill could not be judged: its footprint holds archived entries, \
-                     which only an armed submission restores; skipping it"
+                    pool,
+                    account,
+                    what,
+                    "this operation could not be judged: its footprint holds archived \
+                     entries, which only an armed submission restores; skipping it"
                 );
-                Ok(Judged::Refused(ExecOutcome::Refused {
-                    contract_error: None,
-                }))
+                Ok(Judged::Unjudged)
             }
         }
+    }
+
+    /// One unwind pass: [`Executor::execute`]'s path for the operation
+    /// [`crate::math::unwind::plan_unwind`] builds, and its guards.
+    ///
+    /// 1. **The mode guards**, before anything touches the chain: the
+    ///    same three [`Executor::execute`] runs, with the same answers.
+    /// 2. **Simulate the exact `submit`** the queue would send — `from`,
+    ///    `spender` and `to` all the filler's own address, the requests
+    ///    [`unwind_requests`] builds — through
+    ///    [`Submitter::simulate_only`]. Any refusal answers
+    ///    [`UnwindOutcome::Refused`] with the code on a warn line: there
+    ///    is no percent to lower, so nothing is re-planned this pass. A
+    ///    footprint holding archived entries is refused in dry-run and
+    ///    proceeds when armed, unsimulated, exactly as a fill's is.
+    /// 3. **Log before sending.** There is no unwind table: the
+    ///    `unwind planned` event *is* the record, and it exists before the
+    ///    operation is handed to the queue.
+    /// 4. **Submit** on `queue`, when one is given, at
+    ///    [`Priority::Normal`] — an unwind races nobody — and with
+    ///    [`UNWIND_RETRIES`]. [`ChainError::BadSequence`] answers
+    ///    [`UnwindOutcome::Stale`]; a refusal at `prepare` answers as step
+    ///    2 does.
+    /// 5. **A dry run stops after step 3** with
+    ///    [`UnwindOutcome::Planned`], as does an armed executor handed no
+    ///    queue.
+    ///
+    /// The reservation is settled by value on every path: consumed when
+    /// the transaction landed or may have (ruling 14), released otherwise.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecutorError`] for one pass: a chain read that could not be made
+    /// at all, an operation that would not encode, a queue that refused the
+    /// submission, or a mode guard. A contract's refusal is none of those
+    /// — it is an [`UnwindOutcome`].
+    pub async fn unwind(
+        &self,
+        pool: &str,
+        plan: &UnwindPlan,
+        settlement: Settlement,
+        queue: Option<&SubmissionQueue>,
+    ) -> Result<UnwindOutcome, ExecutorError> {
+        let reservation = self.guard(settlement, queue.is_some())?;
+
+        // The one settlement point, as `execute` has: what the reservation
+        // becomes is decided by what the chain did, never by what this
+        // module then managed to say about it.
+        let (answer, settled) = self.run_unwind(pool, plan, queue).await;
+        settle(reservation, settled);
+        answer
+    }
+
+    /// Steps 2 to 4 of an unwind, and what the reservation the caller
+    /// still holds becomes. Nothing of the pass has been sent while steps
+    /// 2 and 3 run, so every early answer in them releases.
+    async fn run_unwind(
+        &self,
+        pool: &str,
+        plan: &UnwindPlan,
+        queue: Option<&SubmissionQueue>,
+    ) -> (Result<UnwindOutcome, ExecutorError>, Settle) {
+        let requests = unwind_requests(&plan.actions);
+        let judged = match self
+            .judge_operation(pool, None, &requests, queue.is_some(), "unwind")
+            .await
+        {
+            Ok(judged) => judged,
+            Err(error) => return (Err(error), Settle::Release),
+        };
+        let (operation, simulated) = match judged {
+            Judged::Accepted(operation) => (Some(operation), true),
+            Judged::NeedsRestore(operation) => (Some(operation), false),
+            Judged::Unsimulated => (None, false),
+            Judged::Unjudged => {
+                return (
+                    Ok(UnwindOutcome::Refused {
+                        contract_error: None,
+                    }),
+                    Settle::Release,
+                )
+            }
+            Judged::Refused {
+                contract_error,
+                message,
+            } => {
+                tracing::warn!(
+                    pool,
+                    contract_error,
+                    %message,
+                    "the contract refused this unwind; there is no percent to lower, so it \
+                     is planned again from fresh state or not at all"
+                );
+                return (
+                    Ok(UnwindOutcome::Refused { contract_error }),
+                    Settle::Release,
+                );
+            }
+        };
+
+        // The record, since there is no unwind table to write one in: it
+        // exists before the operation reaches the queue, so a crash
+        // between them leaves a logged intent and never a transaction on
+        // chain that nothing named.
+        tracing::info!(
+            pool,
+            actions = plan.actions.len(),
+            spend = ?plan.spend,
+            remaining = ?plan.remaining_liabilities,
+            projected_health = plan.projected_health,
+            simulated,
+            armed = queue.is_some(),
+            "unwind planned"
+        );
+        let Some(queue) = queue else {
+            return (Ok(UnwindOutcome::Planned { simulated }), Settle::Release);
+        };
+        // The mode guards refuse a queue to an executor with no signer, so
+        // an operation was built above. Answering as a dry run does is the
+        // safe reading of a composition that somehow got past them, and is
+        // never a panic.
+        let Some(operation) = operation else {
+            return (Ok(UnwindOutcome::Planned { simulated }), Settle::Release);
+        };
+
+        let (landed, settle) = enqueue(
+            queue,
+            Submission {
+                operation,
+                priority: Priority::Normal,
+                label: format!("unwind {pool}"),
+                retries: UNWIND_RETRIES,
+            },
+        )
+        .await;
+        match landed {
+            Ok(Landed::Outcome(outcome)) => {
+                tracing::info!(
+                    pool,
+                    tx_hash = %outcome.hash().to_hex(),
+                    status = outcome.status(),
+                    "unwind submitted"
+                );
+                (Ok(UnwindOutcome::Submitted(outcome)), settle)
+            }
+            Ok(Landed::Stale) => {
+                tracing::info!(
+                    pool,
+                    "another transaction spent this key's sequence first; this unwind is \
+                     stale and is planned again from fresh state rather than resent"
+                );
+                (Ok(UnwindOutcome::Stale), settle)
+            }
+            Ok(Landed::Refused {
+                contract_error,
+                message,
+            }) => {
+                tracing::warn!(
+                    pool,
+                    contract_error,
+                    %message,
+                    "the contract refused this unwind when it was prepared"
+                );
+                (Ok(UnwindOutcome::Refused { contract_error }), settle)
+            }
+            Err(error) => (Err(error), settle),
+        }
+    }
+}
+
+/// Settles a reservation by what the chain did with the plan it was
+/// holding. The one place either path settles, and by value: the drop
+/// guard's warning stays a bug's signature rather than the sound of an
+/// ordinary refusal.
+fn settle(reservation: Option<Reservation>, settlement: Settle) {
+    match settlement {
+        Settle::Consume => {
+            if let Some(reservation) = reservation {
+                reservation.consume();
+            }
+        }
+        Settle::Release => release(reservation),
     }
 }
 
@@ -1727,6 +2138,670 @@ mod tests {
         assert!(
             rpc.calls("sendTransaction").is_empty(),
             "and restoring, which is a submission, is not this path's business"
+        );
+        assert_eq!(
+            rpc.remaining(),
+            0,
+            "every scripted answer was used: an over-scripted test would hide a chain call \
+             this module never made"
+        );
+        Ok(())
+    }
+
+    /// The unwind every test below sends: repay 10 USDC, take the USDC
+    /// collateral out whole, and 7 XLM of the primary out with it. Only
+    /// the repay spends the wallet, so `spend` names USDC alone.
+    fn unwind_plan() -> UnwindPlan {
+        UnwindPlan {
+            actions: vec![
+                UnwindAction::Repay {
+                    asset: USDC.to_string(),
+                    amount: 10,
+                },
+                UnwindAction::WithdrawAll {
+                    asset: USDC.to_string(),
+                },
+                UnwindAction::Withdraw {
+                    asset: XLM.to_string(),
+                    amount: 7,
+                },
+            ],
+            spend: BTreeMap::from([(USDC.to_string(), 10)]),
+            remaining_liabilities: Vec::new(),
+            projected_health: None,
+        }
+    }
+
+    /// One request per action, in the order planned, and no fill in front
+    /// of them: an unwind acts on the bot's own position, and there is no
+    /// auction to take first.
+    #[test]
+    fn unwind_requests_map_each_action() {
+        let requests = unwind_requests(&unwind_plan().actions);
+
+        assert_eq!(
+            requests.len(),
+            3,
+            "one request per action, and nothing else"
+        );
+        assert_eq!(
+            requests[0],
+            Request {
+                request_type: RequestType::Repay,
+                address: USDC.to_string(),
+                amount: 10,
+            }
+        );
+        assert_eq!(
+            requests[1],
+            Request {
+                request_type: RequestType::WithdrawCollateral,
+                address: USDC.to_string(),
+                amount: WITHDRAW_ALL,
+            },
+            "'withdraw all' carries no amount of its own: the contract's cap is the amount"
+        );
+        assert_eq!(
+            requests[2],
+            Request {
+                request_type: RequestType::WithdrawCollateral,
+                address: XLM.to_string(),
+                amount: 7,
+            }
+        );
+        assert!(
+            unwind_requests(&[]).is_empty(),
+            "an idle plan asks the contract for nothing"
+        );
+    }
+
+    /// Dry-run lets the contract judge the unwind through `simulate_only`
+    /// and stops there: no fee stats, no send, and no audit row — there is
+    /// no unwind table, and the log event is the record.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_dry_run_unwind_is_planned_and_sends_nothing(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        script_simulate_prelude(&rpc, &signer, 10, 100);
+        script_simulate_accepted(&rpc, 100);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let executor = Executor::new(&store, Some(submitter), true);
+
+        let outcome = executor
+            .unwind(harness::POOL, &unwind_plan(), Settlement::DryRun, None)
+            .await
+            .expect("unwind");
+
+        assert!(
+            matches!(outcome, UnwindOutcome::Planned { simulated: true }),
+            "a dry run still lets the contract judge the unwind; got {outcome:?}"
+        );
+        assert!(
+            !outcome.landed(),
+            "nothing landed, because nothing was sent"
+        );
+
+        assert!(
+            rpc.calls("sendTransaction").is_empty(),
+            "a dry run never sends"
+        );
+        assert!(
+            rpc.calls("getFeeStats").is_empty(),
+            "and never reaches the signing path, which is what pays a fee"
+        );
+        let rows = sqlx::query!("SELECT count(*) AS n FROM fills")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(rows.n, Some(0), "an unwind is not a fill: no audit row");
+        assert_eq!(
+            rpc.remaining(),
+            0,
+            "every scripted answer was used: an over-scripted test would hide a chain call \
+             this module never made"
+        );
+        Ok(())
+    }
+
+    /// With no key there is no account to simulate as — and no RPC client
+    /// to ask with either, which is why this test scripts nothing. The
+    /// pass is still planned, and says it was not simulated.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_keyless_dry_run_unwind_is_planned_unsimulated(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let executor = Executor::new(&store, None, true);
+
+        let outcome = executor
+            .unwind(harness::POOL, &unwind_plan(), Settlement::DryRun, None)
+            .await
+            .expect("unwind");
+
+        assert!(
+            matches!(outcome, UnwindOutcome::Planned { simulated: false }),
+            "there is no source account to ask the contract as; got {outcome:?}"
+        );
+        assert!(!outcome.landed());
+        Ok(())
+    }
+
+    /// Armed: the unwind goes out on the filler's queue at `Normal` with
+    /// the unwind budget, under a label naming its pool, and what it
+    /// repaid is consumed.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_live_unwind_is_submitted_at_normal_priority_with_its_budget(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        script_simulate_prelude(&rpc, &signer, 10, 100);
+        script_simulate_accepted(&rpc, 100);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let executor = Executor::new(&store, Some(submitter), false);
+        let inventory = inventory();
+        let plan = unwind_plan();
+        let reservation = inventory
+            .reserve(&plan.spend)
+            .expect("the wallet holds the repay");
+        assert_eq!(
+            inventory.available()[USDC],
+            490,
+            "the reservation is out of what later plans may spend"
+        );
+
+        // A stand-in worker, as the fill tests use: what this test is
+        // about is what reaches the queue, not how the queue sends it.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let (queue, mut receiver) = SubmissionQueue::new(queue_capacity());
+        let worker = tokio::spawn(async move {
+            while let Some(queued) = receiver.recv().await {
+                recorder.lock().expect("the recorder mutex").push((
+                    queued.submission.priority,
+                    queued.submission.retries,
+                    queued.submission.label.clone(),
+                ));
+                let _ = queued.respond.send(Ok(TxOutcome::Succeeded {
+                    hash: TxHash([7_u8; 32]),
+                    ledger: 1,
+                    return_value: None,
+                }));
+            }
+        });
+
+        let outcome = executor
+            .unwind(
+                harness::POOL,
+                &plan,
+                Settlement::Live(reservation),
+                Some(&queue),
+            )
+            .await
+            .expect("unwind");
+        drop(queue);
+        worker.await.expect("the worker ends with the queue");
+
+        assert!(outcome.landed(), "this one landed; got {outcome:?}");
+        assert!(matches!(
+            outcome,
+            UnwindOutcome::Submitted(TxOutcome::Succeeded { .. })
+        ));
+        assert_eq!(
+            *seen.lock().expect("the recorder mutex"),
+            vec![(
+                Priority::Normal,
+                UNWIND_RETRIES,
+                format!("unwind {}", harness::POOL)
+            )],
+            "an unwind pays no premium to land first, and retries twice"
+        );
+
+        assert!(
+            inventory.reserved().values().all(|held| *held == 0),
+            "the reservation is settled"
+        );
+        assert_eq!(
+            inventory.available()[USDC],
+            490,
+            "consumed: the balance itself is down by the repay, not merely held"
+        );
+        assert_eq!(
+            inventory.available()[XLM],
+            1_000,
+            "and a withdrawal spends nothing"
+        );
+        let rows = sqlx::query!("SELECT count(*) AS n FROM fills")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(rows.n, Some(0), "an unwind writes no audit row");
+        assert_eq!(
+            rpc.remaining(),
+            0,
+            "every scripted answer was used: an over-scripted test would hide a chain call \
+             this module never made"
+        );
+        Ok(())
+    }
+
+    /// An unwind the chain applied and failed frees what it reserved: the
+    /// repay never happened.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_unwind_the_chain_failed_releases_its_reservation(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        script_simulate_prelude(&rpc, &signer, 10, 100);
+        script_simulate_accepted(&rpc, 100);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let executor = Executor::new(&store, Some(submitter), false);
+        let inventory = inventory();
+        let plan = unwind_plan();
+        let reservation = inventory.reserve(&plan.spend).expect("reserve");
+
+        let (queue, mut receiver) = SubmissionQueue::new(queue_capacity());
+        let worker = tokio::spawn(async move {
+            while let Some(queued) = receiver.recv().await {
+                let _ = queued.respond.send(Ok(TxOutcome::Failed {
+                    hash: TxHash([9_u8; 32]),
+                    ledger: 1,
+                    contract_error: Some(1_207),
+                    result: TransactionResult {
+                        fee_charged: 100,
+                        result: TransactionResultResult::TxFailed(VecM::default()),
+                        ext: TransactionResultExt::V0,
+                    },
+                }));
+            }
+        });
+
+        let outcome = executor
+            .unwind(
+                harness::POOL,
+                &plan,
+                Settlement::Live(reservation),
+                Some(&queue),
+            )
+            .await
+            .expect("unwind");
+        drop(queue);
+        worker.await.expect("the worker ends with the queue");
+
+        assert!(!outcome.landed());
+        assert!(
+            matches!(outcome, UnwindOutcome::Submitted(TxOutcome::Failed { .. })),
+            "the chain applied it and it failed; got {outcome:?}"
+        );
+        assert!(inventory.reserved().values().all(|held| *held == 0));
+        assert_eq!(
+            inventory.available()[USDC],
+            500,
+            "released: the unwind failed, so the wallet never paid it"
+        );
+        assert_eq!(
+            rpc.remaining(),
+            0,
+            "every scripted answer was used: an over-scripted test would hide a chain call \
+             this module never made"
+        );
+        Ok(())
+    }
+
+    /// Ruling 14 on this path too: an `Unknown` outcome consumes. The
+    /// transaction may yet land and repay, so the ledger assumes it did
+    /// until the next balance read says otherwise.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_unknown_unwind_outcome_consumes_its_reservation(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        script_simulate_prelude(&rpc, &signer, 10, 100);
+        script_simulate_accepted(&rpc, 100);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let executor = Executor::new(&store, Some(submitter), false);
+        let inventory = inventory();
+        let plan = unwind_plan();
+        let reservation = inventory.reserve(&plan.spend).expect("reserve");
+
+        let (queue, mut receiver) = SubmissionQueue::new(queue_capacity());
+        let worker = tokio::spawn(async move {
+            while let Some(queued) = receiver.recv().await {
+                let _ = queued.respond.send(Ok(TxOutcome::Unknown {
+                    hash: TxHash([4_u8; 32]),
+                    sequence: 11,
+                    window: LedgerWindow::try_new(100, 120).expect("a window ends after it opens"),
+                }));
+            }
+        });
+
+        let outcome = executor
+            .unwind(
+                harness::POOL,
+                &plan,
+                Settlement::Live(reservation),
+                Some(&queue),
+            )
+            .await
+            .expect("unwind");
+        drop(queue);
+        worker.await.expect("the worker ends with the queue");
+
+        assert!(
+            outcome.landed(),
+            "an unresolved outcome may have landed, and the filler stops repeating on it"
+        );
+        assert!(matches!(
+            outcome,
+            UnwindOutcome::Submitted(TxOutcome::Unknown { .. })
+        ));
+        assert!(
+            inventory.reserved().values().all(|held| *held == 0),
+            "settled, not left held"
+        );
+        assert_eq!(
+            inventory.available()[USDC],
+            490,
+            "consumed: the transaction may yet spend the wallet, so the ledger assumes it \
+             did (ruling 14)"
+        );
+        assert_eq!(
+            rpc.remaining(),
+            0,
+            "every scripted answer was used: an over-scripted test would hide a chain call \
+             this module never made"
+        );
+        Ok(())
+    }
+
+    /// A refused unwind is skipped whole: there is no percent to lower, so
+    /// nothing is re-planned, nothing is sent, and the reservation goes
+    /// back.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_refused_unwind_sends_nothing_and_releases(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        script_simulate_prelude(&rpc, &signer, 10, 100);
+        script_simulate_refused(&rpc, 1_207, 100);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let executor = Executor::new(&store, Some(submitter), false);
+        let inventory = inventory();
+        let plan = unwind_plan();
+        let reservation = inventory.reserve(&plan.spend).expect("reserve");
+
+        let outcome = executor
+            .unwind(harness::POOL, &plan, Settlement::Live(reservation), None)
+            .await
+            .expect("unwind");
+
+        assert!(
+            matches!(
+                outcome,
+                UnwindOutcome::Refused {
+                    contract_error: Some(1_207)
+                }
+            ),
+            "got {outcome:?}"
+        );
+        assert!(
+            inventory.reserved().values().all(|held| *held == 0),
+            "the refusal released what it had reserved"
+        );
+        assert_eq!(inventory.available()[USDC], 500);
+        assert!(
+            rpc.calls("sendTransaction").is_empty(),
+            "a refused unwind is never sent"
+        );
+        assert_eq!(
+            rpc.remaining(),
+            0,
+            "every scripted answer was used: an over-scripted test would hide a chain call \
+             this module never made"
+        );
+        Ok(())
+    }
+
+    /// A bad sequence means someone else spent this key's sequence first:
+    /// the plan was built against state that has moved, so it is planned
+    /// again from fresh state rather than resent.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_stale_unwind_is_replanned_not_resent(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        script_simulate_prelude(&rpc, &signer, 10, 100);
+        script_simulate_accepted(&rpc, 100);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let executor = Executor::new(&store, Some(submitter), false);
+        let inventory = inventory();
+        let plan = unwind_plan();
+        let reservation = inventory.reserve(&plan.spend).expect("reserve");
+
+        let (queue, mut receiver) = SubmissionQueue::new(queue_capacity());
+        let worker = tokio::spawn(async move {
+            while let Some(queued) = receiver.recv().await {
+                let _ = queued
+                    .respond
+                    .send(Err(QueueError::Chain(ChainError::BadSequence)));
+            }
+        });
+
+        let outcome = executor
+            .unwind(
+                harness::POOL,
+                &plan,
+                Settlement::Live(reservation),
+                Some(&queue),
+            )
+            .await
+            .expect("unwind");
+        drop(queue);
+        worker.await.expect("the worker ends with the queue");
+
+        assert!(
+            matches!(outcome, UnwindOutcome::Stale),
+            "a stale plan is planned again from fresh state, never resent; got {outcome:?}"
+        );
+        assert!(!outcome.landed());
+        assert!(
+            inventory.reserved().values().all(|held| *held == 0),
+            "nothing was sent, so nothing was spent"
+        );
+        assert_eq!(inventory.available()[USDC], 500);
+        assert_eq!(
+            rpc.remaining(),
+            0,
+            "every scripted answer was used: an over-scripted test would hide a chain call \
+             this module never made"
+        );
+        Ok(())
+    }
+
+    /// The same coupling the fill path has: the two settlements cannot be
+    /// mixed up, and the guard runs before any chain call.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_unwind_settlement_must_match_the_mode(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let inventory = inventory();
+        let plan = unwind_plan();
+
+        let dry = Executor::new(&store, Some(submitter), true);
+        let reservation = inventory.reserve(&plan.spend).expect("reserve");
+        let error = dry
+            .unwind(harness::POOL, &plan, Settlement::Live(reservation), None)
+            .await
+            .expect_err("a dry run spends nothing, so it holds no reservation");
+        assert!(matches!(error, ExecutorError::Mode(_)), "got {error:?}");
+        assert!(
+            inventory.reserved().values().all(|held| *held == 0),
+            "the guard released it rather than leaving it to the drop guard"
+        );
+        assert_eq!(inventory.available()[USDC], 500);
+
+        let live = Executor::new(&store, Some(submitter), false);
+        let error = live
+            .unwind(harness::POOL, &plan, Settlement::DryRun, None)
+            .await
+            .expect_err("a live unwind repays from the wallet, so it must hold a reservation");
+        assert!(matches!(error, ExecutorError::Mode(_)), "got {error:?}");
+
+        assert!(
+            rpc.received().await.is_empty(),
+            "refused before any chain call at all"
+        );
+        Ok(())
+    }
+
+    /// A queue offered to a dry-run executor is refused before anything is
+    /// simulated or enqueued — as is one offered to an executor with no
+    /// signer, which could judge nothing before sending it.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_queue_offered_to_a_dry_run_unwind_is_refused(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let inventory = inventory();
+        let plan = unwind_plan();
+        let (queue, mut receiver) = SubmissionQueue::new(queue_capacity());
+
+        let dry = Executor::new(&store, Some(submitter), true);
+        let error = dry
+            .unwind(harness::POOL, &plan, Settlement::DryRun, Some(&queue))
+            .await
+            .expect_err("dry-run sends nothing, so the queue is refused rather than used");
+        assert!(matches!(error, ExecutorError::Mode(_)), "got {error:?}");
+
+        let keyless = Executor::new(&store, None, false);
+        let reservation = inventory.reserve(&plan.spend).expect("reserve");
+        let error = keyless
+            .unwind(
+                harness::POOL,
+                &plan,
+                Settlement::Live(reservation),
+                Some(&queue),
+            )
+            .await
+            .expect_err("nothing could judge this unwind before it was sent");
+        assert!(matches!(error, ExecutorError::Mode(_)), "got {error:?}");
+        assert!(
+            inventory.reserved().values().all(|held| *held == 0),
+            "that guard released the reservation too"
+        );
+        assert_eq!(inventory.available()[USDC], 500);
+
+        assert!(
+            rpc.calls("simulateTransaction").is_empty(),
+            "refused before anything was simulated"
+        );
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "and nothing was enqueued"
+        );
+        Ok(())
+    }
+
+    /// An archived footprint cannot be judged in dry-run: only an armed
+    /// submission restores it, and restoring is a submission this path
+    /// does not make. Armed, the same answer proceeds — the queue's own
+    /// `prepare` restores and judges it.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_dry_run_unwind_that_needs_a_restore_is_refused(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        script_simulate_prelude(&rpc, &signer, 10, 100);
+        script_simulate_needs_restore(&rpc, 100);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let plan = unwind_plan();
+
+        let dry = Executor::new(&store, Some(submitter), true);
+        let outcome = dry
+            .unwind(harness::POOL, &plan, Settlement::DryRun, None)
+            .await
+            .expect("unwind");
+
+        assert!(
+            matches!(
+                outcome,
+                UnwindOutcome::Refused {
+                    contract_error: None
+                }
+            ),
+            "the contract said nothing about the unwind itself; got {outcome:?}"
+        );
+        assert!(
+            rpc.calls("sendTransaction").is_empty(),
+            "and restoring, which is a submission, is not this path's business"
+        );
+
+        // Armed, the same answer is not a refusal: the queue's `prepare`
+        // restores the footprint and judges the unwind on the way out.
+        script_simulate_prelude(&rpc, &signer, 10, 100);
+        script_simulate_needs_restore(&rpc, 100);
+        let live = Executor::new(&store, Some(submitter), false);
+        let inventory = inventory();
+        let reservation = inventory.reserve(&plan.spend).expect("reserve");
+        let (queue, mut receiver) = SubmissionQueue::new(queue_capacity());
+        let worker = tokio::spawn(async move {
+            while let Some(queued) = receiver.recv().await {
+                let _ = queued.respond.send(Ok(TxOutcome::Succeeded {
+                    hash: TxHash([6_u8; 32]),
+                    ledger: 1,
+                    return_value: None,
+                }));
+            }
+        });
+
+        let outcome = live
+            .unwind(
+                harness::POOL,
+                &plan,
+                Settlement::Live(reservation),
+                Some(&queue),
+            )
+            .await
+            .expect("unwind");
+        drop(queue);
+        worker.await.expect("the worker ends with the queue");
+
+        assert!(
+            outcome.landed(),
+            "it was sent all the same; got {outcome:?}"
+        );
+        assert_eq!(
+            inventory.available()[USDC],
+            490,
+            "consumed: the repay landed"
         );
         assert_eq!(
             rpc.remaining(),
