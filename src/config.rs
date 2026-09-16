@@ -463,6 +463,13 @@ pub struct TelegramConfig {
     pub token: Secret,
     /// The chat (or channel) id notifications are sent to.
     pub chat_id: String,
+    /// The Bot API host to call instead of
+    /// [`crate::notifier::telegram::TELEGRAM_API`]. Always `None` from
+    /// configuration — no argument and no environment variable sets it —
+    /// and it exists so a test can aim the channel at a local mock server
+    /// through the same `ServiceConfig` the service is handed, rather than
+    /// through a hook the service would have to consult at runtime.
+    pub base_url: Option<String>,
 }
 
 /// Everything the service needs, validated.
@@ -1018,6 +1025,8 @@ impl Args {
             (Some(chat_id), Some(token)) => Some(TelegramConfig {
                 token: Secret::new(token),
                 chat_id,
+                // Telegram's own host: see `TelegramConfig::base_url`.
+                base_url: None,
             }),
             (None, None) => None,
             (Some(_), None) => {

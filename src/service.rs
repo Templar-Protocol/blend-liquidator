@@ -11,33 +11,58 @@
 //! configuration would happily submit against a pool it misread, or start
 //! armed with a filler account that does not exist.
 //!
-//! # Six kinds of task
+//! # Seven kinds of task
 //!
 //! [`Service::run`] spawns one [`LedgerPoller`] per pool, one tracker task
 //! consuming their shared channel, one auctioneer task, one filler task,
-//! one watchdog task, and — only when armed — one submission-queue worker
-//! per distinct signing key. The queues are the subject of `spawn_queues`:
-//! one worker per key and never two, because a Soroban transaction is
-//! built against its source account's sequence number at prepare time.
-//! The watchdog is `watchdog_loop`: it reads the pollers' heartbeats off
-//! the run's one [`crate::metrics::Metrics`] and reports a pool that has
-//! stopped heartbeating, and it is a task of its own because a poller
-//! that has stopped is exactly the thing that cannot report itself.
+//! one watchdog task, one HTTP server when a port is set, and — only when
+//! armed — one submission-queue worker per distinct signing key. The
+//! queues are the subject of `spawn_queues`: one worker per key and never
+//! two, because a Soroban transaction is built against its source
+//! account's sequence number at prepare time. The watchdog is
+//! `watchdog_loop`: it reads the pollers' heartbeats off the run's one
+//! [`crate::metrics::Metrics`] and reports a pool that has stopped
+//! heartbeating, and it is a task of its own because a poller that has
+//! stopped is exactly the thing that cannot report itself. The HTTP
+//! server is [`crate::http::serve`] over that same recorder and the
+//! store, and it is spawned only when `PORT` or `HTTP_PORT` gave the run
+//! an address; it answers `Ok(())` however it ends, a bind failure
+//! included, because a diagnostics port that cannot open must not stop
+//! the bot from trading (spec §8).
 //!
 //! The run's one [`crate::metrics::Metrics`] and its one
-//! [`crate::notifier::Notifier`] — the latter built from
-//! `config.notification_cooldown`, log-only until a Telegram channel is
-//! configured — are both constructed before the seed pass, which is the
-//! first thing that records through them and runs before any task is
-//! spawned at all; every loop that needs both is handed them together as
-//! one `Instruments`, and the pollers, the watchdog and the filler are
-//! handed those same two instances rather than instances of their own,
-//! since dedup state and gauges mean nothing split across copies. Delivery is fire-and-forget: `notify` spawns
+//! [`crate::notifier::Notifier`] — the latter over the Telegram channel
+//! when both credentials are configured and over
+//! [`crate::notifier::LogChannel`] otherwise, at
+//! `config.notification_cooldown` — are both constructed before the seed
+//! pass, which is the first thing that records through them and runs
+//! before any task is spawned at all; every loop that needs both is
+//! handed them together as one `Instruments`, and the pollers, the
+//! watchdog, the HTTP server and the filler are handed those same two
+//! instances rather than instances of their own, since dedup state and
+//! gauges mean nothing split across copies. `build_notifier` is also the
+//! only place the notifier's recorder can be installed at all:
+//! [`crate::notifier::Notifier::with_metrics`] works through
+//! `Arc::get_mut`, so a notifier that has already spawned a delivery can
+//! no longer take one. Delivery is fire-and-forget: `notify` spawns
 //! behind a bounded semaphore and never awaits a channel, so no
 //! notification can delay a tick, a decision or a fill, and a channel
 //! that has stopped answering costs a bounded number of tasks and drops
-//! what does not fit. What a shutdown owes the sends still in flight is
-//! [`crate::notifier::Notifier::drain`].
+//! what does not fit.
+//!
+//! # Every exit of `run` drains
+//!
+//! What a shutdown owes the sends still in flight is
+//! [`crate::notifier::Notifier::drain`], and `finish_run` is where both
+//! of [`Service::run`]'s exits pay it: a task failure and a shutdown
+//! signal join the same way (see `drain_tasks`), so they leave the same
+//! way too — every in-flight delivery gets
+//! [`crate::notifier::DRAIN_BUDGET`] to finish, a timeout is a warning
+//! and nothing more, and the result `drain_tasks` answered is returned
+//! unchanged. The one exit that does not drain is deliberate: the *second*
+//! `SIGINT`/`SIGTERM` is answered by `spawn_shutdown_listener` with
+//! `exit(130)`, because a second signal means now and a drain is exactly
+//! the delay it is refusing.
 //!
 //! # The deciding tasks are joined to the tracker by a tick
 //!
@@ -94,13 +119,20 @@ use crate::chain::pool::{PoolReader, PoolSnapshot};
 use crate::chain::rpc::RpcClient;
 use crate::chain::xdr::PoolStatus;
 use crate::chain::{ChainError, Network, Signer, Submitter, TxConfig, TxOutcome};
-use crate::config::{PoolConfig, SeedConfig, ServiceConfig, Signers, SigningKeys};
+use crate::config::{
+    HttpConfig, PoolConfig, SeedConfig, ServiceConfig, Signers, SigningKeys, TelegramConfig,
+};
 use crate::executor::Executor;
 use crate::filler::{Filler, FillerConfig, FillerState};
+use crate::http::{self, HttpState};
 use crate::inventory::Inventory;
 use crate::ledger::{LedgerPoller, LedgerTick, PollerConfig, PollerMessage};
 use crate::metrics::{Attempt, Metrics};
-use crate::notifier::{Notification, NotificationKind, Notifier, Severity};
+use crate::notifier::telegram::TelegramChannel;
+use crate::notifier::{
+    LogChannel, Notification, NotificationChannel, NotificationKind, Notifier, Severity,
+    DRAIN_BUDGET,
+};
 use crate::queue::{run_queue, QueueError, SubmissionQueue};
 use crate::store::{events_cursor, CreationKind, Cursor, Store, StoreError, TrackedUser};
 use crate::tracker::{AnalyticsSeed, FileSeed, SeedSource, Tracker, TrackerError};
@@ -595,6 +627,90 @@ async fn connect_store(config: &ServiceConfig) -> Result<Store, LiquidatorError>
     )
     .await
     .map_err(|error| LiquidatorError::Config(format!("database: {error}")))
+}
+
+/// Builds the configured Telegram channel: the token goes to
+/// [`TelegramChannel::new`] and nowhere else, and a channel that cannot be
+/// built at all is a configuration failure.
+///
+/// The error text is safe to log: every [`crate::notifier::NotifyError`]
+/// this channel produces has already been through
+/// [`reqwest::Error::without_url`] or is built from Telegram's own
+/// `description` field, because the bot token sits in the request *path*
+/// (see [`crate::notifier::telegram`]).
+fn telegram_channel(config: &TelegramConfig) -> Result<TelegramChannel, LiquidatorError> {
+    let channel = TelegramChannel::new(config.token.clone(), config.chat_id.clone())
+        .map_err(|error| LiquidatorError::Config(format!("telegram: {error}")))?;
+    Ok(match &config.base_url {
+        Some(base) => channel.with_base_url(base.clone()),
+        None => channel,
+    })
+}
+
+/// The run's one [`Notifier`]: the Telegram channel when both credentials
+/// are configured, [`LogChannel`] otherwise, counting every delivery on
+/// `metrics`.
+///
+/// Called exactly once per run, and **before anything notifies**:
+/// [`Notifier::with_metrics`] installs through `Arc::get_mut`, so a
+/// notifier that has already spawned a delivery can no longer be given a
+/// recorder — it says so and counts nothing.
+///
+/// Logs which channel is in use and nothing else about it: the token is a
+/// secret, and the chat id is one more identifier a log line has no reason
+/// to carry.
+fn build_notifier(
+    config: &ServiceConfig,
+    metrics: Arc<Metrics>,
+) -> Result<Notifier, LiquidatorError> {
+    let channel: Box<dyn NotificationChannel> = match &config.telegram {
+        Some(telegram) => Box::new(telegram_channel(telegram)?),
+        None => Box::new(LogChannel),
+    };
+    let name = channel.name();
+    let notifier = Notifier::new(channel, config.notification_cooldown).with_metrics(metrics);
+    tracing::info!(
+        channel = name,
+        cooldown_secs = config.notification_cooldown.as_secs(),
+        "notification channel"
+    );
+    Ok(notifier)
+}
+
+/// Proves the configured Telegram credentials work, through the one Bot
+/// API call that reads nothing and changes nothing: `getMe`.
+///
+/// A refusal is a [`LiquidatorError::Config`] — exit 2, the code spec §10
+/// gives a configuration the operator must fix — and never carries the
+/// token. The only side effect [`Service::check_config`] has beyond its
+/// reads, and it is a read too.
+async fn verify_telegram(config: &ServiceConfig) -> Result<(), LiquidatorError> {
+    let Some(telegram) = &config.telegram else {
+        tracing::info!(
+            "no TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID: notifications are written to the log only"
+        );
+        return Ok(());
+    };
+    let username = telegram_channel(telegram)?
+        .verify()
+        .await
+        .map_err(|error| LiquidatorError::Config(format!("telegram: {error}")))?;
+    tracing::info!(username, "telegram reachable");
+    Ok(())
+}
+
+/// Reports whether the diagnostics server is configured, and where. Shared
+/// by both entry points so `check-config` says exactly what `run` would.
+fn log_http(http: Option<HttpConfig>) {
+    if let Some(http) = http {
+        tracing::info!(
+            bind = %http.bind,
+            max_lag_ledgers = http.max_lag_ledgers,
+            "serving /healthz, /livez and /metrics"
+        );
+    } else {
+        tracing::info!("neither PORT nor HTTP_PORT is set: /healthz, /livez and /metrics are off");
+    }
 }
 
 /// Timings the tracker loop reads every message, bundled so its functions
@@ -2383,6 +2499,42 @@ async fn drain_tasks(
     }
 }
 
+/// The last thing every exit of [`Service::run`] does: gives the
+/// notifications still in flight [`DRAIN_BUDGET`] to leave, then returns
+/// `result` unchanged.
+///
+/// Spec §7 asks for `drain()` on every exit path, and this is where both
+/// of `run`'s are — a task failure and a shutdown signal join the same way
+/// (see [`drain_tasks`]), so they leave the same way too. `run`'s earlier
+/// `?`s need no drain of their own: everything before the [`JoinSet`] —
+/// validation and the seed pass — records gauges and logs, and nothing
+/// there notifies, so a startup failure has nothing in flight to wait on.
+/// The one exit that deliberately does not drain is the second
+/// `SIGINT`/`SIGTERM`, which `spawn_shutdown_listener` answers with
+/// `exit(130)`: a second signal means *now*, and a drain would be exactly
+/// the delay it is refusing.
+///
+/// A drain that times out is a warning and nothing else. An instrument
+/// never affects trading (spec §8), and by here there is no trading left
+/// to affect: what it costs is a notification the operator reads in the
+/// log instead of in the channel, which [`Notifier`] has already written
+/// there.
+async fn finish_run(
+    result: Result<(), LiquidatorError>,
+    notifier: &Notifier,
+) -> Result<(), LiquidatorError> {
+    if notifier.drain(DRAIN_BUDGET).await {
+        tracing::info!("notifications drained");
+    } else {
+        tracing::warn!(
+            budget_secs = DRAIN_BUDGET.as_secs(),
+            in_flight = notifier.in_flight(),
+            "notifications still in flight at the drain budget; leaving them behind"
+        );
+    }
+    result
+}
+
 /// The bot's two entry points: [`run`](Service::run) follows the configured
 /// pools until shut down, and [`check_config`](Service::check_config)
 /// validates and reports without following anything. Both are associated
@@ -2420,7 +2572,14 @@ impl Service {
         let (validations, mut warnings) = validate(&rpc, &config.pools).await?;
         let signing = SigningContext::from_config(config, keys)?;
         warnings.extend(validate_filler(&rpc, config, &signing).await?);
+        log_http(config.http);
         log_validation(config, &validations, &warnings);
+        // Last, and after everything is reported: the credentials the run
+        // would trust, checked here rather than discovered at the first
+        // notification the operator needed to see. One `getMe`, which
+        // reads and changes nothing — and reporting first means a refused
+        // token does not cost the operator the rest of the report.
+        verify_telegram(config).await?;
         Ok(warnings)
     }
 
@@ -2428,9 +2587,11 @@ impl Service {
     /// every pool that needs it, then follows every configured pool — one
     /// [`LedgerPoller`] per pool, one tracker task consuming their shared
     /// channel, one auctioneer task and one filler task, each fed by the
-    /// tick the tracker publishes after it acknowledges, and — only when
-    /// armed — one submission-queue worker per distinct signing key —
-    /// until a shutdown signal arrives and every task has returned.
+    /// tick the tracker publishes after it acknowledges, one watchdog,
+    /// one HTTP server when a port is set, and — only when armed — one
+    /// submission-queue worker per distinct signing key — until a
+    /// shutdown signal arrives and every task has returned. However it
+    /// ends, it leaves through `finish_run`, which drains the notifier.
     ///
     /// `keys` holds both of `AUCTIONEER_SECRET_KEY` and
     /// `FILLER_SECRET_KEY`, either or both of which may be absent — neither
@@ -2474,11 +2635,14 @@ impl Service {
         // the first thing that records or reports through them — which is
         // the seed pass below, before any task is spawned at all — rather
         // than beside whichever task happens to be their last caller. The
-        // notifier is log-only until a Telegram channel is configured;
-        // every delivery it makes is spawned behind its own semaphore
-        // rather than awaited in a tick (spec §8).
+        // notifier is built here and not a line later for a second reason:
+        // `with_metrics` installs through `Arc::get_mut`, so it must be
+        // called before any delivery has been spawned. It is log-only
+        // unless both Telegram credentials are configured; every delivery
+        // it makes is spawned behind its own semaphore rather than awaited
+        // in a tick (spec §8).
         let metrics = Arc::new(Metrics::new());
-        let notifier = Arc::new(Notifier::log_only(config.notification_cooldown));
+        let notifier = Arc::new(build_notifier(&config, Arc::clone(&metrics))?);
         // The pair every loop that needs both is handed. The pollers and
         // the watchdog take the two `Arc`s themselves: each uses one of
         // them the way its own constructor already spells it.
@@ -2549,6 +2713,26 @@ impl Service {
             poller_config,
             &shutdown_rx,
         );
+        // The diagnostics port, when one is configured, and a task of the
+        // run like any other so that a shutdown joins it with the rest.
+        // It answers `Ok(())` however it ends: `http::serve` reports a
+        // bind failure itself and returns, because a port that cannot open
+        // must not stop the bot from trading (spec §8).
+        log_http(config.http);
+        if let Some(http) = config.http {
+            let state = Arc::new(HttpState {
+                metrics: Arc::clone(&metrics),
+                store: store.clone(),
+                pools: pool_addresses.clone(),
+                max_lag_ledgers: http.max_lag_ledgers,
+                liveness_deadline: poller_config.liveness_deadline(),
+            });
+            let shutdown = shutdown_rx.clone();
+            tasks.spawn(async move {
+                http::serve(http.bind, state, shutdown).await;
+                Ok(())
+            });
+        }
         spawn_auctioneer(
             &mut tasks,
             &rpc,
@@ -2572,7 +2756,7 @@ impl Service {
             config.xlm_fee_reserve,
             config.startup_delay_ledgers,
             queues.filler,
-            notifier,
+            Arc::clone(&notifier),
             Arc::clone(&instruments.metrics),
             tick_rx,
             &shutdown_rx,
@@ -2600,7 +2784,11 @@ impl Service {
             .map_err(LiquidatorError::from)
         });
 
-        drain_tasks(tasks, &shutdown_tx).await
+        // Both exits — every task returned, or one failed and the rest
+        // were shut down behind it — leave through here, so the
+        // notifications the way out produced have their bounded chance to
+        // go before the process does.
+        finish_run(drain_tasks(tasks, &shutdown_tx).await, &notifier).await
     }
 }
 
@@ -6785,5 +6973,262 @@ mod tests {
             "a poller that has never heartbeated has not started, which is \
              not the same as having stopped: {sent:?}"
         );
+    }
+
+    /// A [`NotificationChannel`] that holds every send until the test hands
+    /// it a permit: what proves a drain *waited* rather than merely
+    /// returning. Simpler than the notifier tests' own gate because
+    /// nothing here needs a send to be released and then re-held —
+    /// `release` adds the permits once and every held send proceeds.
+    struct GatedChannel {
+        gate: tokio::sync::Semaphore,
+        sent: std::sync::atomic::AtomicUsize,
+    }
+
+    impl GatedChannel {
+        fn new() -> Self {
+            Self {
+                gate: tokio::sync::Semaphore::new(0),
+                sent: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        /// Lets every held send — and every later one — through.
+        fn release(&self) {
+            self.gate.add_permits(crate::notifier::NOTIFY_IN_FLIGHT);
+        }
+
+        fn sent_count(&self) -> usize {
+            self.sent.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl crate::notifier::NotificationChannel for Arc<GatedChannel> {
+        fn name(&self) -> &'static str {
+            "gated"
+        }
+
+        fn send<'a>(
+            &'a self,
+            _notification: &'a Notification,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(), crate::notifier::NotifyError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                let permit = self.gate.acquire().await.expect("the gate is never closed");
+                permit.forget();
+                self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    /// The URL of the database `#[sqlx::test]` built for this test:
+    /// `DATABASE_URL`'s own host and credentials — the server the harness
+    /// created it on — with the per-test database name the pool itself
+    /// reports. What a test driving an entry point that takes a
+    /// [`ServiceConfig`] needs, since those connect by URL rather than
+    /// borrowing a pool.
+    async fn test_database_url(store: &Store) -> String {
+        let name: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(store.pool())
+            .await
+            .expect("the test database names itself");
+        let base = std::env::var("DATABASE_URL").expect("sqlx::test needs DATABASE_URL too");
+        let base = base.split('?').next().unwrap_or(&base);
+        let (server, _) = base
+            .rsplit_once('/')
+            .expect("DATABASE_URL carries a database path");
+        format!("{server}/{name}")
+    }
+
+    /// The configured credentials decide the channel, and nothing else
+    /// does: both of `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` build the
+    /// Telegram channel, and their absence leaves the run log-only. The
+    /// token reaches the channel and no rendering of the notifier.
+    #[tokio::test]
+    async fn the_notifier_is_telegram_when_configured_and_log_otherwise() {
+        let metrics = Arc::new(Metrics::new());
+        let mut config = filler_service_config(vec![filler_pool_config(0)], true, 0);
+
+        let notifier = build_notifier(&config, Arc::clone(&metrics)).expect("a log-only notifier");
+        let rendered = format!("{notifier:?}");
+        assert!(
+            rendered.contains("channel: \"log\""),
+            "no credentials is log-only: {rendered}"
+        );
+
+        config.telegram = Some(crate::config::TelegramConfig {
+            token: Secret::new("123456:a-bot-token"),
+            chat_id: "-1001".to_string(),
+            base_url: None,
+        });
+        let notifier = build_notifier(&config, metrics).expect("a telegram notifier");
+        let rendered = format!("{notifier:?}");
+        assert!(
+            rendered.contains("channel: \"telegram\""),
+            "configured credentials pick the telegram channel: {rendered}"
+        );
+        assert!(
+            !rendered.contains("a-bot-token"),
+            "the token never renders: {rendered}"
+        );
+    }
+
+    /// `check-config` proves the configured Telegram credentials work
+    /// before the bot starts trusting them: a `getMe` that answers is an
+    /// `info!` and a pass, and one that refuses is a configuration error —
+    /// exit 2 through `main` — whose message never carries the token.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn check_config_verifies_a_configured_telegram_token(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        const TOKEN: &str = "123456:a-bot-token";
+
+        let store = Store::from_pool(db);
+        let database_url = test_database_url(&store).await;
+        let rpc = ScriptedRpc::start().await;
+        // One script per `check_config` call: the scripted answers are
+        // consumed in order, and this test makes two calls.
+        for _ in 0..2 {
+            script_pool(
+                &rpc,
+                POOL_A,
+                BACKSTOP_A,
+                PoolStatus::Active.code(),
+                &[usable_reserve()],
+                LEDGER,
+            );
+        }
+
+        let telegram = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"ok": true, "result": {"id": 1, "is_bot": true, "username": "liquidator_bot"}}),
+            ))
+            .mount(&telegram)
+            .await;
+
+        let mut config =
+            filler_service_config(vec![pool_config(POOL_A, USDC, &[USDC], &["*"])], true, 0);
+        config.chain.rpc_url = rpc.url();
+        config.database_url = Secret::new(database_url);
+        config.telegram = Some(crate::config::TelegramConfig {
+            token: Secret::new(TOKEN),
+            chat_id: "-1001".to_string(),
+            base_url: Some(telegram.uri()),
+        });
+
+        let warnings = Service::check_config(
+            &config,
+            SigningKeys {
+                auctioneer: None,
+                filler: None,
+            },
+        )
+        .await
+        .expect("a reachable telegram passes the check");
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("no FILLER_SECRET_KEY")),
+            "the keyless run still reports its own warnings: {warnings:?}"
+        );
+
+        // The same configuration against a bot token Telegram refuses.
+        let refusing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(
+                json!({"ok": false, "error_code": 401, "description": "Unauthorized"}),
+            ))
+            .mount(&refusing)
+            .await;
+        config.telegram = Some(crate::config::TelegramConfig {
+            token: Secret::new(TOKEN),
+            chat_id: "-1001".to_string(),
+            base_url: Some(refusing.uri()),
+        });
+
+        let error = Service::check_config(
+            &config,
+            SigningKeys {
+                auctioneer: None,
+                filler: None,
+            },
+        )
+        .await
+        .expect_err("a refused token fails the check");
+        assert!(
+            matches!(error, LiquidatorError::Config(_)),
+            "a credential the operator must fix is a configuration error: {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("telegram") && message.contains("401"),
+            "the message says which channel refused and how: {message}"
+        );
+        assert!(
+            !message.contains("a-bot-token"),
+            "the token never reaches an error message: {message}"
+        );
+        Ok(())
+    }
+
+    /// Every exit of the run drains the notifier before it returns, and
+    /// returns what it was given: `finish_run` waits for the sends still in
+    /// flight — proved here by a channel that holds one until the test
+    /// releases it — and passes both an `Ok` and an `Err` through
+    /// untouched.
+    #[tokio::test]
+    async fn the_run_drains_the_notifier_on_shutdown() {
+        let gated = Arc::new(GatedChannel::new());
+        let notifier = Arc::new(Notifier::new(
+            Box::new(Arc::clone(&gated)),
+            std::time::Duration::from_hours(1),
+        ));
+        assert_eq!(
+            notifier.notify(Notification {
+                kind: NotificationKind::PollerStalled,
+                severity: Severity::High,
+                pool: POOL_A.to_string(),
+                account: None,
+                message: "on its way out".to_string(),
+            }),
+            crate::notifier::Delivery::Queued
+        );
+
+        let finishing = tokio::spawn({
+            let notifier = Arc::clone(&notifier);
+            async move { finish_run(Ok(()), &notifier).await }
+        });
+        // The send is still held, so the drain cannot have finished: a
+        // `finish_run` that returned here would be one that left a
+        // notification the bot decided to send behind.
+        tokio::task::yield_now().await;
+        assert!(
+            !finishing.is_finished(),
+            "the drain waits for the send the channel is holding"
+        );
+        assert_eq!(gated.sent_count(), 0);
+
+        gated.release();
+        finishing
+            .await
+            .expect("joined")
+            .expect("an Ok is returned unchanged");
+        assert_eq!(gated.sent_count(), 1, "the held send left before the exit");
+
+        // The error path drains the same way and reports the same error.
+        let error = finish_run(
+            Err(LiquidatorError::Config("a task failed".to_string())),
+            &notifier,
+        )
+        .await
+        .expect_err("an Err is returned unchanged");
+        assert!(matches!(error, LiquidatorError::Config(message) if message == "a task failed"));
     }
 }
