@@ -589,8 +589,9 @@ pub struct Args {
     /// Connections in the database pool.
     ///
     /// Must cover every task that queries concurrently: one ledger poller
-    /// per pool, the tracker, and the auctioneer — roughly `pools + 2`, and
-    /// the default covers up to eight pools. Sizing it below that does not
+    /// per pool, the tracker, the auctioneer and the filler — roughly
+    /// `pools + 3`, and the default covers up to seven pools. Sizing it
+    /// below that does not
     /// deadlock; it times out acquiring a connection, and every
     /// [`crate::store::StoreError`] in this bot is fatal, so a load spike
     /// becomes a process exit.

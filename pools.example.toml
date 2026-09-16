@@ -22,14 +22,31 @@ min_primary_collateral = "1000000000000"
 
 # The health factor the filler keeps its own position above after a fill.
 # Decimal text, parsed into 7-decimal fixed point at startup.
+#
+# Must be strictly above 1.00001, the contract's own post-submit minimum:
+# at or under it the filler would plan fills the contract refuses as
+# InvalidHf, every one of them a wasted simulation and re-plan. The floor a
+# plan actually holds is this times HF_SAFETY_MULTIPLIER (see .env.example),
+# so the margin above the contract's minimum is the product of the two.
 min_health_factor = 1.5
 
 # Profit required when none of the [[pools.profits]] rules below match, in
 # basis points.
 default_profit_bps = 1000
 
-# Fill regardless of profit. For exercising a pool's wiring end to end, not
-# for production: it disables the one check that keeps a fill economical.
+# Fill this pool's auctions on the auction's schedule rather than on
+# profit's. An auction's lot ramps up over its first 200 ledgers and its bid
+# ramps down to nothing over the next 200; the filler normally waits for the
+# ledger at which the lot covers the bid plus the profit rules below, and
+# will not fill past the auction's 400th ledger at all. force_fill changes
+# both ends: the fill happens no later than 350 ledgers into the auction,
+# however little the lot covers by then, and an auction already past its
+# 400th ledger is filled rather than skipped.
+#
+# It does not waive the health check — a fill is a position takeover, and
+# min_health_factor above still binds every plan. For exercising a pool's
+# wiring end to end, not for production: the 350-ledger cap is the one
+# thing that will take a fill at whatever the lot covers by then.
 force_fill = false
 
 # Assets the bot will pay as the auction's bid, or ["*"] for any reserve.

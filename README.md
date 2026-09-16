@@ -6,17 +6,23 @@
 A liquidation bot for [Blend Protocol](https://blend.capital) lending pools on
 [Stellar](https://stellar.org).
 
-> **Status: Phase 4.** The bot validates its configuration, seeds its
+> **Status: Phase 5.** The bot validates its configuration, seeds its
 > tracked-user set from the [Blend analytics API](https://api.blend.templarfi.org)
 > or a static file, and follows every configured pool — applying pool events
 > and refreshing borrowers' health factors from chain into a Postgres store.
-> Once a tick it now also decides which tracked borrowers are liquidatable
+> Once a tick it decides which tracked borrowers are liquidatable
 > or owe bad debt, builds the auction the contract should accept, lets the
 > contract judge the percent through simulation, and records every
 > creation it decides to make — and, only with a signing key configured
 > and `DRY_RUN=false`,
-> creates it on chain. It still fills no auction: nothing pays a bid or
-> takes a lot yet. What *is* complete is the scaffolding around it — CI
+> creates it on chain. It now also fills: once a tick it plans a fill for
+> every open liquidation auction whose assets its pool configuration
+> supports, works out the ledger at which the auction's lot first covers
+> its bid plus the pool's profit margin, keeps its own position at or above
+> `min_health_factor × HF_SAFETY_MULTIPLIER` while taking one over, records
+> every fill it executes — and, only with `DRY_RUN=false` *and*
+> `FILLER_SECRET_KEY`, submits it on chain. **Nothing unwinds a fill yet**
+> (see Safety below). What *is* complete is the scaffolding around it — CI
 > gates, lint posture, dev container, release preflight — so the
 > liquidation logic lands into a repository that already fails loudly.
 
@@ -33,6 +39,18 @@ default for exactly that reason:
   `on` are refused at startup rather than guessed at, because the dangerous
   direction is silent: a value quietly read as false would arm the bot while
   looking, to the operator, like it had been disarmed.
+- `DRY_RUN=false` additionally requires `FILLER_SECRET_KEY`, and refuses it
+  if it is the same key as `AUCTIONEER_SECRET_KEY`. Both are read from the
+  environment only: a signing key passed on the command line is readable
+  from `/proc/<pid>/cmdline`, `ps` and `docker inspect`.
+
+**Phase 5 does not unwind.** A live fill pays the auction's bid and takes
+its lot, which leaves the position *in the pool* — the lot as collateral,
+the bid as debt on the filler's own account — and nothing in this phase
+sells, repays or withdraws any of it. Profit is unrealised and the filler's
+own health factor is what carries the position until Phase 6 lands the
+unwind. Running live before then means choosing to hold and manage those
+positions by hand.
 
 ## Quickstart
 

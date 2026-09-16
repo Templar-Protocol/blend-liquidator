@@ -9,6 +9,142 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The filler (`src/filler.rs`, `Filler`): once a tick, per configured pool,
+  `tick` keeps only the open-auction rows worth a chain read — a user
+  liquidation, none of the bot's own accounts, every asset accepted by the
+  pool's `supported_bid`/`supported_lot` lists (`PoolConfig::supports`), not
+  one this process has already recorded a dry-run fill for, and *due*: no
+  plan yet, no plan this process made, within `REPLAN_NEAR_LEDGERS` of its
+  planned fill ledger, or `REPLAN_LEDGERS` since it was last planned. Each
+  kept row's on-chain auction entry is re-read before anything is planned,
+  and the entry — never the stored row — is what is planned against, since
+  a competitor's fill reaches the entry first; an entry that is gone closes
+  the row. One snapshot per pool serves every auction in it, valued at the
+  clamp the tracker and the auctioneer already share. The filler writes
+  `fill_ledger` and `percent` onto a row and **nothing else**: its `bid`,
+  `lot` and `start_ledger` are the tracker's, from the pool's own events,
+  and a filler that wrote them would be asserting an auction state no event
+  ever reported. One auction's failure is one auction's — everything but a
+  `StoreError` is logged with its pool and account and the pass carries on
+  — and a raised shutdown flag ends a tick between auctions, never inside a
+  submission already waiting for its outcome.
+- The filler's arithmetic (`src/math/fill.rs`), pure and panic-free like
+  the rest of `math`: `fill_delay` answers in closed form — proved against
+  the contract's own modifiers by `meets_margin`, at `d` and at `d − 1` —
+  the fewest ledgers after an auction's start at which its lot covers its
+  bid plus the pool's profit margin; `health_floor` is the pool's
+  `min_health_factor` times `HF_SAFETY_MULTIPLIER`, rounded up; and
+  `plan_fill` builds the health-bounded request list — the fill, a repay of
+  each bid asset the wallet holds (with a one-basis-point allowance the
+  contract refunds), a withdrawal of each zero-collateral-factor lot asset,
+  a supply of the primary asset — by projecting the filler's own post-fill
+  position exactly. When a projection is short it escalates in the spec's
+  order: supply more of the primary where the pool's status permits it,
+  else the largest lower percent that projects healthy, else the first
+  later ledger that does. Candidates are searched exactly rather than
+  estimated, and a skip is named (`Unprofitable`, `PastAuctionEnd`,
+  `TooManyPositions`, `Unfunded`, `Health`) rather than silent.
+- The executor (`src/executor.rs`, `Executor`): one planned fill, from the
+  contract's judgment to the audit row, the submission and the settled
+  reservation. The mode guards run before anything touches the chain — a
+  dry-run executor handed a live reservation, a live one handed a dry-run
+  settlement, or *any* queue offered to an executor that is dry-run or has
+  no signer to judge with, all fail before anything is simulated, recorded
+  or enqueued. Then the exact `submit` is simulated unsigned through
+  `Submitter::simulate_only` (never `prepare`, which signs unconditionally
+  and restores an archived footprint by sending a transaction of its own),
+  the `fills` row is written *before* anything is submitted, the operation
+  goes onto the filler's queue, and the transaction's hash is attached for
+  every outcome — the failed, expired and unresolved included, each having
+  consumed a sequence number worth naming. `InvalidHf` (1205) and
+  `MinCollateralNotMet` (1224) answer a re-plan, which the filler makes
+  exactly once at half the percent; `BadSequence` clears the plan rather
+  than resending it; every other refusal is logged with its contract error
+  code and left for the next tick. The wallet reservation is settled by
+  value on every non-panicking path, including an error raised after the
+  chain has already answered.
+- The filler's inventory (`src/inventory.rs`): the balance last read per
+  asset, the `XLM_FEE_RESERVE` withheld from the native asset so a plan
+  never spends the wallet below its own fees, and a must-use `Reservation`
+  a plan takes for what it will spend, consumed or released by value
+  exactly once, carrying the manager that issued it and warning if it is
+  ever dropped unsettled. Balances are re-read after a transaction that
+  landed or may have landed, and at most every `INVENTORY_REFRESH_SECS`
+  otherwise. It holds wallet balances only — a plan's positions come from
+  its own snapshot, because positions valued against a different ledger's
+  reserves are exactly the disagreement this bot's accrual clamp exists to
+  prevent. Its arithmetic saturates, the one sanctioned exception to the
+  crate's checked-arithmetic rule, and its doc says why.
+- `src/queue.rs` now resolves every submission to a terminal outcome before
+  it takes the next one for that key: an `Unknown` is polled by the hash
+  the queue already holds until it is terminal, and a send whose *answer*
+  was lost is resolved the same way rather than resent, because the RPC may
+  already have forwarded the envelope. Preparing the next submission first
+  would build it against a sequence number an in-flight transaction may
+  still consume. Only a failure that provably sent nothing — a `prepare`
+  that failed before any envelope left, or a send the RPC refused outright
+  — is retried, within the budget its `Submission` carries: 3 for an
+  auction creation, 10 for a fill, backing off from one second, doubling,
+  to thirty, with shutdown cutting a backoff short. `QueueError::Chain` is
+  narrowed to exactly those failures, which is what lets a caller release
+  its wallet reservation on it.
+- `RUN_MODE=loop` now runs the filler as a fifth kind of task, fed by the
+  same `watch` the auctioneer is — never inside the tracker's
+  acknowledgement path, whose cursor a fill must not be able to stall, and
+  never a second reader of the poller channel. Each of the two holds its
+  own startup gate, because each measures `STARTUP_DELAY_LEDGERS` from the
+  first ledger it saw and each answers for its own key; before it elapses
+  the filler plans and writes its plans but executes nothing, so an
+  operator sees what the bot would do before it may do it. Submission
+  queues are now spawned one per **distinct** signing key: the auctioneer
+  shares the filler's whenever it falls back to the filler's key, since two
+  queues on one key is the sequence race `queue.rs` exists to make
+  unreachable.
+- Migration `0003`: a `fills` table auditing every fill the filler
+  executed, dry-run or not, written before anything is submitted with the
+  transaction's hash attached once there is one — so `dry_run` records the
+  mode the bot was configured in and `tx_hash` records whether anything was
+  sent, and a row with `dry_run = false` and no hash is an armed attempt
+  whose transaction was never named. A dry-run fill is recorded once per
+  auction per process, keyed by pool, account and start ledger, rather than
+  once per tick for as long as nobody else fills it.
+- The auctioneer now adopts an auction the chain already holds and the
+  store does not. An auction opened before this bot's events cursor
+  produced no `NewAuction` for the tracker to apply, so the filler — which
+  walks the store — could never have found it; when a creation's simulation
+  answers `AuctionInProgress` (1212), the entry is read from chain and
+  upserted as a row with no fill plan.
+- New knobs: `HF_SAFETY_MULTIPLIER` (1.1; the pool's own
+  `min_health_factor` times this is the floor a fill keeps the filler's
+  position at or above — at least 1, refused under rather than clamped,
+  since under one the floor would sit *below* the operator's stated
+  minimum), `REPLAN_LEDGERS` (10) and `REPLAN_NEAR_LEDGERS` (5; zero is
+  meaningful here — re-plan only at the fill ledger itself — while
+  `REPLAN_LEDGERS=0` is refused, since it would re-plan every auction on
+  every ledger), `XLM_FEE_RESERVE` (50, in decimal XLM: XLM has 7 decimals,
+  so the parsed value is its value in stroops), `HIGH_FEE_PROFIT_THRESHOLD`
+  (10, in the pool oracle's units, at or above which a fill pays the high
+  fee tier) and `INVENTORY_REFRESH_SECS` (30, refused at zero, which would
+  read every wallet balance on every tick). `FILLER_SECRET_KEY` is now
+  **required** when `DRY_RUN=false` — the filler signs with its own key
+  only, never the auctioneer's, so an armed bot without it would create
+  auctions and never fill one — and `AUCTIONEER_SECRET_KEY` equal to it is
+  refused at startup; leaving `AUCTIONEER_SECRET_KEY` unset is how one key
+  signs both roles, through the one queue that key needs. A pool's
+  `min_health_factor` must now be strictly above the contract's own
+  post-submit minimum of 1.00001, or the filler would plan fills the
+  contract refuses as `InvalidHf`.
+- Startup validation, in `loop` and `check-config` alike, now also checks
+  the filler's account: it must exist on the network and hold more of the
+  native asset than `XLM_FEE_RESERVE`, and armed, holding less than a
+  pool's `min_primary_collateral` is a warning. Armed, each of the first
+  two is a startup error; in dry-run each is a warning, and no
+  `FILLER_SECRET_KEY` at all warns that the filler plans against an empty
+  inventory and simulates nothing.
+- **Nothing unwinds a fill yet.** A live fill pays the auction's bid and
+  takes its lot, which leaves the position in the pool — the lot as
+  collateral, the bid as debt on the filler's own account — and nothing in
+  this phase sells, repays or withdraws it. That is Phase 6.
 - The auctioneer (`src/auctioneer.rs`, `Auctioneer`): `decide` reads one
   snapshot per batch of tracked users, values each at the later of the
   tick's close time and the newest reserve entry the snapshot holds — the
@@ -48,8 +184,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not be reached by the next one either.
 - `src/queue.rs`'s `SubmissionQueue`: one ordered queue per signing key, so
   two tasks preparing a transaction for the same key cannot race to spend
-  its sequence number and produce an unrecoverable `BadSequence` — Phase
-  5's filler will hold a second queue for its own key. An error from any
+  its sequence number and produce an unrecoverable `BadSequence` — the
+  filler holds a second one for its own key whenever that key is not also
+  the auctioneer's. An error from any
   service task now raises the shutdown flag and lets every other task
   return on its own rather than dropping the `JoinSet` and aborting them:
   aborting the queue between `sendTransaction` and the poll that learns
@@ -93,15 +230,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signs, but a filler position this bot could liquidate is its own.
   `DATABASE_MAX_CONNECTIONS` now defaults to 10 rather than 5: the pool
   must cover every task that queries concurrently — one poller per pool,
-  the tracker, and the auctioneer — roughly `pools + 2`, and an acquire
-  timeout surfaces as a fatal `StoreError`.
+  the tracker, the auctioneer and the filler — roughly `pools + 3`, and an
+  acquire timeout surfaces as a fatal `StoreError`.
 - Migration `0002`: a `creations` table auditing every auctioneer
   submission (the ones dry-run only simulated included, with a `tx_hash`
   only once one was actually sent), and a durable `users.recheck_ledger`
   flag — with a partial index — that the auctioneer's recheck queue reads
   oldest-flag-first.
-- The bot still fills no auction of its own or anyone else's: nothing pays
-  a bid or takes a lot yet. That is Phase 5's filler and executor.
 - The Postgres store (`src/store.rs`): cursors per polling task, tracked
   borrowers (`users`, one row while an account owes something, deleted the
   moment it does not) and open auctions (`auctions`), migrated by embedded,
