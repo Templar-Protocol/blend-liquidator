@@ -328,6 +328,14 @@ const SUPPLY_ROUNDING_ALLOWANCE: i128 = 2;
 /// 5. Out of rounds or candidates: `Unfunded` if the wallet capped a
 ///    supply along the way, else `Health`.
 ///
+/// A plan that is not `force_fill` may land on exactly `start + 400`,
+/// where the bid modifier has already reached zero, and it is meant to:
+/// step 1's gate is `> 400` and it is asked at *planning* time, while the
+/// transaction is sent at the earliest ledger it could land in, so such a
+/// fill applies at 401 or later. Nothing is lost by that — from block 400
+/// on the bid is nothing and the lot is whole — and landing later than the
+/// candidate only improves the fill.
+///
 /// Whatever a round or a search produces is still refused as
 /// `Unprofitable` when its own lot no longer covers its own bid: step 1
 /// judges the margin on the whole auction, and a lowered percent or a

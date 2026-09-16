@@ -76,9 +76,12 @@ pub struct FillRecorded {
     /// The `fills` row this was written as, written before anything was
     /// submitted.
     pub fill_id: i64,
-    /// Whether the contract was actually asked. `false` only when no
-    /// filler key is configured at all — there is then no source account
-    /// to simulate against, dry-run or not (ruling 4).
+    /// Whether the contract actually judged this fill: `false` when no
+    /// filler key is configured, or when the footprint needed a restore
+    /// and the judgment is the queue's. With no key there is no source
+    /// account to simulate against, dry-run or not (ruling 4); with an
+    /// archived footprint the simulation answered nothing about the fill,
+    /// and [`Submitter::prepare`] restores and judges it behind the queue.
     pub simulated: bool,
     /// The bot's configured `DRY_RUN` mode, which is what the row's
     /// `dry_run` column means — never "whether this was sent", which is
@@ -204,9 +207,13 @@ enum Settle {
 
 /// What the contract made of the plan, and what is left to do with it.
 enum Judged {
-    /// It accepted the operation — or, armed, only needs a restore that
-    /// `Submitter::prepare` makes on the way to sending.
+    /// It accepted the operation.
     Accepted(Operation),
+    /// Armed, and the footprint holds archived entries: the contract
+    /// judged nothing about the fill itself, and `Submitter::prepare`
+    /// restores them and simulates again on the way to sending. The
+    /// operation goes to the queue all the same, recorded unsimulated.
+    NeedsRestore(Operation),
     /// There is no signer to simulate as, so the plan is recorded
     /// unsimulated. It is never submitted: the mode guards refuse a queue
     /// to an executor with no signer.
@@ -284,8 +291,10 @@ impl<'a> Executor<'a> {
     ///    [`ExecOutcome::Refused`] with the code on a warn line. Nothing is
     ///    recorded for either. A footprint holding archived entries is
     ///    `Refused` in dry-run — restoring is a submission, and this is not
-    ///    the code that makes one — and proceeds when armed, since
-    ///    [`Submitter::prepare`] restores it behind the queue. With no
+    ///    the code that makes one — and proceeds when armed, recorded
+    ///    unsimulated, since the contract judged nothing and
+    ///    [`Submitter::prepare`] restores and judges it behind the queue.
+    ///    With no
     ///    signer there is no source account to ask as, so the plan is
     ///    recorded unsimulated (ruling 4).
     /// 3. **Record before sending.** The `fills` row, and the structured
@@ -388,6 +397,7 @@ impl<'a> Executor<'a> {
         let (operation, simulated) = match judged {
             Judged::Refused(outcome) => return (Ok(outcome), Settle::Release),
             Judged::Accepted(operation) => (Some(operation), true),
+            Judged::NeedsRestore(operation) => (Some(operation), false),
             Judged::Unsimulated => (None, false),
         };
 
@@ -601,9 +611,9 @@ impl<'a> Executor<'a> {
                     pool = %plan.pool,
                     account = %plan.user,
                     "this fill's footprint holds archived entries; the submission restores \
-                     them before it sends"
+                     them and judges it before it sends"
                 );
-                Ok(Judged::Accepted(operation))
+                Ok(Judged::NeedsRestore(operation))
             }
             Judgment::NeedsRestore => {
                 tracing::info!(
@@ -648,7 +658,7 @@ mod tests {
     use crate::chain::signer::{Network, Signer};
     use crate::chain::tx::TxConfig;
     use crate::chain::xdr::FillPercent;
-    use crate::chain::TxHash;
+    use crate::chain::{LedgerWindow, TxHash};
     use crate::harness;
     use crate::inventory::Inventory;
     use crate::math::AuctionData;
@@ -1094,6 +1104,153 @@ mod tests {
         Ok(())
     }
 
+    /// Ruling 14: an `Unknown` outcome consumes its reservation. The
+    /// transaction may still land and spend the wallet, so the ledger
+    /// assumes it did until the next balance read says otherwise.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_unknown_outcome_consumes_its_reservation(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        script_simulate_prelude(&rpc, &signer, 10, 100);
+        script_simulate_accepted(&rpc, 100);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let executor = Executor::new(&store, Some(submitter), false);
+        let inventory = inventory();
+        let fill = plan(Priority::Normal);
+        let reservation = inventory.reserve(&fill.draft.spend).expect("reserve");
+
+        // A stand-in worker, as the failing test above uses: what this
+        // test is about is which settlement an unresolved outcome takes,
+        // not how the queue arrived at one.
+        let (queue, mut receiver) = SubmissionQueue::new(queue_capacity());
+        let worker = tokio::spawn(async move {
+            while let Some(queued) = receiver.recv().await {
+                let _ = queued.respond.send(Ok(TxOutcome::Unknown {
+                    hash: TxHash([4_u8; 32]),
+                    sequence: 11,
+                    window: LedgerWindow::try_new(100, 120).expect("a window ends after it opens"),
+                }));
+            }
+        });
+
+        let outcome = recorded(
+            executor
+                .execute(&fill, Settlement::Live(reservation), Some(&queue))
+                .await
+                .expect("execute"),
+        );
+        drop(queue);
+        worker.await.expect("the worker ends with the queue");
+
+        assert!(
+            !outcome.succeeded(),
+            "an unresolved outcome is not a success"
+        );
+        assert!(matches!(
+            outcome.submission,
+            Some(TxOutcome::Unknown { .. })
+        ));
+
+        let row = sqlx::query!("SELECT tx_hash FROM fills WHERE id = $1", outcome.fill_id)
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(
+            row.tx_hash,
+            Some(TxHash([4_u8; 32]).to_hex()),
+            "a transaction nobody can resolve is exactly the one worth naming"
+        );
+
+        assert!(
+            inventory.reserved().values().all(|held| *held == 0),
+            "settled, not left held"
+        );
+        assert_eq!(
+            inventory.available()[USDC],
+            490,
+            "consumed: the transaction may yet spend the wallet, so the ledger assumes it \
+             did (ruling 14)"
+        );
+        assert_eq!(inventory.available()[XLM], 993);
+        assert_eq!(
+            rpc.remaining(),
+            0,
+            "every scripted answer was used: an over-scripted test would hide a chain call \
+             this module never made"
+        );
+        Ok(())
+    }
+
+    /// Ruling 14's other half: an `Expired` transaction provably never
+    /// applied, so what it reserved goes back to the wallet.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_expired_outcome_releases_its_reservation(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        script_simulate_prelude(&rpc, &signer, 10, 100);
+        script_simulate_accepted(&rpc, 100);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let executor = Executor::new(&store, Some(submitter), false);
+        let inventory = inventory();
+        let fill = plan(Priority::Normal);
+        let reservation = inventory.reserve(&fill.draft.spend).expect("reserve");
+
+        let (queue, mut receiver) = SubmissionQueue::new(queue_capacity());
+        let worker = tokio::spawn(async move {
+            while let Some(queued) = receiver.recv().await {
+                let _ = queued.respond.send(Ok(TxOutcome::Expired {
+                    hash: TxHash([8_u8; 32]),
+                    window: LedgerWindow::try_new(100, 120).expect("a window ends after it opens"),
+                    latest_ledger: 121,
+                }));
+            }
+        });
+
+        let outcome = recorded(
+            executor
+                .execute(&fill, Settlement::Live(reservation), Some(&queue))
+                .await
+                .expect("execute"),
+        );
+        drop(queue);
+        worker.await.expect("the worker ends with the queue");
+
+        assert!(!outcome.succeeded());
+        assert!(matches!(
+            outcome.submission,
+            Some(TxOutcome::Expired { .. })
+        ));
+
+        let row = sqlx::query!("SELECT tx_hash FROM fills WHERE id = $1", outcome.fill_id)
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(
+            row.tx_hash,
+            Some(TxHash([8_u8; 32]).to_hex()),
+            "the attempt stays on the audit, named by the transaction it became"
+        );
+
+        assert!(inventory.reserved().values().all(|held| *held == 0));
+        assert_eq!(
+            inventory.available()[USDC],
+            500,
+            "released: the chain passed the window without applying it, so nothing was spent"
+        );
+        assert_eq!(inventory.available()[XLM], 1_000);
+        assert_eq!(
+            rpc.remaining(),
+            0,
+            "every scripted answer was used: an over-scripted test would hide a chain call \
+             this module never made"
+        );
+        Ok(())
+    }
+
     /// What the reservation becomes is the chain's answer, not this
     /// module's bookkeeping: a hash write that fails after a transaction
     /// landed still consumes, or the wallet's ledger would hand the next
@@ -1468,6 +1625,60 @@ mod tests {
             vec![(Priority::High, FILL_RETRIES)],
             "a fill worth paying to land first, with the fill budget spec §8 gives it"
         );
+        assert_eq!(
+            rpc.remaining(),
+            0,
+            "every scripted answer was used: an over-scripted test would hide a chain call \
+             this module never made"
+        );
+        Ok(())
+    }
+
+    /// Armed, an archived footprint is not a judgment on the fill: the
+    /// submission restores it and simulates again behind the queue, so
+    /// the row is recorded unsimulated and still sent.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_armed_restore_is_recorded_unsimulated(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        script_simulate_prelude(&rpc, &signer, 10, 100);
+        script_simulate_needs_restore(&rpc, 100);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let executor = Executor::new(&store, Some(submitter), false);
+        let inventory = inventory();
+        let fill = plan(Priority::Normal);
+        let reservation = inventory.reserve(&fill.draft.spend).expect("reserve");
+
+        // A stand-in worker: `Submitter::prepare`'s own restore is the
+        // queue's business, and scripting it would exercise that instead.
+        let (queue, mut receiver) = SubmissionQueue::new(queue_capacity());
+        let worker = tokio::spawn(async move {
+            while let Some(queued) = receiver.recv().await {
+                let _ = queued.respond.send(Ok(TxOutcome::Succeeded {
+                    hash: TxHash([6_u8; 32]),
+                    ledger: 1,
+                    return_value: None,
+                }));
+            }
+        });
+
+        let outcome = recorded(
+            executor
+                .execute(&fill, Settlement::Live(reservation), Some(&queue))
+                .await
+                .expect("execute"),
+        );
+        drop(queue);
+        worker.await.expect("the worker ends with the queue");
+
+        assert!(
+            !outcome.simulated,
+            "the contract judged nothing about the fill itself; the queue's prepare does"
+        );
+        assert!(outcome.succeeded(), "and it was sent all the same");
         assert_eq!(
             rpc.remaining(),
             0,

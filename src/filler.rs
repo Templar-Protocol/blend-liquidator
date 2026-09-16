@@ -39,7 +39,11 @@
 //!    (ruling 12); a second refusal is a skip. [`ExecOutcome::Stale`]
 //!    clears the plan and forgets when it was made, so the next tick
 //!    plans from fresh state rather than resending a plan the chain has
-//!    moved past (spec §8).
+//!    moved past (spec §8). A submission that landed — or may have
+//!    (ruling 14) — ends this pool's walk: every auction still to come in
+//!    it was projected against the positions and the wallet as they stood
+//!    *before* that fill, which is an optimistic view of both, and the
+//!    next tick reads a snapshot that holds it.
 //! 6. **One auction's failure is one auction's.** Every error but
 //!    [`StoreError`] is logged with the pool and the account and the pass
 //!    carries on; a store failure is fatal, as it is for the tracker and
@@ -114,7 +118,7 @@ pub struct FillerConfig {
 
 /// What one run of the filler remembers between ticks.
 ///
-/// All three are in memory on purpose. Losing them on a restart costs one
+/// All of it is in memory on purpose. Losing them on a restart costs one
 /// extra plan per auction, one extra wallet read, and — for
 /// `recorded_dry_run` — one extra dry-run `fills` row per open auction:
 /// cheap, and none of it is a chain effect. The store holds everything
@@ -386,8 +390,19 @@ impl<'a> Filler<'a> {
             if *shutdown.borrow() {
                 return Ok(());
             }
-            self.plan_and_act(&context, &row, &auction, execute, queue, pass)
-                .await?;
+            if self
+                .plan_and_act(&context, &row, &auction, execute, queue, pass)
+                .await?
+            {
+                tracing::debug!(
+                    pool = %pool.address,
+                    account = %row.account,
+                    "a fill of this pool landed, or may have; its remaining auctions wait for \
+                     the next tick rather than being planned against positions and a wallet \
+                     this fill has moved"
+                );
+                return Ok(());
+            }
         }
         Ok(())
     }
@@ -628,7 +643,11 @@ impl<'a> Filler<'a> {
         plan_fill(&self.terms(context, auction), &inputs)
     }
 
-    /// Steps 4 and 5 for one auction.
+    /// Steps 4 and 5 for one auction. `true` when a submission landed or
+    /// may have, which ends this pool's walk: everything left in it was
+    /// projected against the positions and the wallet as they stood
+    /// *before* this fill, an optimistic view of both, and the next tick
+    /// reads a snapshot that holds it.
     async fn plan_and_act(
         &self,
         context: &PoolPass<'_>,
@@ -637,7 +656,7 @@ impl<'a> Filler<'a> {
         execute: bool,
         queue: Option<&SubmissionQueue>,
         pass: &mut Pass<'_>,
-    ) -> Result<(), FillerError> {
+    ) -> Result<bool, FillerError> {
         let whole = match FillPercent::try_from(WHOLE_AUCTION) {
             Ok(percent) => percent,
             Err(error) => {
@@ -647,17 +666,17 @@ impl<'a> Filler<'a> {
                     %error,
                     "the whole-auction percent does not construct; skipping this auction"
                 );
-                return Ok(());
+                return Ok(false);
             }
         };
         let Some(draft) = self.drafted(context, row, auction, whole, pass).await? else {
-            return Ok(());
+            return Ok(false);
         };
         if !self.write_plan(row, &draft, pass).await? {
-            return Ok(());
+            return Ok(false);
         }
         if !execute || draft.fill_ledger > context.earliest_ledger {
-            return Ok(());
+            return Ok(false);
         }
         self.execute_draft(context, row, auction, &draft, queue, pass)
             .await
@@ -752,7 +771,8 @@ impl<'a> Filler<'a> {
         Ok(())
     }
 
-    /// Step 5: one execution and what its answer means.
+    /// Step 5: one execution and what its answer means. `true` when the
+    /// submission landed or may have, which is what ends this pool's walk.
     async fn execute_draft(
         &self,
         context: &PoolPass<'_>,
@@ -761,15 +781,12 @@ impl<'a> Filler<'a> {
         draft: &FillDraft,
         queue: Option<&SubmissionQueue>,
         pass: &mut Pass<'_>,
-    ) -> Result<(), FillerError> {
+    ) -> Result<bool, FillerError> {
         let Some(outcome) = self.execute_once(context, row, draft, queue, pass).await? else {
-            return Ok(());
+            return Ok(false);
         };
         match outcome {
-            ExecOutcome::Recorded(recorded) => {
-                note_recorded(row, &recorded, pass);
-                Ok(())
-            }
+            ExecOutcome::Recorded(recorded) => Ok(note_recorded(row, &recorded, pass)),
             ExecOutcome::Replan { contract_error } => {
                 tracing::info!(
                     pool = %row.pool,
@@ -788,13 +805,13 @@ impl<'a> Filler<'a> {
                     "this fill was refused; leaving it for the next tick"
                 );
                 pass.summary.skipped += 1;
-                Ok(())
+                Ok(false)
             }
             ExecOutcome::Stale => {
                 self.clear_plan(row).await?;
                 pass.state.forget(&row.pool, &row.account);
                 pass.summary.skipped += 1;
-                Ok(())
+                Ok(false)
             }
         }
     }
@@ -802,7 +819,8 @@ impl<'a> Filler<'a> {
     /// Ruling 12's one re-plan, at half the refused percent and never
     /// below 1. A second refusal is a skip: the contract has now disagreed
     /// twice, and a third guess costs another simulation for the same
-    /// answer.
+    /// answer. `true` means the same thing it does for the first draft: a
+    /// submission landed, or may have, and this pool's walk ends here.
     async fn replan(
         &self,
         context: &PoolPass<'_>,
@@ -811,20 +829,20 @@ impl<'a> Filler<'a> {
         refused: &FillDraft,
         queue: Option<&SubmissionQueue>,
         pass: &mut Pass<'_>,
-    ) -> Result<(), FillerError> {
+    ) -> Result<bool, FillerError> {
         let half = match FillPercent::try_from((refused.percent.get() / 2).max(1)) {
             Ok(percent) => percent,
             Err(error) => {
                 tracing::warn!(pool = %row.pool, account = %row.account, %error, "half a percent is not one");
                 pass.summary.skipped += 1;
-                return Ok(());
+                return Ok(false);
             }
         };
         let Some(draft) = self.drafted(context, row, auction, half, pass).await? else {
-            return Ok(());
+            return Ok(false);
         };
         if !self.write_plan(row, &draft, pass).await? {
-            return Ok(());
+            return Ok(false);
         }
         // The same gate the first draft passed, and for the same reason:
         // `plan_fill` answers a *later* ledger when the lower percent no
@@ -839,17 +857,18 @@ impl<'a> Filler<'a> {
                 percent = draft.percent.get(),
                 "the re-plan is for a later ledger; it is on the row and waits for it"
             );
-            return Ok(());
+            return Ok(false);
         }
         let Some(outcome) = self.execute_once(context, row, &draft, queue, pass).await? else {
-            return Ok(());
+            return Ok(false);
         };
-        match outcome {
+        Ok(match outcome {
             ExecOutcome::Recorded(recorded) => note_recorded(row, &recorded, pass),
             ExecOutcome::Stale => {
                 self.clear_plan(row).await?;
                 pass.state.forget(&row.pool, &row.account);
                 pass.summary.skipped += 1;
+                false
             }
             other => {
                 tracing::info!(
@@ -859,9 +878,9 @@ impl<'a> Filler<'a> {
                     "the contract refused the re-plan too; leaving this auction for the next tick"
                 );
                 pass.summary.skipped += 1;
+                false
             }
-        }
-        Ok(())
+        })
     }
 
     /// Hands one draft to the executor with the settlement its mode
@@ -937,7 +956,12 @@ impl<'a> Filler<'a> {
 /// What a recorded fill leaves behind: ruling 8's "recorded once" for a
 /// dry run, and a wallet to re-read when the chain may have spent it
 /// (ruling 14 — an `Unknown` may still land).
-fn note_recorded(row: &TrackedAuction, recorded: &FillRecorded, pass: &mut Pass<'_>) {
+///
+/// Answers whether the chain applied this fill or may yet, which is both
+/// why the wallet is re-read and why the rest of this pool's auctions are
+/// left for the next tick: they were projected against the borrower's
+/// positions and the filler's own as this fill has just changed them.
+fn note_recorded(row: &TrackedAuction, recorded: &FillRecorded, pass: &mut Pass<'_>) -> bool {
     pass.summary.executed += 1;
     if recorded.dry_run {
         pass.state.recorded_dry_run.insert((
@@ -946,12 +970,14 @@ fn note_recorded(row: &TrackedAuction, recorded: &FillRecorded, pass: &mut Pass<
             row.start_ledger,
         ));
     }
-    if matches!(
+    let landed = matches!(
         recorded.submission,
         Some(TxOutcome::Succeeded { .. } | TxOutcome::Unknown { .. })
-    ) {
+    );
+    if landed {
         pass.state.inventory_stale = true;
     }
+    landed
 }
 
 #[cfg(test)]
@@ -978,6 +1004,7 @@ mod tests {
     use crate::chain::{ChainError, TxHash, TxOutcome};
     use crate::fixture::{mainnet_fixed_v2, text};
     use crate::harness;
+    use crate::math::fill::FillAction;
     use crate::queue::QueueError;
     use stellar_xdr::{
         ContractDataDurability, ContractDataEntry, ExtensionPoint, LedgerEntryData, ScVal,
@@ -2470,6 +2497,208 @@ mod tests {
                 .fill_ledger,
             Some(tick.sequence + 1),
             "and the one behind it was still planned"
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// A fill that landed, or may have, ends this pool's walk: every
+    /// auction still to come in it was projected against the positions
+    /// and the wallet as they stood before that fill, so the rest of the
+    /// pool waits for the next tick's snapshot.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_landed_fill_ends_this_pools_pass(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        // Distinct start ledgers, so `open_auctions`'s order is the one
+        // this test scripts: the one that is filled comes first.
+        let first = auction(tick.sequence - 300);
+        let second = auction(tick.sequence - 299);
+        store
+            .upsert_auction(&tracked(harness::USER_ONE, &first))
+            .await
+            .expect("seed the first auction");
+        store
+            .upsert_auction(&tracked(harness::USER_TWO, &second))
+            .await
+            .expect("seed the second auction");
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        // Both entries are re-read before the snapshot is taken, so both
+        // are scripted: what the landed fill stops is the planning that
+        // comes after it.
+        harness::script_auction_entry(&rpc, harness::USER_ONE, &first, tick.sequence);
+        harness::script_auction_entry(&rpc, harness::USER_TWO, &second, tick.sequence);
+        harness::script_snapshot(&rpc, &[]);
+        script_empty_wallet(&rpc, tick.sequence);
+        // One judgment only. A second would mean the second auction was
+        // planned and executed against a view this fill has moved past,
+        // and it would answer HTTP 500 here.
+        script_simulate_prelude(&rpc, &signer, 10, tick.sequence);
+        script_simulate_accepted(&rpc, tick.sequence);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            FillerConfig {
+                dry_run: false,
+                ..filler_config()
+            },
+            Executor::new(&store, Some(submitter), false),
+            Inventory::new(XLM.to_string(), 0),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+
+        // A stand-in queue worker: this test is about what the filler does
+        // once a fill has landed, not about how the queue landed it.
+        let (queue, mut receiver) =
+            SubmissionQueue::new(NonZeroUsize::new(4).expect("a test capacity is never zero"));
+        let worker = tokio::spawn(async move {
+            while let Some(queued) = receiver.recv().await {
+                let _ = queued.respond.send(Ok(TxOutcome::Succeeded {
+                    hash: TxHash([2_u8; 32]),
+                    ledger: 1,
+                    return_value: None,
+                }));
+            }
+        });
+
+        let summary = filler
+            .tick(&mut state, tick, true, Some(&queue), &shutdown)
+            .await
+            .expect("tick");
+        drop(queue);
+        worker.await.expect("the worker ends with the queue");
+
+        assert_eq!(
+            summary,
+            TickSummary {
+                planned: 1,
+                executed: 1,
+                ..TickSummary::default()
+            },
+            "the first auction was filled and the second was not reached at all"
+        );
+        let fills = sqlx::query!("SELECT count(*) AS n FROM fills")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(fills.n, Some(1), "one execution, not one per open auction");
+        let left = row(&store, harness::USER_TWO)
+            .await
+            .expect("the second auction's row stays open");
+        assert_eq!(
+            (left.fill_ledger, left.percent),
+            (None, None),
+            "and unplanned: it is planned next tick, against a snapshot that holds the fill"
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// The wallet cannot fund this fill: the reservation is refused, the
+    /// auction is skipped, and nothing is recorded or sent.
+    ///
+    /// Driven through `execute_once` rather than `Filler::tick` on
+    /// purpose. `plan_fill` sizes every spend against the same
+    /// `Inventory::available` the reservation is then taken out of — its
+    /// own `a_plan_never_spends_more_than_the_wallet_holds` proves it —
+    /// and nothing inside a tick moves the wallet between the two, so a
+    /// tick cannot reach this refusal by itself. It is the guard for a
+    /// wallet that moved under a plan, which is what a second holder of
+    /// the same ledger would do, so a test of it has to hand the plan a
+    /// spend the wallet no longer covers.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_wallet_that_cannot_fund_a_fill_skips_it(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let auction = auction(tick.sequence - 300);
+        let rpc = ScriptedRpc::start().await;
+        harness::script_snapshot(&rpc, &[]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let snapshot = PoolReader::new(&client, harness::POOL)
+            .snapshot(&[])
+            .await
+            .expect("snapshot");
+        // A tenth of what the draft below repays.
+        let inventory = Inventory::new(XLM.to_string(), 0);
+        inventory.record_balances(
+            BTreeMap::from([(USDC.to_string(), 1_000_000_000)]),
+            Instant::now(),
+        );
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            FillerConfig {
+                dry_run: false,
+                ..filler_config()
+            },
+            // Live and keyless: the refusal comes before the executor is
+            // asked anything at all, which is the point.
+            Executor::new(&store, None, false),
+            inventory,
+        );
+        let context = filler
+            .pool_context(&pools[0], snapshot, tick)
+            .expect("the fixture pool plans");
+        let draft = FillDraft {
+            fill_ledger: tick.sequence + 1,
+            percent: FillPercent::try_from(WHOLE_AUCTION).expect("100 is in range"),
+            actions: vec![FillAction::Repay {
+                asset: USDC.to_string(),
+                amount: 10_000_000_000,
+            }],
+            to_fill: auction.clone(),
+            lot_value: 2,
+            bid_value: 1,
+            est_profit: 1,
+            spend: BTreeMap::from([(USDC.to_string(), 10_000_000_000)]),
+            projected_health: Some(20_000_000),
+        };
+        let mut state = FillerState::default();
+        let mut pass = Pass {
+            tick,
+            state: &mut state,
+            summary: TickSummary::default(),
+        };
+
+        let outcome = filler
+            .execute_once(
+                &context,
+                &tracked(harness::USER_ONE, &auction),
+                &draft,
+                None,
+                &mut pass,
+            )
+            .await
+            .expect("a wallet that cannot fund one fill is not the tick's failure");
+
+        assert!(outcome.is_none(), "nothing was executed");
+        assert_eq!(
+            pass.summary,
+            TickSummary {
+                skipped: 1,
+                ..TickSummary::default()
+            },
+            "a refused reservation is a decision, and it is counted as one"
+        );
+        let fills = sqlx::query!("SELECT count(*) AS n FROM fills")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(
+            fills.n,
+            Some(0),
+            "nothing that was never funded is recorded"
+        );
+        assert!(
+            rpc.calls("sendTransaction").is_empty(),
+            "and nothing was sent"
         );
         assert_eq!(rpc.remaining(), 0);
         Ok(())

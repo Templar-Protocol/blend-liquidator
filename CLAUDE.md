@@ -230,7 +230,11 @@ make help                           # Docker Compose lifecycle
   the row, is what is planned against: someone else's fill reaches the
   entry first), takes one snapshot per pool valued at
   `PoolSnapshot::valued_at`, plans each with `plan_fill`, and executes the
-  ones whose fill ledger has come. Before `STARTUP_DELAY_LEDGERS` has
+  ones whose fill ledger has come. A fill that landed — or may have — ends
+  that pool's walk for the tick: everything still queued behind it was
+  projected against the positions and the wallet as they stood *before*
+  it, and the next tick reads a snapshot that holds it. Before
+  `STARTUP_DELAY_LEDGERS` has
   elapsed it plans and writes but executes nothing, so an operator sees
   what the bot would do before it may do it. One auction's failure is one
   auction's: everything but a `StoreError` is logged with its pool and
@@ -250,7 +254,7 @@ make help                           # Docker Compose lifecycle
   as fatal and a `Chain` or `Math` one as transient — it declines the tick,
   and the same range is read again. Both entry points share `validate` and
   `validate_filler`: the filler's account must exist on the network and
-  hold more of the native asset than `XLM_FEE_RESERVE` — armed, either
+  hold at least `XLM_FEE_RESERVE` of the native asset — armed, either
   failure is a startup *error*; in dry-run each is a warning — and, armed
   only, holding less than a pool's `min_primary_collateral` is a warning.
   With no `FILLER_SECRET_KEY` at all there is nothing to check and the
