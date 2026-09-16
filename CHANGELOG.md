@@ -111,8 +111,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cooldown — `FAILURE_NOTIFICATION_COOLDOWN_HOURS`, default 24 hours,
   refused at zero since there is no "no cooldown" spelling, only shorter
   ones — before handing what survives to one channel. `LogChannel`, the
-  only channel before Phase 6b's Telegram, logs at `WARN` for
-  `Severity::High` and `INFO` otherwise. A channel failure answers
+  fallback channel and the only one when no Telegram credentials are
+  configured, logs at `WARN` for `Severity::High` and `INFO` otherwise.
+  A channel failure answers
   `Delivery::Failed`, rolls back the dedup entry it optimistically
   inserted, and never affects trading: `Notifier::notify` returns no
   `Result`, only a `Delivery`.

@@ -271,8 +271,8 @@ make help                           # Docker Compose lifecycle
   is what an exit path calls to give in-flight sends a bounded chance to
   leave before the process does. `pub mod telegram` is `TelegramChannel`,
   the second `NotificationChannel`. `NotificationKind` already lists every
-  kind spec §7 names, so Phase 6b's semaphore, `drain()` and Telegram
-  channel added no new variant. Must be used from inside a tokio runtime:
+  kind spec §7 names, so the semaphore, `drain()` and the Telegram channel
+  add no new variant. Must be used from inside a tokio runtime:
   `notify` spawns.
 - `src/notifier/telegram.rs` — `TelegramChannel`: `sendMessage` for
   delivery, `getMe` (`verify`) to prove the configured credentials work
@@ -288,8 +288,9 @@ make help                           # Docker Compose lifecycle
   aiming the channel at a mock server through `TelegramConfig::base_url`.
 - `src/metrics.rs` — `Metrics`: the run's counters and gauges, one
   `Mutex<Inner>` behind synchronous methods (no `.await` anywhere in this
-  module, so the lock is never held across one) that every other Phase 6b
-  task calls as the corresponding event happens, and `Metrics::render` to
+  module, so the lock is never held across one) that the poller, the
+  tracker, the auctioneer, the filler and the notifier call as the
+  corresponding event happens, and `Metrics::render` to
   Prometheus text exposition format on demand for `/metrics`. Label sets
   are closed enums (`Attempt`, `SkipLabel`, `DeliveryLabel`) rendered with
   every member present, zero included, so a dashboard never has to guess
@@ -396,8 +397,8 @@ make help                           # Docker Compose lifecycle
   top-level `unwind.rs`: the pass shares the filler's inventory, executor,
   wallet refresh and per-tick state closely enough that it lives here as a
   second `impl Filler` block, with the pure builder in `math::unwind`.
-  Phase 6b wired `Metrics` and `Notifier` through every step above rather
-  than adding a step: `fills_total{result}` counts every recorded fill
+  `Metrics` and `Notifier` are wired through every step above rather than
+  through a step of their own: `fills_total{result}` counts every recorded fill
   (`attempted`, and `succeeded`/`failed` once the chain answers),
   `skips_total{reason}` counts every planner and executor skip a
   `SkipLabel` names, `estimated_profit_total` adds a landed fill's
