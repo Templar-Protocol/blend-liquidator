@@ -18,7 +18,11 @@
 //! and — only when armed — one submission-queue worker per distinct
 //! signing key. The queues are the subject of `spawn_queues`: one worker
 //! per key and never two, because a Soroban transaction is built against
-//! its source account's sequence number at prepare time.
+//! its source account's sequence number at prepare time. The filler task
+//! holds the run's one [`crate::notifier::Notifier`], built from
+//! `config.notification_cooldown` — log-only in this phase, since Telegram,
+//! the semaphore and `drain()` are Phase 6b's — and it is the notifier's
+//! only reader.
 //!
 //! # The deciding tasks are joined to the tracker by a tick
 //!
@@ -61,7 +65,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::Duration;
 
 use rand::RngExt as _;
 use std::num::NonZeroUsize;
@@ -1332,11 +1335,6 @@ const AUCTIONEER_ROLE: &str = "auctioneer";
 /// The filler's, for the same line.
 const FILLER_ROLE: &str = "filler";
 
-/// `FAILURE_NOTIFICATION_COOLDOWN_HOURS`' own default: what the filler's
-/// log-only [`Notifier`] deduplicates by until the configured channel and
-/// cooldown are wired through to it.
-const DEFAULT_NOTIFICATION_COOLDOWN: Duration = Duration::from_hours(24);
-
 /// One task's share of `STARTUP_DELAY_LEDGERS`: whether the chain has
 /// moved far enough past the first tick this task saw for it to be
 /// allowed to submit anything.
@@ -1970,6 +1968,10 @@ fn spawn_auctioneer(
 /// plans — its [`Executor`] over that, an [`Inventory`] withholding
 /// `xlm_fee_reserve` of the network's native asset, and runs
 /// [`filler_loop`] off `tick_rx` until the tracker task's sender drops.
+///
+/// `notifier` is [`Service::run`]'s one instance, shared with nothing else:
+/// the filler is the only task that ever reports through it, so this is
+/// simply where that instance is handed in rather than built here.
 #[allow(clippy::too_many_arguments)]
 fn spawn_filler(
     tasks: &mut JoinSet<Result<(), LiquidatorError>>,
@@ -1981,6 +1983,7 @@ fn spawn_filler(
     xlm_fee_reserve: u64,
     startup_delay_ledgers: u32,
     queue: Option<SubmissionQueue>,
+    notifier: Arc<Notifier>,
     tick_rx: watch::Receiver<LedgerTick>,
     shutdown: &watch::Receiver<bool>,
 ) {
@@ -1998,10 +2001,6 @@ fn spawn_filler(
             .map(|signer| Submitter::new(&rpc, &network, signer, tx_config));
         let executor = Executor::new(&store, submitter, dry_run);
         let inventory = Inventory::new(native_asset, xlm_fee_reserve);
-        // Log-only, at the spec's default cooldown: the channel and the
-        // cooldown the configuration names reach the filler with the rest
-        // of the notification wiring.
-        let notifier = Arc::new(Notifier::log_only(DEFAULT_NOTIFICATION_COOLDOWN));
         let filler = Filler::new(&rpc, &store, &pools, config, executor, inventory, notifier);
         filler_loop(
             &filler,
@@ -2205,6 +2204,10 @@ impl Service {
             tick_rx.clone(),
             &shutdown_rx,
         );
+        // One instance for the run, log-only in this phase: Telegram, the
+        // semaphore and `drain()` are Phase 6b's. The filler is its only
+        // reader.
+        let notifier = Arc::new(Notifier::log_only(config.notification_cooldown));
         spawn_filler(
             &mut tasks,
             &rpc,
@@ -2215,6 +2218,7 @@ impl Service {
             config.xlm_fee_reserve,
             config.startup_delay_ledgers,
             queues.filler,
+            notifier,
             tick_rx,
             &shutdown_rx,
         );
@@ -5610,7 +5614,7 @@ mod tests {
             filler_tick_config(),
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
-            Arc::new(Notifier::log_only(Duration::from_hours(1))),
+            Arc::new(Notifier::log_only(std::time::Duration::from_hours(1))),
         );
         let (flag_tx, flag_rx) = watch::channel(false);
         let (tick_tx, tick_rx) = watch::channel(LedgerTick {
@@ -5675,7 +5679,7 @@ mod tests {
             filler_tick_config(),
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
-            Arc::new(Notifier::log_only(Duration::from_hours(1))),
+            Arc::new(Notifier::log_only(std::time::Duration::from_hours(1))),
         );
         let (flag_tx, flag_rx) = watch::channel(false);
         let (tick_tx, tick_rx) = watch::channel(LedgerTick {
@@ -5718,6 +5722,81 @@ mod tests {
             .fetch_one(store.pool())
             .await?;
         assert_eq!(fills.n, Some(0), "nothing is recorded inside the delay");
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// The filler loop unwinds a pool it holds a position in on its first
+    /// tick, dry-run: the `unwind planned` path runs off the published tick
+    /// like everything else in this task.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_filler_loop_plans_a_startup_unwind(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        // No auctions are seeded, so the fill walk reads nothing and the
+        // only chain traffic is the startup unwind pass: a position above
+        // the pool's (zero) primary floor, read for the filler's own
+        // account.
+        harness::script_snapshot_positions(
+            &rpc,
+            &[(
+                signer.address(),
+                harness::positions_entry_xdr(signer.address(), &[(0, 5_000_000_000_000)], &[]),
+            )],
+        );
+        harness::script_empty_wallet(&rpc, tick.sequence);
+        crate::chain::script::script_simulate_prelude(&rpc, &signer, 10, tick.sequence);
+        crate::chain::script::script_simulate_accepted(&rpc, tick.sequence);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, test_tx_config());
+        let pools = vec![filler_pool_config(0)];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            filler_tick_config(),
+            // Keyed and dry-run: the judgment still simulates through the
+            // key, and nothing is queued.
+            Executor::new(&store, Some(submitter), true),
+            Inventory::new(XLM.to_string(), 0),
+            Arc::new(Notifier::log_only(std::time::Duration::from_hours(1))),
+        );
+        let (flag_tx, flag_rx) = watch::channel(false);
+        let (tick_tx, tick_rx) = watch::channel(LedgerTick {
+            sequence: 0,
+            close_time: 0,
+        });
+
+        let positions_key =
+            to_base64(&keys::positions(harness::POOL, signer.address()).expect("positions key"))
+                .expect("key encodes");
+        let driver = async {
+            tick_tx.send(tick).expect("publish the tick");
+            let mut read = false;
+            for _ in 0..200 {
+                read = rpc.calls("getLedgerEntries").iter().any(|params| {
+                    params["keys"].as_array().is_some_and(|keys| {
+                        keys.iter().any(|key| key.as_str() == Some(&positions_key))
+                    })
+                });
+                if read {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(
+                read,
+                "the loop never read the filler's own account positions"
+            );
+            flag_tx.send(true).expect("raise shutdown");
+            drop(tick_tx);
+        };
+        let (outcome, ()) = tokio::join!(filler_loop(&filler, 0, None, tick_rx, &flag_rx), driver);
+        outcome.expect("the loop returned when its sender dropped");
+
         assert_eq!(rpc.remaining(), 0);
         Ok(())
     }
