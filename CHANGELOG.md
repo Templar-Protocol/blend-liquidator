@@ -67,8 +67,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provably holds that submission: its ledger at or past the one the
   submission landed in, and never for an unresolved `Unknown`, which
   landed in no ledger anyone can name. The evidence is the run's, not the
-  tick's, since a snapshot two ticks later can still be behind it, and
-  what the position happens to look like is not evidence either way. Leftover
+  tick's (`FillerState::unwind_after`), since a snapshot two ticks later
+  can still be behind it, and it is a high-water mark rather than a
+  one-shot: the snapshot that proves it does not clear it, because
+  `latestLedger` is not monotonic across calls and nearly everything past
+  the gate can return having sent nothing while the pool stays pending.
+  The next submission that lands raises it; only clearing the pool drops
+  it. What the position happens to look like is not evidence either way. Leftover
   debt the wallet cannot repay notifies
   `NotificationKind::UnwindLeftovers` at `Severity::High` once per pool,
   not again until a later pass finds it clean. A pass that moves nothing —

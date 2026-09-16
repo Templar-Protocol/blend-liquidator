@@ -289,12 +289,21 @@ make help                           # Docker Compose lifecycle
   unwind must not strand the position, and an idle pass costs one snapshot
   and one wallet read. The pass reads its own snapshot even for a pool the
   fill walk just read in this same tick, since a fill may have changed the
-  position in between — and a pool whose fill landed *this* tick is passed
-  over entirely until a snapshot provably holds that fill (its ledger at or
-  past the fill's, and never for a `TxOutcome::Unknown`, which landed in no
-  ledger): what the position then looks like is not evidence either way,
-  and planning against a pre-fill snapshot sizes a withdrawal against
-  liabilities the fill is about to raise. It plans through
+  position in between — and a pool whose fill *or whose own earlier
+  unwind* landed, or may have, is passed over entirely until a snapshot
+  provably holds that submission (its ledger at or past the one the
+  submission landed in, and never for a `TxOutcome::Unknown`, which landed
+  in no ledger anyone can name). The evidence is the run's, not the tick's:
+  `FillerState::unwind_after` holds it, so a pool is held across every
+  later tick whose snapshot is still behind, and the entry is a high-water
+  mark — the snapshot that proves it does not clear it, because
+  `latestLedger` is not monotonic across calls and most of what follows the
+  gate can return having sent nothing while the pool stays pending. It is
+  raised by the next submission that lands and dropped only where the pool
+  itself is cleared. What the position then looks like is not evidence
+  either way, and planning against a snapshot taken before the submission
+  sizes a withdrawal against liabilities the fill is about to raise, or
+  re-plans a withdrawal the contract then caps at what is left. It plans through
   `math::unwind::plan_unwind` and executes through `Executor::unwind`
   behind the same startup gate and queue a fill uses. A pass that moves
   something leaves its pool pending for the next tick's fresh plan; the

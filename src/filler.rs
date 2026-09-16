@@ -250,11 +250,20 @@ pub struct FillerState {
     /// episode starts at full cadence rather than inheriting the last
     /// one's backoff.
     unwind_setbacks: BTreeMap<String, Setback>,
-    /// Per pool, the ledger a snapshot must reach before this pool's
-    /// unwind is planned again — `None` for a [`TxOutcome::Unknown`],
-    /// whose ledger is not known and which therefore holds the pool
-    /// indefinitely. An entry exists only while such a submission is
-    /// outstanding: the first pass whose snapshot reaches it removes it.
+    /// Per pool, the least ledger every later snapshot must reach before
+    /// this pool's unwind is planned against it — `None` for a
+    /// [`TxOutcome::Unknown`], whose ledger is not known and which
+    /// therefore holds the pool indefinitely.
+    ///
+    /// A high-water mark, not a one-shot. Proving one snapshot holds the
+    /// submission does not clear it: `latestLedger` is not monotonic
+    /// across calls, and most of what a pass does after the gate can
+    /// return having sent nothing while the pool stays pending, so the
+    /// pass after that one can be served an older ledger by a lagging
+    /// node and see the position as it stood before the submission. The
+    /// entry is raised by the next submission that lands and dropped only
+    /// where the pool itself is cleared — a pass that finds nothing left
+    /// to unwind, and a run with no filler key to hold a position at all.
     ///
     /// Both a fill and an unwind write it, because both move the
     /// filler's own position, and a pass reads its own snapshot, which
@@ -273,8 +282,8 @@ pub struct FillerState {
     ///
     /// So the pass is held on the evidence rather than on the shape of
     /// what it read: a pool whose entry is `None`, or whose snapshot is
-    /// older than the ledger the submission landed in, is left pending
-    /// and untouched. This lives here rather than on [`Pass`] because a
+    /// older than the ledger the entry names, is left pending and
+    /// untouched. This lives here rather than on [`Pass`] because a
     /// submission that landed at one tick is not a fact about that tick:
     /// the snapshot two ticks later can still be behind it. An `Unknown`
     /// reaches the filler only at shutdown — [`crate::queue`] resolves
@@ -1242,6 +1251,7 @@ impl Filler<'_> {
         let Some(filler) = self.executor.filler() else {
             if !pass.state.unwind_pending.is_empty() {
                 pass.state.unwind_pending.clear();
+                pass.state.unwind_after.clear();
                 tracing::debug!("no filler key: nothing to unwind");
             }
             return Ok(());
@@ -1304,6 +1314,19 @@ impl Filler<'_> {
         // Before the position is looked at at all: what this snapshot
         // shows of a pool a fill or an earlier pass has just changed means
         // nothing until the snapshot is known to hold that submission.
+        //
+        // The entry survives the snapshot that proves it. Most of what
+        // follows can return having sent nothing while the pool stays
+        // pending — reserves that will not accrue, a plan that cannot be
+        // built, a wallet that no longer covers the repays, an executor
+        // failure, a contract refusal — and `latestLedger` is not
+        // monotonic across calls: `same_ledger` makes one snapshot's own
+        // parts agree, nothing makes the next snapshot newer than the
+        // last. A gate that disarmed on proof would let the pass after
+        // any of those plan against an older ledger from a lagging node,
+        // which is the pre-withdrawal position again. So it is a
+        // high-water mark, raised by the next submission that lands and
+        // dropped only when the pool is cleared.
         if let Some(landed) = pass.state.unwind_after.get(&pool.address).copied() {
             let holds_it = landed.is_some_and(|ledger| snapshot.ledger >= ledger);
             if !holds_it {
@@ -1316,9 +1339,6 @@ impl Filler<'_> {
                 );
                 return Ok(());
             }
-            // Proven, and proven once: what every later snapshot shows is
-            // this one's or newer.
-            pass.state.unwind_after.remove(&pool.address);
         }
         let positions = snapshot.positions.get(filler).cloned().unwrap_or_default();
         if nothing_to_unwind(&positions) {
@@ -1328,6 +1348,9 @@ impl Filler<'_> {
             );
             pass.state.unwind_pending.remove(&pool.address);
             pass.state.leftovers_notified.remove(&pool.address);
+            // The pool is done, so there is no submission left for a
+            // later snapshot to have to hold.
+            pass.state.unwind_after.remove(&pool.address);
             clear_setback(&pool.address, pass);
             return Ok(());
         }
@@ -4204,9 +4227,9 @@ mod tests {
         assert_eq!(
             holds.unwind_after.get(harness::POOL),
             Some(&Some(harness::fixture_tick().sequence)),
-            "and the pass that was shown one clears the fill's entry — what is left is the \
-             one its own landed unwind then armed, at the ledger this run's worker answers \
-             every submission with"
+            "and it stays a high-water mark past the snapshot that proved it — raised \
+             again, to the same ledger, by the unwind this pass then landed: this run's \
+             worker answers every submission with it"
         );
         assert_eq!(
             holds.entry_reads, 7,
@@ -4349,8 +4372,185 @@ mod tests {
         );
         assert!(
             !state.unwind_after.contains_key(harness::POOL),
-            "and the evidence goes with the pass that was shown it: a submission nothing is \
-             waiting on any more must not hold a pool the next snapshot is read behind"
+            "and the evidence goes with the pool: a pool with no position left has no \
+             submission outstanding for a later snapshot to have to hold"
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// The gate is a high-water mark, not a one-shot: proving a snapshot
+    /// holds the submission is not the same as having no submission
+    /// outstanding.
+    ///
+    /// Four of `unwind_pool`'s later paths — reserves that will not
+    /// accrue, a plan that cannot be built, a wallet that no longer
+    /// covers the repays, an executor that failed — and a contract
+    /// refusal all return having sent nothing while the pool stays
+    /// pending. `latestLedger` is not monotonic across calls, and
+    /// `same_ledger` only makes one snapshot's own parts agree, so the
+    /// next pass can read an older ledger from a node behind a load
+    /// balancer and see the pre-withdrawal position again. A gate that
+    /// disarmed on proof would re-plan step 2's absolute primary
+    /// `Withdraw` against it, which the contract caps at the position —
+    /// taking the primary collateral to zero.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_proven_gate_still_holds_a_snapshot_that_lags(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        // The ledger the withdrawal lands in: every snapshot below is at
+        // this or at the one before it.
+        let landed = tick.sequence + 1;
+        // Tick one: the startup pass, judged and submitted.
+        script_unwind_position(&rpc, signer.address(), &[(0, UNWIND_COLLATERAL)], &[]);
+        script_wallet(&rpc, tick.sequence, [0, 0, 0]);
+        script_simulate_prelude(&rpc, &signer, 10, tick.sequence);
+        script_simulate_accepted(&rpc, tick.sequence);
+        // Tick two: a snapshot a ledger behind it. Nothing past the
+        // snapshot is scripted — an unscripted read answers HTTP 500 — so
+        // a pass that plans when it should have waited shows up in the
+        // counts below.
+        script_unwind_position(&rpc, signer.address(), &[(0, UNWIND_COLLATERAL)], &[]);
+        // Tick three: a snapshot that holds the withdrawal, and a pass
+        // the contract then refuses — `InvalidUtilRate`, which a
+        // withdrawal draws when the reserve is fully lent out. It sent
+        // nothing, so the withdrawal of tick one is still the newest
+        // thing any snapshot must hold.
+        script_unwind_position_at(
+            &rpc,
+            landed,
+            signer.address(),
+            &[(0, UNWIND_COLLATERAL)],
+            &[],
+        );
+        script_wallet(&rpc, landed, [0, 0, 0]);
+        script_simulate_prelude(&rpc, &signer, 11, landed);
+        script_simulate_refused(&rpc, 1_207, landed);
+        // Tick four, past the setback's backoff: a lagging node answers
+        // with the ledger before the withdrawal, and the position it
+        // shows is the one the withdrawal already took out.
+        script_unwind_position(&rpc, signer.address(), &[(0, UNWIND_COLLATERAL)], &[]);
+        // Tick five: a snapshot that holds it again, and what it left.
+        harness::script_snapshot_positions_at(&rpc, landed, &[]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            FillerConfig {
+                dry_run: false,
+                ..filler_config()
+            },
+            Executor::new(&store, Some(submitter), false),
+            Inventory::new(XLM.to_string(), 0),
+            notifier(),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+        let (queue, mut receiver) =
+            SubmissionQueue::new(NonZeroUsize::new(4).expect("a test capacity is never zero"));
+        let worker = tokio::spawn(async move {
+            while let Some(queued) = receiver.recv().await {
+                let _ = queued.respond.send(Ok(TxOutcome::Succeeded {
+                    hash: TxHash([4_u8; 32]),
+                    ledger: landed,
+                    return_value: None,
+                }));
+            }
+        });
+
+        let first = filler
+            .tick(&mut state, tick, true, Some(&queue), &shutdown)
+            .await
+            .expect("the first tick");
+
+        assert_eq!(
+            first,
+            TickSummary {
+                unwound: 1,
+                ..TickSummary::default()
+            },
+            "the startup pass planned the withdrawal and the chain took it"
+        );
+
+        let second = filler
+            .tick(&mut state, later(tick, 1), true, Some(&queue), &shutdown)
+            .await
+            .expect("the second tick");
+
+        assert_eq!(second, TickSummary::default(), "this snapshot is behind it");
+
+        let third = filler
+            .tick(&mut state, later(tick, 2), true, Some(&queue), &shutdown)
+            .await
+            .expect("the third tick");
+
+        assert_eq!(
+            third,
+            TickSummary::default(),
+            "the snapshot held it, so the pass planned — and the contract refused it"
+        );
+        assert_eq!(
+            state.unwind_after.get(harness::POOL),
+            Some(&Some(landed)),
+            "a refusal sent nothing, so the withdrawal that did is still the least ledger \
+             any later snapshot has to reach: proving one snapshot is not the same as \
+             having nothing outstanding"
+        );
+        assert!(
+            state.unwind_pending.contains(harness::POOL),
+            "and the pool stays pending"
+        );
+        let reads = rpc.calls("getLedgerEntries").len();
+        let simulations = rpc.calls("simulateTransaction").len();
+
+        // The setback backed the next pass off by two ledgers.
+        let fourth = filler
+            .tick(&mut state, later(tick, 4), true, Some(&queue), &shutdown)
+            .await
+            .expect("the fourth tick");
+
+        assert_eq!(
+            fourth,
+            TickSummary::default(),
+            "the node that answered this one is behind the withdrawal again"
+        );
+        assert_eq!(
+            rpc.calls("getLedgerEntries").len(),
+            reads + 2,
+            "so it is gated: the snapshot's two entry reads, and nothing past them"
+        );
+        assert_eq!(
+            rpc.calls("simulateTransaction").len(),
+            simulations + 4,
+            "its four oracle reads: no wallet read, and no judgment"
+        );
+
+        let fifth = filler
+            .tick(&mut state, later(tick, 5), true, Some(&queue), &shutdown)
+            .await
+            .expect("the fifth tick");
+        drop(queue);
+        worker.await.expect("the worker ends with the queue");
+
+        assert_eq!(
+            fifth,
+            TickSummary::default(),
+            "a snapshot that holds the withdrawal again shows what it left: nothing"
+        );
+        assert!(
+            !state.unwind_pending.contains(harness::POOL),
+            "so the pool is cleared rather than withdrawn from a second time"
+        );
+        assert!(
+            !state.unwind_after.contains_key(harness::POOL),
+            "and the gate goes with it: a pool with no position left has no submission \
+             outstanding to hold a later snapshot against"
         );
         assert_eq!(rpc.remaining(), 0);
         Ok(())
