@@ -131,6 +131,18 @@ pub struct FillerState {
     /// Set by a submission that landed or may have landed, so the next
     /// pool pass re-reads the wallet however fresh its balances look.
     inventory_stale: bool,
+    /// Every asset any pool this run has read a snapshot of names, plus
+    /// the native asset. A wallet read covers **all** of them, never just
+    /// the pool that triggered it: [`Inventory::record_balances`] replaces
+    /// the whole map, so a read of one pool's reserves would leave every
+    /// other pool's assets showing zero — and a zero wallet plans no
+    /// repay, caps a supply at nothing, and skips fills the funds were
+    /// there for.
+    known_assets: BTreeSet<String>,
+    /// What the last successful wallet read actually covered. A pool
+    /// naming an asset outside it is read for, however fresh the balances
+    /// look.
+    covered_assets: BTreeSet<String>,
 }
 
 impl FillerState {
@@ -139,6 +151,36 @@ impl FillerState {
     fn forget(&mut self, pool: &str, account: &str) {
         self.last_planned
             .remove(&(pool.to_string(), account.to_string()));
+    }
+
+    /// Forgets an auction that is no longer there: when it was planned,
+    /// and that a dry run already recorded a fill for it.
+    fn closed(&mut self, pool: &str, account: &str, start_ledger: u32) {
+        self.forget(pool, account);
+        self.recorded_dry_run
+            .remove(&(pool.to_string(), account.to_string(), start_ledger));
+    }
+
+    /// Drops every `recorded_dry_run` key of `pool` that `rows` — the
+    /// pool's open auctions, read at the start of this pool's walk — no
+    /// longer names.
+    ///
+    /// Ruling 8's set suppresses an auction by `(pool, account, start
+    /// ledger)`, and that suppression is what keeps the filler from ever
+    /// re-reading its entry: nothing else would notice the row going
+    /// away. So the walk that already holds the open rows is where a key
+    /// whose auction has been filled, or replaced by a new one at a later
+    /// start ledger, is dropped — otherwise the set only ever grows, for
+    /// as long as the process runs.
+    fn prune_recorded(&mut self, pool: &str, rows: &[TrackedAuction]) {
+        let open: BTreeSet<(&str, u32)> = rows
+            .iter()
+            .map(|row| (row.account.as_str(), row.start_ledger))
+            .collect();
+        self.recorded_dry_run
+            .retain(|(recorded_pool, account, start_ledger)| {
+                recorded_pool != pool || open.contains(&(account.as_str(), *start_ledger))
+            });
     }
 }
 
@@ -302,6 +344,7 @@ impl<'a> Filler<'a> {
         shutdown: &watch::Receiver<bool>,
     ) -> Result<(), FillerError> {
         let rows = self.store.open_auctions(&pool.address).await?;
+        pass.state.prune_recorded(&pool.address, &rows);
         let candidates: Vec<TrackedAuction> = rows
             .into_iter()
             .filter(|row| self.considered(pool, row, pass))
@@ -406,7 +449,7 @@ impl<'a> Filler<'a> {
                     self.store
                         .delete_auction(&row.pool, &row.account, row.auction_type)
                         .await?;
-                    pass.state.forget(&row.pool, &row.account);
+                    pass.state.closed(&row.pool, &row.account, row.start_ledger);
                     pass.summary.closed += 1;
                     tracing::info!(
                         pool = %row.pool,
@@ -438,15 +481,26 @@ impl<'a> Filler<'a> {
         let Some(filler) = self.executor.filler() else {
             return;
         };
+        state
+            .known_assets
+            .extend(snapshot.asset_index.keys().cloned());
+        state.known_assets.insert(self.config.native_asset.clone());
+        // This pool naming an asset the last read did not cover is a
+        // refresh on its own: the balances may be seconds old and still
+        // show nothing at all for what this pool's auctions are paid in.
+        let uncovered = snapshot
+            .asset_index
+            .keys()
+            .any(|asset| !state.covered_assets.contains(asset));
         if !state.inventory_stale
+            && !uncovered
             && !self
                 .inventory
                 .stale(Instant::now(), self.config.inventory_refresh)
         {
             return;
         }
-        let mut assets: BTreeSet<String> = snapshot.asset_index.keys().cloned().collect();
-        assets.insert(self.config.native_asset.clone());
+        let assets = state.known_assets.clone();
         match read_balances(reader, filler, &assets).await {
             Ok(balances) => {
                 self.inventory.record_balances(balances, Instant::now());
@@ -456,6 +510,7 @@ impl<'a> Filler<'a> {
                     assets = assets.len(),
                     "the filler's wallet balances were re-read"
                 );
+                state.covered_assets = assets;
             }
             Err(error) => tracing::warn!(
                 pool = %snapshot.pool,
@@ -771,6 +826,21 @@ impl<'a> Filler<'a> {
         if !self.write_plan(row, &draft, pass).await? {
             return Ok(());
         }
+        // The same gate the first draft passed, and for the same reason:
+        // `plan_fill` answers a *later* ledger when the lower percent no
+        // longer holds the filler's floor where the refused one did, and
+        // a draft sent before its own ledger meets neither the health
+        // margin nor the profit margin it was chosen for.
+        if draft.fill_ledger > context.earliest_ledger {
+            tracing::debug!(
+                pool = %row.pool,
+                account = %row.account,
+                fill_ledger = draft.fill_ledger,
+                percent = draft.percent.get(),
+                "the re-plan is for a later ledger; it is on the row and waits for it"
+            );
+            return Ok(());
+        }
         let Some(outcome) = self.execute_once(context, row, &draft, queue, pass).await? else {
             return Ok(());
         };
@@ -901,10 +971,17 @@ mod tests {
     };
     use crate::chain::signer::{Network, Signer};
     use crate::chain::tx::{Submitter, TxConfig};
-    use crate::chain::xdr::encode::i128_val;
+    use crate::chain::xdr::encode::{
+        address, from_base64, i128_val, map, sc_address, symbol, to_base64, vec as sc_vec,
+    };
+    use crate::chain::xdr::keys;
     use crate::chain::{ChainError, TxHash, TxOutcome};
+    use crate::fixture::{mainnet_fixed_v2, text};
     use crate::harness;
     use crate::queue::QueueError;
+    use stellar_xdr::{
+        ContractDataDurability, ContractDataEntry, ExtensionPoint, LedgerEntryData, ScVal,
+    };
 
     /// The fixture's XLM and USDC reserves. Real strkeys: every address
     /// here round-trips through the encoder on its way into a scripted
@@ -1041,12 +1118,630 @@ mod tests {
         }
     }
 
-    /// The row as the store holds it now.
+    /// The fixture pool's row as the store holds it now.
     async fn row(store: &Store, account: &str) -> Option<TrackedAuction> {
+        row_in(store, harness::POOL, account).await
+    }
+
+    /// The same, for any pool.
+    async fn row_in(store: &Store, pool: &str, account: &str) -> Option<TrackedAuction> {
         store
-            .auction(harness::POOL, account, AuctionType::UserLiquidation)
+            .auction(pool, account, AuctionType::UserLiquidation)
             .await
             .expect("read the auction row")
+    }
+
+    /// A `Positions` ledger entry for `account`, by reserve index.
+    /// Copied from `service.rs`'s test module and widened to carry
+    /// collateral as well as liabilities: the filler's own position is
+    /// what makes a lower percent *worse* than a higher one, and the
+    /// fixture holds no position for the filler's key.
+    fn positions_entry_xdr(
+        account: &str,
+        collateral: &[(u32, i128)],
+        liabilities: &[(u32, i128)],
+    ) -> String {
+        let side = |amounts: &[(u32, i128)]| {
+            map(amounts
+                .iter()
+                .map(|(index, amount)| (ScVal::U32(*index), i128_val(*amount)))
+                .collect())
+            .expect("positions side")
+        };
+        let value = map(vec![
+            (symbol("collateral").expect("symbol"), side(collateral)),
+            (symbol("liabilities").expect("symbol"), side(liabilities)),
+            (symbol("supply").expect("symbol"), side(&[])),
+        ])
+        .expect("positions map");
+        let entry = LedgerEntryData::ContractData(ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: sc_address(harness::POOL).expect("pool"),
+            key: sc_vec(vec![
+                symbol("Positions").expect("symbol"),
+                address(account).expect("account"),
+            ])
+            .expect("positions key"),
+            durability: ContractDataDurability::Persistent,
+            val: value,
+        });
+        to_base64(&entry).expect("positions entry")
+    }
+
+    /// `harness::script_snapshot`'s reserves and oracle reads, with
+    /// hand-built positions entries instead of the fixture's. Copied from
+    /// `service.rs`'s test module.
+    fn script_snapshot_positions(rpc: &ScriptedRpc, positions: &[(&str, String)]) {
+        let fixture = mainnet_fixed_v2();
+        let ledger = fixture["ledger"].as_u64().expect("ledger");
+        rpc.expect(
+            "getLedgerEntries",
+            json!({"latestLedger": ledger, "entries": [
+                entry(&keys::instance(harness::POOL).expect("key"), text(&fixture, &["instance_entry_xdr"])),
+                entry(&keys::reserve_list(harness::POOL).expect("key"), text(&fixture, &["res_list_entry_xdr"])),
+            ]}),
+        );
+        let mut entries = Vec::new();
+        for reserve in fixture["reserves"].as_array().expect("reserves") {
+            let asset = reserve["asset"].as_str().expect("asset");
+            entries.push(entry(
+                &keys::reserve_config(harness::POOL, asset).expect("key"),
+                reserve["config_entry_xdr"].as_str().expect("config"),
+            ));
+            entries.push(entry(
+                &keys::reserve_data(harness::POOL, asset).expect("key"),
+                reserve["data_entry_xdr"].as_str().expect("data"),
+            ));
+        }
+        for (account, positions_xdr) in positions {
+            entries.push(entry(
+                &keys::positions(harness::POOL, account).expect("key"),
+                positions_xdr,
+            ));
+        }
+        rpc.expect(
+            "getLedgerEntries",
+            json!({"latestLedger": ledger, "entries": entries}),
+        );
+        let ledger = u32::try_from(ledger).expect("ledger fits");
+        rpc.expect(
+            "simulateTransaction",
+            simulation(text(&fixture, &["oracle_decimals_return_xdr"]), ledger),
+        );
+        for reserve in fixture["reserves"].as_array().expect("reserves") {
+            rpc.expect(
+                "simulateTransaction",
+                simulation(
+                    reserve["lastprice_return_xdr"].as_str().expect("price"),
+                    ledger,
+                ),
+            );
+        }
+    }
+
+    /// An entry answer, as `harness`'s own private helper builds it.
+    fn entry(key: &stellar_xdr::LedgerKey, xdr: &str) -> Value {
+        json!({"key": to_base64(key).expect("key"), "xdr": xdr,
+               "lastModifiedLedgerSeq": 1, "liveUntilLedgerSeq": 99_999_999_u32})
+    }
+
+    /// The filler's own starting position: 15.9 billion b-tokens of the
+    /// fixture's third reserve (about $20,031 of effective collateral at
+    /// its 0.95 factor) against 38.7 billion d-tokens of USDC (about
+    /// $50,050 of effective liability). Chosen so the *whole* auction
+    /// lifts it over the 1.65 floor and half of it does not — see
+    /// `a_re_plan_for_a_later_ledger_is_written_and_left`.
+    const FILLER_COLLATERAL: i128 = 15_900_000_000;
+    const FILLER_LIABILITIES: i128 = 38_700_000_000;
+
+    /// A second pool, built here rather than captured: the fixture holds
+    /// one pool, and the wallet a multi-pool tick plans against is exactly
+    /// what a second one is needed to pin.
+    const POOL_TWO: &str = "CAQQR5SWBXKIGZKPBZDH3KM5GQ5GUTPKB7JAFCINLZBC5WXPJKRG3IM7";
+    /// An asset of `POOL_TWO` that the fixture's pool does not list.
+    const BLND: &str = "CD25MNVTZDL4Y3XBCPCJXGXATV5WUHHOWMYFF4YBEGU5FCPGMYTVG5JY";
+    /// The fixture's third reserve, which `POOL_TWO` does not list.
+    const EURC: &str = "CDTKPWPLOURQA2SGTKTUQOWRCBZEORB4BWBOMJ3D3ZTQQSGE5F6JBQLV";
+    /// The fixture's oracle and admin, reused so `POOL_TWO`'s entries
+    /// decode against real strkeys.
+    const ORACLE: &str = "CCVTVW2CVA7JLH4ROQGP3CU4T3EXVCK66AZGSM4MUQPXAI4QHCZPOATS";
+    const ADMIN: &str = "GDAWX4KV5EQLP5W44HE5AA5QN5QRBJOVQIAI5OXOH5FW2ENT5PXN33DE";
+
+    /// One reserve of the synthetic second pool. Rates are 1.0, so no
+    /// accrual moves them and every amount below is also its underlying.
+    #[derive(Debug, Clone, Copy)]
+    struct SyntheticReserve {
+        asset: &'static str,
+        c_factor: u32,
+        l_factor: u32,
+        price: i128,
+    }
+
+    /// The instance entry of a synthetic pool: the five config fields
+    /// `decode::pool_instance` reads, and the four storage keys around
+    /// them. Modelled on `service.rs`'s test module.
+    fn instance_entry_xdr(pool: &str) -> String {
+        let config = map(vec![
+            (symbol("bstop_rate").expect("symbol"), ScVal::U32(2_000_000)),
+            (symbol("max_positions").expect("symbol"), ScVal::U32(6)),
+            (symbol("min_collateral").expect("symbol"), i128_val(0)),
+            (
+                symbol("oracle").expect("symbol"),
+                address(ORACLE).expect("oracle"),
+            ),
+            (symbol("status").expect("symbol"), ScVal::U32(1)),
+        ])
+        .expect("config map");
+        let ScVal::Map(Some(config)) = config else {
+            panic!("map returns a map")
+        };
+        let storage = stellar_xdr::ScMap::sorted_from(vec![
+            (
+                symbol("Admin").expect("symbol"),
+                address(ADMIN).expect("admin"),
+            ),
+            (
+                symbol("BLNDTkn").expect("symbol"),
+                address(BLND).expect("blnd"),
+            ),
+            (
+                symbol("Backstop").expect("symbol"),
+                address(POOL_TWO).expect("backstop"),
+            ),
+            (symbol("Config").expect("symbol"), ScVal::Map(Some(config))),
+            (
+                symbol("Name").expect("symbol"),
+                ScVal::String(
+                    stellar_xdr::ScString::try_from(b"Second Pool".to_vec()).expect("name"),
+                ),
+            ),
+        ])
+        .expect("storage map");
+        let instance = ScVal::ContractInstance(stellar_xdr::ScContractInstance {
+            executable: stellar_xdr::ContractExecutable::StellarAsset,
+            storage: Some(storage),
+        });
+        contract_entry_xdr(pool, ScVal::LedgerKeyContractInstance, instance)
+    }
+
+    /// A `ContractData` entry of `pool` holding `value`. The scripted RPC
+    /// answers by the key it is asked for, so the entry's own key field
+    /// only has to decode.
+    fn contract_entry_xdr(pool: &str, key: ScVal, value: ScVal) -> String {
+        let entry = LedgerEntryData::ContractData(ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: sc_address(pool).expect("pool"),
+            key,
+            durability: ContractDataDurability::Persistent,
+            val: value,
+        });
+        to_base64(&entry).expect("entry")
+    }
+
+    /// Scripts one complete `PoolReader::snapshot` of a synthetic pool:
+    /// the shape read, the batched reserve read, then the oracle's
+    /// decimals and one `lastprice` per reserve, in reserve-list order —
+    /// the call sequence `harness::script_snapshot` scripts for the
+    /// fixture, built from parameters instead of a captured ledger.
+    fn script_second_pool(
+        rpc: &ScriptedRpc,
+        reserves: &[SyntheticReserve],
+        close_time: u64,
+        ledger: u32,
+    ) {
+        let list = sc_vec(
+            reserves
+                .iter()
+                .map(|reserve| address(reserve.asset).expect("asset"))
+                .collect(),
+        )
+        .expect("reserve list");
+        rpc.expect(
+            "getLedgerEntries",
+            json!({"latestLedger": ledger, "entries": [
+                entry(&keys::instance(POOL_TWO).expect("key"), &instance_entry_xdr(POOL_TWO)),
+                entry(&keys::reserve_list(POOL_TWO).expect("key"),
+                      &contract_entry_xdr(POOL_TWO, ScVal::Void, list)),
+            ]}),
+        );
+        let mut entries = Vec::new();
+        for (index, reserve) in reserves.iter().enumerate() {
+            let index = u32::try_from(index).expect("index fits");
+            let config = map(vec![
+                (
+                    symbol("c_factor").expect("symbol"),
+                    ScVal::U32(reserve.c_factor),
+                ),
+                (symbol("decimals").expect("symbol"), ScVal::U32(7)),
+                (symbol("enabled").expect("symbol"), ScVal::Bool(true)),
+                (symbol("index").expect("symbol"), ScVal::U32(index)),
+                (
+                    symbol("l_factor").expect("symbol"),
+                    ScVal::U32(reserve.l_factor),
+                ),
+                (symbol("max_util").expect("symbol"), ScVal::U32(9_500_000)),
+                (symbol("r_base").expect("symbol"), ScVal::U32(0)),
+                (symbol("r_one").expect("symbol"), ScVal::U32(0)),
+                (symbol("r_three").expect("symbol"), ScVal::U32(0)),
+                (symbol("r_two").expect("symbol"), ScVal::U32(0)),
+                (symbol("reactivity").expect("symbol"), ScVal::U32(0)),
+                (symbol("supply_cap").expect("symbol"), i128_val(0)),
+                (symbol("util").expect("symbol"), ScVal::U32(0)),
+            ])
+            .expect("reserve config");
+            let data = map(vec![
+                (
+                    symbol("b_rate").expect("symbol"),
+                    i128_val(1_000_000_000_000),
+                ),
+                (symbol("b_supply").expect("symbol"), i128_val(0)),
+                (symbol("backstop_credit").expect("symbol"), i128_val(0)),
+                (
+                    symbol("d_rate").expect("symbol"),
+                    i128_val(1_000_000_000_000),
+                ),
+                (symbol("d_supply").expect("symbol"), i128_val(0)),
+                (symbol("ir_mod").expect("symbol"), i128_val(10_000_000)),
+                (symbol("last_time").expect("symbol"), ScVal::U64(close_time)),
+            ])
+            .expect("reserve data");
+            entries.push(entry(
+                &keys::reserve_config(POOL_TWO, reserve.asset).expect("key"),
+                &contract_entry_xdr(POOL_TWO, ScVal::Void, config),
+            ));
+            entries.push(entry(
+                &keys::reserve_data(POOL_TWO, reserve.asset).expect("key"),
+                &contract_entry_xdr(POOL_TWO, ScVal::Void, data),
+            ));
+        }
+        rpc.expect(
+            "getLedgerEntries",
+            json!({"latestLedger": ledger, "entries": entries}),
+        );
+        rpc.expect(
+            "simulateTransaction",
+            simulation(&scval_b64(&ScVal::U32(7)), ledger),
+        );
+        for reserve in reserves {
+            let price = map(vec![
+                (symbol("price").expect("symbol"), i128_val(reserve.price)),
+                (symbol("timestamp").expect("symbol"), ScVal::U64(close_time)),
+            ])
+            .expect("price");
+            rpc.expect(
+                "simulateTransaction",
+                simulation(&scval_b64(&price), ledger),
+            );
+        }
+    }
+
+    /// The token every `balance` simulation asked about, in the order the
+    /// filler asked. Decoded from the envelopes the client actually sent,
+    /// so this is what reached the chain and not what a test hoped for.
+    fn balance_reads(rpc: &ScriptedRpc) -> Vec<stellar_xdr::ScAddress> {
+        rpc.calls("simulateTransaction")
+            .iter()
+            .filter_map(|params| {
+                let encoded = params["transaction"].as_str()?;
+                let envelope: stellar_xdr::TransactionEnvelope = from_base64(encoded).ok()?;
+                let stellar_xdr::TransactionEnvelope::Tx(v1) = envelope else {
+                    return None;
+                };
+                let stellar_xdr::OperationBody::InvokeHostFunction(op) =
+                    &v1.tx.operations.first()?.body
+                else {
+                    return None;
+                };
+                let stellar_xdr::HostFunction::InvokeContract(args) = &op.host_function else {
+                    return None;
+                };
+                (args.function_name.to_utf8_string_lossy() == "balance")
+                    .then(|| args.contract_address.clone())
+            })
+            .collect()
+    }
+
+    /// The contract's health check refused the whole auction, and the
+    /// halved plan no longer holds the filler's floor where the whole one
+    /// did — so the planner answers a *later* ledger for it. That plan
+    /// goes onto the row and waits, exactly as a first plan for a later
+    /// ledger does; nothing is sent before the ledger it was chosen for.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_re_plan_for_a_later_ledger_is_written_and_left(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let auction = auction(tick.sequence - 300);
+        store
+            .upsert_auction(&tracked(harness::USER_ONE, &auction))
+            .await
+            .expect("seed the auction");
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        harness::script_auction_entry(&rpc, harness::USER_ONE, &auction, tick.sequence);
+        // The filler already owes more than it holds, so half the auction
+        // lifts it less than the whole does.
+        script_snapshot_positions(
+            &rpc,
+            &[(
+                signer.address(),
+                positions_entry_xdr(
+                    signer.address(),
+                    &[(2, FILLER_COLLATERAL)],
+                    &[(1, FILLER_LIABILITIES)],
+                ),
+            )],
+        );
+        script_empty_wallet(&rpc, tick.sequence);
+        // One simulation only: the refusal. A second would mean the
+        // halved plan was sent before its ledger.
+        script_simulate_prelude(&rpc, &signer, 10, tick.sequence);
+        script_simulate_refused(&rpc, 1_205, tick.sequence);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            filler_config(),
+            Executor::new(&store, Some(submitter), true),
+            Inventory::new(XLM.to_string(), 0),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+
+        let summary = filler
+            .tick(&mut state, tick, true, None, &shutdown)
+            .await
+            .expect("tick");
+
+        assert_eq!(
+            summary,
+            TickSummary {
+                planned: 2,
+                ..TickSummary::default()
+            },
+            "both drafts were written; neither was executed — the first was refused and \
+             the second is for a ledger that has not come"
+        );
+        let row = row(&store, harness::USER_ONE).await.expect("the row stays");
+        assert_eq!(
+            (row.fill_ledger, row.percent.map(FillPercent::get)),
+            (Some(tick.sequence + 62), Some(50)),
+            "the halved plan needs 61 more ledgers of the bid ramp to hold the floor: it \
+             projects 1.6518 there against the 1.65 the whole auction already cleared"
+        );
+        let fills = sqlx::query!("SELECT count(*) AS n FROM fills")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(
+            fills.n,
+            Some(0),
+            "a refusal records nothing, and a plan whose ledger has not come sends nothing"
+        );
+        assert_eq!(
+            rpc.calls("getLedgerEntries").len(),
+            4,
+            "the auction entry, the snapshot's two reads, and one source-account read: a              second account read would mean the re-plan was simulated, which is the first              step of sending it"
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// One wallet read covers every pool's assets, not just the pool whose
+    /// snapshot triggered it: `record_balances` replaces the whole map, so
+    /// a read of one pool's reserves would leave the next pool planning
+    /// against a wallet of zero.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_wallet_read_covers_every_pools_assets(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let first = auction(tick.sequence - 300);
+        // The second pool pays in BLND, which the fixture's pool does not
+        // list at all.
+        let second = AuctionData {
+            bid: BTreeMap::from([(BLND.to_string(), 1_000_000_000)]),
+            lot: BTreeMap::from([(XLM.to_string(), 100_000_000_000)]),
+            block: tick.sequence - 300,
+        };
+        store
+            .upsert_auction(&tracked(harness::USER_ONE, &first))
+            .await
+            .expect("seed the first pool's auction");
+        store
+            .upsert_auction(&TrackedAuction {
+                pool: POOL_TWO.to_string(),
+                ..tracked(harness::USER_TWO, &second)
+            })
+            .await
+            .expect("seed the second pool's auction");
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        harness::script_auction_entry(&rpc, harness::USER_ONE, &first, tick.sequence);
+        harness::script_snapshot(&rpc, &[]);
+        script_empty_wallet(&rpc, tick.sequence);
+        harness::script_auction_entry_in(&rpc, POOL_TWO, harness::USER_TWO, &second, tick.sequence);
+        script_second_pool(
+            &rpc,
+            &[
+                SyntheticReserve {
+                    asset: XLM,
+                    c_factor: 7_500_000,
+                    l_factor: 7_500_000,
+                    price: 1_778_617,
+                },
+                SyntheticReserve {
+                    asset: BLND,
+                    c_factor: 9_500_000,
+                    l_factor: 9_500_000,
+                    price: 10_000_000,
+                },
+            ],
+            tick.close_time,
+            tick.sequence,
+        );
+        // Four balances this time: the union, which BLND has joined.
+        for _ in 0..4 {
+            rpc.expect(
+                "simulateTransaction",
+                simulation(&scval_b64(&i128_val(0)), tick.sequence),
+            );
+        }
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let pools = vec![
+            pool_config(),
+            PoolConfig {
+                address: POOL_TWO.to_string(),
+                ..pool_config()
+            },
+        ];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            filler_config(),
+            Executor::new(&store, Some(submitter), true),
+            Inventory::new(XLM.to_string(), 0),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+
+        let summary = filler
+            .tick(&mut state, tick, false, None, &shutdown)
+            .await
+            .expect("tick");
+
+        assert_eq!(
+            summary,
+            TickSummary {
+                planned: 2,
+                ..TickSummary::default()
+            },
+            "both pools' auctions were planned against the one wallet"
+        );
+        let expected: Vec<stellar_xdr::ScAddress> = [XLM, USDC, EURC, XLM, USDC, BLND, EURC]
+            .iter()
+            .map(|asset| sc_address(asset).expect("asset"))
+            .collect();
+        assert_eq!(
+            balance_reads(&rpc),
+            expected,
+            "the first pool's read covers its own three reserves; the second's covers the \
+             union, so the second pool's BLND is not invisible to it"
+        );
+        assert_eq!(
+            state.covered_assets,
+            BTreeSet::from([
+                XLM.to_string(),
+                USDC.to_string(),
+                BLND.to_string(),
+                EURC.to_string()
+            ])
+        );
+        assert_eq!(
+            row_in(&store, POOL_TWO, harness::USER_TWO)
+                .await
+                .expect("the row stays")
+                .fill_ledger,
+            Some(tick.sequence + 1)
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// Ruling 8's set is not a leak: an auction the store no longer holds
+    /// a row for is dropped from it, so a later auction for the same
+    /// account is recorded again — and the set does not grow for as long
+    /// as the process runs.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_closed_auctions_dry_run_record_is_forgotten(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let opened = auction(tick.sequence - 300);
+        store
+            .upsert_auction(&tracked(harness::USER_ONE, &opened))
+            .await
+            .expect("seed the auction");
+        let rpc = ScriptedRpc::start().await;
+        harness::script_auction_entry(&rpc, harness::USER_ONE, &opened, tick.sequence);
+        harness::script_snapshot(&rpc, &[]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            filler_config(),
+            Executor::new(&store, None, true),
+            Inventory::new(XLM.to_string(), 0),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+
+        filler
+            .tick(&mut state, tick, true, None, &shutdown)
+            .await
+            .expect("the first tick");
+        assert_eq!(
+            state.recorded_dry_run.len(),
+            1,
+            "the dry run recorded this auction once"
+        );
+
+        // The tracker, applying the fill that closed it: the row goes.
+        store
+            .delete_auction(
+                harness::POOL,
+                harness::USER_ONE,
+                AuctionType::UserLiquidation,
+            )
+            .await
+            .expect("close the auction");
+        let empty = filler
+            .tick(&mut state, later(tick, 1), true, None, &shutdown)
+            .await
+            .expect("the second tick");
+
+        assert_eq!(empty, TickSummary::default());
+        assert!(
+            state.recorded_dry_run.is_empty(),
+            "an auction the store no longer holds is dropped from the set that suppresses it"
+        );
+
+        // A new liquidation of the same account, at a later start ledger.
+        let again = auction(tick.sequence - 250);
+        store
+            .upsert_auction(&tracked(harness::USER_ONE, &again))
+            .await
+            .expect("seed the new auction");
+        let third = later(tick, 2);
+        harness::script_auction_entry(&rpc, harness::USER_ONE, &again, third.sequence);
+        harness::script_snapshot(&rpc, &[]);
+
+        let summary = filler
+            .tick(&mut state, third, true, None, &shutdown)
+            .await
+            .expect("the third tick");
+
+        assert_eq!(
+            summary,
+            TickSummary {
+                planned: 1,
+                executed: 1,
+                ..TickSummary::default()
+            }
+        );
+        let fills = sqlx::query!("SELECT count(*) AS n FROM fills")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(fills.n, Some(2), "a new auction is a new record");
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
     }
 
     /// Planned, but its ledger has not come: the plan goes onto the row and

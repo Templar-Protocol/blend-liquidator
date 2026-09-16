@@ -115,6 +115,18 @@ pub(crate) fn script_auction_entry(
     auction: &crate::math::AuctionData,
     ledger: u32,
 ) {
+    script_auction_entry_in(rpc, POOL, user, auction, ledger);
+}
+
+/// The same, for a pool other than the fixture's — a second configured
+/// pool whose entries a test builds itself.
+pub(crate) fn script_auction_entry_in(
+    rpc: &ScriptedRpc,
+    pool: &str,
+    user: &str,
+    auction: &crate::math::AuctionData,
+    ledger: u32,
+) {
     use crate::chain::xdr::encode::{address, i128_val, map, sc_address, symbol, vec as sc_vec};
     use stellar_xdr::{
         ContractDataDurability, ContractDataEntry, ExtensionPoint, LedgerEntryData, ScVal,
@@ -143,12 +155,12 @@ pub(crate) fn script_auction_entry(
     .expect("auction key");
     let data = LedgerEntryData::ContractData(ContractDataEntry {
         ext: ExtensionPoint::V0,
-        contract: sc_address(POOL).expect("pool address"),
+        contract: sc_address(pool).expect("pool address"),
         key: sc_vec(vec![symbol("Auction").expect("symbol"), auction_key]).expect("key vec"),
         durability: ContractDataDurability::Temporary,
         val: value,
     });
-    let key = keys::auction(POOL, user, crate::chain::xdr::AuctionType::UserLiquidation)
+    let key = keys::auction(pool, user, crate::chain::xdr::AuctionType::UserLiquidation)
         .expect("auction key");
     rpc.expect(
         "getLedgerEntries",
