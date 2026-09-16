@@ -11,22 +11,32 @@
 //! configuration would happily submit against a pool it misread, or start
 //! armed with a filler account that does not exist.
 //!
-//! # Five kinds of task
+//! # Six kinds of task
 //!
 //! [`Service::run`] spawns one [`LedgerPoller`] per pool, one tracker task
 //! consuming their shared channel, one auctioneer task, one filler task,
-//! and — only when armed — one submission-queue worker per distinct
-//! signing key. The queues are the subject of `spawn_queues`: one worker
-//! per key and never two, because a Soroban transaction is built against
-//! its source account's sequence number at prepare time. The filler task
-//! holds the run's one [`crate::notifier::Notifier`], built from
-//! `config.notification_cooldown` — log-only until a Telegram channel is
-//! configured — and it is the notifier's only caller. Delivery is
-//! fire-and-forget: `notify` spawns behind a bounded semaphore and never
-//! awaits a channel, so no notification can delay a tick, a decision or a
-//! fill, and a channel that has stopped answering costs a bounded number
-//! of tasks and drops what does not fit. What a shutdown owes the sends
-//! still in flight is [`crate::notifier::Notifier::drain`].
+//! one watchdog task, and — only when armed — one submission-queue worker
+//! per distinct signing key. The queues are the subject of `spawn_queues`:
+//! one worker per key and never two, because a Soroban transaction is
+//! built against its source account's sequence number at prepare time.
+//! The watchdog is `watchdog_loop`: it reads the pollers' heartbeats off
+//! the run's one [`crate::metrics::Metrics`] and reports a pool that has
+//! stopped heartbeating, and it is a task of its own because a poller
+//! that has stopped is exactly the thing that cannot report itself.
+//!
+//! The run's one [`crate::metrics::Metrics`] and its one
+//! [`crate::notifier::Notifier`] — the latter built from
+//! `config.notification_cooldown`, log-only until a Telegram channel is
+//! configured — are both constructed before `spawn_pollers`, because the
+//! pollers are the first tasks to record and report through them; the
+//! watchdog and the filler are handed those same two instances rather
+//! than instances of their own, since dedup state and gauges mean nothing
+//! split across copies. Delivery is fire-and-forget: `notify` spawns
+//! behind a bounded semaphore and never awaits a channel, so no
+//! notification can delay a tick, a decision or a fill, and a channel
+//! that has stopped answering costs a bounded number of tasks and drops
+//! what does not fit. What a shutdown owes the sends still in flight is
+//! [`crate::notifier::Notifier::drain`].
 //!
 //! # The deciding tasks are joined to the tracker by a tick
 //!
@@ -86,7 +96,8 @@ use crate::executor::Executor;
 use crate::filler::{Filler, FillerConfig, FillerState};
 use crate::inventory::Inventory;
 use crate::ledger::{LedgerPoller, LedgerTick, PollerConfig, PollerMessage};
-use crate::notifier::Notifier;
+use crate::metrics::Metrics;
+use crate::notifier::{Notification, NotificationKind, Notifier, Severity};
 use crate::queue::{run_queue, SubmissionQueue};
 use crate::store::{events_cursor, Cursor, Store, StoreError, TrackedUser};
 use crate::tracker::{AnalyticsSeed, FileSeed, SeedSource, Tracker, TrackerError};
@@ -1804,6 +1815,14 @@ impl SigningContext {
 /// drops the caller's own clone once every one holds its own — which is
 /// what lets the tracker task's channel close, and its `recv` return
 /// `None`, once (and only once) every poller has stopped.
+///
+/// Every poller records its heartbeat and its pool's chain head on the
+/// run's one `metrics`, and reports a run of failed passes through its one
+/// `notifier`. Both are shared rather than per-pool: `/livez` and
+/// [`watchdog_loop`] read one recorder for every pool, and the notifier's
+/// dedup is keyed by pool, so one instance never lets one pool's failures
+/// silence another's.
+#[allow(clippy::too_many_arguments)]
 fn spawn_pollers(
     tasks: &mut JoinSet<Result<(), LiquidatorError>>,
     rpc: &RpcClient,
@@ -1811,6 +1830,8 @@ fn spawn_pollers(
     pools: &[PoolConfig],
     poller_config: PollerConfig,
     sender: &mpsc::Sender<PollerMessage>,
+    metrics: &Arc<Metrics>,
+    notifier: &Arc<Notifier>,
     shutdown: &watch::Receiver<bool>,
 ) {
     for pool in pools {
@@ -1818,13 +1839,116 @@ fn spawn_pollers(
         let store = store.clone();
         let pool = pool.address.clone();
         let sender = sender.clone();
+        let metrics = Arc::clone(metrics);
+        let notifier = Arc::clone(notifier);
         let shutdown = shutdown.clone();
         tasks.spawn(async move {
             LedgerPoller::new(&rpc, &store, &pool, poller_config)
+                .with_metrics(metrics)
+                .with_notifier(notifier)
                 .run(sender, shutdown)
                 .await
                 .map_err(LiquidatorError::from)
         });
+    }
+}
+
+/// Spawns the watchdog: one task for the whole run, watching every
+/// poller's heartbeat rather than any pool's chain state.
+///
+/// It is the counterpart of `/livez` for a deployment that nothing probes:
+/// the same [`PollerConfig::liveness_deadline`], reported to the operator
+/// instead of to a load balancer. Spawned beside the pollers rather than
+/// inside one, because a poller that has stopped is exactly the thing that
+/// cannot report itself.
+fn spawn_watchdog(
+    tasks: &mut JoinSet<Result<(), LiquidatorError>>,
+    metrics: Arc<Metrics>,
+    notifier: Arc<Notifier>,
+    pools: Vec<String>,
+    config: PollerConfig,
+    shutdown: &watch::Receiver<bool>,
+) {
+    let shutdown = shutdown.clone();
+    tasks.spawn(async move {
+        watchdog_loop(&metrics, &notifier, &pools, config, &shutdown).await;
+        Ok(())
+    });
+}
+
+/// Reports every pool whose poller has not heartbeated within
+/// [`PollerConfig::liveness_deadline`], once per `poll_interval`, until
+/// `shutdown` flips.
+///
+/// Three things it deliberately does not do:
+///
+/// - **It does not read a missing heartbeat as a stall.** A pool with no
+///   heartbeat at all has a poller that may not have run its first
+///   iteration yet — seeding a busy pool is tens of seconds — and a
+///   watchdog that notified on that would notify on every restart.
+/// - **It does not deduplicate.** A pool that is still stalled is notified
+///   again on every pass and the notifier's own cooldown suppresses it,
+///   which is the one place in this crate that decides how often a
+///   repeating condition is worth saying out loud.
+/// - **It does not notify a recovery.** Spec §7's kinds are a closed set
+///   and none of them means "the heartbeat is back", so a pool whose
+///   poller returns is logged once. `reported` exists for exactly that
+///   once: without it the log line would repeat every pass.
+///
+/// Returns rather than erroring, always: a watchdog that failed the run
+/// would be instrumentation stopping trading (spec §8).
+pub(crate) async fn watchdog_loop(
+    metrics: &Metrics,
+    notifier: &Notifier,
+    pools: &[String],
+    config: PollerConfig,
+    shutdown: &watch::Receiver<bool>,
+) {
+    let deadline = config.liveness_deadline();
+    let mut shutdown = shutdown.clone();
+    let mut reported: BTreeSet<String> = BTreeSet::new();
+    loop {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        for pool in pools {
+            let Some(last) = metrics
+                .pool_status(pool)
+                .and_then(|status| status.heartbeat)
+            else {
+                continue;
+            };
+            let silent = now.saturating_duration_since(last);
+            if silent > deadline {
+                reported.insert(pool.clone());
+                notifier.notify(Notification {
+                    kind: NotificationKind::PollerStalled,
+                    severity: Severity::High,
+                    pool: pool.clone(),
+                    account: None,
+                    message: format!(
+                        "no poller heartbeat for {}s (limit {}s)",
+                        silent.as_secs(),
+                        deadline.as_secs()
+                    ),
+                });
+            } else if reported.remove(pool) {
+                tracing::info!(
+                    pool = %pool,
+                    silent_secs = silent.as_secs(),
+                    "the poller is heartbeating again"
+                );
+            }
+        }
+        tokio::select! {
+            () = tokio::time::sleep(config.poll_interval) => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -1973,9 +2097,11 @@ fn spawn_auctioneer(
 /// `xlm_fee_reserve` of the network's native asset, and runs
 /// [`filler_loop`] off `tick_rx` until the tracker task's sender drops.
 ///
-/// `notifier` is [`Service::run`]'s one instance, shared with nothing else:
-/// the filler is the only task that ever reports through it, so this is
-/// simply where that instance is handed in rather than built here.
+/// `notifier` is [`Service::run`]'s one instance, shared with the pollers
+/// and the watchdog: it is built there, before the first task that reports
+/// through it, and handed in here rather than constructed per task — the
+/// dedup its cooldown rests on is keyed by `(pool, account, kind)` and
+/// means nothing split across instances.
 #[allow(clippy::too_many_arguments)]
 fn spawn_filler(
     tasks: &mut JoinSet<Result<(), LiquidatorError>>,
@@ -2123,6 +2249,11 @@ impl Service {
     /// Whether a submission is ever actually sent is `!config.dry_run` and
     /// a key for that role — the one gate this crate has into live
     /// trading, per the safety invariant that `DRY_RUN` defaults `true`.
+    // Wiring, not logic: this function is one `spawn_*` call per kind of
+    // task, each of which is a named function with its own docs, so
+    // splitting it further would hide the one place the run's shape — and
+    // its order — can be read end to end.
+    #[allow(clippy::too_many_lines)]
     pub async fn run(config: ServiceConfig, keys: SigningKeys) -> Result<(), LiquidatorError> {
         // Installed before anything that takes time. Seeding a busy pool
         // is tens of seconds of sequential round trips, and until this is
@@ -2161,6 +2292,15 @@ impl Service {
         let (message_tx, message_rx) = mpsc::channel(1_024);
         let poller_config = PollerConfig::new(config.poll_interval);
         let mut tasks = JoinSet::new();
+        // The run's one recorder and its one notifier, both built before
+        // the first task that records or reports through them — which is
+        // the pollers, so both are constructed here rather than beside
+        // the task that happens to be their last caller. The notifier is
+        // log-only until a Telegram channel is configured; every delivery
+        // it makes is spawned behind its own semaphore rather than
+        // awaited in a tick (spec §8).
+        let metrics = Arc::new(Metrics::new());
+        let notifier = Arc::new(Notifier::log_only(config.notification_cooldown));
         spawn_pollers(
             &mut tasks,
             &rpc,
@@ -2168,6 +2308,8 @@ impl Service {
             &config.pools,
             poller_config,
             &message_tx,
+            &metrics,
+            &notifier,
             &shutdown_rx,
         );
         // Every poller now holds its own sender clone; dropping this one
@@ -2196,6 +2338,16 @@ impl Service {
             sequence: 0,
             close_time: 0,
         });
+        // Beside the pollers, never inside one: a poller that has stopped
+        // is exactly what cannot report itself.
+        spawn_watchdog(
+            &mut tasks,
+            Arc::clone(&metrics),
+            Arc::clone(&notifier),
+            pool_addresses.clone(),
+            poller_config,
+            &shutdown_rx,
+        );
         spawn_auctioneer(
             &mut tasks,
             &rpc,
@@ -2208,11 +2360,6 @@ impl Service {
             tick_rx.clone(),
             &shutdown_rx,
         );
-        // One instance for the run, log-only until a Telegram channel is
-        // configured. The filler is its only caller, and every delivery it
-        // makes is spawned behind the notifier's own semaphore rather than
-        // awaited in a tick.
-        let notifier = Arc::new(Notifier::log_only(config.notification_cooldown));
         spawn_filler(
             &mut tasks,
             &rpc,
@@ -5806,5 +5953,84 @@ mod tests {
 
         assert_eq!(rpc.remaining(), 0);
         Ok(())
+    }
+
+    /// The watchdog notifies about a poller whose heartbeat has aged past
+    /// [`PollerConfig::liveness_deadline`], once per cooldown, and says
+    /// nothing about one that keeps heartbeating — nor about a pool with
+    /// no heartbeat at all, which is a poller that has not started rather
+    /// than one that has stopped.
+    #[tokio::test]
+    async fn the_watchdog_notifies_a_stalled_poller_once_per_cooldown() {
+        const STALLED: &str = "pool-stalled";
+        const ALIVE: &str = "pool-alive";
+        const SILENT: &str = "pool-never-started";
+
+        let metrics = Arc::new(Metrics::new());
+        // `max_backoff` zero makes the deadline exactly five intervals —
+        // 25 ms — so the stale stamp below is four deadlines old and the
+        // live pool's is never more than one interval old.
+        let config = PollerConfig {
+            poll_interval: std::time::Duration::from_millis(5),
+            page_limit: 200,
+            min_backoff: std::time::Duration::from_millis(1),
+            max_backoff: std::time::Duration::ZERO,
+        };
+        assert_eq!(
+            config.liveness_deadline(),
+            std::time::Duration::from_millis(25)
+        );
+        metrics.heartbeat_at(
+            STALLED,
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(100))
+                .expect("a recent instant"),
+            std::time::SystemTime::now(),
+        );
+        // A pool whose poller is running: its own task keeps stamping,
+        // which is what a live loop does every iteration.
+        let alive = tokio::spawn({
+            let metrics = Arc::clone(&metrics);
+            async move {
+                loop {
+                    metrics.heartbeat(ALIVE);
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+            }
+        });
+
+        let recording = Arc::new(harness::RecordingChannel::new(false));
+        let notifier = Notifier::new(
+            Box::new(Arc::clone(&recording)),
+            std::time::Duration::from_hours(1),
+        );
+        let pools = vec![STALLED.to_string(), ALIVE.to_string(), SILENT.to_string()];
+        let (flag, shutdown) = watch::channel(false);
+        let stop = async {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            flag.send(true).expect("raise shutdown");
+        };
+        let ((), ()) = tokio::join!(
+            watchdog_loop(&metrics, &notifier, &pools, config, &shutdown),
+            stop
+        );
+        alive.abort();
+
+        assert!(notifier.drain(std::time::Duration::from_secs(5)).await);
+        let sent = recording.sent();
+        assert_eq!(
+            sent.len(),
+            1,
+            "one stalled poller, and the cooldown suppresses every later pass: {sent:?}"
+        );
+        assert_eq!(sent[0].kind, NotificationKind::PollerStalled);
+        assert_eq!(sent[0].severity, Severity::High);
+        assert_eq!(sent[0].pool, STALLED);
+        assert_eq!(sent[0].account, None);
+        assert!(
+            sent[0].message.contains("no poller heartbeat"),
+            "the message says what is missing: {}",
+            sent[0].message
+        );
     }
 }

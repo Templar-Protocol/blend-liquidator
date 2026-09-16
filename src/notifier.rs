@@ -482,52 +482,9 @@ impl Notifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::RecordingChannel;
     use crate::metrics::Metrics;
     use std::sync::atomic::{AtomicBool, Ordering};
-
-    /// A recording channel for the tests: what it was asked to send.
-    struct Recording {
-        sent: Mutex<Vec<Notification>>,
-        fail: AtomicBool,
-    }
-
-    impl Recording {
-        fn new(fail: bool) -> Self {
-            Self {
-                sent: Mutex::new(Vec::new()),
-                fail: AtomicBool::new(fail),
-            }
-        }
-
-        fn sent_count(&self) -> usize {
-            self.sent
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .len()
-        }
-    }
-
-    impl NotificationChannel for Arc<Recording> {
-        fn name(&self) -> &'static str {
-            "recording"
-        }
-
-        fn send<'a>(
-            &'a self,
-            notification: &'a Notification,
-        ) -> Pin<Box<dyn Future<Output = Result<(), NotifyError>> + Send + 'a>> {
-            Box::pin(async move {
-                if self.fail.load(Ordering::SeqCst) {
-                    return Err(NotifyError::Channel("recording channel failed".to_string()));
-                }
-                self.sent
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push(notification.clone());
-                Ok(())
-            })
-        }
-    }
 
     /// A channel that holds every send until the test releases it, which is
     /// how a test holds permits open and watches what the notifier does
@@ -609,7 +566,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_first_of_a_kind_is_sent_and_the_next_within_the_cooldown_is_not() {
-        let recording = Arc::new(Recording::new(false));
+        let recording = Arc::new(RecordingChannel::new(false));
         let notifier = Notifier::new(Box::new(Arc::clone(&recording)), cooldown());
         let note = notification(NotificationKind::AuctionCreated, "pool-a", Some("acct-1"));
 
@@ -625,7 +582,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_different_pool_account_or_kind_is_its_own_key() {
-        let recording = Arc::new(Recording::new(false));
+        let recording = Arc::new(RecordingChannel::new(false));
         let notifier = Notifier::new(Box::new(Arc::clone(&recording)), cooldown());
         let base = notification(NotificationKind::AuctionCreated, "pool-a", Some("acct-1"));
 
@@ -660,7 +617,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_cooldown_expires() {
-        let recording = Arc::new(Recording::new(false));
+        let recording = Arc::new(RecordingChannel::new(false));
         let notifier = Notifier::new(Box::new(Arc::clone(&recording)), cooldown());
         let note = notification(NotificationKind::PollerStalled, "pool-a", None);
         let now = Instant::now();
@@ -730,7 +687,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_send_rolls_back_the_cooldown_and_counts_as_failed() {
-        let recording = Arc::new(Recording::new(true));
+        let recording = Arc::new(RecordingChannel::new(true));
         let metrics = Arc::new(Metrics::new());
         let notifier = Notifier::new(Box::new(Arc::clone(&recording)), cooldown())
             .with_metrics(Arc::clone(&metrics));

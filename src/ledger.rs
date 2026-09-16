@@ -25,7 +25,15 @@
 //! repeated, or ran past a hard cap — leaves the cursor untouched, for the
 //! same reason: the bot re-reads rather than skips, and a persistently
 //! broken RPC stalls visibly instead of silently losing ledgers.
+//!
+//! What the loop reports about itself is instrumentation and nothing more:
+//! a heartbeat every iteration, the chain head every pass that read one,
+//! and one [`NotificationKind::RpcFailing`] per run of
+//! [`RPC_FAILING_AFTER`] failed passes. None of it is awaited, none of it
+//! can fail a pass, and a poller given neither recorder behaves exactly as
+//! one given both (spec §8).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot, watch};
@@ -33,6 +41,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::chain::rpc::{EventQuery, RpcClient};
 use crate::chain::xdr::{decode_pool_event, PoolEvent};
 use crate::chain::ChainError;
+use crate::metrics::Metrics;
+use crate::notifier::{Notification, NotificationKind, Notifier, Severity};
 use crate::store::{events_cursor, Cursor, Store, StoreError};
 
 /// A ledger the poller has caught up to.
@@ -130,6 +140,16 @@ impl PollerConfig {
 /// tolerates before a missing heartbeat fails `/livez`.
 pub const LIVENESS_INTERVALS: u32 = 5;
 
+/// How many consecutive failed passes [`LedgerPoller::run`] reports
+/// [`NotificationKind::RpcFailing`] at.
+///
+/// Notified at exactly this many, never at more: one streak is one
+/// notification, and the streak's own count — not the notifier's cooldown
+/// — is what makes it so. High enough that a single flaky round trip is
+/// merely a backoff, low enough that an outage is reported within a minute
+/// of the default poll interval.
+pub const RPC_FAILING_AFTER: u32 = 5;
+
 /// A failure in the poller.
 #[derive(Debug, thiserror::Error)]
 pub enum LedgerError {
@@ -170,18 +190,39 @@ struct DrainOutcome {
 }
 
 /// Follows one pool's events.
-#[derive(Debug)]
 pub struct LedgerPoller<'a> {
     rpc: &'a RpcClient,
     store: &'a Store,
     pool: &'a str,
     config: PollerConfig,
+    /// Where the heartbeat and the chain-head gauge go, when this run
+    /// records them at all. `None` records nothing: instrumentation is
+    /// never load-bearing (spec §8), so every call through it is behind
+    /// this option rather than behind a no-op recorder a caller must
+    /// remember to build.
+    metrics: Option<Arc<Metrics>>,
+    /// Where a run of failed passes is reported, when this run notifies at
+    /// all. Never awaited: [`Notifier::notify`] spawns.
+    notifier: Option<Arc<Notifier>>,
     /// The cursor a `Gap` was last reported for. A gap makes the tracker
     /// walk every seed source, and a pass that then fails leaves the same
     /// stale cursor behind, so without this the next poll would compute
     /// the very same gap and reseed again — once per poll interval, which
     /// earns a rate limit rather than a recovery.
     gap_reported_at: Option<u32>,
+}
+
+impl std::fmt::Debug for LedgerPoller<'_> {
+    /// Where this poller is, and nothing about what it records through:
+    /// [`Metrics`] is not `Debug`, and neither recorder is state a log
+    /// line should come to depend on.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LedgerPoller")
+            .field("pool", &self.pool)
+            .field("config", &self.config)
+            .field("gap_reported_at", &self.gap_reported_at)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a> LedgerPoller<'a> {
@@ -193,30 +234,99 @@ impl<'a> LedgerPoller<'a> {
             store,
             pool,
             config,
+            metrics: None,
+            notifier: None,
             gap_reported_at: None,
         }
     }
 
+    /// Records this poller's heartbeat and chain head on `metrics`.
+    ///
+    /// A builder step taken before [`LedgerPoller::run`]: without it the
+    /// poller records nothing, which is what every caller that has no
+    /// recorder — a test, an example — gets.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Reports a run of [`RPC_FAILING_AFTER`] failed passes through
+    /// `notifier`.
+    ///
+    /// A builder step taken before [`LedgerPoller::run`]: without it a
+    /// failing RPC is logged and nothing else.
+    #[must_use]
+    pub fn with_notifier(mut self, notifier: Arc<Notifier>) -> Self {
+        self.notifier = Some(notifier);
+        self
+    }
+
+    /// Reports `failures` consecutive failed passes, if this run notifies
+    /// at all.
+    ///
+    /// Never awaited: [`Notifier::notify`] spawns its delivery, so a
+    /// channel that has stopped answering costs the poll loop nothing
+    /// (spec §8). A [`LedgerError`]'s `Display` is safe to forward — it
+    /// carries an RPC's status or a store's message, never the API key,
+    /// which [`RpcClient`] keeps out of its errors.
+    fn report_rpc_failing(&self, failures: u32, error: &LedgerError) {
+        let Some(notifier) = &self.notifier else {
+            return;
+        };
+        notifier.notify(Notification {
+            kind: NotificationKind::RpcFailing,
+            severity: Severity::High,
+            pool: self.pool.to_string(),
+            account: None,
+            message: format!("{failures} consecutive poll failures; last: {error}"),
+        });
+    }
+
     /// Polls until `shutdown` flips, backing off on RPC failures. An RPC
     /// outage never advances the cursor, so nothing is skipped.
+    ///
+    /// Every iteration records a heartbeat first, before the shutdown
+    /// check and before the pass: the heartbeat is this loop's own
+    /// liveness, not the pass's, which is what lets `/livez` (see
+    /// [`crate::http::liveness`]) tell an RPC outage — where the loop
+    /// keeps turning and backing off — from a poller that has stopped
+    /// turning at all. A run of [`RPC_FAILING_AFTER`] failed passes is
+    /// notified once, at the threshold, and the counter is reset by the
+    /// first pass that succeeds.
     pub async fn run(
         &mut self,
         sender: mpsc::Sender<PollerMessage>,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<(), LedgerError> {
         let mut backoff = self.config.min_backoff;
+        let mut failures: u32 = 0;
         loop {
+            if let Some(metrics) = &self.metrics {
+                metrics.heartbeat(self.pool);
+            }
             if *shutdown.borrow_and_update() {
                 return Ok(());
             }
             let wait = match self.poll_once(&sender).await {
                 Ok(_) => {
+                    if failures >= RPC_FAILING_AFTER {
+                        tracing::info!(pool = self.pool, failures, "rpc recovered");
+                    }
+                    failures = 0;
                     backoff = self.config.min_backoff;
                     self.config.poll_interval
                 }
                 Err(LedgerError::Closed) => return Ok(()),
                 Err(error) => {
-                    tracing::warn!(pool = self.pool, %error, "poll failed; backing off");
+                    failures = failures.saturating_add(1);
+                    tracing::warn!(pool = self.pool, %error, failures, "poll failed; backing off");
+                    // At the threshold, not past it: the count passes
+                    // through this value once per streak, so one outage is
+                    // one notification whatever the notifier's cooldown is.
+                    if failures == RPC_FAILING_AFTER {
+                        self.report_rpc_failing(failures, &error);
+                    }
                     let wait = backoff;
                     backoff = (backoff * 2).min(self.config.max_backoff);
                     wait
@@ -335,6 +445,12 @@ impl<'a> LedgerPoller<'a> {
     ) -> Result<Option<LedgerTick>, LedgerError> {
         let health = self.rpc.health().await?;
         let head = self.rpc.latest_ledger().await?;
+        // The head this pool's poller has seen, whatever the pass does
+        // with it: `/healthz` compares it against what the tracker has
+        // applied, so it is recorded before anything here can decline.
+        if let Some(metrics) = &self.metrics {
+            metrics.ledger_head(self.pool, head.sequence);
+        }
         let stored = self.store.cursor(&events_cursor(self.pool)).await?;
 
         // With no cursor the bot follows from now: history comes from
@@ -450,6 +566,7 @@ mod tests {
     use super::*;
     use crate::chain::script::ScriptedRpc;
     use crate::chain::xdr::encode::{address, i128_val, symbol, to_base64, vec as sc_vec};
+    use crate::harness::RecordingChannel;
     use serde_json::json;
     use std::time::Duration;
 
@@ -1058,6 +1175,153 @@ mod tests {
              gap rather than staying silent for the rest of the process: \
              {seen_third:?}"
         );
+        Ok(())
+    }
+
+    /// A streak of failures notifies exactly once — at the threshold, not
+    /// at every failure past it — and the pass that succeeds records the
+    /// head it read. The notifier's cooldown is zero here so that dedup
+    /// cannot be what makes the count one: only the counter's `==` may.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_fifth_consecutive_failure_notifies_rpc_failing_once_and_a_success_resets(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        // Six failed passes, so a counter that notified at every failure
+        // past the threshold would notify twice.
+        for _ in 0..=RPC_FAILING_AFTER {
+            rpc.expect_http("getHealth", 500);
+        }
+        rpc.expect("getHealth", health(103, 1));
+        rpc.expect("getLatestLedger", latest(103, 1_788_645_403));
+        rpc.expect(
+            "getEvents",
+            json!({"latestLedger": 103, "cursor": "103-1", "events": []}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let recording = Arc::new(RecordingChannel::new(false));
+        let notifier = Arc::new(Notifier::new(
+            Box::new(Arc::clone(&recording)),
+            Duration::ZERO,
+        ));
+        let metrics = Arc::new(Metrics::new());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        let (flag, watch) = tokio::sync::watch::channel(false);
+        let config = PollerConfig {
+            // Long enough that the pass after the healthy one never starts
+            // before the flag below stops the loop.
+            poll_interval: Duration::from_millis(500),
+            min_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(2),
+            ..config()
+        };
+        let mut poller = LedgerPoller::new(&client, &store, POOL, config)
+            .with_metrics(Arc::clone(&metrics))
+            .with_notifier(Arc::clone(&notifier));
+
+        let run = poller.run(sender, watch);
+        let drain = async {
+            while let Some(message) = receiver.recv().await {
+                let _ = record(message, true);
+            }
+        };
+        // The healthy pass is the only one that reaches `getEvents`, so
+        // its call is what says the run has done what the test scripted.
+        let stop = async {
+            for _ in 0..2_000 {
+                if !rpc.calls("getEvents").is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            flag.send(true).expect("flag");
+        };
+        let (result, (), ()) = tokio::join!(run, drain, stop);
+        result.expect("run");
+
+        assert!(notifier.drain(Duration::from_secs(5)).await);
+        let sent = recording.sent();
+        assert_eq!(
+            sent.len(),
+            1,
+            "the threshold is crossed once per streak: {sent:?}"
+        );
+        assert_eq!(sent[0].kind, NotificationKind::RpcFailing);
+        assert_eq!(sent[0].severity, Severity::High);
+        assert_eq!(sent[0].pool, POOL);
+        assert_eq!(sent[0].account, None);
+        assert!(
+            sent[0].message.starts_with(&format!(
+                "{RPC_FAILING_AFTER} consecutive poll failures; last: "
+            )),
+            "the message names the streak and the failure: {}",
+            sent[0].message
+        );
+        assert_eq!(
+            metrics.pool_status(POOL).expect("a status").head,
+            Some(103),
+            "the pass that read a head recorded it"
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// The heartbeat is the loop's own liveness, not the pass's: it is
+    /// recorded before anything can fail, which is what lets `/livez` tell
+    /// an RPC outage from a poller that has stopped.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn every_iteration_records_a_heartbeat(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        rpc.expect("getHealth", health(103, 1));
+        rpc.expect("getLatestLedger", latest(103, 1_788_645_403));
+        rpc.expect(
+            "getEvents",
+            json!({"latestLedger": 103, "cursor": "103-1", "events": []}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let metrics = Arc::new(Metrics::new());
+        assert!(
+            metrics.pool_status(POOL).is_none(),
+            "nothing has been recorded for this pool yet"
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        let (flag, watch) = tokio::sync::watch::channel(false);
+        let config = PollerConfig {
+            poll_interval: Duration::from_millis(500),
+            ..config()
+        };
+        let mut poller =
+            LedgerPoller::new(&client, &store, POOL, config).with_metrics(Arc::clone(&metrics));
+
+        let run = poller.run(sender, watch);
+        let drain = async {
+            while let Some(message) = receiver.recv().await {
+                let _ = record(message, true);
+            }
+        };
+        let stop = async {
+            for _ in 0..2_000 {
+                if !rpc.calls("getEvents").is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            flag.send(true).expect("flag");
+        };
+        let (result, (), ()) = tokio::join!(run, drain, stop);
+        result.expect("run");
+
+        assert!(
+            metrics
+                .pool_status(POOL)
+                .expect("a status")
+                .heartbeat
+                .is_some(),
+            "the iteration that polled recorded a heartbeat"
+        );
+        assert_eq!(rpc.remaining(), 0);
         Ok(())
     }
 
