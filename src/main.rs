@@ -83,7 +83,7 @@ async fn main() {
     };
 
     let exit_code = match config.run_mode {
-        RunMode::CheckConfig => match Service::check_config(&config).await {
+        RunMode::CheckConfig => match Service::check_config(&config, keys).await {
             Ok(_warnings) => 0,
             Err(error) => {
                 tracing::error!(%error, "configuration check failed");
