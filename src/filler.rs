@@ -220,17 +220,27 @@ impl FillerState {
     /// already holds the open rows is where every version of an auction
     /// that has been filled, or replaced by a new one at a later start
     /// ledger, is dropped — otherwise the set only ever grows, for as long
-    /// as the process runs. Older versions of an auction still open stay
-    /// until it closes: a handful of entries per auction, bounded by how
-    /// many partial fills it took.
+    /// as the process runs.
+    ///
+    /// A version is kept while its start ledger is *at or past* the row's,
+    /// not only when it equals it. The chain can hold a new auction for an
+    /// account — a later start ledger — before the tracker has applied the
+    /// events that close the old one and open it, and the filler, which
+    /// re-reads the chain's entry, records that new auction against the old
+    /// row. Pruning it for not matching the row would record it again on
+    /// every tick until the tracker caught up. Older versions go once the
+    /// row has advanced past them; every version goes when the row does.
     fn prune_recorded(&mut self, pool: &str, rows: &[TrackedAuction]) {
-        let open: BTreeSet<(&str, u32)> = rows
+        let open: BTreeMap<&str, u32> = rows
             .iter()
+            .filter(|row| row.auction_type == AuctionType::UserLiquidation)
             .map(|row| (row.account.as_str(), row.start_ledger))
             .collect();
         self.recorded_dry_run.retain(|recorded| {
             recorded.pool != pool
-                || open.contains(&(recorded.account.as_str(), recorded.start_ledger))
+                || open
+                    .get(recorded.account.as_str())
+                    .is_some_and(|start| recorded.start_ledger >= *start)
         });
     }
 }
@@ -3016,6 +3026,95 @@ mod tests {
             4,
             "the one snapshot's oracle reads"
         );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// A new auction the chain already holds, while the store still holds
+    /// the previous one: the tracker has not applied the events that closed
+    /// the old auction and opened the new. The filler re-reads the chain,
+    /// so it plans and records the new one — once. A version at or past
+    /// the row's start ledger survives `prune_recorded` until the row
+    /// advances, so the next tick neither records it again nor, once the
+    /// tracker has caught up, reads the chain for it.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_new_auction_seen_before_the_tracker_opened_it_is_recorded_once(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let old = auction(tick.sequence - 300);
+        let new = auction(tick.sequence - 200);
+        store
+            .upsert_auction(&tracked(harness::USER_ONE, &old))
+            .await
+            .expect("the store still holds the old auction");
+        let rpc = ScriptedRpc::start().await;
+        // Tick one: the chain holds the new auction.
+        harness::script_auction_entry(&rpc, harness::USER_ONE, &new, tick.sequence);
+        harness::script_snapshot(&rpc, &[]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            filler_config(),
+            Executor::new(&store, None, true),
+            Inventory::new(XLM.to_string(), 0),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+
+        let first = filler
+            .tick(&mut state, tick, true, None, &shutdown)
+            .await
+            .expect("the first tick");
+        assert_eq!(
+            first,
+            TickSummary {
+                planned: 1,
+                executed: 1,
+                ..TickSummary::default()
+            }
+        );
+
+        // Tick two: the tracker still lags, so the row still says the old
+        // auction and the entry is re-read — and found already recorded.
+        let second = later(tick, 1);
+        harness::script_auction_entry(&rpc, harness::USER_ONE, &new, second.sequence);
+        let summary = filler
+            .tick(&mut state, second, true, None, &shutdown)
+            .await
+            .expect("the second tick");
+        assert_eq!(
+            summary,
+            TickSummary::default(),
+            "the new auction's record survived the prune and suppresses a second record"
+        );
+        assert_eq!(state.recorded_dry_run.len(), 1);
+        let reads = rpc.calls("getLedgerEntries").len();
+
+        // Tick three: the tracker has caught up and the row is the new
+        // auction. Nothing is scripted: it is recognised without a read.
+        let third = later(tick, 2);
+        store
+            .upsert_auction(&TrackedAuction {
+                updated_ledger: third.sequence,
+                ..tracked(harness::USER_ONE, &new)
+            })
+            .await
+            .expect("the tracker opens the new auction");
+        let summary = filler
+            .tick(&mut state, third, true, None, &shutdown)
+            .await
+            .expect("the third tick");
+        assert_eq!(summary, TickSummary::default());
+        assert_eq!(rpc.calls("getLedgerEntries").len(), reads, "no chain read");
+        let fills = sqlx::query!("SELECT count(*) AS n FROM fills")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(fills.n, Some(1), "recorded once across the tracker's lag");
         assert_eq!(rpc.remaining(), 0);
         Ok(())
     }
