@@ -863,6 +863,10 @@ impl<'a> Executor<'a> {
     ///
     /// 1. **The mode guards**, before anything touches the chain: the
     ///    same three [`Executor::execute`] runs, with the same answers.
+    ///    An idle plan ([`UnwindPlan::is_idle`]) stops right after them
+    ///    with [`UnwindOutcome::Planned`] and `simulated: false`: an empty
+    ///    request list judges nothing and moves nothing, so it costs no
+    ///    round trip and, armed, no sequence number.
     /// 2. **Simulate the exact `submit`** the queue would send — `from`,
     ///    `spender` and `to` all the filler's own address, the requests
     ///    [`unwind_requests`] builds — through
@@ -900,6 +904,22 @@ impl<'a> Executor<'a> {
         queue: Option<&SubmissionQueue>,
     ) -> Result<UnwindOutcome, ExecutorError> {
         let reservation = self.guard(settlement, queue.is_some())?;
+
+        // An idle plan is the ordinary end of an unwind, not an operation:
+        // `submit` with no requests judges nothing and moves nothing, so it
+        // is answered here rather than costing a simulation and — armed —
+        // a sequence number. The guards still ran, and the reservation a
+        // caller happened to be holding is released by value like any
+        // other path's.
+        if plan.is_idle() {
+            release(reservation);
+            tracing::debug!(
+                pool,
+                remaining_liabilities = ?plan.remaining_liabilities,
+                "this unwind pass moves nothing; it is not sent"
+            );
+            return Ok(UnwindOutcome::Planned { simulated: false });
+        }
 
         // The one settlement point, as `execute` has: what the reservation
         // becomes is decided by what the chain did, never by what this
@@ -964,7 +984,7 @@ impl<'a> Executor<'a> {
             pool,
             actions = plan.actions.len(),
             spend = ?plan.spend,
-            remaining = ?plan.remaining_liabilities,
+            remaining_liabilities = ?plan.remaining_liabilities,
             projected_health = plan.projected_health,
             simulated,
             armed = queue.is_some(),
@@ -2213,6 +2233,107 @@ mod tests {
             unwind_requests(&[]).is_empty(),
             "an idle plan asks the contract for nothing"
         );
+    }
+
+    /// A plan that moves nothing is not a submission: the mode guards run
+    /// and settle the reservation, and the chain is not touched at all —
+    /// no simulation to judge an empty request list with, and nothing
+    /// enqueued. Dry-run and armed alike, because an idle pass is the
+    /// ordinary end of an unwind and it must cost neither a round trip nor
+    /// a sequence number.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_idle_plan_is_not_sent(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let idle = UnwindPlan {
+            actions: Vec::new(),
+            spend: BTreeMap::new(),
+            remaining_liabilities: vec![USDC.to_string()],
+            projected_health: Some(20_000_000),
+        };
+        assert!(idle.is_idle());
+
+        let dry = Executor::new(
+            &store,
+            Some(Submitter::new(&client, &network, &signer, tx_config())),
+            true,
+        );
+        let outcome = dry
+            .unwind(harness::POOL, &idle, Settlement::DryRun, None)
+            .await
+            .expect("unwind");
+        assert!(
+            matches!(outcome, UnwindOutcome::Planned { simulated: false }),
+            "nothing was judged, because nothing was going to be sent; got {outcome:?}"
+        );
+
+        let armed = Executor::new(
+            &store,
+            Some(Submitter::new(&client, &network, &signer, tx_config())),
+            false,
+        );
+        // A reservation an idle plan would never take, held here so the
+        // settlement is observable: every path out of `unwind` settles by
+        // value exactly once, this one included.
+        let inventory = inventory();
+        let reservation = inventory
+            .reserve(&BTreeMap::from([(USDC.to_string(), 10)]))
+            .expect("the wallet holds it");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let (queue, mut receiver) = SubmissionQueue::new(queue_capacity());
+        let worker = tokio::spawn(async move {
+            while let Some(queued) = receiver.recv().await {
+                recorder
+                    .lock()
+                    .expect("the recorder mutex")
+                    .push(queued.submission.label.clone());
+                let _ = queued.respond.send(Ok(TxOutcome::Succeeded {
+                    hash: TxHash([9_u8; 32]),
+                    ledger: 1,
+                    return_value: None,
+                }));
+            }
+        });
+
+        let outcome = armed
+            .unwind(
+                harness::POOL,
+                &idle,
+                Settlement::Live(reservation),
+                Some(&queue),
+            )
+            .await
+            .expect("unwind");
+        drop(queue);
+        worker.await.expect("the worker ends with the queue");
+
+        assert!(
+            matches!(outcome, UnwindOutcome::Planned { simulated: false }),
+            "an armed executor answers the same: there was nothing to send; got {outcome:?}"
+        );
+        assert!(
+            seen.lock().expect("the recorder mutex").is_empty(),
+            "nothing reached the queue"
+        );
+        assert!(
+            inventory.reserved().values().all(|held| *held == 0),
+            "the reservation is settled"
+        );
+        assert_eq!(
+            inventory.available()[USDC],
+            500,
+            "released, not consumed: nothing was spent"
+        );
+        assert!(
+            rpc.received().await.is_empty(),
+            "and the chain was never asked anything"
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
     }
 
     /// Dry-run lets the contract judge the unwind through `simulate_only`

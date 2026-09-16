@@ -61,6 +61,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use rand::RngExt as _;
 use std::num::NonZeroUsize;
@@ -78,6 +79,7 @@ use crate::executor::Executor;
 use crate::filler::{Filler, FillerConfig, FillerState};
 use crate::inventory::Inventory;
 use crate::ledger::{LedgerPoller, LedgerTick, PollerConfig, PollerMessage};
+use crate::notifier::Notifier;
 use crate::queue::{run_queue, SubmissionQueue};
 use crate::store::{events_cursor, Cursor, Store, StoreError, TrackedUser};
 use crate::tracker::{AnalyticsSeed, FileSeed, SeedSource, Tracker, TrackerError};
@@ -1330,6 +1332,11 @@ const AUCTIONEER_ROLE: &str = "auctioneer";
 /// The filler's, for the same line.
 const FILLER_ROLE: &str = "filler";
 
+/// `FAILURE_NOTIFICATION_COOLDOWN_HOURS`' own default: what the filler's
+/// log-only [`Notifier`] deduplicates by until the configured channel and
+/// cooldown are wired through to it.
+const DEFAULT_NOTIFICATION_COOLDOWN: Duration = Duration::from_hours(24);
+
 /// One task's share of `STARTUP_DELAY_LEDGERS`: whether the chain has
 /// moved far enough past the first tick this task saw for it to be
 /// allowed to submit anything.
@@ -1644,7 +1651,11 @@ async fn filler_loop(
         // A tick that did nothing is the ordinary one — most ledgers hold
         // no open auction worth planning — so it stays at debug and only
         // a tick that moved something is worth a line per ledger.
-        if summary.planned == 0 && summary.executed == 0 && summary.closed == 0 {
+        if summary.planned == 0
+            && summary.executed == 0
+            && summary.closed == 0
+            && summary.unwound == 0
+        {
             tracing::debug!(
                 ledger = tick.sequence,
                 skipped = summary.skipped,
@@ -1657,6 +1668,7 @@ async fn filler_loop(
                 executed = summary.executed,
                 skipped = summary.skipped,
                 closed = summary.closed,
+                unwound = summary.unwound,
                 "filler tick"
             );
         }
@@ -1986,7 +1998,11 @@ fn spawn_filler(
             .map(|signer| Submitter::new(&rpc, &network, signer, tx_config));
         let executor = Executor::new(&store, submitter, dry_run);
         let inventory = Inventory::new(native_asset, xlm_fee_reserve);
-        let filler = Filler::new(&rpc, &store, &pools, config, executor, inventory);
+        // Log-only, at the spec's default cooldown: the channel and the
+        // cooldown the configuration names reach the filler with the rest
+        // of the notification wiring.
+        let notifier = Arc::new(Notifier::log_only(DEFAULT_NOTIFICATION_COOLDOWN));
+        let filler = Filler::new(&rpc, &store, &pools, config, executor, inventory, notifier);
         filler_loop(
             &filler,
             startup_delay_ledgers,
@@ -5594,6 +5610,7 @@ mod tests {
             filler_tick_config(),
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
+            Arc::new(Notifier::log_only(Duration::from_hours(1))),
         );
         let (flag_tx, flag_rx) = watch::channel(false);
         let (tick_tx, tick_rx) = watch::channel(LedgerTick {
@@ -5658,6 +5675,7 @@ mod tests {
             filler_tick_config(),
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
+            Arc::new(Notifier::log_only(Duration::from_hours(1))),
         );
         let (flag_tx, flag_rx) = watch::channel(false);
         let (tick_tx, tick_rx) = watch::channel(LedgerTick {
