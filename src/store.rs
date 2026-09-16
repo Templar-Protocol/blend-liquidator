@@ -1,4 +1,6 @@
-//! The bot's durable state: cursors, tracked borrowers and open auctions.
+//! The bot's durable state: cursors, tracked borrowers, open auctions, and
+//! the audit trail of what the auctioneer and filler did with them —
+//! `creations` and `fills`.
 //!
 //! Every query is checked at compile time against the schema in
 //! `migrations/`, and the metadata that makes that work without a database
@@ -773,12 +775,15 @@ impl Store {
     /// apart takes an out-of-band check: the signing account's sequence
     /// number.
     ///
-    /// `false` means no row has that `id`. Nothing in this crate deletes a
-    /// creation, so the caller logs it rather than failing a submission that
-    /// has already happened.
+    /// A hash is attached once: the write is guarded by `tx_hash IS NULL`,
+    /// so a repeated attachment can never replace the transaction the audit
+    /// already names. `false` means no row has that `id`, or the row already
+    /// names a transaction. Nothing in this crate deletes a creation, so the
+    /// caller logs it rather than failing a submission that has already
+    /// happened.
     pub async fn attach_creation_tx(&self, id: i64, tx_hash: &str) -> Result<bool, StoreError> {
         let done = sqlx::query!(
-            "UPDATE creations SET tx_hash = $2 WHERE id = $1",
+            "UPDATE creations SET tx_hash = $2 WHERE id = $1 AND tx_hash IS NULL",
             id,
             tx_hash
         )
@@ -982,6 +987,131 @@ impl Store {
                 })
             })
             .collect()
+    }
+}
+
+/// One fill the filler executed, as the `fills` table records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FillRecord {
+    /// The pool contract.
+    pub pool: String,
+    /// The liquidated account.
+    pub account: String,
+    /// Which auction; the filler fills user liquidations only.
+    pub auction_type: AuctionType,
+    /// The ledger the fill was planned for.
+    pub fill_ledger: u32,
+    /// The percent of the auction filled.
+    pub percent: FillPercent,
+    /// The d-tokens the filler takes on, per asset, scaled to `fill_ledger`
+    /// and `percent`.
+    pub bid: BTreeMap<String, i128>,
+    /// The b-tokens the filler receives, per asset, scaled the same way.
+    pub lot: BTreeMap<String, i128>,
+    /// `bid`'s raw value in the pool oracle's units.
+    pub bid_value: i128,
+    /// `lot`'s raw value in the pool oracle's units.
+    pub lot_value: i128,
+    /// `lot_value − bid_value`. Negative only under `force_fill`.
+    pub est_profit: i128,
+    /// The bot's configured `DRY_RUN` mode when the row was written — the
+    /// column's meaning, exactly as [`CreationRecord::dry_run`]'s, and never
+    /// "whether this was sent": that is `tx_hash`.
+    pub dry_run: bool,
+}
+
+impl Store {
+    /// Records a fill and returns its id.
+    pub async fn record_fill(&self, fill: &FillRecord) -> Result<i64, StoreError> {
+        let percent = i16::try_from(fill.percent.get()).map_err(|_| StoreError::Decimal {
+            column: "percent",
+            value: fill.percent.get().to_string(),
+        })?;
+        let row = sqlx::query!(
+            "INSERT INTO fills (pool, account, auction_type, fill_ledger, percent, bid, lot,
+                                 bid_value, lot_value, est_profit, dry_run)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::numeric, $9::text::numeric,
+                     $10::text::numeric, $11)
+             RETURNING id",
+            fill.pool,
+            fill.account,
+            auction_type_code(fill.auction_type),
+            i64::from(fill.fill_ledger),
+            percent,
+            asset_amounts_to_json(&fill.bid),
+            asset_amounts_to_json(&fill.lot),
+            fill.bid_value.to_string(),
+            fill.lot_value.to_string(),
+            fill.est_profit.to_string(),
+            fill.dry_run,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.id)
+    }
+
+    /// Attaches the transaction a recorded fill became. Answers whether a
+    /// row was updated.
+    ///
+    /// A fill is recorded *before* it is submitted, so the row exists while
+    /// the hash does not yet: a crash between a transaction landing on chain
+    /// and its row being written would otherwise lose the record of a fill
+    /// that exists, which is the one direction an audit must not fail in.
+    /// The hash is therefore a second write, and a row carrying
+    /// `tx_hash IS NULL` with `dry_run = false` is an armed attempt whose
+    /// transaction was never named.
+    ///
+    /// A hash is attached once: the write is guarded by `tx_hash IS NULL`,
+    /// so a repeated attachment — a completion handled twice — can never
+    /// replace the transaction the audit already names. `false` means no
+    /// row has that `id`, or the row already names a transaction. Nothing
+    /// in this crate deletes a fill, so the caller logs it rather than
+    /// failing a submission that has already happened.
+    pub async fn attach_fill_tx(&self, id: i64, tx_hash: &str) -> Result<bool, StoreError> {
+        let done = sqlx::query!(
+            "UPDATE fills SET tx_hash = $2 WHERE id = $1 AND tx_hash IS NULL",
+            id,
+            tx_hash
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    /// Writes the filler's plan — `fill_ledger` and `percent` — onto its
+    /// auction row, or clears both with `None`. This is the filler's plan
+    /// and nothing else: the tracker owns every other column.
+    ///
+    /// `false` when the row has gone: the auction closed while it was being
+    /// planned, which is not an error.
+    pub async fn set_fill_plan(
+        &self,
+        pool: &str,
+        account: &str,
+        auction_type: AuctionType,
+        plan: Option<(u32, FillPercent)>,
+    ) -> Result<bool, StoreError> {
+        let fill_ledger = plan.map(|(fill_ledger, _)| i64::from(fill_ledger));
+        let percent = plan
+            .map(|(_, percent)| {
+                i16::try_from(percent.get()).map_err(|_| StoreError::Decimal {
+                    column: "percent",
+                    value: percent.get().to_string(),
+                })
+            })
+            .transpose()?;
+        let done = sqlx::query!(
+            "UPDATE auctions SET fill_ledger = $4, percent = $5
+             WHERE pool = $1 AND account = $2 AND auction_type = $3",
+            pool,
+            account,
+            auction_type_code(auction_type),
+            fill_ledger,
+            percent,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
     }
 }
 
@@ -1925,6 +2055,178 @@ mod tests {
                 .expect("a missing row is not an error"),
             "no row, no update — and not a failure either"
         );
+        assert!(
+            !store
+                .attach_creation_tx(id, "ef".repeat(32).as_str())
+                .await
+                .expect("a repeated attachment is not an error"),
+            "a row that already names a transaction keeps it"
+        );
+        let kept = sqlx::query!("SELECT tx_hash FROM creations WHERE id = $1", id)
+            .fetch_one(store.pool())
+            .await
+            .expect("the row still exists");
+        assert_eq!(kept.tx_hash, Some("cd".repeat(32)));
+        Ok(())
+    }
+
+    fn sample_fill() -> FillRecord {
+        FillRecord {
+            pool: POOL.to_string(),
+            account: USER.to_string(),
+            auction_type: AuctionType::UserLiquidation,
+            fill_ledger: 64_271_400,
+            percent: FillPercent::try_from(80).unwrap(),
+            bid: BTreeMap::from([("CBID".to_string(), i128::MAX)]),
+            lot: BTreeMap::from([("CLOT".to_string(), 12)]),
+            // Beyond bigint, which is why the column is numeric.
+            bid_value: 10_i128.pow(30),
+            lot_value: 10_i128.pow(30) + 7,
+            // A force_fill pool can fill at a loss; the column must hold it.
+            est_profit: -5,
+            dry_run: true,
+        }
+    }
+
+    /// Every column round-trips exactly, i128s included.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_fill_is_recorded_with_every_column(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let id = store.record_fill(&sample_fill()).await.expect("record");
+        let row = sqlx::query!(
+            r#"SELECT tx_hash, auction_type, fill_ledger, percent, bid, lot,
+                      bid_value::text AS "bid_value!", lot_value::text AS "lot_value!",
+                      est_profit::text AS "est_profit!", dry_run
+               FROM fills WHERE id = $1"#,
+            id
+        )
+        .fetch_one(store.pool())
+        .await?;
+        assert_eq!(row.tx_hash, None, "recorded before anything is sent");
+        assert_eq!(
+            (row.auction_type, row.fill_ledger, row.percent),
+            (0, 64_271_400, 80)
+        );
+        assert_eq!(row.bid["CBID"], serde_json::json!(i128::MAX.to_string()));
+        assert_eq!(row.bid_value, 10_i128.pow(30).to_string());
+        assert_eq!(row.lot_value, (10_i128.pow(30) + 7).to_string());
+        assert_eq!(row.est_profit, "-5");
+        assert!(row.dry_run);
+        Ok(())
+    }
+
+    /// The hash is a second write; a missing row is `false`, not an error,
+    /// and so is a row that already names a transaction: the audit keeps
+    /// the first hash it was given, whatever a repeated completion says.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_fills_transaction_is_attached_once_it_has_one(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let id = store.record_fill(&sample_fill()).await.expect("record");
+        assert!(store
+            .attach_fill_tx(id, &"ab".repeat(32))
+            .await
+            .expect("attach"));
+        assert!(!store
+            .attach_fill_tx(id + 1, &"cd".repeat(32))
+            .await
+            .expect("attach"));
+        assert!(
+            !store
+                .attach_fill_tx(id, &"ef".repeat(32))
+                .await
+                .expect("attach again"),
+            "a second attachment is refused, not applied"
+        );
+        let hash = sqlx::query_scalar!("SELECT tx_hash FROM fills WHERE id = $1", id)
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(hash, Some("ab".repeat(32)), "the first hash stands");
+        Ok(())
+    }
+
+    /// One transaction is one fill: the column is unique.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn two_fills_cannot_share_a_transaction(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let first = store.record_fill(&sample_fill()).await.expect("record");
+        let second = store.record_fill(&sample_fill()).await.expect("record");
+        assert!(store
+            .attach_fill_tx(first, &"ab".repeat(32))
+            .await
+            .expect("attach"));
+        assert!(store
+            .attach_fill_tx(second, &"ab".repeat(32))
+            .await
+            .is_err());
+        Ok(())
+    }
+
+    /// The plan is the filler's two columns and nothing else: the tracker's
+    /// `bid`, `lot` and `start_ledger` are untouched, `None` clears the plan,
+    /// and a row that has gone is `false`.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_fill_plan_is_written_onto_its_auction_and_cleared(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let auction = TrackedAuction {
+            pool: POOL.to_string(),
+            account: USER.to_string(),
+            auction_type: AuctionType::UserLiquidation,
+            start_ledger: 100,
+            fill_ledger: None,
+            percent: None,
+            bid: BTreeMap::from([("CBID".to_string(), 5)]),
+            lot: BTreeMap::from([("CLOT".to_string(), 9)]),
+            updated_ledger: 101,
+        };
+        store.upsert_auction(&auction).await.expect("upsert");
+        let percent = FillPercent::try_from(80).unwrap();
+        assert!(store
+            .set_fill_plan(
+                POOL,
+                USER,
+                AuctionType::UserLiquidation,
+                Some((310, percent))
+            )
+            .await
+            .expect("plan"));
+        let planned = store
+            .auction(POOL, USER, AuctionType::UserLiquidation)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(
+            (planned.fill_ledger, planned.percent),
+            (Some(310), Some(percent))
+        );
+        assert_eq!(
+            TrackedAuction {
+                fill_ledger: None,
+                percent: None,
+                ..planned
+            },
+            auction,
+            "only the plan columns moved"
+        );
+        assert!(store
+            .set_fill_plan(POOL, USER, AuctionType::UserLiquidation, None)
+            .await
+            .expect("clear"));
+        let cleared = store
+            .auction(POOL, USER, AuctionType::UserLiquidation)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!((cleared.fill_ledger, cleared.percent), (None, None));
+        store
+            .delete_auction(POOL, USER, AuctionType::UserLiquidation)
+            .await
+            .expect("delete");
+        assert!(!store
+            .set_fill_plan(POOL, USER, AuctionType::UserLiquidation, None)
+            .await
+            .expect("gone"));
         Ok(())
     }
 }

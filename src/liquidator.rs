@@ -33,6 +33,9 @@
 pub mod auctioneer;
 pub mod chain;
 pub mod config;
+pub mod executor;
+pub mod filler;
+pub mod inventory;
 pub mod ledger;
 pub mod math;
 pub mod queue;
@@ -75,4 +78,7 @@ pub enum LiquidatorError {
     /// The auctioneer failed to decide who is liquidatable, or to act on it.
     #[error("auctioneer: {0}")]
     Auctioneer(#[from] auctioneer::AuctioneerError),
+    /// The filler failed to plan or execute an auction's fill.
+    #[error("filler: {0}")]
+    Filler(#[from] filler::FillerError),
 }

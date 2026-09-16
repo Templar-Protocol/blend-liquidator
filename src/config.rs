@@ -1,5 +1,7 @@
 //! CLI and environment configuration.
 
+use std::sync::Arc;
+
 use clap::Parser;
 
 use crate::LiquidatorError;
@@ -181,6 +183,18 @@ fn target_health_factor(text: &str) -> Result<Decimal7, String> {
     Ok(value)
 }
 
+/// `HF_SAFETY_MULTIPLIER`'s parser: a `Decimal7` of at least one.
+fn health_multiplier(text: &str) -> Result<Decimal7, String> {
+    let value: Decimal7 = text.parse()?;
+    if value.get() < crate::math::SCALAR_7 {
+        return Err(format!(
+            "`{text}` is under 1: HF_SAFETY_MULTIPLIER scales the pool's own \
+             min_health_factor, and under one the filler's floor would sit below it"
+        ));
+    }
+    Ok(value)
+}
+
 /// An amount in an asset's own decimals, written as a decimal string
 /// because it exceeds what TOML integers and JSON numbers hold.
 fn amount_from_str(text: &str, field: &'static str) -> Result<i128, String> {
@@ -248,6 +262,11 @@ struct RawPools {
     pools: Vec<RawPool>,
 }
 
+/// The contract's own post-submit health minimum, `1.0000100` in 7
+/// decimals (`validate_submit`'s `is_hf_under(e, 1_0000100)`). A filler
+/// floor at or under it plans fills the contract refuses as `InvalidHf`.
+const CONTRACT_MIN_HEALTH: i128 = 10_000_100;
+
 /// Parses the pools file. Every failure names the field that caused it,
 /// because this runs at startup where the operator is watching.
 pub fn parse_pools(text: &str) -> Result<Vec<PoolConfig>, LiquidatorError> {
@@ -278,6 +297,17 @@ pub fn parse_pools(text: &str) -> Result<Vec<PoolConfig>, LiquidatorError> {
                 "pools file: min_primary_collateral must not be negative".to_owned(),
             ));
         }
+        // A floor at or under the contract's own post-submit minimum lets
+        // the filler plan fills the contract refuses as `InvalidHf` — every
+        // one of them a wasted simulation and re-plan.
+        if pool.min_health_factor.get() <= CONTRACT_MIN_HEALTH {
+            return Err(LiquidatorError::Config(format!(
+                "pools file: pool {}: min_health_factor is at or under the contract's own \
+                 post-submit minimum (1.00001), so the filler would plan fills the contract \
+                 refuses as InvalidHf",
+                pool.address
+            )));
+        }
         pools.push(PoolConfig {
             address: pool.address,
             primary_asset: pool.primary_asset,
@@ -291,6 +321,36 @@ pub fn parse_pools(text: &str) -> Result<Vec<PoolConfig>, LiquidatorError> {
         });
     }
     Ok(pools)
+}
+
+impl PoolConfig {
+    /// Whether the filler takes this auction at all (spec §5): every bid
+    /// asset is in `supported_bid` and every lot asset in `supported_lot`,
+    /// `*` matching any reserve. One unsupported asset on either side
+    /// refuses the whole auction — a fill takes every asset it names.
+    #[must_use]
+    pub fn supports(&self, bid: &[&str], lot: &[&str]) -> bool {
+        covers(&self.supported_bid, bid) && covers(&self.supported_lot, lot)
+    }
+
+    /// The margin a fill waits for, in basis points: the first `profits`
+    /// rule whose lists cover every bid and lot asset, else
+    /// `default_profit_bps`. Order matters and is the operator's.
+    #[must_use]
+    pub fn profit_bps(&self, bid: &[&str], lot: &[&str]) -> u32 {
+        self.profits
+            .iter()
+            .find(|rule| covers(&rule.supported_bid, bid) && covers(&rule.supported_lot, lot))
+            .map_or(self.default_profit_bps, |rule| rule.profit_bps)
+    }
+}
+
+/// Whether `list` names every one of `assets`, `*` naming them all.
+fn covers(list: &[String], assets: &[&str]) -> bool {
+    list.iter().any(|entry| entry == "*")
+        || assets
+            .iter()
+            .all(|asset| list.iter().any(|entry| entry == asset))
 }
 
 /// What the binary does when it starts.
@@ -433,6 +493,27 @@ pub struct ServiceConfig {
     pub startup_delay_ledgers: u32,
     /// Seeding.
     pub seed: SeedConfig,
+    /// The pool's `min_health_factor` is multiplied by this for the floor
+    /// the filler keeps its own position at or above after a fill, 7
+    /// decimals. Always at least `SCALAR_7` (1.0).
+    pub hf_safety_multiplier: i128,
+    /// How often, in ledgers, an auction the filler has already planned is
+    /// planned again. Always at least 1.
+    pub replan_ledgers: u32,
+    /// Within this many ledgers of its planned fill ledger an auction is
+    /// planned again on every ledger. Zero means only at the fill ledger.
+    pub replan_near_ledgers: u32,
+    /// XLM the filler never spends, kept back for transaction fees, in
+    /// stroops. Unsigned by type: `XLM_FEE_RESERVE` is refused negative at
+    /// parse, and the inventory a negative reserve would *widen* takes a
+    /// `u64` so nothing can hand it one.
+    pub xlm_fee_reserve: u64,
+    /// The estimated profit, in the pool oracle's units (7 decimals), at or
+    /// above which a fill pays the high fee tier rather than the base one.
+    pub high_fee_profit_threshold: i128,
+    /// The longest the filler's wallet balances go unread. Always at least
+    /// one second.
+    pub inventory_refresh: std::time::Duration,
 }
 
 #[derive(Debug, Parser)]
@@ -510,8 +591,9 @@ pub struct Args {
     /// Connections in the database pool.
     ///
     /// Must cover every task that queries concurrently: one ledger poller
-    /// per pool, the tracker, and the auctioneer — roughly `pools + 2`, and
-    /// the default covers up to eight pools. Sizing it below that does not
+    /// per pool, the tracker, the auctioneer and the filler — roughly
+    /// `pools + 3`, and the default covers up to seven pools. Sizing it
+    /// below that does not
     /// deadlock; it times out acquiring a connection, and every
     /// [`crate::store::StoreError`] in this bot is fatal, so a load spike
     /// becomes a process exit.
@@ -656,6 +738,57 @@ pub struct Args {
     /// acting on health factors it has not yet re-verified against it.
     #[arg(long, env = "STARTUP_DELAY_LEDGERS", default_value_t = 0)]
     pub startup_delay_ledgers: u32,
+
+    /// The pool's `min_health_factor` is multiplied by this for the floor the
+    /// filler keeps its own position at or above after a fill (spec §5).
+    ///
+    /// At least 1, refused at parse rather than clamped: under one, the floor
+    /// would sit under the pool's own `min_health_factor`, the operator's
+    /// stated minimum, and a fill could leave the filler below it by design.
+    #[arg(
+        long,
+        env = "HF_SAFETY_MULTIPLIER",
+        default_value = "1.1",
+        value_parser = health_multiplier,
+    )]
+    pub hf_safety_multiplier: Decimal7,
+
+    /// How often, in ledgers, an auction the filler has already planned is
+    /// planned again. Zero is refused: it would re-plan every auction on every
+    /// ledger, which is `REPLAN_NEAR_LEDGERS`'s job and only near the target.
+    #[arg(
+        long,
+        env = "REPLAN_LEDGERS",
+        default_value_t = 10,
+        value_parser = clap::value_parser!(u32).range(1..),
+    )]
+    pub replan_ledgers: u32,
+
+    /// Within this many ledgers of its planned fill ledger an auction is
+    /// planned again on every ledger. Zero means only at the fill ledger.
+    #[arg(long, env = "REPLAN_NEAR_LEDGERS", default_value_t = 5)]
+    pub replan_near_ledgers: u32,
+
+    /// XLM the filler never spends, kept back for transaction fees. Decimal
+    /// XLM; XLM has 7 decimals, so the parsed value is in stroops.
+    #[arg(long, env = "XLM_FEE_RESERVE", default_value = "50")]
+    pub xlm_fee_reserve: Decimal7,
+
+    /// The estimated profit, in the pool oracle's units, at or above which a
+    /// fill pays the high fee tier (`HIGH_FEE`) rather than the base one.
+    #[arg(long, env = "HIGH_FEE_PROFIT_THRESHOLD", default_value = "10")]
+    pub high_fee_profit_threshold: Decimal7,
+
+    /// The longest the filler's wallet balances go unread, in seconds; they
+    /// are also re-read after every confirmed transaction. Zero is refused:
+    /// it would read every balance on every tick.
+    #[arg(
+        long,
+        env = "INVENTORY_REFRESH_SECS",
+        default_value_t = 30,
+        value_parser = clap::value_parser!(u64).range(1..),
+    )]
+    pub inventory_refresh_secs: u64,
 
     /// The analytics API the tracker seeds from. Empty disables it.
     #[arg(
@@ -825,6 +958,16 @@ impl Args {
                 health_factor_max: self.seed_hf_max.get(),
                 file: self.seed_file.clone(),
             },
+            hf_safety_multiplier: self.hf_safety_multiplier.get(),
+            replan_ledgers: self.replan_ledgers,
+            replan_near_ledgers: self.replan_near_ledgers,
+            xlm_fee_reserve: u64::try_from(self.xlm_fee_reserve.get()).map_err(|_| {
+                LiquidatorError::Config(
+                    "XLM_FEE_RESERVE is larger than any wallet can hold".to_string(),
+                )
+            })?,
+            high_fee_profit_threshold: self.high_fee_profit_threshold.get(),
+            inventory_refresh: std::time::Duration::from_secs(self.inventory_refresh_secs),
         })
     }
 
@@ -852,10 +995,35 @@ impl Args {
         filler: Option<String>,
         auctioneer: Option<String>,
     ) -> Result<SigningKeys, LiquidatorError> {
-        Ok(SigningKeys {
+        let keys = SigningKeys {
             auctioneer: parse_signing_key("AUCTIONEER_SECRET_KEY", auctioneer)?,
             filler: parse_signing_key("FILLER_SECRET_KEY", filler)?,
-        })
+        };
+        // Two roles on one key would need two queues on one key — the
+        // sequence race `queue.rs` exists to make unreachable — so the same
+        // key twice is refused, and leaving `AUCTIONEER_SECRET_KEY` unset is
+        // how one key signs both.
+        if let (Some(auctioneer), Some(filler)) = (&keys.auctioneer, &keys.filler) {
+            if auctioneer.address() == filler.address() {
+                return Err(LiquidatorError::Config(
+                    "AUCTIONEER_SECRET_KEY and FILLER_SECRET_KEY are the same key: leave \
+                     AUCTIONEER_SECRET_KEY unset and the auctioneer signs with the filler's key, \
+                     through the one queue that key needs"
+                        .to_string(),
+                ));
+            }
+        }
+        // Live trading fills auctions, and the filler signs with its own
+        // key only — an armed bot with just the auctioneer's key would
+        // create auctions and never fill one.
+        if !self.dry_run && keys.filler.is_none() {
+            return Err(LiquidatorError::Config(
+                "DRY_RUN=false needs FILLER_SECRET_KEY: live trading fills auctions, and the \
+                 filler signs with its own key only"
+                    .to_string(),
+            ));
+        }
+        Ok(keys)
     }
 }
 
@@ -876,15 +1044,14 @@ fn parse_signing_key(
 
 /// Every signing key this process holds.
 ///
-/// Two keys, one signer: the auctioneer signs with `auctioneer` when it is
-/// configured and falls back to `filler`, but **both** addresses are the
-/// bot's own regardless of which one signs. The auctioneer must never
-/// create a liquidation auction against either — the contract has no reason
-/// to refuse the bot liquidating its own filler position, and in dry-run
-/// there is no contract to refuse at all — so
-/// [`SigningKeys::own_addresses`] reports both and
-/// [`SigningKeys::into_auctioneer_signer`] answers the separate question of
-/// which one signs.
+/// **Both** addresses are the bot's own regardless of which one signs: the
+/// auctioneer must never create a liquidation auction against either — the
+/// contract has no reason to refuse the bot liquidating its own filler
+/// position, and in dry-run there is no contract to refuse at all — so
+/// [`SigningKeys::own_addresses`] reports both, and
+/// [`SigningKeys::into_signers`] answers the separate question of which key
+/// signs which role: the filler always signs with its own, and the
+/// auctioneer signs with its own when configured, else the filler's.
 #[derive(Debug)]
 pub struct SigningKeys {
     /// `AUCTIONEER_SECRET_KEY`, when set.
@@ -909,13 +1076,40 @@ impl SigningKeys {
             .collect()
     }
 
-    /// The key the auctioneer signs with: its own when configured,
-    /// otherwise the filler's, and `None` when neither is — the ordinary
-    /// dry-run deployment, not an error. Consuming, because `Signer` is
-    /// deliberately not `Clone`: it holds key material.
+    /// The two roles' keys: the filler's own, and the auctioneer's own or
+    /// else the filler's — the spec's "auctioneer key optional, defaulting
+    /// to the filler key". Never the reverse: the filler does not sign with
+    /// the auctioneer's key.
     #[must_use]
-    pub fn into_auctioneer_signer(self) -> Option<crate::chain::Signer> {
-        self.auctioneer.or(self.filler)
+    pub fn into_signers(self) -> Signers {
+        let filler = self.filler.map(Arc::new);
+        let auctioneer = self.auctioneer.map(Arc::new).or_else(|| filler.clone());
+        Signers { auctioneer, filler }
+    }
+}
+
+/// The two signing roles' keys. Each is an `Arc` — `Signer` is
+/// deliberately not `Clone`, since it holds key material — so a role that
+/// falls back to the other's key holds *the same* key, and
+/// [`Signers::shared`] tells by pointer. Whether the roles share a key is
+/// what decides whether they share a submission queue: one queue per key,
+/// because two queues on one key race each other for its sequence number.
+#[derive(Debug, Default)]
+pub struct Signers {
+    /// Signs auction creations: `AUCTIONEER_SECRET_KEY`, else the filler's.
+    pub auctioneer: Option<Arc<crate::chain::Signer>>,
+    /// Signs fills: `FILLER_SECRET_KEY`, and never the auctioneer's.
+    pub filler: Option<Arc<crate::chain::Signer>>,
+}
+
+impl Signers {
+    /// Whether both roles hold the one key.
+    #[must_use]
+    pub fn shared(&self) -> bool {
+        matches!(
+            (&self.auctioneer, &self.filler),
+            (Some(auctioneer), Some(filler)) if Arc::ptr_eq(auctioneer, filler)
+        )
     }
 }
 
@@ -1004,6 +1198,12 @@ mod tests {
             "PRICE_DELTA_BPS",
             "PLAN_ITERATIONS",
             "STARTUP_DELAY_LEDGERS",
+            "HF_SAFETY_MULTIPLIER",
+            "REPLAN_LEDGERS",
+            "REPLAN_NEAR_LEDGERS",
+            "XLM_FEE_RESERVE",
+            "HIGH_FEE_PROFIT_THRESHOLD",
+            "INVENTORY_REFRESH_SECS",
             "SEED_URL",
             "SEED_HF_MAX",
             "SEED_FILE",
@@ -1654,7 +1854,8 @@ supported_lot = ["*"]
         let only_filler = args
             .signing_keys(Some(FILLER_SEED.to_string()), None)
             .expect("keys")
-            .into_auctioneer_signer()
+            .into_signers()
+            .auctioneer
             .expect("a key is configured");
         let both = args
             .signing_keys(
@@ -1662,7 +1863,8 @@ supported_lot = ["*"]
                 Some(AUCTIONEER_SEED.to_string()),
             )
             .expect("keys")
-            .into_auctioneer_signer()
+            .into_signers()
+            .auctioneer
             .expect("a key is configured");
         assert_ne!(
             only_filler.address(),
@@ -1672,7 +1874,8 @@ supported_lot = ["*"]
         assert!(
             args.signing_keys(None, None)
                 .expect("no key")
-                .into_auctioneer_signer()
+                .into_signers()
+                .auctioneer
                 .is_none(),
             "no key configured is not an error: dry-run needs none"
         );
@@ -1719,7 +1922,8 @@ supported_lot = ["*"]
             "the auctioneer's address"
         );
         assert_eq!(
-            keys.into_auctioneer_signer()
+            keys.into_signers()
+                .auctioneer
                 .expect("a key is configured")
                 .address(),
             auctioneer.address(),
@@ -1864,5 +2068,252 @@ supported_lot = ["*"]
     #[test]
     fn a_zero_price_delta_bps_is_refused_at_parse() {
         assert!(Args::try_parse_from(["liquidator", "--price-delta-bps", "0"]).is_err());
+    }
+
+    /// The first pool of the sample file, for struct-update syntax in the
+    /// rule tests below.
+    fn sample_pool() -> PoolConfig {
+        parse_pools(POOLS).expect("the sample parses").remove(0)
+    }
+
+    /// Spec §6's defaults for the filler's knobs.
+    #[test]
+    fn the_filler_knobs_default_to_the_spec() {
+        assert_clean_environment();
+        let args = Args::try_parse_from(["liquidator"]).unwrap();
+        assert_eq!(args.hf_safety_multiplier.get(), 11_000_000, "1.1");
+        assert_eq!(args.replan_ledgers, 10);
+        assert_eq!(args.replan_near_ledgers, 5);
+        assert_eq!(
+            args.xlm_fee_reserve.get(),
+            500_000_000,
+            "50 XLM: XLM has 7 decimals, so a Decimal7 is its value in stroops"
+        );
+        assert_eq!(args.high_fee_profit_threshold.get(), 100_000_000, "10");
+        assert_eq!(args.inventory_refresh_secs, 30);
+    }
+
+    /// A negative fee reserve would widen what the filler may spend by its
+    /// magnitude; `Decimal7` refuses the sign, so it never reaches the
+    /// inventory.
+    #[test]
+    fn a_negative_fee_reserve_is_refused_at_parse() {
+        assert!(Args::try_parse_from(["liquidator", "--xlm-fee-reserve", "-1"]).is_err());
+        assert!(Args::try_parse_from(["liquidator", "--xlm-fee-reserve", "0"]).is_ok());
+    }
+
+    /// Under one, the filler's floor would sit under the pool's own
+    /// `min_health_factor` — the operator's stated minimum — and a fill could
+    /// leave the filler below it by design.
+    #[test]
+    fn a_health_multiplier_under_one_is_refused_at_parse() {
+        assert!(
+            Args::try_parse_from(["liquidator", "--hf-safety-multiplier", "0.9999999"]).is_err()
+        );
+        assert!(Args::try_parse_from(["liquidator", "--hf-safety-multiplier", "1"]).is_ok());
+    }
+
+    /// `REPLAN_LEDGERS=0` would re-plan every auction on every ledger — not a
+    /// cadence at all — and `INVENTORY_REFRESH_SECS=0` would read every wallet
+    /// balance on every tick. Both refused like every other cadence knob.
+    #[test]
+    fn zero_filler_cadences_are_refused_at_parse() {
+        assert!(Args::try_parse_from(["liquidator", "--replan-ledgers", "0"]).is_err());
+        assert!(Args::try_parse_from(["liquidator", "--inventory-refresh-secs", "0"]).is_err());
+        assert!(
+            Args::try_parse_from(["liquidator", "--replan-near-ledgers", "0"]).is_ok(),
+            "zero is meaningful here: re-plan only at the fill ledger itself"
+        );
+    }
+
+    /// Spec §6: "Keys parse and differ when both are given." Two roles on one
+    /// key would need two queues on one key — the sequence race `queue.rs`
+    /// exists to make unreachable — so the same key twice is refused, and
+    /// leaving `AUCTIONEER_SECRET_KEY` unset is how one key signs both.
+    #[test]
+    fn the_same_key_twice_is_refused() {
+        assert_clean_environment();
+        let args = parse(&[
+            "liquidator",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "http://rpc",
+        ]);
+        let error = args
+            .signing_keys(Some(FILLER_SEED.to_string()), Some(FILLER_SEED.to_string()))
+            .expect_err("the same key twice");
+        let message = error.to_string();
+        assert!(
+            message.contains("AUCTIONEER_SECRET_KEY") && message.contains("FILLER_SECRET_KEY"),
+            "{message}"
+        );
+        assert!(
+            !message.contains(FILLER_SEED),
+            "the message never echoes the key"
+        );
+    }
+
+    /// Spec §6: `FILLER_SECRET_KEY` is "required for live". An armed bot with
+    /// only an auctioneer key would create auctions and never fill one.
+    #[test]
+    fn live_trading_needs_the_fillers_key() {
+        assert_clean_environment();
+        let live = parse(&[
+            "liquidator",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "http://rpc",
+            "--dry-run=false",
+        ]);
+        assert!(live.signing_keys(None, None).is_err(), "no key at all");
+        assert!(
+            live.signing_keys(None, Some(AUCTIONEER_SEED.to_string()))
+                .is_err(),
+            "an auctioneer key alone"
+        );
+        assert!(live
+            .signing_keys(Some(FILLER_SEED.to_string()), None)
+            .is_ok());
+
+        let dry = parse(&[
+            "liquidator",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "http://rpc",
+        ]);
+        assert!(
+            dry.signing_keys(None, None).is_ok(),
+            "a dry run needs no key"
+        );
+    }
+
+    /// With no auctioneer key both roles hold the filler's one key — the same
+    /// `Arc`, so `shared` can tell by pointer — and that is what gives them one
+    /// queue. Two configured keys are two keys and two queues.
+    #[test]
+    fn a_fallback_auctioneer_shares_the_fillers_key() {
+        assert_clean_environment();
+        let args = parse(&[
+            "liquidator",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "http://rpc",
+        ]);
+
+        let one = args
+            .signing_keys(Some(FILLER_SEED.to_string()), None)
+            .unwrap()
+            .into_signers();
+        assert!(one.shared());
+        assert_eq!(
+            one.auctioneer.as_ref().unwrap().address(),
+            one.filler.as_ref().unwrap().address()
+        );
+
+        let two = args
+            .signing_keys(
+                Some(FILLER_SEED.to_string()),
+                Some(AUCTIONEER_SEED.to_string()),
+            )
+            .unwrap()
+            .into_signers();
+        assert!(!two.shared());
+        assert_ne!(
+            two.auctioneer.as_ref().unwrap().address(),
+            two.filler.as_ref().unwrap().address()
+        );
+
+        let auctioneer_only = args
+            .signing_keys(None, Some(AUCTIONEER_SEED.to_string()))
+            .unwrap()
+            .into_signers();
+        assert!(
+            auctioneer_only.filler.is_none(),
+            "the filler never borrows the auctioneer's key"
+        );
+        assert!(auctioneer_only.auctioneer.is_some() && !auctioneer_only.shared());
+
+        let none = args.signing_keys(None, None).unwrap().into_signers();
+        assert!(none.auctioneer.is_none() && none.filler.is_none() && !none.shared());
+    }
+
+    /// A pool floor at or under the contract's own post-submit minimum,
+    /// `1.0000100`, lets the filler plan fills the contract refuses as
+    /// `InvalidHf` — every one of them a wasted simulation and re-plan.
+    #[test]
+    fn a_pool_floor_at_the_contracts_own_minimum_is_refused() {
+        let at =
+            parse_pools(&POOLS.replace("min_health_factor = 1.5", "min_health_factor = 1.00001"));
+        assert!(
+            matches!(&at, Err(error) if error.to_string().contains("min_health_factor")),
+            "{at:?}"
+        );
+        assert!(parse_pools(
+            &POOLS.replace("min_health_factor = 1.5", "min_health_factor = 1.0000101")
+        )
+        .is_ok());
+    }
+
+    /// Spec §5: an auction is a candidate only when every bid asset is in
+    /// `supported_bid` and every lot asset in `supported_lot`; `*` matches
+    /// any reserve.
+    #[test]
+    fn supported_assets_cover_every_asset_on_each_side() {
+        let pool = PoolConfig {
+            supported_bid: vec!["A".to_string(), "B".to_string()],
+            supported_lot: vec!["*".to_string()],
+            ..sample_pool()
+        };
+        assert!(pool.supports(&["A"], &["X", "Y"]));
+        assert!(pool.supports(&["A", "B"], &["X"]));
+        assert!(
+            !pool.supports(&["A", "C"], &["X"]),
+            "one unsupported bid asset refuses the auction"
+        );
+        let strict = PoolConfig {
+            supported_lot: vec!["X".to_string()],
+            ..pool
+        };
+        assert!(
+            !strict.supports(&["A"], &["X", "Y"]),
+            "one unsupported lot asset refuses it too"
+        );
+    }
+
+    /// Spec §5: the margin is the first `profits` rule whose lists cover every
+    /// auction asset, else `default_profit_bps`.
+    #[test]
+    fn the_first_matching_profit_rule_wins() {
+        let pool = PoolConfig {
+            default_profit_bps: 1_000,
+            profits: vec![
+                ProfitRule {
+                    profit_bps: 500,
+                    supported_bid: vec!["USDC".to_string()],
+                    supported_lot: vec!["*".to_string()],
+                },
+                ProfitRule {
+                    profit_bps: 200,
+                    supported_bid: vec!["*".to_string()],
+                    supported_lot: vec!["*".to_string()],
+                },
+            ],
+            ..sample_pool()
+        };
+        assert_eq!(pool.profit_bps(&["USDC"], &["XLM"]), 500);
+        assert_eq!(
+            pool.profit_bps(&["XLM"], &["USDC"]),
+            200,
+            "the first rule does not cover an XLM bid"
+        );
+        let no_rules = PoolConfig {
+            profits: Vec::new(),
+            ..pool
+        };
+        assert_eq!(no_rules.profit_bps(&["XLM"], &["USDC"]), 1_000);
     }
 }

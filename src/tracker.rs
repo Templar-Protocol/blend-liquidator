@@ -220,14 +220,12 @@ impl<'a> Tracker<'a> {
         // One timestamp for every reserve, so the position is valued at a
         // single instant: the earliest one at which every entry read is
         // valid. Per-reserve clamping would value one asset later than
-        // another and quietly mix two ledgers into one health factor.
-        let valued_at = snapshot
-            .reserves
-            .values()
-            .map(|reserve| reserve.data.last_time)
-            .max()
-            .unwrap_or(0)
-            .max(tick.close_time);
+        // another and quietly mix two ledgers into one health factor. It
+        // is `PoolSnapshot::valued_at` and nothing of its own, because the
+        // auctioneer and the filler value positions with that same clamp
+        // and the three must not disagree about which instant a position
+        // is worth what.
+        let valued_at = snapshot.valued_at(tick.close_time);
         let mut outcome = RefreshOutcome::default();
         for account in accounts {
             let positions = snapshot.positions.get(account);

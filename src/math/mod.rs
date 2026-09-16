@@ -12,6 +12,7 @@
 //! diff against those four files.
 
 pub mod auction;
+pub mod fill;
 pub mod fixed;
 pub mod liquidation;
 pub mod position;

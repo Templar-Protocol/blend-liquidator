@@ -6,11 +6,21 @@
 //! [`Service::check_config`] reads the chain and pings the store and
 //! reports, writing nothing and following nothing, and [`Service::run`]
 //! additionally migrates the store, seeds it, and follows every configured
-//! pool until a shutdown signal arrives. Both share `validate`, because a
-//! bot that never checked its own configuration would happily submit
-//! against a pool it misread.
+//! pool until a shutdown signal arrives. Both share `validate` and
+//! `validate_filler`, because a bot that never checked its own
+//! configuration would happily submit against a pool it misread, or start
+//! armed with a filler account that does not exist.
 //!
-//! # The tracker and the auctioneer are separate tasks, joined by a tick
+//! # Five kinds of task
+//!
+//! [`Service::run`] spawns one [`LedgerPoller`] per pool, one tracker task
+//! consuming their shared channel, one auctioneer task, one filler task,
+//! and — only when armed — one submission-queue worker per distinct
+//! signing key. The queues are the subject of `spawn_queues`: one worker
+//! per key and never two, because a Soroban transaction is built against
+//! its source account's sequence number at prepare time.
+//!
+//! # The deciding tasks are joined to the tracker by a tick
 //!
 //! `tracker_loop` is the one consumer of the poller channel every pool's
 //! events and ticks arrive on, and its cursor rests on a strict rule:
@@ -30,6 +40,15 @@
 //! that way). The one failure that ends the auctioneer's *own* task is a
 //! [`crate::store::StoreError`], for the same reason it ends the
 //! tracker's: the bot cannot trust what it reads.
+//!
+//! `filler_loop` is a third task on the same watch, and is one for exactly
+//! the same reason: a fill is not a stored effect of a ledger either, so
+//! planning and executing one must never sit between a tick and the
+//! acknowledgement that commits the poller's cursor — and it must never be
+//! a second reader of the poller channel, which would break the
+//! per-sender ordering that cursor rests on. Each of the two holds its own
+//! `StartupGate`, because each measures the delay from the first tick
+//! *it* saw and each answers for its own key.
 //!
 //! The durable link between the two tasks is
 //! [`crate::store::Store::flag_recheck`]: `apply_tick` flags every account
@@ -53,8 +72,11 @@ use crate::auctioneer::{Auctioneer, AuctioneerConfig, AuctioneerError, PriceWatc
 use crate::chain::pool::{PoolReader, PoolSnapshot};
 use crate::chain::rpc::RpcClient;
 use crate::chain::xdr::PoolStatus;
-use crate::chain::{Network, Signer, Submitter, TxConfig};
-use crate::config::{PoolConfig, SeedConfig, ServiceConfig, SigningKeys};
+use crate::chain::{ChainError, Network, Signer, Submitter, TxConfig};
+use crate::config::{PoolConfig, SeedConfig, ServiceConfig, Signers, SigningKeys};
+use crate::executor::Executor;
+use crate::filler::{Filler, FillerConfig, FillerState};
+use crate::inventory::Inventory;
 use crate::ledger::{LedgerPoller, LedgerTick, PollerConfig, PollerMessage};
 use crate::queue::{run_queue, SubmissionQueue};
 use crate::store::{events_cursor, Cursor, Store, StoreError, TrackedUser};
@@ -192,6 +214,164 @@ fn validate_supported_assets(
         }
     }
     Ok(())
+}
+
+/// Checks the things only a bot with a filler key can check (spec §6):
+/// that the filler account exists, that it holds `XLM_FEE_RESERVE` of the
+/// network's native asset, and — armed — that it holds at least
+/// `min_primary_collateral` of each pool's primary asset.
+///
+/// The first two are failures when armed and warnings in dry-run: an
+/// account that does not exist can sign nothing, and a wallet below the
+/// fee reserve has nothing left to spend once fees are held back, so an
+/// armed bot in either state would fill nothing while reporting itself
+/// live. A dry run is allowed both, because it submits nothing either way
+/// and refusing to start would make `DRY_RUN=true` harder to run than
+/// live trading.
+///
+/// The third is a warning whether armed or not: too little primary
+/// collateral caps how much the filler can take, it does not stop it from
+/// taking anything, and the floor is an operator's own target rather than
+/// a chain constraint.
+///
+/// With no filler key there is nothing to check and one warning to make:
+/// the filler still plans, against an empty wallet and without simulating
+/// (ruling 4). `Args::signing_keys` refuses an armed bot with no filler
+/// key, so that path is a dry run's.
+///
+/// # Errors
+///
+/// [`LiquidatorError::Config`] for a refusal an operator fixes, and
+/// [`LiquidatorError::Chain`] for any other failure of the reads
+/// themselves — a validation that cannot read the chain has not passed.
+async fn validate_filler(
+    rpc: &RpcClient,
+    config: &ServiceConfig,
+    signing: &SigningContext,
+) -> Result<Vec<String>, LiquidatorError> {
+    let mut warnings = Vec::new();
+    let Some(signer) = signing.signers.filler.as_ref() else {
+        warnings.push(
+            "no FILLER_SECRET_KEY: the filler plans against an empty inventory and simulates \
+             nothing"
+                .to_owned(),
+        );
+        return Ok(warnings);
+    };
+    let address = signer.address();
+    let armed = !config.dry_run;
+    let refuse_or_warn = |warnings: &mut Vec<String>, message: String| {
+        if armed {
+            return Err(LiquidatorError::Config(message));
+        }
+        warnings.push(message);
+        Ok(())
+    };
+
+    match rpc.account(address).await {
+        Ok(_) => {}
+        Err(ChainError::NoAccount(_)) => {
+            refuse_or_warn(
+                &mut warnings,
+                format!(
+                    "the filler account {address} does not exist on this network: it must be \
+                     funded before it can sign, hold collateral or pay a fee"
+                ),
+            )?;
+            // Nothing further is true of an account that is not there, and
+            // every read below would only report the same absence again.
+            return Ok(warnings);
+        }
+        Err(error) => return Err(LiquidatorError::Chain(error)),
+    }
+
+    // Any configured pool serves: `balance` is a view call on the *token*
+    // contract, and the pool is only what the reader happens to be
+    // addressed with. `parse_pools` refuses a configuration with no pool
+    // at all, so the `else` is only ever reached by a hand-built one — and
+    // a bot with nothing to follow has no wallet to check.
+    let Some(any_pool) = config.pools.first() else {
+        return Ok(warnings);
+    };
+    let (_, native_balance) = PoolReader::new(rpc, &any_pool.address)
+        .balance(&signing.native_asset, address)
+        .await?;
+    if native_balance < i128::from(config.xlm_fee_reserve) {
+        refuse_or_warn(
+            &mut warnings,
+            format!(
+                "the filler account {address} holds {native_balance} stroops of the native \
+                 asset, below the {} stroops XLM_FEE_RESERVE asks for (XLM_FEE_RESERVE is set \
+                 in decimal XLM, i.e. XLM_FEE_RESERVE × 10^7 stroops): it could not pay for \
+                 the fills it plans",
+                config.xlm_fee_reserve
+            ),
+        )?;
+    }
+
+    // Only armed: a dry run plans against whatever the wallet holds and
+    // fills nothing, so a pool-by-pool snapshot read per startup would buy
+    // nothing but round trips.
+    if !armed {
+        return Ok(warnings);
+    }
+    for pool in &config.pools {
+        let snapshot = PoolReader::new(rpc, &pool.address)
+            .snapshot(std::slice::from_ref(&address))
+            .await?;
+        match filler_primary_collateral(&snapshot, address, &pool.primary_asset) {
+            // The subtraction cannot go negative or overflow: the guard
+            // gives `held < min_primary_collateral`, `held` is
+            // non-negative because it is a b-token balance through
+            // `to_asset_from_b_token`, and `parse_pools` refuses a
+            // negative `min_primary_collateral` — so the difference lies
+            // in `1..=min_primary_collateral`.
+            Ok(held) if held < pool.min_primary_collateral => warnings.push(format!(
+                "pool {}: the filler holds {held} of its primary asset {}, {} short of \
+                 min_primary_collateral ({})",
+                pool.address,
+                pool.primary_asset,
+                pool.min_primary_collateral - held,
+                pool.min_primary_collateral
+            )),
+            Ok(_) => {}
+            Err(error) => warnings.push(format!(
+                "pool {}: the filler's primary collateral could not be valued: {error}",
+                pool.address
+            )),
+        }
+    }
+    Ok(warnings)
+}
+
+/// How much of `asset` the filler holds as collateral in `snapshot`, in
+/// the asset's own units.
+///
+/// The b-tokens are converted at the rate the snapshot was **read** with
+/// rather than one accrued to a close time, because this answers a
+/// startup question — is the wallet within an order of magnitude of the
+/// floor an operator set — and not a question any fill is planned against.
+/// Zero when the pool holds no position for this account, or does not list
+/// the asset at all: `validate` has already refused a primary asset that
+/// is not a reserve.
+fn filler_primary_collateral(
+    snapshot: &PoolSnapshot,
+    filler: &str,
+    asset: &str,
+) -> Result<i128, crate::math::MathError> {
+    let Some(index) = snapshot.asset_index.get(asset) else {
+        return Ok(0);
+    };
+    let Some(reserve) = snapshot.reserves.get(index) else {
+        return Ok(0);
+    };
+    let b_tokens = snapshot
+        .positions
+        .get(filler)
+        .and_then(|positions| positions.collateral.get(index))
+        .copied()
+        .unwrap_or(0);
+    reserve.to_asset_from_b_token(b_tokens)
 }
 
 /// Logs the redacted configuration, the per-pool validation and every
@@ -826,6 +1006,48 @@ fn auctioneer_cadence_from(config: &ServiceConfig) -> AuctioneerCadence {
     }
 }
 
+/// Reads [`AuctioneerConfig`] out of the resolved configuration and the
+/// keys this process holds. `own_addresses` is every one of them, never
+/// just the signing role's: see [`SigningContext`].
+fn auctioneer_config_from(config: &ServiceConfig, signing: &SigningContext) -> AuctioneerConfig {
+    AuctioneerConfig {
+        liquidation_health_factor: config.liquidation_health_factor,
+        target_health_factor: config.target_health_factor,
+        plan_iterations: config.plan_iterations,
+        dry_run: config.dry_run,
+        own_addresses: signing.own_addresses(),
+    }
+}
+
+/// The same for [`FillerConfig`], whose `native_asset` comes from the
+/// network rather than the configuration: it is what pays the fees
+/// `XLM_FEE_RESERVE` holds back for.
+fn filler_config_from(config: &ServiceConfig, signing: &SigningContext) -> FillerConfig {
+    FillerConfig {
+        dry_run: config.dry_run,
+        own_addresses: signing.own_addresses(),
+        hf_safety_multiplier: config.hf_safety_multiplier,
+        plan_iterations: config.plan_iterations,
+        replan_ledgers: config.replan_ledgers,
+        replan_near_ledgers: config.replan_near_ledgers,
+        high_fee_profit_threshold: config.high_fee_profit_threshold,
+        inventory_refresh: config.inventory_refresh,
+        native_asset: signing.native_asset.clone(),
+    }
+}
+
+/// The tracker's own cadence, whose full-scan phase is drawn separately
+/// from the auctioneer's on the same knob — see [`AuctioneerCadence`].
+fn tracker_cadence_from(config: &ServiceConfig) -> Cadence {
+    Cadence {
+        user_refresh_ledgers: config.user_refresh_ledgers,
+        refresh_batch: config.refresh_batch,
+        full_scan_ledgers: config.full_scan_ledgers,
+        scan_health_factor: config.scan_health_factor,
+        phase: scan_phase(config.full_scan_ledgers),
+    }
+}
+
 /// Pages every one of `pool`'s borrowers below `threshold` and flags each
 /// for an auctioneer decision. This is the full scan's whole job — making
 /// sure nothing below the threshold stays un-flagged — never to decide
@@ -1102,19 +1324,28 @@ async fn move_flag_forward(
     Ok(ledger)
 }
 
-/// Mutable state the auctioneer task carries from one tick to the next:
-/// where the startup delay is measured from and whether it has elapsed,
-/// and each pool's oracle-scan and full-scan cadence state. Bundled into
-/// one struct, rather than five `&mut` parameters on [`auctioneer_tick`],
-/// for the same reason [`LoopState`] exists for the tracker.
-#[derive(Debug, Default)]
-struct AuctioneerState {
-    /// Each pool's oracle-scan reference prices.
-    price_watches: BTreeMap<String, PriceWatch>,
-    /// The ledger each pool's oracle scan last fired at.
-    last_oracle_scan: BTreeMap<String, u32>,
-    /// The ledger each pool's full scan last fired at.
-    last_full_scan: BTreeMap<String, u32>,
+/// The two role names a [`StartupGate`] logs under, so the one "startup
+/// delay has elapsed" line each task prints says which of them unlocked.
+const AUCTIONEER_ROLE: &str = "auctioneer";
+/// The filler's, for the same line.
+const FILLER_ROLE: &str = "filler";
+
+/// One task's share of `STARTUP_DELAY_LEDGERS`: whether the chain has
+/// moved far enough past the first tick this task saw for it to be
+/// allowed to submit anything.
+///
+/// One per task, never shared: the auctioneer and the filler each start
+/// at whatever tick they first observe, each answers for its own key, and
+/// a gate shared between them would have one task's first tick decide
+/// when the other may spend. Each therefore carries the role it logs
+/// under, so the two unlock lines are told apart rather than read as one
+/// line printed twice.
+///
+/// No `Default`: a gate with no role would log an unnamed one, and the
+/// whole point of the field is that it is set deliberately at each of the
+/// two construction sites.
+#[derive(Debug)]
+struct StartupGate {
     /// The ledger of the first tick this task observed, which the startup
     /// delay is measured from. `None` until that first tick: there is no
     /// meaningful "how far has the chain moved" before one has arrived.
@@ -1131,11 +1362,85 @@ struct AuctioneerState {
     /// count would have a safety knob deliver a distance it never
     /// measured; the ledger is the chain's own.
     first_tick_ledger: Option<u32>,
-    /// Whether the chain has moved `startup_delay_ledgers` past
+    /// Whether the chain has moved `delay_ledgers` past
     /// `first_tick_ledger`. Latches `true` and stays there — the delay is
     /// measured from startup, never re-armed — so the "submissions are
-    /// now possible" log line fires at most once.
-    submissions_unlocked: bool,
+    /// now possible" log line fires at most once per task.
+    unlocked: bool,
+    /// Which task this gate belongs to, on that one log line. Two tasks
+    /// unlock independently and a line with no role would read as a
+    /// duplicate of the other's rather than as the second of two.
+    role: &'static str,
+}
+
+impl StartupGate {
+    /// A locked gate for `role`, which is what its one log line is named
+    /// with: [`AUCTIONEER_ROLE`] or [`FILLER_ROLE`].
+    fn new(role: &'static str) -> Self {
+        Self {
+            first_tick_ledger: None,
+            unlocked: false,
+            role,
+        }
+    }
+
+    /// Observes `tick` and answers whether this task may submit.
+    ///
+    /// The elapsed distance cannot underflow: the watch these tasks read
+    /// is monotonic — the tracker publishes through `send_if_modified`,
+    /// gated on a newer sequence, so a pool whose poller is a ledger or
+    /// two behind never moves it backwards — and the first tick seen is
+    /// therefore the smallest. It is written as a `saturating_sub` all the
+    /// same, so the arithmetic stays total and a later change to how ticks
+    /// are published cannot turn this line into a debug-build panic: a
+    /// saturated answer reads as "no ledgers have elapsed yet", which
+    /// keeps submissions locked — the safe direction.
+    fn observe(&mut self, tick: LedgerTick, delay_ledgers: u32) -> bool {
+        let first_ledger = *self.first_tick_ledger.get_or_insert(tick.sequence);
+        let elapsed = tick.sequence.saturating_sub(first_ledger);
+        if !self.unlocked && elapsed >= delay_ledgers {
+            self.unlocked = true;
+            tracing::info!(
+                role = self.role,
+                ledger = tick.sequence,
+                first_ledger,
+                elapsed,
+                "the startup delay has elapsed; submissions are now possible"
+            );
+        }
+        self.unlocked
+    }
+}
+
+/// Mutable state the auctioneer task carries from one tick to the next:
+/// its startup gate, and each pool's oracle-scan and full-scan cadence
+/// state. Bundled into one struct, rather than four `&mut` parameters on
+/// [`auctioneer_tick`], for the same reason [`LoopState`] exists for the
+/// tracker.
+#[derive(Debug)]
+struct AuctioneerState {
+    /// Each pool's oracle-scan reference prices.
+    price_watches: BTreeMap<String, PriceWatch>,
+    /// The ledger each pool's oracle scan last fired at.
+    last_oracle_scan: BTreeMap<String, u32>,
+    /// The ledger each pool's full scan last fired at.
+    last_full_scan: BTreeMap<String, u32>,
+    /// Whether this task may submit yet.
+    gate: StartupGate,
+}
+
+impl Default for AuctioneerState {
+    /// Every cadence map empty and the gate the auctioneer's own: only
+    /// this task ever builds one, and [`StartupGate`] has no `Default` of
+    /// its own precisely so the role cannot be left unset.
+    fn default() -> Self {
+        Self {
+            price_watches: BTreeMap::new(),
+            last_oracle_scan: BTreeMap::new(),
+            last_full_scan: BTreeMap::new(),
+            gate: StartupGate::new(AUCTIONEER_ROLE),
+        }
+    }
 }
 
 /// What one auctioneer task holds for its whole life: the pieces
@@ -1156,19 +1461,12 @@ struct AuctioneerContext<'a> {
 /// each pool's currently flagged users, and fire the oracle-scan and
 /// full-scan-and-flag cadences when due.
 ///
-/// `state.submissions_unlocked` gates whether `ctx.submission_queue` is
-/// actually handed to [`recheck_batch`] (`None` until the chain has moved
+/// `state.gate` decides whether `ctx.submission_queue` is actually handed
+/// to [`recheck_batch`] (`None` until the chain has moved
 /// `startup_delay_ledgers` past the first tick this task saw, regardless
 /// of whether the queue itself exists — i.e. regardless of dry-run or
-/// armed) or passed through unchanged after it has. The elapsed distance
-/// cannot underflow: the watch this task reads is monotonic — the tracker
-/// publishes through `send_if_modified`, gated on a newer sequence, so a
-/// pool whose poller is a ledger or two behind never moves it backwards —
-/// and the first tick seen is therefore the smallest. It is written as a
-/// `saturating_sub` all the same, so the arithmetic stays total and a
-/// later change to how ticks are published cannot turn this line into a
-/// debug-build panic: a saturated answer reads as "no ledgers have
-/// elapsed yet", which keeps submissions locked — the safe direction.
+/// armed) or passed through unchanged after it has; see
+/// [`StartupGate::observe`].
 ///
 /// A [`StoreError`] is fatal, exactly as it is in [`tracker_loop`]:
 /// without a trustworthy store there is no way to know who is flagged or
@@ -1182,18 +1480,7 @@ async fn auctioneer_tick(
     tick: LedgerTick,
     state: &mut AuctioneerState,
 ) -> Result<(), LiquidatorError> {
-    let first_ledger = *state.first_tick_ledger.get_or_insert(tick.sequence);
-    let elapsed = tick.sequence.saturating_sub(first_ledger);
-    if !state.submissions_unlocked && elapsed >= ctx.cadence.startup_delay_ledgers {
-        state.submissions_unlocked = true;
-        tracing::info!(
-            ledger = tick.sequence,
-            first_ledger,
-            elapsed,
-            "the startup delay has elapsed; submissions are now possible"
-        );
-    }
-    let submit = if state.submissions_unlocked {
+    let submit = if state.gate.observe(tick, ctx.cadence.startup_delay_ledgers) {
         ctx.submission_queue
     } else {
         None
@@ -1315,6 +1602,68 @@ async fn auctioneer_loop(
     Ok(())
 }
 
+/// Runs [`Filler::tick`] off the same tick the tracker publishes after it
+/// has acknowledged one.
+///
+/// [`auctioneer_loop`]'s shape, and a separate task for the same reason
+/// (see the module doc's wiring note): a fill is not a stored effect of a
+/// ledger, so nothing here is upstream of a tick's acknowledgement and a
+/// slow or failing pass falls behind the newest ledger rather than
+/// blocking, delaying or failing it. It is fed by the watch, never by the
+/// poller channel the cursor rests on. `changed()` returning an error
+/// means every sender has dropped — the tracker task is gone — and this
+/// loop then has nothing further to do.
+///
+/// Its own [`StartupGate`] decides `execute`: inside the delay the filler
+/// still plans every auction, and records and submits nothing (ruling 9).
+///
+/// # Errors
+///
+/// [`crate::filler::FillerError::Store`] only, which ends this task — as
+/// a store failure ends the tracker's and the auctioneer's, for the same
+/// reason: the bot cannot trust what it read about which auctions are
+/// open. [`drain_tasks`] turns that into a shutdown like any other.
+async fn filler_loop(
+    filler: &Filler<'_>,
+    startup_delay_ledgers: u32,
+    queue: Option<&SubmissionQueue>,
+    mut tick_rx: watch::Receiver<LedgerTick>,
+    shutdown: &watch::Receiver<bool>,
+) -> Result<(), LiquidatorError> {
+    let mut state = FillerState::default();
+    let mut gate = StartupGate::new(FILLER_ROLE);
+    while tick_rx.changed().await.is_ok() {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        let tick = *tick_rx.borrow_and_update();
+        let execute = gate.observe(tick, startup_delay_ledgers);
+        let summary = filler
+            .tick(&mut state, tick, execute, queue, shutdown)
+            .await?;
+        // A tick that did nothing is the ordinary one — most ledgers hold
+        // no open auction worth planning — so it stays at debug and only
+        // a tick that moved something is worth a line per ledger.
+        if summary.planned == 0 && summary.executed == 0 && summary.closed == 0 {
+            tracing::debug!(
+                ledger = tick.sequence,
+                skipped = summary.skipped,
+                "filler tick"
+            );
+        } else {
+            tracing::info!(
+                ledger = tick.sequence,
+                planned = summary.planned,
+                executed = summary.executed,
+                skipped = summary.skipped,
+                closed = summary.closed,
+                "filler tick"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Waits for one shutdown request: `ctrl_c`, or on Unix `SIGTERM` too.
 /// Neither failing to install `SIGTERM`'s handler nor `ctrl_c` itself
 /// erroring is treated as a shutdown: both are exceedingly rare, and the
@@ -1380,36 +1729,53 @@ fn spawn_shutdown_listener(shutdown: Arc<watch::Sender<bool>>) {
     });
 }
 
-/// What signs a transaction, shared by the submission queue's own task and
-/// the auctioneer's — whenever a key is configured at all, dry-run
-/// included, since `Auctioneer` still simulates with no intent to submit
-/// (see its own doc). `Signer` is deliberately not `Clone` — it holds key
-/// material — so an `Arc` is what lets both tasks borrow the one key
-/// without duplicating it in memory.
+/// What signs a transaction, shared by the submission queues' own tasks
+/// and by the auctioneer's and the filler's — each holding a key whenever
+/// one is configured at all, dry-run included, since both still simulate
+/// with no intent to submit (see their own docs). `Signer` is deliberately
+/// not `Clone` — it holds key material — so an `Arc` is what lets several
+/// tasks borrow the one key without duplicating it in memory, and what
+/// lets [`Signers::shared`] tell "both roles fell back to one key" from
+/// "two keys that happen to be configured" by pointer.
 ///
 /// `own_addresses` is computed from **every** key the process was given,
-/// not from the one that signs: with `AUCTIONEER_SECRET_KEY` and
-/// `FILLER_SECRET_KEY` set to different keys only the auctioneer's signs,
-/// and deriving the set from `signer` alone would leave the filler's own
-/// position a borrower the auctioneer is willing to liquidate. It is
-/// therefore taken from [`SigningKeys::own_addresses`] before the choice of
-/// signer collapses the two.
+/// not from the one that signs a given role: with `AUCTIONEER_SECRET_KEY`
+/// and `FILLER_SECRET_KEY` set to different keys, deriving the set from
+/// the auctioneer's alone would leave the filler's own position a borrower
+/// the auctioneer is willing to liquidate. It is therefore taken from
+/// [`SigningKeys::own_addresses`] before [`SigningKeys::into_signers`]
+/// consumes the keys.
+///
+/// `native_asset` is the network's own — derived from the passphrase, not
+/// configured — because it is what pays every fee, and so what
+/// `XLM_FEE_RESERVE` is withheld from.
 struct SigningContext {
     network: Network,
     tx_config: TxConfig,
-    signer: Option<Arc<Signer>>,
+    signers: Signers,
     own_addresses: BTreeSet<String>,
+    native_asset: String,
 }
 
 impl SigningContext {
-    fn from_config(config: &ServiceConfig, keys: SigningKeys) -> Self {
+    /// # Errors
+    ///
+    /// [`LiquidatorError::Chain`] when the network's native asset contract
+    /// cannot be derived, which is an XDR failure rather than anything an
+    /// operator configured.
+    fn from_config(config: &ServiceConfig, keys: SigningKeys) -> Result<Self, LiquidatorError> {
+        // Before `into_signers`, which consumes the keys and collapses the
+        // auctioneer's onto the filler's when only one is configured.
         let own_addresses = keys.own_addresses();
-        Self {
-            network: Network::from_config(&config.chain),
+        let network = Network::from_config(&config.chain);
+        let native_asset = network.native_asset_contract()?;
+        Ok(Self {
+            network,
             tx_config: TxConfig::from_config(&config.chain),
-            signer: keys.into_auctioneer_signer().map(Arc::new),
+            signers: keys.into_signers(),
             own_addresses,
-        }
+            native_asset,
+        })
     }
 
     /// Every account this bot holds a key for, the filler's included —
@@ -1448,31 +1814,89 @@ fn spawn_pollers(
     }
 }
 
-/// Builds and spawns the submission queue's worker when armed — `!dry_run`
-/// and a signer configured, the one gate into live trading `DRY_RUN`'s
-/// default makes safe — and returns the queue handle for the auctioneer to
-/// submit through. `None` otherwise: the ordinary dry-run deployment, or a
-/// live one with no key to sign with.
-fn spawn_submission_queue(
+/// The submission queues one run holds: the handle each role submits
+/// through, or `None` when that role submits nothing.
+///
+/// The two fields are the *same* queue whenever the two roles hold the one
+/// key — see [`spawn_queues`] — and that is the point of the type: a role
+/// never learns which, and never needs to.
+struct Queues {
+    /// Where [`Auctioneer::act`] submits an auction creation.
+    auctioneer: Option<SubmissionQueue>,
+    /// Where the filler's [`Executor`] submits a fill.
+    filler: Option<SubmissionQueue>,
+}
+
+/// Builds and spawns one queue worker per **distinct** signing key when
+/// armed — `!dry_run`, the one gate into live trading `DRY_RUN`'s default
+/// makes safe — and returns the handles each role submits through.
+///
+/// One worker per key, and never two: a Soroban transaction is built
+/// against its source account's sequence number at prepare time, so two
+/// workers on one key would race to consume it. So the filler's key gets a
+/// worker, and the auctioneer either shares that worker's queue — when
+/// [`SigningKeys::into_signers`]' fallback gave both roles the one `Arc`,
+/// which [`Signers::shared`] tells by pointer — or gets a worker of its
+/// own for its own key.
+///
+/// A dry run gets neither worker nor handle: nothing is submitted, so
+/// there is nothing to order.
+fn spawn_queues(
     tasks: &mut JoinSet<Result<(), LiquidatorError>>,
     rpc: &RpcClient,
     signing: &SigningContext,
     dry_run: bool,
     shutdown: &watch::Receiver<bool>,
-) -> Option<SubmissionQueue> {
-    let (false, Some(signer)) = (dry_run, signing.signer.as_ref()) else {
-        if !dry_run {
-            // `main` has already warned `LIVE`, on `DRY_RUN` alone. Arming
-            // needs both halves, and a bot that says LIVE and then only ever
-            // simulates is the silent direction this repository logs loudly
-            // against everywhere else.
-            tracing::warn!(
-                "DRY_RUN=false, but no signing key is configured: nothing will be submitted \
-                 until AUCTIONEER_SECRET_KEY or FILLER_SECRET_KEY is set"
-            );
-        }
-        return None;
+) -> Queues {
+    let none = Queues {
+        auctioneer: None,
+        filler: None,
     };
+    if dry_run {
+        return none;
+    }
+    if signing.signers.auctioneer.is_none() && signing.signers.filler.is_none() {
+        // `main` has already warned `LIVE`, on `DRY_RUN` alone. Arming
+        // needs both halves, and a bot that says LIVE and then only ever
+        // simulates is the silent direction this repository logs loudly
+        // against everywhere else. `Args::signing_keys` refuses
+        // `DRY_RUN=false` with no `FILLER_SECRET_KEY`, so this is
+        // unreachable from `main`; it stays because that refusal should
+        // not be the only thing standing between an armed bot and
+        // silence.
+        tracing::warn!(
+            "DRY_RUN=false, but no signing key is configured: nothing will be submitted \
+             until AUCTIONEER_SECRET_KEY or FILLER_SECRET_KEY is set"
+        );
+        return none;
+    }
+    let filler = signing
+        .signers
+        .filler
+        .as_ref()
+        .map(|signer| spawn_queue_worker(tasks, rpc, signing, signer, shutdown));
+    let auctioneer = if signing.signers.shared() {
+        filler.clone()
+    } else {
+        signing
+            .signers
+            .auctioneer
+            .as_ref()
+            .map(|signer| spawn_queue_worker(tasks, rpc, signing, signer, shutdown))
+    };
+    Queues { auctioneer, filler }
+}
+
+/// One ordered worker for one key: its own [`Submitter`] over an
+/// `Arc::clone` of `signer`, draining its queue until every handle has
+/// dropped or shutdown is raised.
+fn spawn_queue_worker(
+    tasks: &mut JoinSet<Result<(), LiquidatorError>>,
+    rpc: &RpcClient,
+    signing: &SigningContext,
+    signer: &Arc<Signer>,
+    shutdown: &watch::Receiver<bool>,
+) -> SubmissionQueue {
     let signer = Arc::clone(signer);
     let rpc = rpc.clone();
     let network = signing.network.clone();
@@ -1484,7 +1908,7 @@ fn spawn_submission_queue(
         run_queue(&submitter, queue_rx, &shutdown).await;
         Ok(())
     });
-    Some(queue)
+    queue
 }
 
 /// Spawns the auctioneer task: builds its own [`Auctioneer`] — with a
@@ -1508,7 +1932,7 @@ fn spawn_auctioneer(
     let store = store.clone();
     let network = signing.network.clone();
     let tx_config = signing.tx_config;
-    let signer = signing.signer.clone();
+    let signer = signing.signers.auctioneer.clone();
     let shutdown = shutdown.clone();
     tasks.spawn(async move {
         let submitter = signer
@@ -1521,6 +1945,52 @@ fn spawn_auctioneer(
             &auctioneer,
             cadence,
             submission_queue.as_ref(),
+            tick_rx,
+            &shutdown,
+        )
+        .await
+    });
+}
+
+/// Spawns the filler task, beside the auctioneer and on the same watch:
+/// builds its own [`Submitter`] whenever a filler key is configured at all
+/// — dry-run included, since a dry run with a key simulates every fill it
+/// plans — its [`Executor`] over that, an [`Inventory`] withholding
+/// `xlm_fee_reserve` of the network's native asset, and runs
+/// [`filler_loop`] off `tick_rx` until the tracker task's sender drops.
+#[allow(clippy::too_many_arguments)]
+fn spawn_filler(
+    tasks: &mut JoinSet<Result<(), LiquidatorError>>,
+    rpc: &RpcClient,
+    store: &Store,
+    signing: &SigningContext,
+    config: FillerConfig,
+    pools: Vec<PoolConfig>,
+    xlm_fee_reserve: u64,
+    startup_delay_ledgers: u32,
+    queue: Option<SubmissionQueue>,
+    tick_rx: watch::Receiver<LedgerTick>,
+    shutdown: &watch::Receiver<bool>,
+) {
+    let rpc = rpc.clone();
+    let store = store.clone();
+    let network = signing.network.clone();
+    let tx_config = signing.tx_config;
+    let signer = signing.signers.filler.clone();
+    let native_asset = signing.native_asset.clone();
+    let shutdown = shutdown.clone();
+    tasks.spawn(async move {
+        let dry_run = config.dry_run;
+        let submitter = signer
+            .as_deref()
+            .map(|signer| Submitter::new(&rpc, &network, signer, tx_config));
+        let executor = Executor::new(&store, submitter, dry_run);
+        let inventory = Inventory::new(native_asset, xlm_fee_reserve);
+        let filler = Filler::new(&rpc, &store, &pools, config, executor, inventory);
+        filler_loop(
+            &filler,
+            startup_delay_ledgers,
+            queue.as_ref(),
             tick_rx,
             &shutdown,
         )
@@ -1588,7 +2058,14 @@ impl Service {
     /// form, the per-pool validation and every warning as it goes. Returns
     /// the warnings for a caller that wants them without re-reading logs;
     /// an `Err` is a failed validation, never a warning.
-    pub async fn check_config(config: &ServiceConfig) -> Result<Vec<String>, LiquidatorError> {
+    ///
+    /// `keys` is taken because `validate_filler` is part of what this
+    /// checks: a deploy smoke test that never looked at the filler account
+    /// would pass on a configuration `run` refuses a moment later.
+    pub async fn check_config(
+        config: &ServiceConfig,
+        keys: SigningKeys,
+    ) -> Result<Vec<String>, LiquidatorError> {
         // Spec §10 makes this a deploy smoke test "against chain **and the
         // database**": a check that passes against an unreachable instance
         // or a wrong password is precisely the failure it exists to catch,
@@ -1603,7 +2080,9 @@ impl Service {
         );
 
         let rpc = RpcClient::from_config(&config.chain)?;
-        let (validations, warnings) = validate(&rpc, &config.pools).await?;
+        let (validations, mut warnings) = validate(&rpc, &config.pools).await?;
+        let signing = SigningContext::from_config(config, keys)?;
+        warnings.extend(validate_filler(&rpc, config, &signing).await?);
         log_validation(config, &validations, &warnings);
         Ok(warnings)
     }
@@ -1611,20 +2090,20 @@ impl Service {
     /// Connects and migrates the store, validates the configuration, seeds
     /// every pool that needs it, then follows every configured pool — one
     /// [`LedgerPoller`] per pool, one tracker task consuming their shared
-    /// channel, one auctioneer task fed by the tick the tracker publishes
-    /// after it acknowledges, and — only when armed and a signer is given —
-    /// one submission-queue worker for that signer's key — until a
-    /// shutdown signal arrives and every task has returned.
+    /// channel, one auctioneer task and one filler task, each fed by the
+    /// tick the tracker publishes after it acknowledges, and — only when
+    /// armed — one submission-queue worker per distinct signing key —
+    /// until a shutdown signal arrives and every task has returned.
     ///
     /// `keys` holds both of `AUCTIONEER_SECRET_KEY` and
     /// `FILLER_SECRET_KEY`, either or both of which may be absent — neither
     /// configured is the ordinary dry-run deployment; see
-    /// [`crate::config::Args::signing_keys`]. At most one of them signs
-    /// (the auctioneer's, else the filler's), but **both** addresses go
-    /// into the set the auctioneer refuses to act on. Whether a submission
-    /// is ever actually sent is `!config.dry_run && signer.is_some()` — the
-    /// one gate this crate has into live trading, per the safety invariant
-    /// that `DRY_RUN` defaults `true`.
+    /// [`crate::config::Args::signing_keys`]. The filler signs with its own
+    /// key and the auctioneer with its own or else the filler's, and
+    /// **both** addresses go into the set the auctioneer refuses to act on.
+    /// Whether a submission is ever actually sent is `!config.dry_run` and
+    /// a key for that role — the one gate this crate has into live
+    /// trading, per the safety invariant that `DRY_RUN` defaults `true`.
     pub async fn run(config: ServiceConfig, keys: SigningKeys) -> Result<(), LiquidatorError> {
         // Installed before anything that takes time. Seeding a busy pool
         // is tens of seconds of sequential round trips, and until this is
@@ -1641,7 +2120,12 @@ impl Service {
         store.migrate().await?;
 
         let rpc = RpcClient::from_config(&config.chain)?;
-        let (validations, warnings) = validate(&rpc, &config.pools).await?;
+        let (validations, mut warnings) = validate(&rpc, &config.pools).await?;
+        // Both validations run before anything is spawned or seeded: a
+        // configuration this bot will refuse should cost one round trip,
+        // not a full seed of every pool first.
+        let signing = SigningContext::from_config(&config, keys)?;
+        warnings.extend(validate_filler(&rpc, &config, &signing).await?);
         log_validation(&config, &validations, &warnings);
 
         let seed_sources = build_seed_sources(&config.seed)?;
@@ -1672,17 +2156,10 @@ impl Service {
         // `None`, once (and only once) every poller has stopped.
         drop(message_tx);
 
-        let signing = SigningContext::from_config(&config, keys);
-        let submission_queue =
-            spawn_submission_queue(&mut tasks, &rpc, &signing, config.dry_run, &shutdown_rx);
+        let queues = spawn_queues(&mut tasks, &rpc, &signing, config.dry_run, &shutdown_rx);
 
-        let auctioneer_config = AuctioneerConfig {
-            liquidation_health_factor: config.liquidation_health_factor,
-            target_health_factor: config.target_health_factor,
-            plan_iterations: config.plan_iterations,
-            dry_run: config.dry_run,
-            own_addresses: signing.own_addresses(),
-        };
+        let auctioneer_config = auctioneer_config_from(&config, &signing);
+        let filler_config = filler_config_from(&config, &signing);
         let auctioneer_cadence = auctioneer_cadence_from(&config);
         let pool_addresses: Vec<String> = config
             .pools
@@ -1690,11 +2167,12 @@ impl Service {
             .map(|pool| pool.address.clone())
             .collect();
 
-        // The auctioneer's own view of the tick, published by the tracker
-        // task only after it has acknowledged one (see `handle_message`'s
-        // `Tick` arm). The initial value is never observed as real: a
-        // `watch::Receiver` only wakes a waiter on a *change*, and this
-        // loop's first `changed()` is what it actually reads.
+        // The deciding tasks' own view of the tick, published by the
+        // tracker task only after it has acknowledged one (see
+        // `handle_message`'s `Tick` arm). The initial value is never
+        // observed as real: a `watch::Receiver` only wakes a waiter on a
+        // *change*, and each loop's first `changed()` is what it actually
+        // reads.
         let (tick_tx, tick_rx) = watch::channel(LedgerTick {
             sequence: 0,
             close_time: 0,
@@ -1707,18 +2185,25 @@ impl Service {
             auctioneer_config,
             auctioneer_cadence,
             pool_addresses,
-            submission_queue,
+            queues.auctioneer,
+            tick_rx.clone(),
+            &shutdown_rx,
+        );
+        spawn_filler(
+            &mut tasks,
+            &rpc,
+            &store,
+            &signing,
+            filler_config,
+            config.pools.clone(),
+            config.xlm_fee_reserve,
+            config.startup_delay_ledgers,
+            queues.filler,
             tick_rx,
             &shutdown_rx,
         );
 
-        let cadence = Cadence {
-            user_refresh_ledgers: config.user_refresh_ledgers,
-            refresh_batch: config.refresh_batch,
-            full_scan_ledgers: config.full_scan_ledgers,
-            scan_health_factor: config.scan_health_factor,
-            phase: scan_phase(config.full_scan_ledgers),
-        };
+        let cadence = tracker_cadence_from(&config);
         let state = LoopState {
             needs_reseed,
             ..LoopState::default()
@@ -1761,9 +2246,11 @@ mod tests {
     use crate::chain::xdr::keys;
     use crate::chain::xdr::{AuctionType, PoolEvent};
     use crate::chain::{TxHash, TxOutcome};
+    use crate::config::{ChainConfig, RunMode, Secret};
     use crate::fixture::{mainnet_fixed_v2, text};
     use crate::harness;
     use crate::math::AuctionData;
+    use crate::store::TrackedAuction;
     use std::collections::BTreeMap;
     use tokio::sync::oneshot;
     use wiremock::matchers::method;
@@ -4220,7 +4707,7 @@ mod tests {
             .await
             .expect("tick one");
         assert!(
-            !state.submissions_unlocked,
+            !state.gate.unlocked,
             "the first tick is still inside the delay"
         );
 
@@ -4265,10 +4752,7 @@ mod tests {
         auctioneer_tick(&ctx, tick_two, &mut state)
             .await
             .expect("tick two");
-        assert!(
-            state.submissions_unlocked,
-            "the second tick is past the delay"
-        );
+        assert!(state.gate.unlocked, "the second tick is past the delay");
 
         let recorded = sqlx::query!(
             "SELECT dry_run, tx_hash FROM creations WHERE pool = $1 AND account = $2 ORDER BY id",
@@ -4731,5 +5215,491 @@ mod tests {
             0,
             "a zero period has only one possible phase"
         );
+    }
+
+    /// The fixture pool's first reserve, which is also mainnet's native
+    /// asset contract: what [`Inventory`] withholds the fee reserve from
+    /// and what `validate_filler` reads the filler's balance of.
+    const XLM: &str = "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA";
+
+    /// The auction the two loop tests plan: 100,000 XLM of b-tokens
+    /// against 20,000,000,000 USDC d-tokens, the same one `filler.rs`'s
+    /// own tests use — a lot worth several times its bid, so every
+    /// decision here is about the loop rather than about the auction.
+    const FILLER_LOT: i128 = 1_000_000_000_000;
+    const FILLER_BID: i128 = 20_000_000_000;
+
+    /// A second key, distinct from [`test_signer`]'s. Ruling 2's two-key
+    /// case needs two addresses that are really different, and `Signers`
+    /// tells the shared case from the distinct one by `Arc` pointer.
+    fn filler_signer() -> Signer {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[11_u8; 32]);
+        let secret = stellar_strkey::ed25519::PrivateKey(key.to_bytes()).to_string();
+        Signer::from_secret(&secret).expect("signer")
+    }
+
+    /// A [`SigningContext`] built by hand, since the real one consumes a
+    /// [`SigningKeys`] whose fallback these tests need to vary
+    /// independently: `own_addresses` is derived from both roles exactly
+    /// as [`SigningKeys::own_addresses`] derives it.
+    fn signing_context(
+        auctioneer: Option<Arc<Signer>>,
+        filler: Option<Arc<Signer>>,
+    ) -> SigningContext {
+        let own_addresses = [auctioneer.as_deref(), filler.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(|signer| signer.address().to_string())
+            .collect();
+        SigningContext {
+            network: Network::testnet(),
+            tx_config: test_tx_config(),
+            signers: Signers { auctioneer, filler },
+            own_addresses,
+            native_asset: XLM.to_string(),
+        }
+    }
+
+    /// The fixture pool, taking every asset, with XLM as the primary
+    /// collateral `min_primary_collateral` is measured in.
+    fn filler_pool_config(min_primary_collateral: i128) -> PoolConfig {
+        PoolConfig {
+            address: harness::POOL.to_string(),
+            primary_asset: XLM.to_string(),
+            min_primary_collateral,
+            min_health_factor: 15_000_000,
+            default_profit_bps: 1_000,
+            force_fill: false,
+            supported_bid: vec!["*".to_string()],
+            supported_lot: vec!["*".to_string()],
+            profits: Vec::new(),
+        }
+    }
+
+    /// A whole [`ServiceConfig`], for the three `validate_filler` tests.
+    /// Only `pools`, `dry_run` and `xlm_fee_reserve` are ever read by it;
+    /// the rest is the design spec's defaults, and nothing here connects
+    /// to the database or the RPC URL it names.
+    fn filler_service_config(
+        pools: Vec<PoolConfig>,
+        dry_run: bool,
+        xlm_fee_reserve: u64,
+    ) -> ServiceConfig {
+        ServiceConfig {
+            chain: ChainConfig {
+                network_passphrase: "Test SDF Network ; September 2015".to_string(),
+                rpc_url: "http://127.0.0.1:1".to_string(),
+                rpc_api_key: None,
+                base_fee: 100,
+                high_fee: 200,
+                tx_poll_ledgers: 3,
+            },
+            database_url: Secret::new("postgres://unused"),
+            database_max_connections: 1,
+            pools,
+            run_mode: RunMode::Loop,
+            dry_run,
+            poll_interval: std::time::Duration::from_millis(1),
+            user_refresh_ledgers: 100,
+            refresh_batch: 10,
+            full_scan_ledgers: 100,
+            scan_health_factor: 11_000_000,
+            liquidation_health_factor: 9_980_000,
+            target_health_factor: 10_600_000,
+            oracle_scan_ledgers: 10,
+            price_delta_bps: 100,
+            plan_iterations: 5,
+            startup_delay_ledgers: 0,
+            seed: SeedConfig {
+                url: None,
+                health_factor_max: 20_000_000,
+                file: None,
+            },
+            hf_safety_multiplier: 11_000_000,
+            replan_ledgers: 10,
+            replan_near_ledgers: 5,
+            xlm_fee_reserve,
+            high_fee_profit_threshold: 1_000_000_000_000_000,
+            inventory_refresh: std::time::Duration::from_secs(30),
+        }
+    }
+
+    /// The keyless dry-run filler the two loop tests run: no signer, so
+    /// nothing is simulated and every `fills` row it writes is a dry-run
+    /// record.
+    fn filler_tick_config() -> FillerConfig {
+        FillerConfig {
+            dry_run: true,
+            own_addresses: BTreeSet::new(),
+            hf_safety_multiplier: 11_000_000,
+            plan_iterations: 5,
+            replan_ledgers: 10,
+            replan_near_ledgers: 5,
+            high_fee_profit_threshold: 1_000_000_000_000_000,
+            inventory_refresh: std::time::Duration::from_secs(30),
+            native_asset: XLM.to_string(),
+        }
+    }
+
+    /// The auction as the chain holds it, starting at `block`.
+    fn filler_auction(block: u32) -> AuctionData {
+        AuctionData {
+            bid: BTreeMap::from([(USDC.to_string(), FILLER_BID)]),
+            lot: BTreeMap::from([(XLM.to_string(), FILLER_LOT)]),
+            block,
+        }
+    }
+
+    /// The row the tracker would have written for it: no plan yet, and
+    /// the amounts the chain holds.
+    fn tracked_auction(account: &str, auction: &AuctionData) -> TrackedAuction {
+        TrackedAuction {
+            pool: harness::POOL.to_string(),
+            account: account.to_string(),
+            auction_type: AuctionType::UserLiquidation,
+            start_ledger: auction.block,
+            fill_ledger: None,
+            percent: None,
+            bid: auction.bid.clone(),
+            lot: auction.lot.clone(),
+            updated_ledger: auction.block,
+        }
+    }
+
+    /// Joins every queue worker `spawn_queues` started, asserting each
+    /// returned on its own rather than being aborted with the set.
+    async fn drain_queue_workers(mut tasks: JoinSet<Result<(), LiquidatorError>>) {
+        while let Some(outcome) = tasks.join_next().await {
+            outcome.expect("join").expect("the queue worker returned");
+        }
+    }
+
+    /// Ruling 2: one key, one queue. The fallback auctioneer shares the
+    /// filler's; two keys are two workers; a dry run starts none.
+    #[tokio::test]
+    async fn one_key_is_one_queue() {
+        let rpc = ScriptedRpc::start().await;
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let (_flag, shutdown) = watch::channel(false);
+
+        // One key in both roles — what `SigningKeys::into_signers` hands
+        // back when `AUCTIONEER_SECRET_KEY` is unset. One worker, and the
+        // auctioneer submits through the filler's own queue: a second
+        // queue on this key would prepare against the same sequence
+        // number.
+        let shared = Arc::new(test_signer());
+        let mut tasks = JoinSet::new();
+        let queues = spawn_queues(
+            &mut tasks,
+            &client,
+            &signing_context(Some(Arc::clone(&shared)), Some(shared)),
+            false,
+            &shutdown,
+        );
+        assert_eq!(tasks.len(), 1, "one key is one worker, never two");
+        assert!(
+            queues.auctioneer.is_some() && queues.filler.is_some(),
+            "both roles submit, through the one queue"
+        );
+        drop(queues);
+        drain_queue_workers(tasks).await;
+
+        // Two distinct keys: a worker each. Sharing one would serialise
+        // two sequence numbers that never race.
+        let mut tasks = JoinSet::new();
+        let queues = spawn_queues(
+            &mut tasks,
+            &client,
+            &signing_context(
+                Some(Arc::new(test_signer())),
+                Some(Arc::new(filler_signer())),
+            ),
+            false,
+            &shutdown,
+        );
+        assert_eq!(tasks.len(), 2, "two keys are two workers");
+        assert!(queues.auctioneer.is_some() && queues.filler.is_some());
+        drop(queues);
+        drain_queue_workers(tasks).await;
+
+        // Dry run: no worker, and no queue to hand either task — the
+        // safety invariant, asserted at the one place that could break it.
+        let mut tasks = JoinSet::new();
+        let queues = spawn_queues(
+            &mut tasks,
+            &client,
+            &signing_context(
+                Some(Arc::new(test_signer())),
+                Some(Arc::new(filler_signer())),
+            ),
+            true,
+            &shutdown,
+        );
+        assert_eq!(tasks.len(), 0, "a dry run spawns no submission worker");
+        assert!(queues.auctioneer.is_none() && queues.filler.is_none());
+
+        // Armed with no key at all: `Args::signing_keys` refuses this, so
+        // it is reachable only by hand — and it still starts nothing.
+        let mut tasks = JoinSet::new();
+        let queues = spawn_queues(
+            &mut tasks,
+            &client,
+            &signing_context(None, None),
+            false,
+            &shutdown,
+        );
+        assert_eq!(tasks.len(), 0, "no key is no worker");
+        assert!(queues.auctioneer.is_none() && queues.filler.is_none());
+    }
+
+    /// Spec §6: an armed filler whose account does not exist cannot start.
+    #[tokio::test]
+    async fn an_armed_filler_with_no_account_is_refused() {
+        let signer = Arc::new(filler_signer());
+        let address = signer.address().to_string();
+        let pools = vec![filler_pool_config(0)];
+        let rpc = ScriptedRpc::start().await;
+        // One account read per call below, both answering no entry —
+        // which is exactly what an unfunded account looks like.
+        for _ in 0..2 {
+            rpc.expect(
+                "getLedgerEntries",
+                json!({"latestLedger": 1_u32, "entries": []}),
+            );
+        }
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let signing = signing_context(Some(Arc::clone(&signer)), Some(signer));
+
+        let refused = validate_filler(
+            &client,
+            &filler_service_config(pools.clone(), false, 0),
+            &signing,
+        )
+        .await
+        .expect_err("an armed filler with no account cannot start");
+        assert!(
+            matches!(&refused, LiquidatorError::Config(message) if message.contains(&address)),
+            "the refusal names the account: {refused}"
+        );
+
+        let warnings = validate_filler(&client, &filler_service_config(pools, true, 0), &signing)
+            .await
+            .expect("a dry run reports it and carries on");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains(&address), "{warnings:?}");
+        assert_eq!(rpc.remaining(), 0);
+    }
+
+    /// Spec §6: nor can one without its fee reserve.
+    #[tokio::test]
+    async fn an_armed_filler_short_of_its_fee_reserve_is_refused() {
+        let signer = Arc::new(filler_signer());
+        let pools = vec![filler_pool_config(0)];
+        let reserve: u64 = 100_000_000;
+        let rpc = ScriptedRpc::start().await;
+        // The account exists; its native balance is one stroop short.
+        for _ in 0..2 {
+            script_account_entry(&rpc, &signer);
+            rpc.expect(
+                "simulateTransaction",
+                simulation(&scval_b64(&i128_val(i128::from(reserve) - 1)), 1),
+            );
+        }
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let signing = signing_context(Some(Arc::clone(&signer)), Some(signer));
+
+        let refused = validate_filler(
+            &client,
+            &filler_service_config(pools.clone(), false, reserve),
+            &signing,
+        )
+        .await
+        .expect_err("an armed filler below its fee reserve cannot start");
+        assert!(
+            matches!(&refused, LiquidatorError::Config(message)
+                if message.contains("XLM_FEE_RESERVE")),
+            "the refusal names the knob an operator sets: {refused}"
+        );
+
+        let warnings = validate_filler(
+            &client,
+            &filler_service_config(pools, true, reserve),
+            &signing,
+        )
+        .await
+        .expect("a dry run reports it and carries on");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("XLM_FEE_RESERVE"), "{warnings:?}");
+        assert_eq!(rpc.remaining(), 0);
+    }
+
+    /// Spec §6: short of a pool's primary floor is a warning, not a
+    /// refusal — the filler can still fill, it just cannot fill as much.
+    #[tokio::test]
+    async fn an_armed_filler_under_its_primary_floor_is_warned() {
+        let signer = Arc::new(filler_signer());
+        let floor: i128 = 1_000_000_000;
+        let pools = vec![filler_pool_config(floor)];
+        let rpc = ScriptedRpc::start().await;
+        script_account_entry(&rpc, &signer);
+        rpc.expect(
+            "simulateTransaction",
+            simulation(&scval_b64(&i128_val(100_000_000)), 1),
+        );
+        // The fixture's own pool, holding no position for this key at
+        // all: zero primary collateral, so the shortfall is the whole
+        // floor.
+        harness::script_snapshot(&rpc, &[]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let signing = signing_context(Some(Arc::clone(&signer)), Some(signer));
+
+        let warnings = validate_filler(
+            &client,
+            &filler_service_config(pools, false, 100_000_000),
+            &signing,
+        )
+        .await
+        .expect("a shortfall is a warning, not a refusal");
+
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains(harness::POOL) && warnings[0].contains(&floor.to_string()),
+            "the warning names the pool and the shortfall: {warnings:?}"
+        );
+        assert_eq!(rpc.remaining(), 0);
+    }
+
+    /// The filler runs off the tracker's published tick, like the
+    /// auctioneer: a due auction in the store becomes a `fills` row, and
+    /// the loop returns when the watch's sender drops.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_filler_runs_off_the_published_tick(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let auction = filler_auction(tick.sequence - 300);
+        store
+            .upsert_auction(&tracked_auction(harness::USER_ONE, &auction))
+            .await
+            .expect("seed the auction");
+        let rpc = ScriptedRpc::start().await;
+        harness::script_auction_entry(&rpc, harness::USER_ONE, &auction, tick.sequence);
+        harness::script_snapshot(&rpc, &[]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let pools = vec![filler_pool_config(0)];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            filler_tick_config(),
+            Executor::new(&store, None, true),
+            Inventory::new(XLM.to_string(), 0),
+        );
+        let (flag_tx, flag_rx) = watch::channel(false);
+        let (tick_tx, tick_rx) = watch::channel(LedgerTick {
+            sequence: 0,
+            close_time: 0,
+        });
+
+        let driver = async {
+            tick_tx.send(tick).expect("publish the tick");
+            let mut filled = false;
+            for _ in 0..200 {
+                let rows = sqlx::query!("SELECT count(*) AS n FROM fills")
+                    .fetch_one(store.pool())
+                    .await
+                    .expect("count the fills");
+                if rows.n == Some(1) {
+                    filled = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(filled, "the published tick never reached the filler");
+            flag_tx.send(true).expect("raise shutdown");
+            drop(tick_tx);
+        };
+        let (outcome, ()) = tokio::join!(filler_loop(&filler, 0, None, tick_rx, &flag_rx), driver);
+        outcome.expect("the loop returned when its sender dropped");
+
+        let fill = sqlx::query!("SELECT dry_run, tx_hash, fill_ledger, percent FROM fills")
+            .fetch_one(store.pool())
+            .await?;
+        assert!(fill.dry_run, "no key, and dry-run: nothing was sent");
+        assert_eq!(fill.tx_hash, None);
+        assert_eq!(
+            (fill.fill_ledger, fill.percent),
+            (i64::from(tick.sequence + 1), 100)
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// Ruling 9 through the loop: inside the startup delay the plan lands
+    /// on the row and nothing is recorded.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_filler_waits_out_the_startup_delay(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let auction = filler_auction(tick.sequence - 300);
+        store
+            .upsert_auction(&tracked_auction(harness::USER_ONE, &auction))
+            .await
+            .expect("seed the auction");
+        let rpc = ScriptedRpc::start().await;
+        harness::script_auction_entry(&rpc, harness::USER_ONE, &auction, tick.sequence);
+        harness::script_snapshot(&rpc, &[]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let pools = vec![filler_pool_config(0)];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            filler_tick_config(),
+            Executor::new(&store, None, true),
+            Inventory::new(XLM.to_string(), 0),
+        );
+        let (flag_tx, flag_rx) = watch::channel(false);
+        let (tick_tx, tick_rx) = watch::channel(LedgerTick {
+            sequence: 0,
+            close_time: 0,
+        });
+
+        let driver = async {
+            tick_tx.send(tick).expect("publish the tick");
+            let mut planned = None;
+            for _ in 0..200 {
+                planned = store
+                    .auction(
+                        harness::POOL,
+                        harness::USER_ONE,
+                        AuctionType::UserLiquidation,
+                    )
+                    .await
+                    .expect("read the auction row")
+                    .and_then(|row| row.fill_ledger);
+                if planned.is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                planned,
+                Some(tick.sequence + 1),
+                "the plan is made; the execution is what the startup delay holds back"
+            );
+            flag_tx.send(true).expect("raise shutdown");
+            drop(tick_tx);
+        };
+        // Five ledgers of delay against a single tick: `observe` can never
+        // unlock, so the loop plans and executes nothing.
+        let (outcome, ()) = tokio::join!(filler_loop(&filler, 5, None, tick_rx, &flag_rx), driver);
+        outcome.expect("the loop returned when its sender dropped");
+
+        let fills = sqlx::query!("SELECT count(*) AS n FROM fills")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(fills.n, Some(0), "nothing is recorded inside the delay");
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
     }
 }

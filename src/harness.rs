@@ -103,3 +103,77 @@ pub(crate) fn fixture_tick() -> crate::ledger::LedgerTick {
         close_time: fixture["ledger_close_time"].as_u64().expect("close time"),
     }
 }
+
+/// Scripts one `PoolReader::auction` read for `user`'s user-liquidation
+/// auction: a temporary-durability `ContractData` entry holding `auction`,
+/// reported at `ledger`. The entry's shape is the contract's own — a map
+/// of `bid`, `block` and `lot`, under the `("Auction", {auct_type, user})`
+/// key — so the read goes through the real decoder.
+pub(crate) fn script_auction_entry(
+    rpc: &ScriptedRpc,
+    user: &str,
+    auction: &crate::math::AuctionData,
+    ledger: u32,
+) {
+    script_auction_entry_in(rpc, POOL, user, auction, ledger);
+}
+
+/// The same, for a pool other than the fixture's — a second configured
+/// pool whose entries a test builds itself.
+pub(crate) fn script_auction_entry_in(
+    rpc: &ScriptedRpc,
+    pool: &str,
+    user: &str,
+    auction: &crate::math::AuctionData,
+    ledger: u32,
+) {
+    use crate::chain::xdr::encode::{address, i128_val, map, sc_address, symbol, vec as sc_vec};
+    use stellar_xdr::{
+        ContractDataDurability, ContractDataEntry, ExtensionPoint, LedgerEntryData, ScVal,
+    };
+
+    let side = |amounts: &std::collections::BTreeMap<String, i128>| {
+        map(amounts
+            .iter()
+            .map(|(asset, amount)| (address(asset).expect("asset address"), i128_val(*amount)))
+            .collect())
+        .expect("side map")
+    };
+    let value = map(vec![
+        (symbol("bid").expect("symbol"), side(&auction.bid)),
+        (symbol("block").expect("symbol"), ScVal::U32(auction.block)),
+        (symbol("lot").expect("symbol"), side(&auction.lot)),
+    ])
+    .expect("auction map");
+    let auction_key = map(vec![
+        (symbol("auct_type").expect("symbol"), ScVal::U32(0)),
+        (
+            symbol("user").expect("symbol"),
+            address(user).expect("user"),
+        ),
+    ])
+    .expect("auction key");
+    let data = LedgerEntryData::ContractData(ContractDataEntry {
+        ext: ExtensionPoint::V0,
+        contract: sc_address(pool).expect("pool address"),
+        key: sc_vec(vec![symbol("Auction").expect("symbol"), auction_key]).expect("key vec"),
+        durability: ContractDataDurability::Temporary,
+        val: value,
+    });
+    let key = keys::auction(pool, user, crate::chain::xdr::AuctionType::UserLiquidation)
+        .expect("auction key");
+    rpc.expect(
+        "getLedgerEntries",
+        json!({"latestLedger": ledger, "entries": [entry(&key, &to_base64(&data).expect("entry"))]}),
+    );
+}
+
+/// Scripts one `PoolReader::auction` read that finds nothing: the answer
+/// the RPC gives for a key with no entry, which is also what an expired
+/// temporary auction entry looks like.
+pub(crate) fn script_no_auction(rpc: &ScriptedRpc, ledger: u32) {
+    rpc.expect(
+        "getLedgerEntries",
+        json!({"latestLedger": ledger, "entries": []}),
+    );
+}

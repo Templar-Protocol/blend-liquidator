@@ -45,8 +45,10 @@ use crate::chain::{ChainError, TxHash, TxOutcome};
 use crate::ledger::LedgerTick;
 use crate::math::liquidation::{plan_liquidation, position_values, LiquidationPlan};
 use crate::math::{div_floor, mul_floor, MathError, OraclePrices, Reserve, SCALAR_7};
-use crate::queue::{QueueError, Submission, SubmissionQueue};
-use crate::store::{CreationKind, CreationRecord, Side, Store, StoreError, TrackedUser};
+use crate::queue::{QueueError, Submission, SubmissionQueue, CREATION_RETRIES};
+use crate::store::{
+    CreationKind, CreationRecord, Side, Store, StoreError, TrackedAuction, TrackedUser,
+};
 
 /// `PoolError::InvalidLiqTooLarge`: the liquidation would leave the
 /// borrower's health factor at or above `1.15`, so the percent is too high.
@@ -56,6 +58,13 @@ const INVALID_LIQ_TOO_LARGE: u32 = 1_213;
 /// borrower's health factor below `1.03`, so the percent is too low. The
 /// contract only raises this for a partial liquidation.
 const INVALID_LIQ_TOO_SMALL: u32 = 1_214;
+
+/// `PoolError::AuctionInProgress`: an auction for this user already exists.
+/// Unlike the other two, `accept_percent`'s catch-all refusal arm matches on
+/// this one deliberately — not to adjust the percent, but to adopt the
+/// auction the chain already holds, through [`Auctioneer::adopt`], before it
+/// answers `Refused`.
+const AUCTION_IN_PROGRESS: u32 = 1_212;
 
 /// Why a borrower was not acted on. Every skip is a decision, and a decision
 /// worth naming: an operator asking "why did nothing happen" is asking about
@@ -191,7 +200,7 @@ impl CreationOutcome {
     /// whatever became of it.
     #[must_use]
     pub fn tx_hash(&self) -> Option<TxHash> {
-        self.submission.as_ref().map(outcome_hash)
+        self.submission.as_ref().map(TxOutcome::hash)
     }
 
     /// Whether the chain applied it and it succeeded. `false` for a
@@ -473,53 +482,6 @@ pub struct Auctioneer<'a> {
     submitter: Option<Submitter<'a>>,
 }
 
-/// Accrues a clone of the snapshot's reserves to `close_time`, once for the
-/// whole batch.
-///
-/// `PoolSnapshot::reserves` is stored, not accrued. [`position_values`]
-/// needs the accrued numbers to price each position individually, the same
-/// instant [`PoolSnapshot::position_data`] accrues its own clone to for the
-/// health-factor gate — accruing a second time here, to the same
-/// `close_time`, is what keeps the two agreeing.
-///
-/// It saves the *second* such pass, and only for the users that turn out
-/// liquidatable, not the first: `decide_one` calls `position_data` for
-/// every borrower in the batch, and that clones and accrues the whole
-/// reserve map on each call. So the per-user accrual this hoists out is one
-/// of two, not one of one — worth doing, and worth not overstating.
-fn accrue_reserves(
-    snapshot: &PoolSnapshot,
-    close_time: u64,
-) -> Result<BTreeMap<u32, Reserve>, MathError> {
-    let mut reserves = snapshot.reserves.clone();
-    for reserve in reserves.values_mut() {
-        reserve.accrue(snapshot.instance.config.bstop_rate, close_time)?;
-    }
-    Ok(reserves)
-}
-
-/// The instant a batch is valued at: the later of the tick's close time and
-/// the newest reserve entry the snapshot holds.
-///
-/// `PoolReader::snapshot` reads at the RPC's head, which is at or past the
-/// tick the auctioneer was woken for, so on an active pool a reserve
-/// touched since that tick carries a `last_time` the tick's close time
-/// precedes — and `Reserve::accrue` refuses to run backwards rather than
-/// clamp. Valuing at the tick alone would fail the whole batch exactly when
-/// the pool is busy, which is exactly when the auctioneer is needed. This is
-/// the clamp `Tracker::refresh` applies for the same reason, and it must
-/// stay the same one: the position values fed to the selection and the
-/// health factor they are compared against both come from it.
-fn valued_at(snapshot: &PoolSnapshot, tick: LedgerTick) -> u64 {
-    snapshot
-        .reserves
-        .values()
-        .map(|reserve| reserve.data.last_time)
-        .max()
-        .unwrap_or(0)
-        .max(tick.close_time)
-}
-
 impl<'a> Auctioneer<'a> {
     /// An auctioneer reading through `rpc`, checking open auctions against
     /// `store`, judging against `config`, and — when `submitter` is given —
@@ -564,8 +526,8 @@ impl<'a> Auctioneer<'a> {
         }
         let accounts: Vec<&str> = users.iter().map(|user| user.account.as_str()).collect();
         let snapshot = PoolReader::new(self.rpc, pool).snapshot(&accounts).await?;
-        let valued_at = valued_at(&snapshot, tick);
-        let reserves = accrue_reserves(&snapshot, valued_at)?;
+        let valued_at = snapshot.valued_at(tick.close_time);
+        let reserves = snapshot.accrued_reserves(valued_at)?;
 
         let mut decisions = Vec::with_capacity(users.len());
         for user in users {
@@ -590,8 +552,8 @@ impl<'a> Auctioneer<'a> {
 
     /// One borrower's decision against an already-read `snapshot` and its
     /// already-accrued `reserves`, both at `valued_at` — the one instant
-    /// [`valued_at`] chose for the whole batch, which the position values
-    /// and the health factor must share. The six steps are the module's
+    /// [`PoolSnapshot::valued_at`] chose for the whole batch, which the
+    /// position values and the health factor must share. The six steps are the module's
     /// whole policy; see the module doc for why each exists.
     async fn decide_one(
         &self,
@@ -725,7 +687,8 @@ impl<'a> Auctioneer<'a> {
         // The other half of the same coupling: a queue means "send this",
         // and dry-run means nothing is sent, so the two cannot both be true
         // of one call. `Service::run` builds no queue at all in dry-run
-        // (`spawn_submission_queue` answers `None`), so this is unreachable
+        // (`spawn_queues` starts no worker and answers `None` for both
+        // roles), so this is unreachable
         // from the binary; it is refused here so that the public pieces
         // composed by hand cannot make a dry-run that submits — the silent
         // direction `DRY_RUN`'s strict parser exists to close.
@@ -906,25 +869,101 @@ impl<'a> Auctioneer<'a> {
                 operation,
                 priority: Priority::Normal,
                 label,
+                retries: CREATION_RETRIES,
             })
             .await?;
-        let hash = outcome_hash(&outcome).to_hex();
+        let hash = outcome.hash().to_hex();
         tracing::info!(
             creation_id,
             pool = %record.pool,
             account = %record.account,
             tx_hash = %hash,
-            status = outcome_status(&outcome),
+            status = outcome.status(),
             "creation submitted"
         );
         if !self.store.attach_creation_tx(creation_id, &hash).await? {
             tracing::warn!(
                 creation_id,
                 tx_hash = %hash,
-                "no creation row to attach this transaction to"
+                "no creation row to attach this transaction to, or the row already names one"
             );
         }
         Ok(outcome)
+    }
+
+    /// Writes the row for an auction the chain holds and the store does not —
+    /// one opened before this bot's events cursor, which no `NewAuction` ever
+    /// reached the tracker for. Without it the filler, which walks the store,
+    /// would never see the auction at all. The chain's entry is the row's
+    /// truth: bid, lot, and its block as the start ledger; no fill plan.
+    ///
+    /// A failed read is a warning: the borrower stays flagged and the next
+    /// pass tries again. A failed write is the store's, and fatal as always.
+    async fn adopt(&self, pool: &str, account: &str) -> Result<(), AuctioneerError> {
+        let read = PoolReader::new(self.rpc, pool)
+            .auction(account, AuctionType::UserLiquidation)
+            .await;
+        let (at, auction) = match read {
+            Ok(Some(found)) => found,
+            Ok(None) => {
+                tracing::debug!(
+                    pool,
+                    account,
+                    "no auction entry to adopt; it must have closed between the simulation \
+                     and this read"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                tracing::warn!(
+                    pool,
+                    account,
+                    %error,
+                    "could not read the auction to adopt; leaving the borrower flagged for \
+                     the next pass"
+                );
+                return Ok(());
+            }
+        };
+        self.store
+            .upsert_auction(&TrackedAuction {
+                pool: pool.to_string(),
+                account: account.to_string(),
+                auction_type: AuctionType::UserLiquidation,
+                start_ledger: auction.block,
+                fill_ledger: None,
+                percent: None,
+                bid: auction.bid,
+                lot: auction.lot,
+                updated_ledger: at,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Answers a refusal `accept_percent`'s walk does not adjust the percent
+    /// for. `AUCTION_IN_PROGRESS` is adopted first — see [`Self::adopt`] —
+    /// so a refusal naming an auction the chain already holds still leaves a
+    /// row for the filler, even though the answer below is the same
+    /// `Ok(None)` as any other refusal.
+    async fn refuse_percent(
+        &self,
+        pool: &str,
+        account: &str,
+        contract_error: Option<u32>,
+        message: &str,
+    ) -> Result<Option<(FillPercent, Operation, bool)>, AuctioneerError> {
+        if contract_error == Some(AUCTION_IN_PROGRESS) {
+            self.adopt(pool, account).await?;
+        }
+        tracing::debug!(
+            pool,
+            account,
+            contract_error,
+            %message,
+            "liquidation refused by simulation; skipping"
+        );
+        Ok(None)
     }
 
     /// Walks a liquidation plan's percent to one the contract accepts.
@@ -945,12 +984,15 @@ impl<'a> Auctioneer<'a> {
     /// can never wrap past `1..=100` and a percent that would leave that
     /// range ends the walk at once instead of retrying a value the contract
     /// could not possibly accept. Any other contract error ends the walk
-    /// immediately too: adjusting a percent against, say,
-    /// `AuctionInProgress` would be more round trips to learn what the first
-    /// one already said. The walk also ends, giving up, after
-    /// `plan_iterations` attempts — a contract that refuses forever must
-    /// cost this one borrower a bounded number of simulations, not the
-    /// batch's whole cadence.
+    /// immediately too: adjusting a percent against most of them would be
+    /// more round trips to learn what the first one already said.
+    /// `AuctionInProgress` (1212) is the one member of that catch-all this
+    /// loop treats specially — not by adjusting the percent, which would be
+    /// exactly as pointless, but by adopting the auction the chain already
+    /// holds (see `adopt`) before the walk ends the same way. The walk also
+    /// ends, giving up, after `plan_iterations` attempts — a contract that
+    /// refuses forever must cost this one borrower a bounded number of
+    /// simulations, not the batch's whole cadence.
     ///
     /// A simulation that comes back needing archived entries restored is
     /// none of those: it is not a judgment on the percent at all, so the
@@ -1041,14 +1083,9 @@ impl<'a> Auctioneer<'a> {
                     contract_error,
                     message,
                 } => {
-                    tracing::debug!(
-                        pool,
-                        account,
-                        contract_error,
-                        %message,
-                        "liquidation refused by simulation; skipping"
-                    );
-                    return Ok(None);
+                    return self
+                        .refuse_percent(pool, account, contract_error, &message)
+                        .await
                 }
                 Judgment::NeedsRestore => {
                     tracing::info!(
@@ -1150,30 +1187,6 @@ impl<'a> Auctioneer<'a> {
     }
 }
 
-/// What a submitted transaction's terminal state is called on a log line.
-/// A short label rather than `TxOutcome`'s `Debug`, whose `Failed` variant
-/// carries a whole decoded `TransactionResult`.
-fn outcome_status(outcome: &TxOutcome) -> &'static str {
-    match outcome {
-        TxOutcome::Succeeded { .. } => "succeeded",
-        TxOutcome::Failed { .. } => "failed",
-        TxOutcome::Expired { .. } => "expired",
-        TxOutcome::Unknown { .. } => "unknown",
-    }
-}
-
-/// The hash every [`TxOutcome`] variant carries, whatever the transaction's
-/// terminal state: even a failed, expired or unresolved transaction
-/// consumed a sequence number and is worth recording by its hash.
-fn outcome_hash(outcome: &TxOutcome) -> TxHash {
-    match outcome {
-        TxOutcome::Succeeded { hash, .. }
-        | TxOutcome::Failed { hash, .. }
-        | TxOutcome::Expired { hash, .. }
-        | TxOutcome::Unknown { hash, .. } => *hash,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -1181,15 +1194,15 @@ mod tests {
     use serde_json::{json, Value};
     use stellar_xdr::{
         ContractDataDurability, ContractDataEntry, ExtensionPoint, InvokeHostFunctionResult,
-        LedgerEntryData, LedgerKey, LedgerKeyAccount, OperationResult, OperationResultTr, ScVal,
-        TransactionResultResult, VecM,
+        LedgerEntryData, OperationResult, OperationResultTr, ScVal, TransactionResultResult, VecM,
     };
 
     use super::*;
     use crate::chain::rpc::RpcClient;
     use crate::chain::script::{
-        account_entry_b64, diagnostic_error_b64, meta_v4_b64, result_b64, scval_b64,
-        transaction_data_b64, ScriptedRpc,
+        diagnostic_error_b64, meta_v4_b64, result_b64, script_prepare_prelude,
+        script_simulate_accepted, script_simulate_needs_restore, script_simulate_prelude,
+        script_simulate_refused, ScriptedRpc,
     };
     use crate::chain::signer::{Network, Signer};
     use crate::chain::tx::TxConfig;
@@ -1201,7 +1214,7 @@ mod tests {
     use crate::fixture::{mainnet_fixed_v2, text};
     use crate::harness::{self, GOLDEN_HEALTH, POOL, USER_ONE, USER_TWO};
     use crate::math::liquidation::PositionValue;
-    use crate::math::PositionData;
+    use crate::math::{AuctionData, PositionData};
     use crate::queue::run_queue;
     use crate::store::TrackedAuction;
 
@@ -1213,13 +1226,6 @@ mod tests {
     /// A valid, distinct account strkey from `byte` alone — no real key
     /// behind it, and none needed: every test here only ever reads chain
     /// state through the scripted RPC, never signs anything.
-    /// `PoolError::AuctionInProgress`: an auction for this user already
-    /// exists. Named here rather than beside `INVALID_LIQ_TOO_LARGE` and
-    /// `INVALID_LIQ_TOO_SMALL` because nothing in `accept_percent` matches
-    /// on it — it is the "any other contract error" arm, and being neither
-    /// of those two is exactly what the tests using it assert.
-    const AUCTION_IN_PROGRESS: u32 = 1_212;
-
     fn synthetic_account(byte: u8) -> String {
         stellar_strkey::ed25519::PublicKey([byte; 32]).to_string()
     }
@@ -1528,82 +1534,6 @@ mod tests {
             wait_cap: std::time::Duration::from_millis(200),
             ..TxConfig::new(100, 200, 3)
         }
-    }
-
-    /// One `Submitter::simulate_only` attempt's prelude: the source
-    /// account's entry, and nothing else. A simulate-only call needs no fee
-    /// stats — it never assembles a transaction to pay for — so a test that
-    /// scripts one and sees it consumed would be scripting the signing path
-    /// by mistake.
-    fn script_simulate_prelude(rpc: &ScriptedRpc, signer: &Signer, sequence: i64, ledger: u32) {
-        let key = LedgerKey::Account(LedgerKeyAccount {
-            account_id: signer.account_id(),
-        });
-        rpc.expect(
-            "getLedgerEntries",
-            json!({"latestLedger": ledger, "entries": [
-                {"key": to_base64(&key).expect("key"),
-                 "xdr": account_entry_b64(signer.address(), sequence),
-                 "lastModifiedLedgerSeq": 1}
-            ]}),
-        );
-    }
-
-    /// One `Submitter::prepare` attempt's prelude: the account read above,
-    /// plus the fee stats a transaction that will actually be signed and
-    /// paid for needs. Only the queue's own submission path takes this
-    /// route.
-    fn script_prepare_prelude(rpc: &ScriptedRpc, signer: &Signer, sequence: i64, ledger: u32) {
-        script_simulate_prelude(rpc, signer, sequence, ledger);
-        rpc.expect(
-            "getFeeStats",
-            json!({"sorobanInclusionFee": {"p70": "100", "p90": "100"},
-                   "inclusionFee": {"p70": "100", "p90": "100"}, "latestLedger": ledger}),
-        );
-    }
-
-    /// The `simulateTransaction` answer for an attempt the contract accepts.
-    fn script_simulate_accepted(rpc: &ScriptedRpc, ledger: u32) {
-        rpc.expect(
-            "simulateTransaction",
-            json!({"transactionData": transaction_data_b64(10),
-                   "events": [],
-                   "minResourceFee": "10",
-                   "results": [{"auth": [], "xdr": scval_b64(&stellar_xdr::ScVal::Void)}],
-                   "latestLedger": ledger}),
-        );
-    }
-
-    /// The `simulateTransaction` answer for an attempt the contract refuses
-    /// with `code`, both in the diagnostic events and the error message —
-    /// exactly the two places `contract_error_in_events` and
-    /// `contract_error_in_message` read it from.
-    fn script_simulate_refused(rpc: &ScriptedRpc, code: u32, ledger: u32) {
-        rpc.expect(
-            "simulateTransaction",
-            json!({"error": format!("HostError: Error(Contract, #{code})"),
-                   "events": [diagnostic_error_b64(code)],
-                   "latestLedger": ledger}),
-        );
-    }
-
-    /// The `simulateTransaction` answer for an operation whose footprint
-    /// holds archived entries: a simulation that succeeded as far as it
-    /// could, carrying a `restorePreamble` the caller would have to submit a
-    /// `RestoreFootprint` transaction for before the call itself can be
-    /// judged. This is what a mainnet pool answers when a reserve or
-    /// positions entry has fallen out of the live state.
-    fn script_simulate_needs_restore(rpc: &ScriptedRpc, ledger: u32) {
-        rpc.expect(
-            "simulateTransaction",
-            json!({"transactionData": transaction_data_b64(10),
-                   "events": [],
-                   "minResourceFee": "10",
-                   "results": [{"auth": [], "xdr": scval_b64(&stellar_xdr::ScVal::Void)}],
-                   "restorePreamble": {"minResourceFee": "7",
-                                       "transactionData": transaction_data_b64(7)},
-                   "latestLedger": ledger}),
-        );
     }
 
     /// A borrower above the threshold is left alone. The threshold sits
@@ -2036,10 +1966,15 @@ mod tests {
         Ok(())
     }
 
+    /// A contract error that is neither `InvalidLiqTooSmall`,
+    /// `InvalidLiqTooLarge` nor `AuctionInProgress` — one this test's own
+    /// stand-in for "the pool refused for some other reason entirely",
+    /// unconnected to any of `accept_percent`'s special-cased codes.
+    const OTHER_CONTRACT_ERROR: u32 = 1_205;
+
     /// Any other contract error skips the borrower immediately, with the
-    /// code on the log line: adjusting a percent against
-    /// `AuctionInProgress` would be four more round trips to learn what the
-    /// first one said.
+    /// code on the log line: adjusting a percent against most refusals
+    /// would be four more round trips to learn what the first one said.
     #[sqlx::test(migrations = "./migrations")]
     async fn another_contract_error_skips_without_retrying(db: sqlx::PgPool) -> sqlx::Result<()> {
         let store = Store::from_pool(db);
@@ -2050,9 +1985,10 @@ mod tests {
         let bid_asset = synthetic_account(12);
         let lot_asset = synthetic_account(13);
 
-        // AuctionInProgress is neither of the percent walk's two codes.
+        // Neither of the percent walk's two codes, and not AuctionInProgress
+        // either — that one is handled separately below.
         script_simulate_prelude(&rpc, &signer, 10, 100);
-        script_simulate_refused(&rpc, AUCTION_IN_PROGRESS, 100);
+        script_simulate_refused(&rpc, OTHER_CONTRACT_ERROR, 100);
 
         let client = RpcClient::new(&rpc.url(), None).expect("client");
         let submitter = Submitter::new(&client, &network, &signer, tx_config());
@@ -2076,9 +2012,165 @@ mod tests {
         assert_eq!(
             rpc.calls("simulateTransaction").len(),
             1,
-            "one simulation, not a retry: AuctionInProgress is not the percent \
-             loop's business"
+            "one simulation, not a retry: this code is not the percent loop's business"
         );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// An auction already open on chain is adopted: the contract's refusal
+    /// names it, the auctioneer reads it, and the row the filler walks
+    /// exists.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_auction_already_open_on_chain_is_adopted(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let signer = auctioneer_signer();
+        let network = Network::testnet();
+        let account = synthetic_account(40);
+        let bid_asset = synthetic_account(41);
+        let lot_asset = synthetic_account(42);
+
+        script_simulate_prelude(&rpc, &signer, 10, 100);
+        script_simulate_refused(&rpc, AUCTION_IN_PROGRESS, 100);
+        let auction = AuctionData {
+            bid: BTreeMap::from([(USDC.to_string(), 1_000_000_000_i128)]),
+            lot: BTreeMap::from([(lot_asset.clone(), 2_000_000_000_i128)]),
+            block: 90,
+        };
+        harness::script_auction_entry(&rpc, &account, &auction, 100);
+
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let auctioneer = Auctioneer::new(&client, &store, config(BTreeSet::new()), Some(submitter));
+        let plan = LiquidationPlan {
+            bid: vec![bid_asset],
+            lot: vec![lot_asset],
+            percent: FillPercent::try_from(50).expect("50 is in range"),
+        };
+        let decision = Decision::Liquidate(plan);
+        let tick = harness::fixture_tick();
+
+        let outcome = auctioneer
+            .act(POOL, &account, &decision, tick, None)
+            .await
+            .expect("act");
+        assert!(
+            matches!(outcome, ActOutcome::Refused),
+            "the chain already holds this auction, so no new one is created"
+        );
+        let row = store
+            .auction(POOL, &account, AuctionType::UserLiquidation)
+            .await
+            .expect("read the row back")
+            .expect("the refusal adopted the chain's own auction");
+        assert_eq!(row.bid, auction.bid, "the chain's bid, not the plan's");
+        assert_eq!(row.lot, auction.lot, "the chain's lot, not the plan's");
+        assert_eq!(row.start_ledger, auction.block, "the auction's own block");
+        assert_eq!(row.fill_ledger, None, "no fill plan yet");
+        assert_eq!(row.percent, None, "no fill plan yet");
+        assert_eq!(row.updated_ledger, 100, "the ledger the read reported");
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// The next pass sees it and skips, which is what clears the flag.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_adopted_auction_is_skipped_on_the_next_pass(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let signer = auctioneer_signer();
+        let network = Network::testnet();
+        let account = synthetic_account(43);
+        let bid_asset = synthetic_account(44);
+        let lot_asset = synthetic_account(45);
+
+        script_simulate_prelude(&rpc, &signer, 10, 100);
+        script_simulate_refused(&rpc, AUCTION_IN_PROGRESS, 100);
+        let auction = AuctionData {
+            bid: BTreeMap::from([(USDC.to_string(), 1_000_000_000_i128)]),
+            lot: BTreeMap::from([(lot_asset.clone(), 2_000_000_000_i128)]),
+            block: 90,
+        };
+        harness::script_auction_entry(&rpc, &account, &auction, 100);
+
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let auctioneer = Auctioneer::new(&client, &store, config(BTreeSet::new()), Some(submitter));
+        let plan = LiquidationPlan {
+            bid: vec![bid_asset],
+            lot: vec![lot_asset],
+            percent: FillPercent::try_from(50).expect("50 is in range"),
+        };
+        let decision = Decision::Liquidate(plan);
+        let tick = harness::fixture_tick();
+
+        auctioneer
+            .act(POOL, &account, &decision, tick, None)
+            .await
+            .expect("the first pass adopts the chain's auction");
+
+        // `decide` always reads a fresh snapshot for the whole batch before
+        // it ever consults the store, regardless of what any one user's
+        // decision turns out to be — this account holds no fixture position,
+        // so an empty snapshot is all the next pass needs.
+        harness::script_snapshot(&rpc, &[]);
+        let decisions = auctioneer
+            .decide(POOL, &[tracked_user(&account)], tick)
+            .await
+            .expect("decide");
+        assert_eq!(
+            decisions,
+            vec![(account.clone(), Decision::Skip(SkipReason::AuctionOpen))],
+            "the adopted row is what the ordinary open-auction check reads"
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// A read that fails is a warning, never a failed pass.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_failed_adoption_is_only_a_warning(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let signer = auctioneer_signer();
+        let network = Network::testnet();
+        let account = synthetic_account(46);
+        let bid_asset = synthetic_account(47);
+        let lot_asset = synthetic_account(48);
+
+        script_simulate_prelude(&rpc, &signer, 10, 100);
+        script_simulate_refused(&rpc, AUCTION_IN_PROGRESS, 100);
+        rpc.expect_http("getLedgerEntries", 500);
+
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let auctioneer = Auctioneer::new(&client, &store, config(BTreeSet::new()), Some(submitter));
+        let plan = LiquidationPlan {
+            bid: vec![bid_asset],
+            lot: vec![lot_asset],
+            percent: FillPercent::try_from(50).expect("50 is in range"),
+        };
+        let decision = Decision::Liquidate(plan);
+        let tick = harness::fixture_tick();
+
+        let outcome = auctioneer
+            .act(POOL, &account, &decision, tick, None)
+            .await
+            .expect("a failed adoption read is a warning, not a failed act");
+        assert!(
+            matches!(outcome, ActOutcome::Refused),
+            "the borrower is still refused, exactly as it would be without adoption"
+        );
+        assert!(
+            store
+                .auction(POOL, &account, AuctionType::UserLiquidation)
+                .await
+                .expect("read")
+                .is_none(),
+            "the failed read wrote no row"
+        );
+        assert_eq!(rpc.remaining(), 0);
         Ok(())
     }
 
@@ -2277,7 +2369,8 @@ mod tests {
     /// A queue handed to a dry-run auctioneer is refused the same way: a
     /// queue means "send this" and dry-run means nothing is sent, so the
     /// two cannot both be true of one call. `Service::run` builds no queue
-    /// at all in dry-run (`spawn_submission_queue` answers `None`); the
+    /// at all in dry-run (`spawn_queues` starts no worker and answers
+    /// `None` for both roles); the
     /// public pieces composed by hand must not be able to make a dry-run
     /// that submits, which is the silent direction `DRY_RUN`'s strict
     /// parser exists to close.

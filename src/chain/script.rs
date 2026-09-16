@@ -24,16 +24,16 @@ use serde_json::{json, Value};
 use stellar_xdr::{
     AccountEntry, AccountEntryExt, AccountId, ContractEvent, ContractEventBody, ContractEventType,
     ContractEventV0, DiagnosticEvent, ExtensionPoint, LedgerEntryChanges, LedgerEntryData,
-    LedgerFootprint, ScError, ScVal, SorobanResources, SorobanTransactionData,
-    SorobanTransactionDataExt, SorobanTransactionMeta, SorobanTransactionMetaExt,
-    SorobanTransactionMetaV2, String32, StringM, Thresholds, TransactionEnvelope, TransactionMeta,
-    TransactionMetaV3, TransactionMetaV4, TransactionResult, TransactionResultExt,
-    TransactionResultResult, VecM,
+    LedgerFootprint, LedgerKey, LedgerKeyAccount, ScError, ScVal, SorobanResources,
+    SorobanTransactionData, SorobanTransactionDataExt, SorobanTransactionMeta,
+    SorobanTransactionMetaExt, SorobanTransactionMetaV2, String32, StringM, Thresholds,
+    TransactionEnvelope, TransactionMeta, TransactionMetaV3, TransactionMetaV4, TransactionResult,
+    TransactionResultExt, TransactionResultResult, VecM,
 };
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-use crate::chain::signer::Network;
+use crate::chain::signer::{Network, Signer};
 use crate::chain::xdr::encode::{from_base64, symbol, to_base64};
 use crate::chain::TxHash;
 
@@ -324,6 +324,142 @@ pub(crate) fn meta_v3_b64(return_value: ScVal, diagnostics: Vec<DiagnosticEvent>
         }),
     });
     to_base64(&meta).expect("encodes")
+}
+
+/// One `Submitter::simulate_only` attempt's prelude: the source
+/// account's entry, and nothing else. A simulate-only call needs no fee
+/// stats — it never assembles a transaction to pay for — so a test that
+/// scripts one and sees it consumed would be scripting the signing path
+/// by mistake.
+pub(crate) fn script_simulate_prelude(
+    rpc: &ScriptedRpc,
+    signer: &Signer,
+    sequence: i64,
+    ledger: u32,
+) {
+    let key = LedgerKey::Account(LedgerKeyAccount {
+        account_id: signer.account_id(),
+    });
+    rpc.expect(
+        "getLedgerEntries",
+        json!({"latestLedger": ledger, "entries": [
+            {"key": to_base64(&key).expect("key"),
+             "xdr": account_entry_b64(signer.address(), sequence),
+             "lastModifiedLedgerSeq": 1}
+        ]}),
+    );
+}
+
+/// One `Submitter::prepare` attempt's prelude: the account read above,
+/// plus the fee stats a transaction that will actually be signed and
+/// paid for needs. Only the queue's own submission path takes this
+/// route.
+pub(crate) fn script_prepare_prelude(
+    rpc: &ScriptedRpc,
+    signer: &Signer,
+    sequence: i64,
+    ledger: u32,
+) {
+    script_simulate_prelude(rpc, signer, sequence, ledger);
+    rpc.expect(
+        "getFeeStats",
+        json!({"sorobanInclusionFee": {"p70": "100", "p90": "100"},
+               "inclusionFee": {"p70": "100", "p90": "100"}, "latestLedger": ledger}),
+    );
+}
+
+/// The `simulateTransaction` answer for an attempt the contract accepts.
+pub(crate) fn script_simulate_accepted(rpc: &ScriptedRpc, ledger: u32) {
+    rpc.expect(
+        "simulateTransaction",
+        json!({"transactionData": transaction_data_b64(10),
+               "events": [],
+               "minResourceFee": "10",
+               "results": [{"auth": [], "xdr": scval_b64(&stellar_xdr::ScVal::Void)}],
+               "latestLedger": ledger}),
+    );
+}
+
+/// The `simulateTransaction` answer for an attempt the contract refuses
+/// with `code`, both in the diagnostic events and the error message —
+/// exactly the two places `contract_error_in_events` and
+/// `contract_error_in_message` read it from.
+pub(crate) fn script_simulate_refused(rpc: &ScriptedRpc, code: u32, ledger: u32) {
+    rpc.expect(
+        "simulateTransaction",
+        json!({"error": format!("HostError: Error(Contract, #{code})"),
+               "events": [diagnostic_error_b64(code)],
+               "latestLedger": ledger}),
+    );
+}
+
+/// The `simulateTransaction` answer for an operation whose footprint
+/// holds archived entries: a simulation that succeeded as far as it
+/// could, carrying a `restorePreamble` the caller would have to submit a
+/// `RestoreFootprint` transaction for before the call itself can be
+/// judged. This is what a mainnet pool answers when a reserve or
+/// positions entry has fallen out of the live state.
+pub(crate) fn script_simulate_needs_restore(rpc: &ScriptedRpc, ledger: u32) {
+    rpc.expect(
+        "simulateTransaction",
+        json!({"transactionData": transaction_data_b64(10),
+               "events": [],
+               "minResourceFee": "10",
+               "results": [{"auth": [], "xdr": scval_b64(&stellar_xdr::ScVal::Void)}],
+               "restorePreamble": {"minResourceFee": "7",
+                                   "transactionData": transaction_data_b64(7)},
+               "latestLedger": ledger}),
+    );
+}
+
+/// The `sendTransaction` answer for `status`, carrying the hash of the
+/// envelope the client actually sent. `error` is the `errorResultXdr` an
+/// `ERROR` status carries — the result the RPC refused the envelope with —
+/// and is `None` for every other status.
+pub(crate) fn script_send(
+    rpc: &ScriptedRpc,
+    status: &str,
+    error: Option<TransactionResultResult>,
+    ledger: u32,
+) {
+    let mut body = json!({"status": status, "hash": ENVELOPE_HASH_PLACEHOLDER,
+                          "latestLedger": ledger, "latestLedgerCloseTime": "1"});
+    if let Some(result) = error {
+        body["errorResultXdr"] = json!(result_b64(result));
+    }
+    rpc.expect("sendTransaction", body);
+}
+
+/// The `getTransaction` answer for a transaction that landed and succeeded
+/// in `ledger`, with no return value.
+///
+/// `txHash` carries the envelope-hash placeholder to say which transaction
+/// this answers, but a `getTransaction` request holds no envelope for the
+/// responder to substitute from, so the text stands as it is — harmlessly,
+/// since the client reads the hash it polled by and never this field.
+pub(crate) fn script_transaction_success(rpc: &ScriptedRpc, ledger: u32) {
+    rpc.expect(
+        "getTransaction",
+        json!({"status": "SUCCESS", "latestLedger": ledger, "oldestLedger": 1,
+               "ledger": ledger, "createdAt": "1", "txHash": ENVELOPE_HASH_PLACEHOLDER,
+               "envelopeXdr": "AAAA",
+               "resultXdr": result_b64(TransactionResultResult::TxSuccess(VecM::default())),
+               "resultMetaXdr": meta_v4_b64(None, vec![]),
+               "diagnosticEventsXdr": []}),
+    );
+}
+
+/// The `getTransaction` answer for a transaction the RPC has not seen.
+/// Whether that proves anything is the caller's arithmetic: it is expiry
+/// only when `latest` has passed the window's `max_ledger` *and* `oldest`
+/// still reaches back to its `min_ledger`, which is why both are the
+/// test's to choose.
+pub(crate) fn script_transaction_not_found(rpc: &ScriptedRpc, latest: u32, oldest: u32) {
+    rpc.expect(
+        "getTransaction",
+        json!({"status": "NOT_FOUND", "latestLedger": latest, "oldestLedger": oldest,
+               "ledger": 0}),
+    );
 }
 
 #[cfg(test)]

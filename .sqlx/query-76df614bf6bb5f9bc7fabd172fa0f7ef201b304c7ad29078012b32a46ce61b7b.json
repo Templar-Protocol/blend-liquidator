@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE creations SET tx_hash = $2 WHERE id = $1 AND tx_hash IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "76df614bf6bb5f9bc7fabd172fa0f7ef201b304c7ad29078012b32a46ce61b7b"
+}

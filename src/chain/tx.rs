@@ -219,6 +219,34 @@ pub enum TxOutcome {
     },
 }
 
+impl TxOutcome {
+    /// What this terminal state is called on a log line. A short label
+    /// rather than `Debug`, whose `Failed` variant carries a whole decoded
+    /// [`TransactionResult`].
+    #[must_use]
+    pub fn status(&self) -> &'static str {
+        match self {
+            Self::Succeeded { .. } => "succeeded",
+            Self::Failed { .. } => "failed",
+            Self::Expired { .. } => "expired",
+            Self::Unknown { .. } => "unknown",
+        }
+    }
+
+    /// The hash every variant carries, whatever the transaction's terminal
+    /// state: even a failed, expired or unresolved transaction consumed a
+    /// sequence number and is worth recording by its hash.
+    #[must_use]
+    pub fn hash(&self) -> TxHash {
+        match self {
+            Self::Succeeded { hash, .. }
+            | Self::Failed { hash, .. }
+            | Self::Expired { hash, .. }
+            | Self::Unknown { hash, .. } => *hash,
+        }
+    }
+}
+
 /// Builds, signs and submits transactions for one signer on one network.
 #[derive(Debug, Clone, Copy)]
 pub struct Submitter<'a> {
@@ -262,6 +290,13 @@ impl<'a> Submitter<'a> {
             signer,
             config,
         }
+    }
+
+    /// The account this submitter signs as, and the source account every
+    /// transaction it builds — a simulation included — is built against.
+    #[must_use]
+    pub fn source(&self) -> &str {
+        self.signer.address()
     }
 
     /// The fee policy: p70 floored at `base_fee`, or p90 floored at
