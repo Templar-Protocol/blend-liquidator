@@ -1250,6 +1250,7 @@ impl Filler<'_> {
             primary_asset: pool.primary_asset.clone(),
             min_primary_collateral: pool.min_primary_collateral,
             min_health_factor: pool.min_health_factor,
+            min_collateral: snapshot.instance.config.min_collateral,
         };
         let wallet = self.inventory.available();
         let inputs = UnwindInputs {
