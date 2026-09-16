@@ -435,6 +435,36 @@ fn endpoint_origin(url: &str) -> String {
     }
 }
 
+/// The `/healthz`, `/livez` and `/metrics` server. Built by
+/// [`Args::service_with_secrets`] only when `PORT` or `HTTP_PORT` is set;
+/// unset leaves the server off, which is every deployment before Phase 6b.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpConfig {
+    /// Address and port the server listens on.
+    pub bind: std::net::SocketAddr,
+    /// `/healthz` answers ready only while the processed ledger is within
+    /// this many ledgers of chain head. Always at least 1:
+    /// `HEALTH_MAX_LAG_LEDGERS=0` is refused at parse, because a bot
+    /// exactly at head would still report not-ready on every ledger
+    /// boundary its poll interval crosses — not a bound at all.
+    pub max_lag_ledgers: u32,
+}
+
+/// The Telegram notification channel. Built by
+/// [`Args::service_with_secrets`] only when both `TELEGRAM_BOT_TOKEN` and
+/// `TELEGRAM_CHAT_ID` are set — either alone is a startup error, since a
+/// token with nowhere to send is as useless as a destination with nothing
+/// to send it with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramConfig {
+    /// The bot token. A secret: read from the environment only, never an
+    /// argument, and never rendered by `Debug` — `Secret`'s own `Debug`
+    /// redacts it, so this struct's derived `Debug` stays safe to log.
+    pub token: Secret,
+    /// The chat (or channel) id notifications are sent to.
+    pub chat_id: String,
+}
+
 /// Everything the service needs, validated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceConfig {
@@ -518,6 +548,13 @@ pub struct ServiceConfig {
     /// is suppressed for (spec §7's dedup cooldown). Always at least one
     /// hour: `FAILURE_NOTIFICATION_COOLDOWN_HOURS` refuses zero at parse.
     pub notification_cooldown: std::time::Duration,
+    /// The `/healthz`, `/livez` and `/metrics` server. `None` when neither
+    /// `PORT` nor `HTTP_PORT` is set, which disables it entirely.
+    pub http: Option<HttpConfig>,
+    /// The Telegram notification channel. `None` when neither
+    /// `TELEGRAM_BOT_TOKEN` nor `TELEGRAM_CHAT_ID` is set; either alone is
+    /// a startup error.
+    pub telegram: Option<TelegramConfig>,
 }
 
 #[derive(Debug, Parser)]
@@ -809,6 +846,48 @@ pub struct Args {
     )]
     pub failure_notification_cooldown_hours: u64,
 
+    /// The port injected by the deployment platform (spec §6: Cloud Run
+    /// sets this). Wins over `HTTP_PORT` when both are set, because this
+    /// is the one the platform controls — a deployment that also sets
+    /// `HTTP_PORT` for some other reason must not silently lose the
+    /// platform's binding. Either alone turns the `/healthz`, `/livez` and
+    /// `/metrics` server on; neither leaves it off.
+    #[arg(long, env = "PORT")]
+    pub port: Option<u16>,
+
+    /// The HTTP server's port for a deployment that does not inject
+    /// `PORT`. See `port`: `PORT` wins when both are set. Unset, and
+    /// `PORT` also unset, leaves the server off.
+    #[arg(long, env = "HTTP_PORT")]
+    pub http_port: Option<u16>,
+
+    /// The address the HTTP server binds. Loopback by default, so nothing
+    /// outside this host can reach it unless asked to. Cloud Run cannot
+    /// route to a loopback listener, which is why that deployment sets
+    /// this to `0.0.0.0`.
+    #[arg(long, env = "HTTP_BIND_ADDR", default_value = "127.0.0.1")]
+    pub http_bind_addr: std::net::IpAddr,
+
+    /// `/healthz` answers ready only while the processed ledger is within
+    /// this many ledgers of chain head. Zero is refused: a bot exactly at
+    /// head would then report not-ready on every ledger boundary its own
+    /// poll interval crosses, which is not a readiness bound at all.
+    #[arg(
+        long,
+        env = "HEALTH_MAX_LAG_LEDGERS",
+        default_value_t = 10,
+        value_parser = clap::value_parser!(u32).range(1..),
+    )]
+    pub health_max_lag_ledgers: u32,
+
+    /// The chat (or channel) Telegram notifications are sent to. Required
+    /// together with `TELEGRAM_BOT_TOKEN` — read from the environment only,
+    /// never an argument, by `Args::service`; either set without the other
+    /// is a startup error, because a token with nowhere to send is as
+    /// useless as a destination with nothing to send it with.
+    #[arg(long, env = "TELEGRAM_CHAT_ID")]
+    pub telegram_chat_id: Option<String>,
+
     /// The analytics API the tracker seeds from. Empty disables it.
     #[arg(
         long,
@@ -897,7 +976,10 @@ impl Args {
         })
     }
 
-    /// The service configuration, reading both secrets from the environment.
+    /// The service configuration, reading all three secrets from the
+    /// environment: `DATABASE_URL`, `RPC_API_KEY` and `TELEGRAM_BOT_TOKEN`.
+    /// An empty value counts as absent for each, the same as the variable
+    /// not being set at all.
     pub fn service(&self) -> Result<ServiceConfig, LiquidatorError> {
         self.service_with_secrets(
             std::env::var("DATABASE_URL")
@@ -906,16 +988,49 @@ impl Args {
             std::env::var("RPC_API_KEY")
                 .ok()
                 .filter(|key| !key.is_empty()),
+            std::env::var("TELEGRAM_BOT_TOKEN")
+                .ok()
+                .filter(|token| !token.is_empty()),
         )
     }
 
     /// What `service` does after reading the environment, separated so
-    /// tests never touch process-global state.
+    /// tests never touch process-global state. `telegram_bot_token` is
+    /// filtered for emptiness the same way `rpc_api_key` is by
+    /// `chain_with_secret`: `Some(String::new())` counts as `None`.
+    ///
+    /// The Telegram pair is validated before anything that needs a chain
+    /// or a database, so a startup error about `TELEGRAM_CHAT_ID` or
+    /// `TELEGRAM_BOT_TOKEN` is never masked by an unrelated one about
+    /// `NETWORK` or `RPC_URL`.
     pub fn service_with_secrets(
         &self,
         database_url: Option<String>,
         rpc_api_key: Option<String>,
+        telegram_bot_token: Option<String>,
     ) -> Result<ServiceConfig, LiquidatorError> {
+        let telegram_bot_token = telegram_bot_token.filter(|token| !token.is_empty());
+        let telegram_chat_id = self
+            .telegram_chat_id
+            .clone()
+            .filter(|chat_id| !chat_id.is_empty());
+        let telegram = match (telegram_chat_id, telegram_bot_token) {
+            (Some(chat_id), Some(token)) => Some(TelegramConfig {
+                token: Secret::new(token),
+                chat_id,
+            }),
+            (None, None) => None,
+            (Some(_), None) => {
+                return Err(LiquidatorError::Config(
+                    "TELEGRAM_CHAT_ID is set but TELEGRAM_BOT_TOKEN is not".to_string(),
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(LiquidatorError::Config(
+                    "TELEGRAM_BOT_TOKEN is set but TELEGRAM_CHAT_ID is not".to_string(),
+                ))
+            }
+        };
         let chain = self.chain_with_secret(rpc_api_key)?;
         let database_url = database_url
             .ok_or_else(|| LiquidatorError::Config("DATABASE_URL is required".to_string()))?;
@@ -951,6 +1066,12 @@ impl Args {
                     .to_string(),
             ));
         }
+        // `PORT` wins over `HTTP_PORT` when both are set (spec §6: `PORT`
+        // is what Cloud Run injects), and either turns the server on.
+        let http = self.port.or(self.http_port).map(|port| HttpConfig {
+            bind: std::net::SocketAddr::new(self.http_bind_addr, port),
+            max_lag_ledgers: self.health_max_lag_ledgers,
+        });
         Ok(ServiceConfig {
             chain,
             database_url: Secret::new(database_url),
@@ -990,6 +1111,8 @@ impl Args {
             notification_cooldown: std::time::Duration::from_hours(
                 self.failure_notification_cooldown_hours,
             ),
+            http,
+            telegram,
         })
     }
 
@@ -1193,7 +1316,10 @@ mod tests {
     /// `AUCTIONEER_SECRET_KEY` and `FILLER_SECRET_KEY` are excluded for the
     /// same reason: both are read straight from the environment by
     /// `main.rs` and handed to [`Args::signing_keys`], and neither is ever
-    /// declared as a clap argument.
+    /// declared as a clap argument. `TELEGRAM_BOT_TOKEN` is excluded for
+    /// the same reason again: it is a secret read straight from the
+    /// environment by `service`, never a clap argument, so the tests pass
+    /// it explicitly to `service_with_secrets` instead.
     fn assert_clean_environment() {
         for name in [
             "RPC_URL",
@@ -1230,6 +1356,11 @@ mod tests {
             "SEED_URL",
             "SEED_HF_MAX",
             "SEED_FILE",
+            "PORT",
+            "HTTP_PORT",
+            "HTTP_BIND_ADDR",
+            "HEALTH_MAX_LAG_LEDGERS",
+            "TELEGRAM_CHAT_ID",
         ] {
             assert!(
                 std::env::var_os(name).is_none(),
@@ -1518,6 +1649,33 @@ supported_bid = ["CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75"]
 supported_lot = ["*"]
 "#;
 
+    /// A `DATABASE_URL` value for tests that need `service_with_secrets`
+    /// to succeed but never connect: nothing here talks to Postgres.
+    const DB: &str = "postgres://u:p@127.0.0.1/x";
+
+    /// A `ServiceConfig` built from a fixed, valid chain-and-pools baseline
+    /// with `args`'s HTTP and Telegram fields overlaid — for tests that
+    /// exercise only those knobs and would otherwise have to spell out a
+    /// whole network, RPC endpoint and pools file to get one.
+    fn minimal_service(args: &Args) -> ServiceConfig {
+        let mut base = parse(&[
+            "liquidator",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "http://rpc",
+            "--pools-toml",
+            POOLS,
+        ]);
+        base.port = args.port;
+        base.http_port = args.http_port;
+        base.http_bind_addr = args.http_bind_addr;
+        base.health_max_lag_ledgers = args.health_max_lag_ledgers;
+        base.telegram_chat_id = args.telegram_chat_id.clone();
+        base.service_with_secrets(Some(DB.into()), None, None)
+            .expect("minimal service configuration")
+    }
+
     #[test]
     fn a_decimal_knob_becomes_seven_decimal_fixed_point() {
         for (text, expected) in [
@@ -1624,11 +1782,11 @@ supported_lot = ["*"]
         ];
         let args = parse(&[&base[..], &["--pools-toml", POOLS]].concat());
         assert!(matches!(
-            args.service_with_secrets(None, None),
+            args.service_with_secrets(None, None, None),
             Err(LiquidatorError::Config(_))
         ));
         let config = args
-            .service_with_secrets(Some("postgres://u:p@localhost/db".to_string()), None)
+            .service_with_secrets(Some("postgres://u:p@localhost/db".to_string()), None, None)
             .expect("configuration");
         assert_eq!(config.pools.len(), 1);
         assert_eq!(config.database_url.expose(), "postgres://u:p@localhost/db");
@@ -1645,7 +1803,7 @@ supported_lot = ["*"]
         // Neither pools source, and both at once, are both errors.
         let neither = parse(&base);
         assert!(matches!(
-            neither.service_with_secrets(Some("postgres://x".to_string()), None),
+            neither.service_with_secrets(Some("postgres://x".to_string()), None, None),
             Err(LiquidatorError::Config(_))
         ));
         assert!(Args::try_parse_from(
@@ -1673,6 +1831,7 @@ supported_lot = ["*"]
             .service_with_secrets(
                 Some("postgres://user:hunter2@localhost/db".to_string()),
                 None,
+                None,
             )
             .expect("configuration");
         let rendered = format!("{config:?}");
@@ -1696,7 +1855,7 @@ supported_lot = ["*"]
             "",
         ]);
         let config = args
-            .service_with_secrets(Some("postgres://x".to_string()), None)
+            .service_with_secrets(Some("postgres://x".to_string()), None, None)
             .expect("configuration");
         assert_eq!(config.seed.url, None);
     }
@@ -1807,7 +1966,7 @@ supported_lot = ["*"]
             "1.3",
         ]);
         let error = args
-            .service_with_secrets(Some("postgres://x".to_string()), None)
+            .service_with_secrets(Some("postgres://x".to_string()), None, None)
             .expect_err("refused");
         assert!(error.to_string().contains("LIQ_HF_THRESHOLD"), "{error}");
 
@@ -1829,7 +1988,7 @@ supported_lot = ["*"]
             "1.2",
         ]);
         let error = equal
-            .service_with_secrets(Some("postgres://x".to_string()), None)
+            .service_with_secrets(Some("postgres://x".to_string()), None, None)
             .expect_err("equality refused");
         assert!(error.to_string().contains("at or above"), "{error}");
     }
@@ -2051,7 +2210,7 @@ supported_lot = ["*"]
             "12",
         ]);
         let config = args
-            .service_with_secrets(Some("postgres://x".to_string()), None)
+            .service_with_secrets(Some("postgres://x".to_string()), None, None)
             .expect("configuration");
         assert_eq!(config.liquidation_health_factor, 9_900_000);
         assert_eq!(config.target_health_factor, 11_000_000);
@@ -2380,5 +2539,85 @@ supported_lot = ["*"]
             ..pool
         };
         assert_eq!(no_rules.profit_bps(&["XLM"], &["USDC"]), 1_000);
+    }
+
+    /// Neither `PORT` nor `HTTP_PORT` leaves the server off; either turns
+    /// it on, and `PORT` wins when both are set — spec §6: Cloud Run
+    /// injects `PORT`, so a deployment that also sets `HTTP_PORT` for some
+    /// other reason must not silently lose the platform's binding.
+    #[test]
+    fn the_http_server_is_off_without_a_port_and_port_wins_over_http_port() {
+        let args = Args::try_parse_from(["liquidator"]).expect("parses");
+        assert_eq!(args.port, None);
+        let config = minimal_service(&args);
+        assert!(config.http.is_none());
+        let args = Args::try_parse_from(["liquidator", "--port", "8080", "--http-port", "9090"])
+            .expect("parses");
+        let config = minimal_service(&args);
+        let http = config.http.expect("a port turns the server on");
+        assert_eq!(http.bind.port(), 8080, "PORT wins: Cloud Run injects it");
+        assert_eq!(http.bind.ip(), std::net::IpAddr::from([127, 0, 0, 1]));
+        assert_eq!(http.max_lag_ledgers, 10);
+    }
+
+    /// `HEALTH_MAX_LAG_LEDGERS=0` is not "always ready", it is "ready only
+    /// exactly at head" — a bound no poll interval can hold on every
+    /// ledger boundary, so `/healthz` would flap between ready and
+    /// not-ready forever. Refused at parse like every other cadence knob.
+    #[test]
+    fn a_zero_health_lag_is_refused_at_parse() {
+        assert!(Args::try_parse_from(["liquidator", "--health-max-lag-ledgers", "0"]).is_err());
+    }
+
+    /// `TELEGRAM_CHAT_ID` or `TELEGRAM_BOT_TOKEN` alone is a startup
+    /// error, never a half-configured channel; only both together build a
+    /// `TelegramConfig`, and the token never renders through `Debug`.
+    #[test]
+    fn telegram_needs_both_the_token_and_the_chat_id() {
+        assert_clean_environment();
+        let args =
+            Args::try_parse_from(["liquidator", "--telegram-chat-id", "12345"]).expect("parses");
+        let error = args
+            .service_with_secrets(Some(DB.into()), None, None)
+            .expect_err("chat id alone");
+        assert!(error.to_string().contains("TELEGRAM_BOT_TOKEN is not"));
+
+        // An empty TELEGRAM_BOT_TOKEN counts as absent, exactly as an
+        // empty RPC_API_KEY does.
+        let error = args
+            .service_with_secrets(Some(DB.into()), None, Some(String::new()))
+            .expect_err("an empty token counts as absent too");
+        assert!(error.to_string().contains("TELEGRAM_BOT_TOKEN is not"));
+
+        let args = Args::try_parse_from(["liquidator"]).expect("parses");
+        let error = args
+            .service_with_secrets(Some(DB.into()), None, Some("123:abc".into()))
+            .expect_err("token alone");
+        assert!(error.to_string().contains("TELEGRAM_CHAT_ID is not"));
+
+        let args = Args::try_parse_from([
+            "liquidator",
+            "--telegram-chat-id",
+            "12345",
+            "--network",
+            "testnet",
+            "--rpc-url",
+            "http://rpc",
+            "--pools-toml",
+            POOLS,
+        ])
+        .expect("parses");
+        let config = args
+            .service_with_secrets(Some(DB.into()), None, Some("123:abc".into()))
+            .expect("both");
+        let telegram = config.telegram.as_ref().expect("configured");
+        assert_eq!(telegram.chat_id, "12345");
+        assert_eq!(telegram.token.expose(), "123:abc");
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains("123:abc"),
+            "the token never renders: {rendered}"
+        );
+        assert!(rendered.contains("Secret(<redacted>)"));
     }
 }
