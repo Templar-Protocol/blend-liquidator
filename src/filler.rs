@@ -1064,29 +1064,29 @@ mod tests {
     use std::num::NonZeroUsize;
     use std::time::Duration;
 
-    use serde_json::{json, Value};
+    use serde_json::json;
     use tokio::sync::watch;
 
     use super::*;
     use crate::chain::rpc::RpcClient;
     use crate::chain::script::{
         script_simulate_accepted, script_simulate_prelude, script_simulate_refused, scval_b64,
-        transaction_data_b64, ScriptedRpc,
+        ScriptedRpc,
     };
-    use crate::chain::signer::{Network, Signer};
-    use crate::chain::tx::{Submitter, TxConfig};
+    use crate::chain::signer::Network;
+    use crate::chain::tx::Submitter;
     use crate::chain::xdr::encode::{
-        address, from_base64, i128_val, map, sc_address, symbol, to_base64, vec as sc_vec,
+        address, from_base64, i128_val, map, sc_address, symbol, vec as sc_vec,
     };
     use crate::chain::xdr::keys;
     use crate::chain::{ChainError, TxHash, TxOutcome};
-    use crate::fixture::{mainnet_fixed_v2, text};
-    use crate::harness;
+    use crate::harness::{
+        self, contract_entry_xdr, entry, filler_signer, instance_entry_xdr, positions_entry_xdr,
+        script_empty_wallet, script_snapshot_positions, simulation, tx_config, BLND, POOL_TWO,
+    };
     use crate::math::fill::FillAction;
     use crate::queue::QueueError;
-    use stellar_xdr::{
-        ContractDataDurability, ContractDataEntry, ExtensionPoint, LedgerEntryData, ScVal,
-    };
+    use stellar_xdr::ScVal;
 
     /// The fixture's XLM and USDC reserves. Real strkeys: every address
     /// here round-trips through the encoder on its way into a scripted
@@ -1150,46 +1150,6 @@ mod tests {
         }
     }
 
-    /// The filler's key, for the two tests that need an account to
-    /// simulate and sign as. Copied from `executor.rs`'s test module: a
-    /// test signer is scaffolding, not an interface.
-    fn filler_signer() -> Signer {
-        let key = ed25519_dalek::SigningKey::from_bytes(&[11_u8; 32]);
-        let secret = stellar_strkey::ed25519::PrivateKey(key.to_bytes()).to_string();
-        Signer::from_secret(&secret).expect("signer")
-    }
-
-    /// Fee and polling policy short enough that nothing here waits on a
-    /// real interval. Copied from `executor.rs`'s test module.
-    fn tx_config() -> TxConfig {
-        TxConfig {
-            poll_interval: Duration::from_millis(1),
-            send_retry_pause: Duration::from_millis(1),
-            wait_cap: Duration::from_millis(200),
-            ..TxConfig::new(100, 200, 3)
-        }
-    }
-
-    /// A bare `simulateTransaction` answer carrying one return value, as
-    /// `chain::pool`'s and `inventory`'s own test helpers build it.
-    fn simulation(return_xdr: &str, ledger: u32) -> Value {
-        json!({"transactionData": transaction_data_b64(1), "events": [],
-               "minResourceFee": "1", "results": [{"auth": [], "xdr": return_xdr}],
-               "latestLedger": ledger})
-    }
-
-    /// One inventory refresh: a zero balance for each of the pool's three
-    /// reserves, which is also the whole asset set here because the
-    /// configured native asset is the fixture's own XLM.
-    fn script_empty_wallet(rpc: &ScriptedRpc, ledger: u32) {
-        for _ in 0..3 {
-            rpc.expect(
-                "simulateTransaction",
-                simulation(&scval_b64(&i128_val(0)), ledger),
-            );
-        }
-    }
-
     /// The auction as the chain holds it, starting at `block`.
     fn auction(block: u32) -> AuctionData {
         AuctionData {
@@ -1236,100 +1196,6 @@ mod tests {
             .expect("read the auction row")
     }
 
-    /// A `Positions` ledger entry for `account`, by reserve index.
-    /// Copied from `service.rs`'s test module and widened to carry
-    /// collateral as well as liabilities: the filler's own position is
-    /// what makes a lower percent *worse* than a higher one, and the
-    /// fixture holds no position for the filler's key.
-    fn positions_entry_xdr(
-        account: &str,
-        collateral: &[(u32, i128)],
-        liabilities: &[(u32, i128)],
-    ) -> String {
-        let side = |amounts: &[(u32, i128)]| {
-            map(amounts
-                .iter()
-                .map(|(index, amount)| (ScVal::U32(*index), i128_val(*amount)))
-                .collect())
-            .expect("positions side")
-        };
-        let value = map(vec![
-            (symbol("collateral").expect("symbol"), side(collateral)),
-            (symbol("liabilities").expect("symbol"), side(liabilities)),
-            (symbol("supply").expect("symbol"), side(&[])),
-        ])
-        .expect("positions map");
-        let entry = LedgerEntryData::ContractData(ContractDataEntry {
-            ext: ExtensionPoint::V0,
-            contract: sc_address(harness::POOL).expect("pool"),
-            key: sc_vec(vec![
-                symbol("Positions").expect("symbol"),
-                address(account).expect("account"),
-            ])
-            .expect("positions key"),
-            durability: ContractDataDurability::Persistent,
-            val: value,
-        });
-        to_base64(&entry).expect("positions entry")
-    }
-
-    /// `harness::script_snapshot`'s reserves and oracle reads, with
-    /// hand-built positions entries instead of the fixture's. Copied from
-    /// `service.rs`'s test module.
-    fn script_snapshot_positions(rpc: &ScriptedRpc, positions: &[(&str, String)]) {
-        let fixture = mainnet_fixed_v2();
-        let ledger = fixture["ledger"].as_u64().expect("ledger");
-        rpc.expect(
-            "getLedgerEntries",
-            json!({"latestLedger": ledger, "entries": [
-                entry(&keys::instance(harness::POOL).expect("key"), text(&fixture, &["instance_entry_xdr"])),
-                entry(&keys::reserve_list(harness::POOL).expect("key"), text(&fixture, &["res_list_entry_xdr"])),
-            ]}),
-        );
-        let mut entries = Vec::new();
-        for reserve in fixture["reserves"].as_array().expect("reserves") {
-            let asset = reserve["asset"].as_str().expect("asset");
-            entries.push(entry(
-                &keys::reserve_config(harness::POOL, asset).expect("key"),
-                reserve["config_entry_xdr"].as_str().expect("config"),
-            ));
-            entries.push(entry(
-                &keys::reserve_data(harness::POOL, asset).expect("key"),
-                reserve["data_entry_xdr"].as_str().expect("data"),
-            ));
-        }
-        for (account, positions_xdr) in positions {
-            entries.push(entry(
-                &keys::positions(harness::POOL, account).expect("key"),
-                positions_xdr,
-            ));
-        }
-        rpc.expect(
-            "getLedgerEntries",
-            json!({"latestLedger": ledger, "entries": entries}),
-        );
-        let ledger = u32::try_from(ledger).expect("ledger fits");
-        rpc.expect(
-            "simulateTransaction",
-            simulation(text(&fixture, &["oracle_decimals_return_xdr"]), ledger),
-        );
-        for reserve in fixture["reserves"].as_array().expect("reserves") {
-            rpc.expect(
-                "simulateTransaction",
-                simulation(
-                    reserve["lastprice_return_xdr"].as_str().expect("price"),
-                    ledger,
-                ),
-            );
-        }
-    }
-
-    /// An entry answer, as `harness`'s own private helper builds it.
-    fn entry(key: &stellar_xdr::LedgerKey, xdr: &str) -> Value {
-        json!({"key": to_base64(key).expect("key"), "xdr": xdr,
-               "lastModifiedLedgerSeq": 1, "liveUntilLedgerSeq": 99_999_999_u32})
-    }
-
     /// The filler's own starting position: 15.9 billion b-tokens of the
     /// fixture's third reserve (about $20,031 of effective collateral at
     /// its 0.95 factor) against 38.7 billion d-tokens of USDC (about
@@ -1339,18 +1205,8 @@ mod tests {
     const FILLER_COLLATERAL: i128 = 15_900_000_000;
     const FILLER_LIABILITIES: i128 = 38_700_000_000;
 
-    /// A second pool, built here rather than captured: the fixture holds
-    /// one pool, and the wallet a multi-pool tick plans against is exactly
-    /// what a second one is needed to pin.
-    const POOL_TWO: &str = "CAQQR5SWBXKIGZKPBZDH3KM5GQ5GUTPKB7JAFCINLZBC5WXPJKRG3IM7";
-    /// An asset of `POOL_TWO` that the fixture's pool does not list.
-    const BLND: &str = "CD25MNVTZDL4Y3XBCPCJXGXATV5WUHHOWMYFF4YBEGU5FCPGMYTVG5JY";
     /// The fixture's third reserve, which `POOL_TWO` does not list.
     const EURC: &str = "CDTKPWPLOURQA2SGTKTUQOWRCBZEORB4BWBOMJ3D3ZTQQSGE5F6JBQLV";
-    /// The fixture's oracle and admin, reused so `POOL_TWO`'s entries
-    /// decode against real strkeys.
-    const ORACLE: &str = "CCVTVW2CVA7JLH4ROQGP3CU4T3EXVCK66AZGSM4MUQPXAI4QHCZPOATS";
-    const ADMIN: &str = "GDAWX4KV5EQLP5W44HE5AA5QN5QRBJOVQIAI5OXOH5FW2ENT5PXN33DE";
 
     /// One reserve of the synthetic second pool. Rates are 1.0, so no
     /// accrual moves them and every amount below is also its underlying.
@@ -1360,67 +1216,6 @@ mod tests {
         c_factor: u32,
         l_factor: u32,
         price: i128,
-    }
-
-    /// The instance entry of a synthetic pool: the five config fields
-    /// `decode::pool_instance` reads, and the four storage keys around
-    /// them. Modelled on `service.rs`'s test module.
-    fn instance_entry_xdr(pool: &str) -> String {
-        let config = map(vec![
-            (symbol("bstop_rate").expect("symbol"), ScVal::U32(2_000_000)),
-            (symbol("max_positions").expect("symbol"), ScVal::U32(6)),
-            (symbol("min_collateral").expect("symbol"), i128_val(0)),
-            (
-                symbol("oracle").expect("symbol"),
-                address(ORACLE).expect("oracle"),
-            ),
-            (symbol("status").expect("symbol"), ScVal::U32(1)),
-        ])
-        .expect("config map");
-        let ScVal::Map(Some(config)) = config else {
-            panic!("map returns a map")
-        };
-        let storage = stellar_xdr::ScMap::sorted_from(vec![
-            (
-                symbol("Admin").expect("symbol"),
-                address(ADMIN).expect("admin"),
-            ),
-            (
-                symbol("BLNDTkn").expect("symbol"),
-                address(BLND).expect("blnd"),
-            ),
-            (
-                symbol("Backstop").expect("symbol"),
-                address(POOL_TWO).expect("backstop"),
-            ),
-            (symbol("Config").expect("symbol"), ScVal::Map(Some(config))),
-            (
-                symbol("Name").expect("symbol"),
-                ScVal::String(
-                    stellar_xdr::ScString::try_from(b"Second Pool".to_vec()).expect("name"),
-                ),
-            ),
-        ])
-        .expect("storage map");
-        let instance = ScVal::ContractInstance(stellar_xdr::ScContractInstance {
-            executable: stellar_xdr::ContractExecutable::StellarAsset,
-            storage: Some(storage),
-        });
-        contract_entry_xdr(pool, ScVal::LedgerKeyContractInstance, instance)
-    }
-
-    /// A `ContractData` entry of `pool` holding `value`. The scripted RPC
-    /// answers by the key it is asked for, so the entry's own key field
-    /// only has to decode.
-    fn contract_entry_xdr(pool: &str, key: ScVal, value: ScVal) -> String {
-        let entry = LedgerEntryData::ContractData(ContractDataEntry {
-            ext: ExtensionPoint::V0,
-            contract: sc_address(pool).expect("pool"),
-            key,
-            durability: ContractDataDurability::Persistent,
-            val: value,
-        });
-        to_base64(&entry).expect("entry")
     }
 
     /// Scripts one complete `PoolReader::snapshot` of a synthetic pool:
