@@ -20,7 +20,7 @@ use crate::chain::xdr::encode::{
 use crate::chain::xdr::{keys, AuctionType, XdrError};
 use crate::chain::ChainError;
 use crate::math::{
-    calculate_position_data, AuctionData, OraclePrices, PositionData, Positions, Reserve,
+    calculate_position_data, AuctionData, MathError, OraclePrices, PositionData, Positions, Reserve,
 };
 
 /// `submit(from, spender, to, requests)`.
@@ -126,15 +126,59 @@ impl PoolSnapshot {
         if positions.is_empty() {
             return Ok(None);
         }
-        let mut reserves = self.reserves.clone();
-        for reserve in reserves.values_mut() {
-            reserve.accrue(self.instance.config.bstop_rate, close_time)?;
-        }
+        let reserves = self.accrued_reserves(close_time)?;
         Ok(Some(calculate_position_data(
             &reserves,
             &self.prices,
             positions,
         )?))
+    }
+
+    /// The instant this snapshot's positions are valued at, given the tick
+    /// they are being valued for: the later of `close_time` and the newest
+    /// reserve entry the snapshot holds.
+    ///
+    /// `PoolReader::snapshot` reads at the RPC's head, which is at or past
+    /// the tick whoever values positions alongside this snapshot — the
+    /// auctioneer and the filler — was woken for, so on an active pool a
+    /// reserve touched since that tick carries a `last_time` the tick's
+    /// close time precedes, and [`Reserve::accrue`] refuses to run
+    /// backwards rather than clamp. Valuing at the tick alone would fail
+    /// the whole batch exactly when the pool is busy, which is exactly when
+    /// the bot is needed. This is the clamp `Tracker::refresh` applies for
+    /// the same reason, and it must stay the same one: the position values
+    /// fed to a selection and the health factor they are compared against
+    /// both come from it.
+    #[must_use]
+    pub fn valued_at(&self, close_time: u64) -> u64 {
+        self.reserves
+            .values()
+            .map(|reserve| reserve.data.last_time)
+            .max()
+            .unwrap_or(0)
+            .max(close_time)
+    }
+
+    /// A clone of this snapshot's reserves accrued to `at`, once for a
+    /// whole batch.
+    ///
+    /// [`PoolSnapshot::reserves`] is stored, not accrued. Anything that
+    /// prices positions itself — the auctioneer's `position_values`, the
+    /// filler's planner — needs the accrued numbers, at the same instant
+    /// [`PoolSnapshot::position_data`] accrues its own clone to for the
+    /// health factor: accruing here, to the same `at`, is what keeps the
+    /// two agreeing.
+    ///
+    /// # Errors
+    ///
+    /// [`MathError`] when a reserve cannot be accrued to `at` — an `at`
+    /// before its `last_time`, or arithmetic no real reserve reaches.
+    pub fn accrued_reserves(&self, at: u64) -> Result<BTreeMap<u32, Reserve>, MathError> {
+        let mut reserves = self.reserves.clone();
+        for reserve in reserves.values_mut() {
+            reserve.accrue(self.instance.config.bstop_rate, at)?;
+        }
+        Ok(reserves)
     }
 }
 

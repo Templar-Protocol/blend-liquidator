@@ -473,53 +473,6 @@ pub struct Auctioneer<'a> {
     submitter: Option<Submitter<'a>>,
 }
 
-/// Accrues a clone of the snapshot's reserves to `close_time`, once for the
-/// whole batch.
-///
-/// `PoolSnapshot::reserves` is stored, not accrued. [`position_values`]
-/// needs the accrued numbers to price each position individually, the same
-/// instant [`PoolSnapshot::position_data`] accrues its own clone to for the
-/// health-factor gate — accruing a second time here, to the same
-/// `close_time`, is what keeps the two agreeing.
-///
-/// It saves the *second* such pass, and only for the users that turn out
-/// liquidatable, not the first: `decide_one` calls `position_data` for
-/// every borrower in the batch, and that clones and accrues the whole
-/// reserve map on each call. So the per-user accrual this hoists out is one
-/// of two, not one of one — worth doing, and worth not overstating.
-fn accrue_reserves(
-    snapshot: &PoolSnapshot,
-    close_time: u64,
-) -> Result<BTreeMap<u32, Reserve>, MathError> {
-    let mut reserves = snapshot.reserves.clone();
-    for reserve in reserves.values_mut() {
-        reserve.accrue(snapshot.instance.config.bstop_rate, close_time)?;
-    }
-    Ok(reserves)
-}
-
-/// The instant a batch is valued at: the later of the tick's close time and
-/// the newest reserve entry the snapshot holds.
-///
-/// `PoolReader::snapshot` reads at the RPC's head, which is at or past the
-/// tick the auctioneer was woken for, so on an active pool a reserve
-/// touched since that tick carries a `last_time` the tick's close time
-/// precedes — and `Reserve::accrue` refuses to run backwards rather than
-/// clamp. Valuing at the tick alone would fail the whole batch exactly when
-/// the pool is busy, which is exactly when the auctioneer is needed. This is
-/// the clamp `Tracker::refresh` applies for the same reason, and it must
-/// stay the same one: the position values fed to the selection and the
-/// health factor they are compared against both come from it.
-fn valued_at(snapshot: &PoolSnapshot, tick: LedgerTick) -> u64 {
-    snapshot
-        .reserves
-        .values()
-        .map(|reserve| reserve.data.last_time)
-        .max()
-        .unwrap_or(0)
-        .max(tick.close_time)
-}
-
 impl<'a> Auctioneer<'a> {
     /// An auctioneer reading through `rpc`, checking open auctions against
     /// `store`, judging against `config`, and — when `submitter` is given —
@@ -564,8 +517,8 @@ impl<'a> Auctioneer<'a> {
         }
         let accounts: Vec<&str> = users.iter().map(|user| user.account.as_str()).collect();
         let snapshot = PoolReader::new(self.rpc, pool).snapshot(&accounts).await?;
-        let valued_at = valued_at(&snapshot, tick);
-        let reserves = accrue_reserves(&snapshot, valued_at)?;
+        let valued_at = snapshot.valued_at(tick.close_time);
+        let reserves = snapshot.accrued_reserves(valued_at)?;
 
         let mut decisions = Vec::with_capacity(users.len());
         for user in users {
@@ -590,8 +543,8 @@ impl<'a> Auctioneer<'a> {
 
     /// One borrower's decision against an already-read `snapshot` and its
     /// already-accrued `reserves`, both at `valued_at` — the one instant
-    /// [`valued_at`] chose for the whole batch, which the position values
-    /// and the health factor must share. The six steps are the module's
+    /// [`PoolSnapshot::valued_at`] chose for the whole batch, which the
+    /// position values and the health factor must share. The six steps are the module's
     /// whole policy; see the module doc for why each exists.
     async fn decide_one(
         &self,
