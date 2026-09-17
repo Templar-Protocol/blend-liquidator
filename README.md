@@ -122,13 +122,15 @@ endpoints:
   window absorbs one worst-case backoff, so an RPC outage the poller is
   already riding out does not fail it. A pool whose poller has not run
   *at all* yet is measured from the process's start instead, and the
-  initial seed heartbeats for the pool it is working on, so a first start
-  against a busy pool is not read as a poller that has stopped. Only a
+  initial seed heartbeats for every configured pool while it runs, so a
+  first start against a busy pool is not read as a poller that has
+  stopped — including the pools the seed has not reached yet. Only a
   poller that has genuinely stopped making progress fails this.
 - `/metrics` — Prometheus text exposition format, prefixed
   `blend_liquidator_`: ledger head and processed per pool, events
   processed, users tracked and auctions open per pool, creation and fill
-  attempts by result, skips by reason, estimated profit, reserved
+  attempts by result, skips by reason, estimated profit and estimated
+  loss, reserved
   inventory per asset, unwind passes, and notification delivery counts.
   Always `200`.
 
@@ -136,18 +138,23 @@ endpoints:
 Restarting on every readiness blip would kill and respawn the bot on
 exactly the RPC outages its own backoff exists to ride out; a wedged
 poller — which only `/livez` catches — is what a restart can actually
-fix. The server binds before the initial seed, so `/livez` is reachable
-for the whole of a first start. None of this is load-bearing: an unset
+fix. The server binds before the initial seed — after the store
+connects, migrates and the configuration is validated, which is the only
+part of a start it is not up for. None of this is load-bearing: an unset
 `PORT`/`HTTP_PORT` leaves the server off entirely, and a bind failure is
 logged and never stops the bot from trading.
 
 One readiness case is expected rather than wrong: when a pool's events
 cursor has fallen out of the RPC's retained window, the bot reseeds that
-pool, and for the duration of the reseed its processed ledger stands
-still while the chain head advances — so `/healthz` answers `503` until
-the reseed finishes. That is honest readiness (the bot is not caught up),
-and the `EventGap` notification names the cause. Alert on it, but expect
-it when a bot has been stopped for longer than the RPC's retention.
+pool, and its poller waits for that reseed to be applied before it polls
+again — so for the reseed's duration it reads no chain head at all and
+processes no ledger. `/healthz` answers `503` once the wait passes the
+window, with `no chain head read for Ns` as the body rather than a lag.
+That is honest readiness (the bot is not following the chain while it
+rebuilds its user set), the poller keeps heartbeating throughout so
+`/livez` stays `200`, and the `EventGap` notification names the cause.
+Alert on it, but expect it when a bot has been stopped for longer than
+the RPC's retention.
 
 Setting both `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` — both or
 neither, either alone is a startup error — sends every notification to

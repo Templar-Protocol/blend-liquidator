@@ -51,9 +51,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `HttpConfig` is set and never propagating a bind failure to its caller:
   a diagnostics port that cannot open must not stop the bot from trading.
   Its task is spawned before the initial seed, so `/livez` is reachable
-  for the whole of a first start, and the seed heartbeats per pool
-  through `ledger::heartbeat_while` (which `LedgerPoller::await_ack` is
-  built on) rather than leaving that window silent.
+  while a first start seeds, and the seed heartbeats every configured
+  pool through `ledger::heartbeat_while` (which `LedgerPoller::await_ack`
+  is built on) rather than leaving that window silent for the pools it
+  has not reached.
 - `Notifier` gains a bounded number of deliveries in flight
   (`NOTIFY_IN_FLIGHT`, 10) and `Notifier::drain(budget)`, which acquires
   every permit with a timeout and is what an exit path calls, with

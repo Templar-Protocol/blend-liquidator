@@ -99,8 +99,9 @@ make help                           # Docker Compose lifecycle
   "no cooldown" spelling, only shorter ones) and `TELEGRAM_CHAT_ID`,
   which is not a secret and is an argument like the rest. `HttpConfig`
   and `TelegramConfig` are what carry them into `ServiceConfig`.
-  The three secrets are the exception, and none of them is ever a clap
-  field, because argv is world-readable: the two signing keys —
+  The secrets are the exception, and none of them is ever a clap field,
+  because argv is world-readable — `DATABASE_URL` and `RPC_API_KEY` as
+  much as the rest: the two signing keys —
   `AUCTIONEER_SECRET_KEY`, and `FILLER_SECRET_KEY`, which it falls back
   to — are read from the environment by `main.rs` and handed to
   `Args::signing_keys`, while `TELEGRAM_BOT_TOKEN` is read by
@@ -457,8 +458,10 @@ make help                           # Docker Compose lifecycle
   `HTTP_PORT` gave the run an address — spawned *before* the seed pass,
   alone among the tasks, because a seed of a busy pool is tens of seconds
   during which a restart probe must still be able to reach `/livez`; the
-  seed itself heartbeats per pool through `ledger::heartbeat_while`, so
-  that window reports honest progress rather than silence — and — only
+  seed itself heartbeats through `ledger::heartbeat_while`, for *every*
+  configured pool and not only the one it is seeding — no pool has a
+  poller yet, so one the pass has not reached would otherwise be the
+  same restart loop — and — only
   when armed — one
   submission-queue worker per *distinct* signing key, which is what
   `spawn_queues` is for. The run's one `Metrics` and one `Notifier`
