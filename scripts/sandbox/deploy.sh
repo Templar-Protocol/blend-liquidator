@@ -129,6 +129,13 @@ ALLOWANCE_UNTIL_LEDGER=500000
 
 ########################################################################
 # Helpers the CLI has no `contract invoke` form for
+#
+# Each of these, and each direct `stellar` call further down, calls
+# lib.sh's sandbox_require_network before it expands
+# "${sandbox_network_args[@]}". That is not ceremony: a call made before
+# require_standalone_network would carry no network flags at all, and the
+# CLI answers a flagless call with its own default — a public network —
+# rather than with an error.
 ########################################################################
 
 # generate_key NAME — creates (or replaces) the CLI identity NAME and
@@ -137,6 +144,7 @@ ALLOWANCE_UNTIL_LEDGER=500000
 # network's key is dead the moment that network is gone.
 generate_key() {
 	local name=$1
+	sandbox_require_network
 	log "generating and funding ${name}"
 	stellar keys generate "${name}" "${sandbox_network_args[@]}" --fund --overwrite \
 		|| die "step 1 keys: stellar keys generate ${name} failed"
@@ -183,6 +191,7 @@ require_funded() {
 deploy_wasm() {
 	local role=$1 key=$2 wasm=$3 id
 	shift 3
+	sandbox_require_network
 	log "deploying ${role} from $(basename "${wasm}") as ${key}"
 	id=$(stellar contract deploy "${sandbox_network_args[@]}" --source-account "${key}" \
 		--wasm "${wasm}" "$@") || die "deploying ${role}: stellar contract deploy failed"
@@ -199,6 +208,7 @@ deploy_wasm() {
 # "Contract not found".
 deploy_sac() {
 	local role=$1 key=$2 asset=$3 id
+	sandbox_require_network
 	log "deploying ${role} as the Stellar Asset Contract for ${asset}"
 	id=$(stellar contract asset deploy "${sandbox_network_args[@]}" --source-account "${key}" \
 		--asset "${asset}") || die "deploying ${role}: stellar contract asset deploy ${asset} failed"
@@ -212,6 +222,7 @@ deploy_sac() {
 # accounts do.
 trust() {
 	local key=$1 asset=$2
+	sandbox_require_network
 	log "opening ${key}'s trustline to ${asset%%:*}"
 	stellar tx new change-trust "${sandbox_network_args[@]}" --source-account "${key}" --line "${asset}" >/dev/null \
 		|| die "opening trustlines: change-trust ${asset%%:*} for ${key} failed"
@@ -365,6 +376,7 @@ invoke "${SANDBOX_KEY_ADMIN}" "${COMET}" init \
 ########################################################################
 
 log "=== step 5: backstop and factory ==="
+sandbox_require_network
 FACTORY=$(stellar contract id wasm "${sandbox_network_args[@]}" \
 	--salt "${FACTORY_SALT}" --source-account "${SANDBOX_KEY_ADMIN}") \
 	|| die "step 5 factory: predicting the factory's address failed"
@@ -381,6 +393,7 @@ BACKSTOP=$(deploy_wasm backstop "${SANDBOX_KEY_ADMIN}" "${wasm_dir}/backstop_v2.
 sandbox_register_role "${BACKSTOP}" backstop
 
 log "uploading the pool wasm"
+sandbox_require_network
 POOL_HASH=$(stellar contract upload "${sandbox_network_args[@]}" \
 	--source-account "${SANDBOX_KEY_ADMIN}" --wasm "${wasm_dir}/pool_v2.0.0.wasm") \
 	|| die "step 5 pool wasm: stellar contract upload failed"
@@ -388,6 +401,7 @@ POOL_HASH=$(stellar contract upload "${sandbox_network_args[@]}" \
 log "pool wasm hash ${POOL_HASH}"
 
 log "deploying the pool factory at the predicted address"
+sandbox_require_network
 FACTORY_DEPLOYED=$(stellar contract deploy "${sandbox_network_args[@]}" \
 	--source-account "${SANDBOX_KEY_ADMIN}" --wasm "${wasm_dir}/pool-factory_v2.0.0.wasm" \
 	--salt "${FACTORY_SALT}" -- \

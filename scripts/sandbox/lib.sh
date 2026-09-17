@@ -179,9 +179,30 @@ wait_for_rpc() {
 # make the URL that was checked and the URL that is used literally the
 # same string rather than two reconstructions of it.
 #
-# Empty until sandbox_set_network has run, so a call made before the gate
-# fails on a missing network rather than falling back to some default.
+# It is empty until sandbox_set_network has run, and an empty one is
+# **not** self-enforcing: with no flags at all the CLI does not refuse,
+# it resolves its own default, which is a public network — `stellar
+# contract id wasm` with a cleared environment and no flags derives
+# testnet's id. Nor does `set -u` help: bash expands an unset array to
+# nothing without complaint. So the ordering is enforced by
+# sandbox_require_network below, which every expansion of this array
+# calls first.
 sandbox_network_args=()
+
+# sandbox_require_network — dies unless the gate has run, i.e. unless
+# sandbox_set_network has exported SANDBOX_RPC_URL.
+#
+# Called immediately before **every** expansion of sandbox_network_args:
+# invoke() and invoke_view() here, and each direct `stellar` call in
+# deploy.sh. That is the rule a new call site has to follow, and it is
+# load-bearing rather than tidy: a call made before
+# require_standalone_network would carry no flags, and a flagless CLI
+# call goes to a public network rather than failing. The one place the
+# check itself is proved is test-network-pinning.sh.
+sandbox_require_network() {
+	[ -n "${SANDBOX_RPC_URL:-}" ] \
+		|| die "sandbox network not verified: call require_standalone_network first"
+}
 
 # sandbox_set_network URL — records URL as this sandbox's RPC, exports it
 # as SANDBOX_RPC_URL (the one name the rest of the tier reads it under)
@@ -265,6 +286,7 @@ sandbox_register_role() {
 invoke() {
 	local key=$1 contract=$2 fn=$3 role
 	shift 3
+	sandbox_require_network
 	role="${SANDBOX_ROLES[${contract}]:-unregistered contract}"
 	log "invoke ${fn} on ${role} as ${key}"
 	stellar contract invoke "${sandbox_network_args[@]}" --source-account "${key}" \
@@ -280,6 +302,7 @@ invoke() {
 invoke_view() {
 	local key=$1 contract=$2 fn=$3 role
 	shift 3
+	sandbox_require_network
 	role="${SANDBOX_ROLES[${contract}]:-unregistered contract}"
 	log "view ${fn} on ${role} as ${key}"
 	stellar contract invoke "${sandbox_network_args[@]}" --source-account "${key}" \

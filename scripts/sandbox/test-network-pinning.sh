@@ -64,7 +64,12 @@ no() {
 
 # derive — the contract id the CLI derives through the sandbox's own flag
 # array. Whichever network it resolved is in the answer.
+#
+# sandbox_require_network first, as every expansion of the array does: a
+# call made before the gate would take the CLI's own default, which is a
+# public network.
 derive() {
+	sandbox_require_network
 	stellar contract id wasm "${sandbox_network_args[@]}" \
 		--salt "${SALT}" --source-account "${ACCOUNT}"
 }
@@ -99,6 +104,48 @@ if [ "${named}" != "${pinned}" ]; then
 	ok "a different network derives a different id (testnet: ${named}), so this test can fail"
 else
 	no "testnet derived the same id ${named} — the comparison above proves nothing"
+fi
+
+# The ordering guard. Without flags the CLI does not fail: it resolves its
+# own default, which is a *public* network — `stellar contract id wasm`
+# with a cleared environment and no flags derives testnet's id, the same
+# one the third case above proves is a different network. So a call made
+# before require_standalone_network has run has to die, and this is the
+# case that says it does.
+#
+# A child process, because lib.sh has already been sourced and the gate
+# already run in this shell: `env -u SANDBOX_RPC_URL` and a fresh source
+# are what "before any gate" means.
+GUARD_MESSAGE="sandbox network not verified: call require_standalone_network first"
+
+before=$(
+	env -u SANDBOX_RPC_URL bash -c '
+		set -euo pipefail
+		source "$1/lib.sh"
+		source "$1/versions.env"
+		sandbox_require_network
+		echo "the guard let a call through before the gate"
+	' guard "${script_dir}" 2>&1
+) && before_status=0 || before_status=$?
+
+case "${before}" in
+*"${GUARD_MESSAGE}"*) guard_said_so=yes ;;
+*) guard_said_so=no ;;
+esac
+
+if [ "${before_status}" -ne 0 ] && [ "${guard_said_so}" = yes ]; then
+	ok "a CLI call before the gate dies, naming require_standalone_network"
+else
+	no "a CLI call before the gate exited ${before_status} saying: ${before}"
+fi
+
+# And the same guard after the gate, which this shell has already passed:
+# a subshell so that a guard that wrongly died ends the subshell rather
+# than this script, and is reported as a failure like any other.
+if (sandbox_require_network); then
+	ok "the guard passes once require_standalone_network has exported SANDBOX_RPC_URL"
+else
+	no "the guard refused a network this shell has already verified"
 fi
 
 printf '%d passed, %d failed\n' "${pass}" "${fail}"
