@@ -18,18 +18,41 @@
 # via PATH).
 sandbox_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# log MESSAGE… — writes a timestamped line to stderr. Always stderr, never
-# stdout: a caller that captures a helper's stdout (e.g. `x=$(fetch …)`)
+# _sandbox_emit MESSAGE… — the one place a sandbox script's prose is
+# written: a timestamped line to stderr, and, when SANDBOX_LOG names a
+# file, appended to it as well. Always stderr, never stdout: a caller
+# that captures a helper's stdout (e.g. `x=$(fetch …)` or `x=$(invoke …)`)
 # must never pick up log noise mixed into its result.
+#
+# Everything reaching SANDBOX_LOG passes through here, which is what makes
+# "sandbox.log holds no secret" a property of two functions rather than of
+# every call site: nothing else appends to that file, and neither log()
+# nor die() is ever handed a secret — invoke() below logs a function name
+# and a contract, never an argument.
+_sandbox_emit() {
+	local line
+	line="$(printf '[%s] %s' "$(date -u +%H:%M:%S)" "$*")"
+	printf '%s\n' "${line}" >&2
+	if [ -n "${SANDBOX_LOG:-}" ]; then
+		printf '%s\n' "${line}" >>"${SANDBOX_LOG}" || true
+	fi
+	return 0
+}
+
+# log MESSAGE… — writes MESSAGE through _sandbox_emit. Returns 0 always,
+# so a `log …` as the last statement of a function can never fail the
+# caller under `set -e`.
 log() {
-	printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2
+	_sandbox_emit "$*"
 }
 
 # die MESSAGE… — logs MESSAGE as an error and exits 1. The one function in
 # this file whose whole job is to end the calling script; every other
 # function here returns a status and leaves the decision to its caller.
+# Every caller's message names the step that failed, because this line is
+# all an operator gets: the sandbox scripts have no stack trace.
 die() {
-	printf '[%s] ERROR: %s\n' "$(date -u +%H:%M:%S)" "$*" >&2
+	_sandbox_emit "ERROR: $*"
 	exit 1
 }
 
@@ -140,4 +163,90 @@ require_standalone_network() {
 	passphrase=$(printf '%s' "${body}" | jq -r '.result.passphrase // empty' 2>/dev/null) || passphrase=""
 	[ -n "${passphrase}" ] || die "require_standalone_network: ${url} did not answer getNetwork"
 	[ "${passphrase}" = "${SANDBOX_PASSPHRASE}" ] || die "require_standalone_network: ${url} reports passphrase '${passphrase}', expected the sandbox's standalone passphrase '${SANDBOX_PASSPHRASE}' — refusing to touch a network that is not this sandbox's own"
+}
+
+# The stellar CLI identity names deploy.sh creates and crash.sh signs
+# with. They live here rather than in either script because crash.sh has
+# to sign the oracle's set_price_stable as the pool's admin and only
+# deploy.sh knows the name it generated it under — sandbox.env carries the
+# admin's G-address, which cannot sign anything. The `sandbox-` prefix is
+# what makes them recognisable among whatever else is in the operator's
+# ~/.config/stellar/identity/; they are throwaway keys for a throwaway
+# network, so down.sh leaves them alone.
+SANDBOX_KEY_ISSUER=sandbox-issuer
+SANDBOX_KEY_ADMIN=sandbox-admin
+SANDBOX_KEY_BORROWER=sandbox-borrower
+SANDBOX_KEY_FILLER=sandbox-filler
+
+# SANDBOX_NETWORK is the stellar CLI network definition every invocation
+# below names. up.sh is what points `local` at the sandbox's RPC; nothing
+# here ever passes a raw --rpc-url, so there is exactly one place a
+# sandbox script's idea of "the network" comes from.
+: "${SANDBOX_NETWORK:=local}"
+
+# SANDBOX_ROLES maps a deployed contract id to the role deploy.sh gave it
+# ("pool", "oracle", "comet", …). invoke() reads it so a log line can name
+# what it is talking to without ever printing an argument — the arguments
+# are where an amount, an address or, in principle, a secret would be, and
+# sandbox.log is a file an operator pastes into an issue.
+declare -A SANDBOX_ROLES
+
+# sandbox_register_role CONTRACT ROLE — records ROLE for CONTRACT and logs
+# the pair. This is the line that puts every deployed address into
+# sandbox.log, so call it for every contract the moment its id is known.
+sandbox_register_role() {
+	local contract=$1 role=$2
+	SANDBOX_ROLES["${contract}"]="${role}"
+	log "${role} is ${contract}"
+}
+
+# invoke KEY CONTRACT FN ARGS… — `stellar contract invoke … --send=yes`,
+# logging the function name and CONTRACT's registered role but **never**
+# the arguments, and dying (naming the function, the role and the key) on
+# any failure. Prints the CLI's stdout — the contract's return value —
+# unmixed, so `POOL=$(invoke admin "${FACTORY}" deploy …)` is the way to
+# capture a returned address.
+#
+# --send=yes and not the default: the default only sends when simulation
+# says the call writes, which turns a call this script means as a
+# state change into a silent no-op the moment a contract's behaviour
+# shifts. Every invoke() here is meant to land on chain; use
+# invoke_view() for the ones that are not.
+invoke() {
+	local key=$1 contract=$2 fn=$3 role
+	shift 3
+	role="${SANDBOX_ROLES[${contract}]:-unregistered contract}"
+	log "invoke ${fn} on ${role} as ${key}"
+	stellar contract invoke --network "${SANDBOX_NETWORK}" --source-account "${key}" \
+		--id "${contract}" --send=yes -- "${fn}" "$@" \
+		|| die "invoke ${fn} on ${role} (${contract}) as ${key} failed"
+}
+
+# invoke_view KEY CONTRACT FN ARGS… — invoke()'s read-only twin:
+# `--send=no`, so the CLI simulates and prints the result without building,
+# signing or sending anything. Same logging and same fatal-on-failure
+# contract. KEY is still required — a simulation needs a source account —
+# but nothing is signed with it.
+invoke_view() {
+	local key=$1 contract=$2 fn=$3 role
+	shift 3
+	role="${SANDBOX_ROLES[${contract}]:-unregistered contract}"
+	log "view ${fn} on ${role} as ${key}"
+	stellar contract invoke --network "${SANDBOX_NETWORK}" --source-account "${key}" \
+		--id "${contract}" --send=no -- "${fn}" "$@" \
+		|| die "view ${fn} on ${role} (${contract}) as ${key} failed"
+}
+
+# env_write FILE — creates FILE empty, restricts it to mode 0600, and only
+# then appends this function's stdin to it. The order is the point:
+# sandbox.env carries the filler's secret key, and creating it under the
+# operator's umask and chmod-ing afterwards would leave a world-readable
+# file holding a signing key for however long the write took. Nothing is
+# ever appended to an existing FILE — a truncate is what makes the mode
+# guarantee hold on a second call.
+env_write() {
+	local file=$1
+	: >"${file}" || die "env_write: could not create ${file}"
+	chmod 600 "${file}" || die "env_write: could not restrict ${file} to mode 0600"
+	cat >>"${file}" || die "env_write: could not write ${file}"
 }
