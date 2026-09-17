@@ -305,17 +305,13 @@ impl<'a> LedgerPoller<'a> {
         &self,
         applied: oneshot::Receiver<()>,
     ) -> Result<(), oneshot::error::RecvError> {
-        tokio::pin!(applied);
-        loop {
-            tokio::select! {
-                result = &mut applied => return result,
-                () = tokio::time::sleep(self.config.poll_interval) => {
-                    if let Some(metrics) = &self.metrics {
-                        metrics.heartbeat(self.pool);
-                    }
-                }
-            }
-        }
+        heartbeat_while(
+            self.metrics.as_deref(),
+            self.pool,
+            self.config.poll_interval,
+            applied,
+        )
+        .await
     }
 
     /// Polls until `shutdown` flips, backing off on RPC failures. An RPC
@@ -584,6 +580,50 @@ impl<'a> LedgerPoller<'a> {
             )
             .await?;
         Ok(Some(tick))
+    }
+}
+
+/// Runs `fut` to completion while recording `pool`'s heartbeat on
+/// `metrics` — once when the wait starts and again every `interval` until
+/// it finishes — and answers exactly what `fut` answered.
+///
+/// **Working is being alive.** A heartbeat says the process is still
+/// turning on this pool's behalf, and the two places that take longer
+/// than [`PollerConfig::liveness_deadline`] without turning the poll loop
+/// are the wait for a tick's acknowledgement (a gap reseed, a full scan)
+/// and the initial seed, which runs before the pollers are spawned at
+/// all. Neither is a stall, and a `/livez` (see [`crate::http::liveness`])
+/// that read either as one would have a restart probe kill the bot in the
+/// middle of the very work it was waiting on — which, on restart, it
+/// would begin again.
+///
+/// Nothing here can change what `fut` answers or when: the output is
+/// returned unchanged, and a caller whose `metrics` is `None` records
+/// nothing at all (spec §8).
+pub async fn heartbeat_while<F: std::future::Future>(
+    metrics: Option<&Metrics>,
+    pool: &str,
+    interval: Duration,
+    fut: F,
+) -> F::Output {
+    // `tokio::time::interval` panics on a zero period, and a heartbeat
+    // helper is no place for a run to die: every production caller is far
+    // above this floor (`POLL_INTERVAL_MS` is at least 100).
+    let period = interval.max(Duration::from_millis(1));
+    let mut ticker = tokio::time::interval(period);
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            output = &mut fut => return output,
+            // The first tick completes immediately, so a wait that starts
+            // is itself recorded rather than only one that lasts a whole
+            // interval.
+            _ = ticker.tick() => {
+                if let Some(metrics) = metrics {
+                    metrics.heartbeat(pool);
+                }
+            }
+        }
     }
 }
 
@@ -1279,6 +1319,16 @@ mod tests {
                 "the cursor waits for the acknowledgement, heartbeat or not"
             );
             tokio::time::sleep(Duration::from_millis(15)).await;
+            let again = metrics
+                .pool_status(POOL)
+                .expect("a status")
+                .heartbeat
+                .expect("the wait is still recording");
+            assert!(
+                again > at,
+                "the heartbeat keeps advancing for as long as the wait lasts, rather \
+                 than being stamped once when it began"
+            );
             ack.send(()).expect("acknowledge the tick");
         };
         let (result, ()) = tokio::join!(poll, driver);

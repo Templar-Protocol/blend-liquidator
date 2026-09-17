@@ -13,15 +13,21 @@
 //!
 //! **`/healthz` is readiness, `/livez` is liveness, and they answer
 //! different questions.** [`readiness`] checks that every configured pool
-//! has processed at least one ledger, that its processed ledger is within
-//! [`HttpState::max_lag_ledgers`] of the chain head this process has
-//! observed, and that the store answers a ping — it fails during an
+//! has processed at least one ledger, that a chain head has been read for
+//! it within [`HttpState::liveness_deadline`], that its processed ledger
+//! is within [`HttpState::max_lag_ledgers`] of that head, and that the
+//! store answers a ping inside [`PING_TIMEOUT`] — it fails during an
 //! ordinary RPC hiccup or a lagging store, conditions the poller's own
-//! backoff already recovers from without help. [`liveness`] checks only
-//! that every pool's poller has heartbeated within
+//! backoff already recovers from without help. The head's *age* is what
+//! makes the first of those true: both ledger gauges are written by this
+//! process, an RPC outage stops both at once, and a readiness that
+//! compared only the two would stay green throughout it. [`liveness`]
+//! checks only that every pool's poller has heartbeated within
 //! [`HttpState::liveness_deadline`] (which itself absorbs one worst-case
-//! backoff — see [`crate::ledger::PollerConfig::liveness_deadline`]) —
-//! it fails only once a poller has genuinely stopped making progress.
+//! backoff — see [`crate::ledger::PollerConfig::liveness_deadline`]),
+//! measuring a pool that has never heartbeated from
+//! [`HttpState::started`] — it fails only once a poller has genuinely
+//! stopped making progress.
 //! **A deployment's restart probe must target `/livez`, never `/healthz`**:
 //! restarting on every readiness blip would kill and respawn the process on
 //! exactly the RPC outages its backoff is designed to ride out, while a
@@ -60,9 +66,17 @@ pub struct HttpState {
     /// [`readiness`]'s lag bound: see
     /// [`crate::config::HttpConfig::max_lag_ledgers`].
     pub max_lag_ledgers: u32,
-    /// [`liveness`]'s bound: see
-    /// [`crate::ledger::PollerConfig::liveness_deadline`].
+    /// [`liveness`]'s bound, and [`readiness`]'s bound on the age of the
+    /// chain head: see [`crate::ledger::PollerConfig::liveness_deadline`].
     pub liveness_deadline: Duration,
+    /// When the run started, which is [`liveness`]'s baseline for a pool
+    /// that has never heartbeated: until [`HttpState::liveness_deadline`]
+    /// has passed since this, silence is a poller still starting — the
+    /// initial seed of a busy pool is tens of seconds — rather than one
+    /// that has stopped. The same rule `crate::service::watchdog_loop`
+    /// applies, and a restart probe that read the two differently would
+    /// kill the process in the middle of the seed it then restarts.
+    pub started: Instant,
 }
 
 /// The router: `/healthz`, `/livez`, `/metrics`. Anything else falls
@@ -106,18 +120,35 @@ pub async fn serve_on(
     }
 }
 
-/// `/healthz`'s answer: `Ok` when every pool in [`HttpState::pools`] has
-/// processed at least one ledger within [`HttpState::max_lag_ledgers`] of
-/// its observed chain head and the store answers a ping; otherwise the
-/// first failure, which is also the `503` body. Checked in configuration
-/// order, so the earliest pool with a problem is what a caller sees.
+/// How long [`readiness`]'s store ping may take before it is a failure
+/// rather than an answer.
 ///
-/// `now` is accepted, and unused, for signature symmetry with
-/// [`liveness`]: every rule here is ledger-counted rather than wall-clock,
-/// so a future caller does not have to thread a clock through a new
-/// signature to add a time-based one.
-pub async fn readiness(state: &HttpState, _now: Instant) -> Result<(), String> {
+/// A saturated pool makes `ping` wait out sqlx's own acquire timeout —
+/// tens of seconds — and a probe that hangs is a probe that times out:
+/// the prober calls it a failure either way, so this makes the endpoint
+/// *say* so, in the body, rather than leave the operator reading a
+/// timeout from their load balancer's logs.
+pub const PING_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `/healthz`'s answer: `Ok` when every pool in [`HttpState::pools`] has
+/// processed at least one ledger, has had a chain head read for it within
+/// [`HttpState::liveness_deadline`], and is within
+/// [`HttpState::max_lag_ledgers`] of that head — and the store answers a
+/// ping inside [`PING_TIMEOUT`]. Otherwise the first failure, which is
+/// also the `503` body. Checked in configuration order, so the earliest
+/// pool with a problem is what a caller sees.
+///
+/// **The head's age is a rule, not a nicety.** Both ledger gauges are
+/// this process's own: `ledger_head` moves only when a pass actually read
+/// a head, and `ledger_processed` only when a tick was acknowledged. An
+/// RPC outage stops both, leaving a lag frozen wherever it was — so a
+/// readiness that compared only the two would answer `200` for the whole
+/// of the one failure it exists to catch. `now` is what tells that apart
+/// from a bot genuinely at chain head, which is why this signature takes
+/// a clock.
+pub async fn readiness(state: &HttpState, now: Instant) -> Result<(), String> {
     let max_lag_ledgers = state.max_lag_ledgers;
+    let limit = state.liveness_deadline.as_secs();
     for pool in &state.pools {
         let status = state.metrics.pool_status(pool);
         let Some(processed) = status.and_then(|status| status.processed) else {
@@ -126,6 +157,18 @@ pub async fn readiness(state: &HttpState, _now: Instant) -> Result<(), String> {
         let Some(head) = status.and_then(|status| status.head) else {
             return Err(format!("no chain head observed yet for {pool}"));
         };
+        // Recorded with the head and never apart from it, so this is
+        // `Some` wherever `head` is; a `None` is read as "just now"
+        // rather than invented as a failure of its own.
+        if let Some(head_at) = status.and_then(|status| status.head_at) {
+            let age = now.saturating_duration_since(head_at);
+            if age > state.liveness_deadline {
+                let secs = age.as_secs();
+                return Err(format!(
+                    "{pool}: no chain head read for {secs}s (limit {limit}s)"
+                ));
+            }
+        }
         let lag = head.saturating_sub(processed);
         if lag > max_lag_ledgers {
             return Err(format!(
@@ -133,25 +176,44 @@ pub async fn readiness(state: &HttpState, _now: Instant) -> Result<(), String> {
             ));
         }
     }
-    state
-        .store
-        .ping()
-        .await
-        .map_err(|error| format!("store: {error}"))
+    match tokio::time::timeout(PING_TIMEOUT, state.store.ping()).await {
+        Ok(result) => result.map_err(|error| format!("store: {error}")),
+        Err(_) => Err(format!(
+            "store: ping timed out after {}s",
+            PING_TIMEOUT.as_secs()
+        )),
+    }
 }
 
 /// `/livez`'s answer: `Ok` when every pool in [`HttpState::pools`] has
 /// heartbeated within [`HttpState::liveness_deadline`] of `now`; otherwise
 /// the first pool that has not, which is also the `503` body. Checked in
 /// configuration order, like [`readiness`].
+///
+/// A pool that has *never* heartbeated is measured from
+/// [`HttpState::started`] instead, and is alive until the same deadline
+/// has passed since then: a poller whose first iteration has not run yet
+/// — the run seeds every pool that needs it before the first pass, which
+/// on a busy pool is tens of seconds — has not stopped, and a restart
+/// probe that read it as dead would kill the process in the middle of the
+/// seed it would then start over. `crate::service::watchdog_loop` reads a
+/// missing heartbeat the same way.
 pub fn liveness(state: &HttpState, now: Instant) -> Result<(), String> {
+    let limit = state.liveness_deadline.as_secs();
     for pool in &state.pools {
         let heartbeat = state
             .metrics
             .pool_status(pool)
             .and_then(|status| status.heartbeat);
         let Some(at) = heartbeat else {
-            return Err(format!("{pool}'s poller has not run yet"));
+            let age = now.saturating_duration_since(state.started);
+            if age > state.liveness_deadline {
+                let secs = age.as_secs();
+                return Err(format!(
+                    "{pool}'s poller has not run yet, {secs}s after start (limit {limit}s)"
+                ));
+            }
+            continue;
         };
         let age = now.saturating_duration_since(at);
         if age > state.liveness_deadline {
@@ -221,32 +283,122 @@ mod tests {
     ) -> sqlx::Result<()> {
         let store = Store::from_pool(db);
         let metrics = Arc::new(Metrics::new());
+        let now = Instant::now();
         let state = HttpState {
             metrics: Arc::clone(&metrics),
             store,
             pools: vec!["A".into(), "B".into()],
             max_lag_ledgers: 10,
             liveness_deadline: Duration::from_secs(35),
+            started: now,
         };
         assert_eq!(
-            readiness(&state, Instant::now()).await,
+            readiness(&state, now).await,
             Err("no ledger processed yet for A".into())
         );
-        metrics.ledger_head("A", 100);
+        metrics.ledger_head_at("A", 100, now);
         metrics.ledger_processed("A", 95);
         assert_eq!(
-            readiness(&state, Instant::now()).await,
+            readiness(&state, now).await,
             Err("no ledger processed yet for B".into())
         );
-        metrics.ledger_head("B", 100);
+        metrics.ledger_head_at("B", 100, now);
         metrics.ledger_processed("B", 80);
         assert_eq!(
-            readiness(&state, Instant::now()).await,
+            readiness(&state, now).await,
             Err("B is 20 ledgers behind head (limit 10)".into())
         );
         metrics.ledger_processed("B", 90);
-        assert_eq!(readiness(&state, Instant::now()).await, Ok(()));
+        assert_eq!(readiness(&state, now).await, Ok(()));
+
+        // The ping is a rule of its own, and a store that refuses is the
+        // one failure no gauge can report: without this the ping could be
+        // deleted and every assertion above would still hold.
+        state.store.pool().close().await;
+        let refused = readiness(&state, now)
+            .await
+            .expect_err("a closed pool cannot answer a ping");
+        assert!(
+            refused.starts_with("store: "),
+            "the store's failure is named as the store's: {refused}"
+        );
         Ok(())
+    }
+
+    /// Readiness compares two *internal* gauges, and an RPC outage stops
+    /// both: `ledger_head` is written only by a pass that read a head and
+    /// `ledger_processed` only by an acknowledged tick, so a frozen lag is
+    /// exactly what the bot following nothing looks like. The head's age
+    /// is what tells the two apart.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn readiness_fails_once_no_chain_head_has_been_read_for_the_deadline(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let metrics = Arc::new(Metrics::new());
+        let now = Instant::now();
+        let state = HttpState {
+            metrics: Arc::clone(&metrics),
+            store,
+            pools: vec!["A".into()],
+            max_lag_ledgers: 10,
+            liveness_deadline: Duration::from_secs(35),
+            started: now,
+        };
+        metrics.ledger_head_at("A", 100, now);
+        metrics.ledger_processed("A", 100);
+        assert_eq!(readiness(&state, now).await, Ok(()));
+
+        let stale = now + Duration::from_secs(36);
+        assert_eq!(
+            readiness(&state, stale).await,
+            Err("A: no chain head read for 36s (limit 35s)".into()),
+            "a head nobody has read since the deadline is not a ready bot, however \
+             small the lag between two gauges that both stopped moving"
+        );
+        Ok(())
+    }
+
+    /// A store that accepts the connection and then never speaks is what
+    /// a saturated pool looks like to a prober: `ping` would wait out
+    /// sqlx's own acquire timeout, tens of seconds, and the endpoint
+    /// would hang rather than answer. This test spends
+    /// [`PING_TIMEOUT`] of real time on purpose — the bound is wall-clock,
+    /// and `tokio::time::pause` is not available to this crate — but it
+    /// spends it concurrently with the rest of the suite.
+    #[tokio::test]
+    async fn readiness_answers_rather_than_hanging_on_a_store_that_never_replies() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a listener that answers nothing");
+        let port = listener.local_addr().expect("read the port back").port();
+        let accepting = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+
+        let store = Store::from_pool(
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy(&format!("postgres://unused:unused@127.0.0.1:{port}/unused"))
+                .expect("a lazy pool never dials, so this cannot fail here"),
+        );
+        let state = HttpState {
+            metrics: Arc::new(Metrics::new()),
+            store,
+            pools: Vec::new(),
+            max_lag_ledgers: 10,
+            liveness_deadline: Duration::from_secs(35),
+            started: Instant::now(),
+        };
+
+        assert_eq!(
+            readiness(&state, Instant::now()).await,
+            Err("store: ping timed out after 5s".into()),
+            "the probe says what is wrong instead of waiting for the store to"
+        );
+        accepting.abort();
     }
 
     // `#[tokio::test]`, not a plain `#[test]`: `liveness` itself is sync,
@@ -256,18 +408,28 @@ mod tests {
     #[tokio::test]
     async fn liveness_is_the_heartbeat_within_the_deadline() {
         let metrics = Arc::new(Metrics::new());
+        let now = Instant::now();
         let state = HttpState {
             metrics: Arc::clone(&metrics),
             store: disconnected_store(),
             pools: vec!["A".into()],
             max_lag_ledgers: 10,
             liveness_deadline: Duration::from_secs(35),
+            started: now,
         };
-        let now = Instant::now();
 
+        // Not yet run is not dead — `watchdog_loop` reads it the same way:
+        // a poller seeding a busy pool has not had its first iteration.
+        assert_eq!(liveness(&state, now), Ok(()));
         assert_eq!(
-            liveness(&state, now),
-            Err("A's poller has not run yet".into())
+            liveness(&state, now + Duration::from_secs(34)),
+            Ok(()),
+            "still inside the startup baseline"
+        );
+        assert_eq!(
+            liveness(&state, now + Duration::from_secs(36)),
+            Err("A's poller has not run yet, 36s after start (limit 35s)".into()),
+            "past it, silence is a poller that never started"
         );
 
         metrics.heartbeat_at("A", now, std::time::SystemTime::now());
@@ -292,6 +454,12 @@ mod tests {
             pools: vec!["A".into()],
             max_lag_ledgers: 10,
             liveness_deadline: Duration::from_secs(35),
+            // Long enough ago that the startup baseline has passed, so a
+            // pool with no heartbeat is the "never started" failure this
+            // test reads over the socket rather than a bot still starting.
+            started: Instant::now()
+                .checked_sub(Duration::from_mins(1))
+                .expect("a minute ago"),
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -310,9 +478,10 @@ mod tests {
             .await
             .expect("livez request");
         assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            response.text().await.expect("livez body"),
-            "A's poller has not run yet"
+        let body = response.text().await.expect("livez body");
+        assert!(
+            body.starts_with("A's poller has not run yet,"),
+            "the body is the reason, and the reason names the pool: {body}"
         );
 
         metrics.heartbeat("A");
@@ -370,6 +539,7 @@ mod tests {
             pools: Vec::new(),
             max_lag_ledgers: 10,
             liveness_deadline: Duration::from_secs(35),
+            started: Instant::now(),
         });
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 

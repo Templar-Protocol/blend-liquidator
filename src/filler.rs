@@ -218,6 +218,19 @@ pub struct FillerState {
     /// Every version of an auction this process has recorded a dry-run
     /// fill for (ruling 8), by content: see [`RecordedFill`].
     recorded_dry_run: BTreeSet<RecordedFill>,
+    /// Every auction this process has already counted a
+    /// `skips_total{unsupported_assets}` for, by pool, account and start
+    /// ledger.
+    ///
+    /// The assets test runs before the dry-run and `due` filters, for
+    /// every open row of every pool on every tick — so without this one
+    /// auction a pool's configuration does not support would count a skip
+    /// per ledger, for as long as it stays open, while every other reason
+    /// counts once per planning attempt. One unsupported auction would
+    /// then bury all four of them. Pruned beside `recorded_dry_run`, by
+    /// the same rule and for the same reason: the row going away is the
+    /// only thing that ends the count.
+    counted_unsupported: BTreeSet<(String, String, u32)>,
     /// Set by a submission that landed or may have landed, so the next
     /// pool pass re-reads the wallet however fresh its balances look.
     inventory_stale: bool,
@@ -348,12 +361,21 @@ impl FillerState {
             .filter(|row| row.auction_type == AuctionType::UserLiquidation)
             .map(|row| (row.account.as_str(), row.start_ledger))
             .collect();
-        self.recorded_dry_run.retain(|recorded| {
-            recorded.pool != pool
+        let kept = |recorded_pool: &str, account: &str, start_ledger: u32| {
+            recorded_pool != pool
                 || open
-                    .get(recorded.account.as_str())
-                    .is_some_and(|start| recorded.start_ledger >= *start)
-        });
+                    .get(account)
+                    .is_some_and(|start| start_ledger >= *start)
+        };
+        self.recorded_dry_run
+            .retain(|recorded| kept(&recorded.pool, &recorded.account, recorded.start_ledger));
+        // The same rule, because it answers the same question: an auction
+        // the pool's open rows no longer name is one nothing will decide
+        // about again, so neither set may keep it.
+        self.counted_unsupported
+            .retain(|(recorded_pool, account, start_ledger)| {
+                kept(recorded_pool, account, *start_ledger)
+            });
     }
 }
 
@@ -583,7 +605,7 @@ impl<'a> Filler<'a> {
         pass.state.prune_recorded(&pool.address, &rows);
         let candidates: Vec<TrackedAuction> = rows
             .into_iter()
-            .filter(|row| self.considered(pool, row, pass))
+            .filter(|row| self.considered(pool, row, &mut *pass))
             .collect();
         if candidates.is_empty() {
             return Ok(());
@@ -660,7 +682,7 @@ impl<'a> Filler<'a> {
     /// every tick, and a line per row per ledger would bury the decisions
     /// that matter. What it filtered out is the difference between the
     /// store's open auctions and the tick's summary.
-    fn considered(&self, pool: &PoolConfig, row: &TrackedAuction, pass: &Pass<'_>) -> bool {
+    fn considered(&self, pool: &PoolConfig, row: &TrackedAuction, pass: &mut Pass<'_>) -> bool {
         if row.auction_type != AuctionType::UserLiquidation {
             return false;
         }
@@ -670,7 +692,17 @@ impl<'a> Filler<'a> {
         let bid: Vec<&str> = row.bid.keys().map(String::as_str).collect();
         let lot: Vec<&str> = row.lot.keys().map(String::as_str).collect();
         if !pool.supports(&bid, &lot) {
-            self.metrics.skip(SkipLabel::UnsupportedAssets);
+            // Once per auction, not once per tick it stays open for: this
+            // test runs over every open row of every pool on every tick,
+            // and every other `skips_total` reason counts per planning
+            // attempt. See `FillerState::counted_unsupported`.
+            if pass.state.counted_unsupported.insert((
+                row.pool.clone(),
+                row.account.clone(),
+                row.start_ledger,
+            )) {
+                self.metrics.skip(SkipLabel::UnsupportedAssets);
+            }
             return false;
         }
         // On the row's own version: the cheap test, before any chain read.
@@ -1969,10 +2001,10 @@ mod tests {
         series(metrics, "skips_total", "reason", reason.as_str())
     }
 
-    /// The rendered running estimated-profit total. A float because that
-    /// is what the exposition format carries — display only, never a
-    /// number anything here decides on.
-    fn profit_total(metrics: &Metrics) -> f64 {
+    /// The rendered running estimated-profit total, in the pool oracle's
+    /// own units — an integer, which is what the counter carries: display
+    /// only, never a number anything here decides on.
+    fn profit_total(metrics: &Metrics) -> i128 {
         metrics
             .render()
             .lines()
@@ -3278,8 +3310,19 @@ mod tests {
             .tick(&mut state, tick, true, None, &shutdown)
             .await
             .expect("tick");
+        // A second tick over the same two rows: nothing about either has
+        // changed, and neither has what the bot decided about them.
+        let next = LedgerTick {
+            sequence: tick.sequence + 1,
+            ..tick
+        };
+        let again = filler
+            .tick(&mut state, next, true, None, &shutdown)
+            .await
+            .expect("a second tick");
 
         assert_eq!(summary, TickSummary::default());
+        assert_eq!(again, TickSummary::default());
         assert!(
             rpc.received().await.is_empty(),
             "an auction the filler would never take is filtered out of the store's own rows, \
@@ -3304,8 +3347,10 @@ mod tests {
         assert_eq!(
             skip_count(&metrics, SkipLabel::UnsupportedAssets),
             1,
-            "the unsupported auction is the one counted; the bot's own account is filtered \
-             before the assets are ever looked at"
+            "the unsupported auction is the one counted, once for the auction and not once \
+             per tick it stays open for — every other reason counts per planning attempt, \
+             and a reason counted at the tick rate would bury them all. The bot's own \
+             account is filtered before the assets are ever looked at"
         );
         assert_eq!(
             skip_count(&metrics, SkipLabel::Unfunded)
@@ -4386,7 +4431,7 @@ mod tests {
             "the chain landed it, so it is attempted and succeeded and nothing else"
         );
         assert!(
-            profit_total(&metrics) > 0.0,
+            profit_total(&metrics) > 0,
             "and the draft's own estimate reached the running total"
         );
         assert!(
@@ -4506,7 +4551,7 @@ mod tests {
             (1, 0, 1)
         );
         assert!(
-            (profit_total(&metrics) - 0.0).abs() < f64::EPSILON,
+            profit_total(&metrics) == 0,
             "a fill that took nothing over earned nothing"
         );
         assert!(
@@ -4629,7 +4674,7 @@ mod tests {
             (1, 0, 1)
         );
         assert!(
-            (profit_total(&metrics) - 0.0).abs() < f64::EPSILON,
+            profit_total(&metrics) == 0,
             "a fill that never applied earned nothing"
         );
         assert!(

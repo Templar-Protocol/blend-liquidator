@@ -26,9 +26,11 @@
 //! stopped is exactly the thing that cannot report itself. The HTTP
 //! server is [`crate::http::serve`] over that same recorder and the
 //! store, and it is spawned only when `PORT` or `HTTP_PORT` gave the run
-//! an address; it answers `Ok(())` however it ends, a bind failure
-//! included, because a diagnostics port that cannot open must not stop
-//! the bot from trading (spec §8).
+//! an address — and, alone among the tasks, *before* the initial seed,
+//! since a seed of a busy pool is tens of seconds during which a restart
+//! probe must be able to reach `/livez` at all. Its task answers `Ok(())`
+//! however it ends, a bind failure included, because a diagnostics port
+//! that cannot open must not stop the bot from trading (spec §8).
 //!
 //! The run's one [`crate::metrics::Metrics`] and its one
 //! [`crate::notifier::Notifier`] — the latter over the Telegram channel
@@ -36,7 +38,7 @@
 //! [`crate::notifier::LogChannel`] otherwise, at
 //! `config.notification_cooldown` — are both constructed before the seed
 //! pass, which is the first thing that records through them and runs
-//! before any task is spawned at all; every loop that needs both is
+//! before every task but the HTTP server; every loop that needs both is
 //! handed them together as one `Instruments`, and the pollers, the
 //! watchdog, the HTTP server and the filler are handed those same two
 //! instances rather than instances of their own, since dedup state and
@@ -126,7 +128,7 @@ use crate::executor::Executor;
 use crate::filler::{Filler, FillerConfig, FillerState};
 use crate::http::{self, HttpState};
 use crate::inventory::Inventory;
-use crate::ledger::{LedgerPoller, LedgerTick, PollerConfig, PollerMessage};
+use crate::ledger::{heartbeat_while, LedgerPoller, LedgerTick, PollerConfig, PollerMessage};
 use crate::metrics::{Attempt, Metrics};
 use crate::notifier::telegram::TelegramChannel;
 use crate::notifier::{
@@ -515,12 +517,26 @@ fn build_seed_sources(seed: &SeedConfig) -> Result<Vec<SeedSource>, LiquidatorEr
 ///
 /// Returns the pools whose seed could not reach every source, for the
 /// tracker loop to retry on its full-scan cadence as spec §4 requires.
+///
+/// Each pool's seed is wrapped in [`heartbeat_while`] at
+/// `heartbeat_interval`, so this pass — which runs before any poller
+/// exists to heartbeat for itself — reports the pool it is working on as
+/// alive. Without it `/livez` would have nothing but
+/// [`crate::http::HttpState::started`]'s baseline to go on for the whole
+/// of a seed that can outlast it, and a restart probe would kill the bot
+/// in the middle of the seed it would then start again.
+// One collaborator per parameter — two clients, the pools, the seed
+// sources, the batch rate, the heartbeat cadence, the shutdown flag and
+// the run's instruments — and no two of them belong together in a type of
+// their own.
+#[allow(clippy::too_many_arguments)]
 async fn seed_pools_needing_it(
     rpc: &RpcClient,
     store: &Store,
     pools: &[PoolConfig],
     sources: &[SeedSource],
     batch: u32,
+    heartbeat_interval: std::time::Duration,
     shutdown: &watch::Receiver<bool>,
     instruments: &Instruments,
 ) -> Result<BTreeSet<String>, LiquidatorError> {
@@ -541,9 +557,13 @@ async fn seed_pools_needing_it(
             sequence: head.sequence,
             close_time: head.close_time,
         };
-        let outcome = match tracker
-            .seed(&pool.address, sources, tick, batch, shutdown)
-            .await
+        let outcome = match heartbeat_while(
+            Some(&instruments.metrics),
+            &pool.address,
+            heartbeat_interval,
+            tracker.seed(&pool.address, sources, tick, batch, shutdown),
+        )
+        .await
         {
             Ok(outcome) => outcome,
             // The same split the tracker loop makes: a store failure is
@@ -2669,6 +2689,44 @@ impl Service {
             notifier: Arc::clone(&notifier),
         };
 
+        let poller_config = PollerConfig::new(config.poll_interval);
+        let pool_addresses: Vec<String> = config
+            .pools
+            .iter()
+            .map(|pool| pool.address.clone())
+            .collect();
+        let mut tasks = JoinSet::new();
+        // The diagnostics port, when one is configured, and a task of the
+        // run like any other so that a shutdown joins it with the rest.
+        //
+        // Spawned **before** the seed pass, not after it: seeding a busy
+        // pool is tens of seconds of sequential round trips, and a port
+        // that is not bound for the whole of that window is a `/livez` a
+        // restart probe cannot reach — a Kubernetes deployment without a
+        // startup probe kills the process mid-seed and it starts the same
+        // seed again, and a Cloud Run revision whose startup TCP probe
+        // never connects fails to start at all. Everything `HttpState`
+        // needs exists by here, and until the pollers run `liveness`
+        // measures a pool's silence from `started` (see
+        // [`crate::http::liveness`]), which is the same rule
+        // `watchdog_loop` applies.
+        log_http(config.http);
+        if let Some(http) = config.http {
+            let state = Arc::new(HttpState {
+                metrics: Arc::clone(&metrics),
+                store: store.clone(),
+                pools: pool_addresses.clone(),
+                max_lag_ledgers: http.max_lag_ledgers,
+                liveness_deadline: poller_config.liveness_deadline(),
+                started: std::time::Instant::now(),
+            });
+            let shutdown = shutdown_rx.clone();
+            tasks.spawn(async move {
+                http::serve(http.bind, state, shutdown).await;
+                Ok(())
+            });
+        }
+
         let seed_sources = build_seed_sources(&config.seed)?;
         let needs_reseed = seed_pools_needing_it(
             &rpc,
@@ -2676,14 +2734,13 @@ impl Service {
             &config.pools,
             &seed_sources,
             config.refresh_batch,
+            config.poll_interval,
             &shutdown_rx,
             &instruments,
         )
         .await?;
 
         let (message_tx, message_rx) = mpsc::channel(1_024);
-        let poller_config = PollerConfig::new(config.poll_interval);
-        let mut tasks = JoinSet::new();
         spawn_pollers(
             &mut tasks,
             &rpc,
@@ -2705,11 +2762,6 @@ impl Service {
         let auctioneer_config = auctioneer_config_from(&config, &signing);
         let filler_config = filler_config_from(&config, &signing);
         let auctioneer_cadence = auctioneer_cadence_from(&config);
-        let pool_addresses: Vec<String> = config
-            .pools
-            .iter()
-            .map(|pool| pool.address.clone())
-            .collect();
 
         // The deciding tasks' own view of the tick, published by the
         // tracker task only after it has acknowledged one (see
@@ -2731,26 +2783,6 @@ impl Service {
             poller_config,
             &shutdown_rx,
         );
-        // The diagnostics port, when one is configured, and a task of the
-        // run like any other so that a shutdown joins it with the rest.
-        // It answers `Ok(())` however it ends: `http::serve` reports a
-        // bind failure itself and returns, because a port that cannot open
-        // must not stop the bot from trading (spec §8).
-        log_http(config.http);
-        if let Some(http) = config.http {
-            let state = Arc::new(HttpState {
-                metrics: Arc::clone(&metrics),
-                store: store.clone(),
-                pools: pool_addresses.clone(),
-                max_lag_ledgers: http.max_lag_ledgers,
-                liveness_deadline: poller_config.liveness_deadline(),
-            });
-            let shutdown = shutdown_rx.clone();
-            tasks.spawn(async move {
-                http::serve(http.bind, state, shutdown).await;
-                Ok(())
-            });
-        }
         spawn_auctioneer(
             &mut tasks,
             &rpc,
@@ -4176,6 +4208,7 @@ mod tests {
             &[pool_config(harness::POOL, USDC, &["*"], &["*"])],
             &sources,
             20,
+            std::time::Duration::from_millis(1),
             &shutdown,
             &instruments,
         )
@@ -4190,6 +4223,18 @@ mod tests {
                 harness::POOL
             )),
             "the seed publishes what it loaded, for this pool: {rendered}"
+        );
+        // The seed runs before this pool has a poller to report itself,
+        // and can outlast `/livez`'s deadline on a busy pool: what it is
+        // working on is alive, and says so.
+        assert!(
+            instruments
+                .metrics
+                .pool_status(harness::POOL)
+                .and_then(|status| status.heartbeat)
+                .is_some(),
+            "seeding a pool heartbeats for it, so a restart probe cannot read the \
+             seed as a poller that has stopped"
         );
         let cursor = store
             .cursor(&events_cursor(harness::POOL))
@@ -4342,6 +4387,7 @@ mod tests {
             &[pool_config(harness::POOL, USDC, &["*"], &["*"])],
             &sources,
             20,
+            std::time::Duration::from_millis(1),
             &shutdown,
             &Instruments::for_tests(),
         )
@@ -4397,6 +4443,7 @@ mod tests {
             &[pool_config(harness::POOL, USDC, &["*"], &["*"])],
             &sources,
             20,
+            std::time::Duration::from_millis(1),
             &shutdown,
             &Instruments::for_tests(),
         )
@@ -6921,22 +6968,25 @@ mod tests {
 
         let metrics = Arc::new(Metrics::new());
         // `max_backoff` zero makes the deadline exactly five intervals —
-        // 25 ms — so the stale stamp below is four deadlines old and the
-        // live pool's is never more than one interval old.
+        // 100 ms — so the stale stamp below is four deadlines old and the
+        // live pool's is never more than one interval old. The margins are
+        // this wide on purpose: a loaded CI runner that starves the
+        // stamping task below for a few tens of milliseconds would
+        // otherwise turn the "alive" assertion into a flake.
         let config = PollerConfig {
-            poll_interval: std::time::Duration::from_millis(5),
+            poll_interval: std::time::Duration::from_millis(20),
             page_limit: 200,
             min_backoff: std::time::Duration::from_millis(1),
             max_backoff: std::time::Duration::ZERO,
         };
         assert_eq!(
             config.liveness_deadline(),
-            std::time::Duration::from_millis(25)
+            std::time::Duration::from_millis(100)
         );
         metrics.heartbeat_at(
             STALLED,
             std::time::Instant::now()
-                .checked_sub(std::time::Duration::from_millis(100))
+                .checked_sub(std::time::Duration::from_millis(400))
                 .expect("a recent instant"),
             std::time::SystemTime::now(),
         );
@@ -6960,7 +7010,7 @@ mod tests {
         let pools = vec![STALLED.to_string(), ALIVE.to_string(), SILENT.to_string()];
         let (flag, shutdown) = watch::channel(false);
         let stop = async {
-            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
             flag.send(true).expect("raise shutdown");
         };
         let ((), ()) = tokio::join!(
@@ -7156,6 +7206,10 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(
                 json!({"ok": true, "result": {"id": 1, "is_bot": true, "username": "liquidator_bot"}}),
             ))
+            // What was scripted was consumed: `check_config` verifies the
+            // token with exactly one `getMe`, and wiremock asserts it on
+            // the server's drop.
+            .expect(1)
             .mount(&telegram)
             .await;
 
@@ -7191,6 +7245,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(401).set_body_json(
                 json!({"ok": false, "error_code": 401, "description": "Unauthorized"}),
             ))
+            .expect(1)
             .mount(&refusing)
             .await;
         config.telegram = Some(crate::config::TelegramConfig {

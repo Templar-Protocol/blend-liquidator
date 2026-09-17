@@ -65,6 +65,12 @@ impl Attempt {
 /// Why the auctioneer or the filler skipped a tracked borrower without
 /// acting. A closed set, rendered the same way [`Attempt`] is: all five
 /// `skips_total` series every time, zero included.
+///
+/// Each is counted once per auction or borrower the bot decided against,
+/// never once per pass over one: a caller whose decision is re-made every
+/// tick — the filler's open-auction walk — remembers what it has already
+/// counted, so one open auction a pool does not support cannot bury every
+/// other reason in the same metric.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SkipLabel {
     /// The auction or fill needs an asset this pool's configuration does
@@ -144,6 +150,14 @@ impl DeliveryLabel {
 pub struct PoolStatus {
     /// The last ledger sequence [`Metrics::ledger_head`] recorded.
     pub head: Option<u32>,
+    /// When that head was recorded, as the [`Instant`]
+    /// [`Metrics::ledger_head`] or [`Metrics::ledger_head_at`] was given.
+    ///
+    /// The head alone cannot tell a bot at chain head from one that has
+    /// not read a head since an RPC outage began: both gauges stop moving
+    /// together, and the lag between them stays where it was. This is what
+    /// [`crate::http::readiness`] measures that against.
+    pub head_at: Option<Instant>,
     /// The last ledger sequence [`Metrics::ledger_processed`] recorded.
     pub processed: Option<u32>,
     /// When this pool's poller last reported itself alive, as the
@@ -159,6 +173,7 @@ pub struct PoolStatus {
 #[derive(Debug, Default)]
 struct PoolRecord {
     head: Option<u32>,
+    head_at: Option<Instant>,
     processed: Option<u32>,
     heartbeat: Option<(Instant, SystemTime)>,
     events_processed: Option<u64>,
@@ -173,9 +188,14 @@ struct Inner {
     creations: [u64; 3],
     fills: [u64; 3],
     skips: [u64; 5],
-    /// Saturating running total, in the pool oracle's units. Display-only:
-    /// see [`Metrics::profit`].
+    /// Saturating running total of the positive estimates, in the pool
+    /// oracle's units. Display-only: see [`Metrics::profit`].
     profit_total: i128,
+    /// Saturating running total of the negative estimates, by magnitude —
+    /// never a subtraction from `profit_total`: both render as counters,
+    /// and a counter that decreases is read as a reset. See
+    /// [`Metrics::profit`].
+    loss_total: i128,
     reserved_inventory: BTreeMap<String, i128>,
     unwind_passes: u64,
     last_successful_scan: Option<SystemTime>,
@@ -190,6 +210,7 @@ impl Inner {
             fills: [0; 3],
             skips: [0; 5],
             profit_total: 0,
+            loss_total: 0,
             reserved_inventory: BTreeMap::new(),
             unwind_passes: 0,
             last_successful_scan: None,
@@ -257,13 +278,24 @@ impl Metrics {
         }
     }
 
-    /// Records the last ledger sequence this pool's poller has seen.
+    /// [`Metrics::ledger_head_at`] at [`Instant::now`].
     pub fn ledger_head(&self, pool: &str, sequence: u32) {
-        lock(&self.inner)
-            .pools
-            .entry(pool.to_string())
-            .or_default()
-            .head = Some(sequence);
+        self.ledger_head_at(pool, sequence, Instant::now());
+    }
+
+    /// Records the last ledger sequence this pool's poller has seen, and
+    /// `at` as when it saw it. The test seam [`Metrics::ledger_head`]
+    /// calls with the current clock.
+    ///
+    /// The two are recorded together and never apart: a head with no
+    /// reading time would leave [`crate::http::readiness`] unable to tell
+    /// a bot at chain head from one whose RPC stopped answering, since
+    /// nothing about either gauge moves in that case.
+    pub fn ledger_head_at(&self, pool: &str, sequence: u32, at: Instant) {
+        let mut inner = lock(&self.inner);
+        let record = inner.pools.entry(pool.to_string()).or_default();
+        record.head = Some(sequence);
+        record.head_at = Some(at);
     }
 
     /// Records the last ledger sequence this pool's tracker has fully
@@ -352,14 +384,31 @@ impl Metrics {
         *slot = slot.saturating_add(1);
     }
 
-    /// Adds `oracle_units` to the running estimated-profit total,
-    /// saturating: this total is rendered as a display-only float (see
+    /// Adds one fill's estimate, in the pool oracle's own units, to the
+    /// running total it belongs in: a positive value to
+    /// `estimated_profit_total`, a negative one's magnitude to
+    /// `estimated_loss_total`.
+    ///
+    /// Two counters rather than one signed running total, because both
+    /// render as Prometheus counters and a counter that decreases is read
+    /// as a counter reset — `rate()` over that window would then report a
+    /// spurious jump. A negative estimate is reachable: `plan_fill`
+    /// refuses one only when the pool does not set `force_fill`.
+    ///
+    /// Saturating, both of them, including the negation of [`i128::MIN`]:
+    /// these totals are rendered and nothing else (see
     /// [`Metrics::render`]), never used in any decision, so a caller that
-    /// has just realised a real profit has nothing wrong with the chain
+    /// has just realised a real fill has nothing wrong with the chain
     /// state it is reporting on.
     pub fn profit(&self, oracle_units: i128) {
         let mut inner = lock(&self.inner);
-        inner.profit_total = inner.profit_total.saturating_add(oracle_units);
+        if oracle_units < 0 {
+            inner.loss_total = inner
+                .loss_total
+                .saturating_add(oracle_units.saturating_neg());
+        } else {
+            inner.profit_total = inner.profit_total.saturating_add(oracle_units);
+        }
     }
 
     /// Replaces the reserved-inventory gauge map wholesale with `reserved`
@@ -398,6 +447,7 @@ impl Metrics {
     pub fn pool_status(&self, pool: &str) -> Option<PoolStatus> {
         lock(&self.inner).pools.get(pool).map(|record| PoolStatus {
             head: record.head,
+            head_at: record.head_at,
             processed: record.processed,
             heartbeat: record.heartbeat.map(|(at, _wall)| at),
         })
@@ -569,7 +619,9 @@ impl Metrics {
         header(
             &mut out,
             "skips_total",
-            "Tracked borrowers skipped without acting, by reason.",
+            "Tracked borrowers skipped without acting, by reason. One per auction or borrower \
+             the bot decided not to take, never one per pass over it, so the reasons are \
+             comparable with each other.",
             "counter",
         );
         for reason in SkipLabel::ALL {
@@ -584,15 +636,31 @@ impl Metrics {
         header(
             &mut out,
             "estimated_profit_total",
-            "Running estimated profit, in the pool oracle's units scaled to whole tokens. Display only: never used in any decision.",
+            "Running estimated profit of the fills that landed, as an integer in the pool \
+             oracle's own units — its decimals are the pool's to read, not this bot's to \
+             assume. Display only: never used in any decision.",
             "counter",
         );
-        // Display-only: `profit_total` is never compared or branched on,
-        // only rendered, so the precision `as f64` loses here is exactly
-        // the precision a human reading a dashboard does not need.
-        #[allow(clippy::cast_precision_loss)]
-        let profit = inner.profit_total as f64 / 1e7;
-        let _ = writeln!(out, "{METRIC_PREFIX}estimated_profit_total {profit:.7}");
+        let _ = writeln!(
+            out,
+            "{METRIC_PREFIX}estimated_profit_total {}",
+            inner.profit_total
+        );
+
+        header(
+            &mut out,
+            "estimated_loss_total",
+            "Running estimated loss of the fills that landed, by magnitude, as an integer in \
+             the pool oracle's own units — its decimals are the pool's to read, not this \
+             bot's to assume. Its own counter rather than a subtraction from \
+             estimated_profit_total, which must never decrease. Display only.",
+            "counter",
+        );
+        let _ = writeln!(
+            out,
+            "{METRIC_PREFIX}estimated_loss_total {}",
+            inner.loss_total
+        );
 
         header(
             &mut out,
@@ -679,7 +747,11 @@ mod tests {
         );
         assert!(text.contains("blend_liquidator_skips_total{reason=\"unsupported_assets\"} 0\n"));
         assert!(text.contains("blend_liquidator_skips_total{reason=\"unfunded\"} 1\n"));
-        assert!(text.contains("blend_liquidator_estimated_profit_total 1335.0000000\n"));
+        assert!(
+            text.contains("blend_liquidator_estimated_profit_total 13350000000\n"),
+            "the oracle's own units, whatever its decimals are: {text}"
+        );
+        assert!(text.contains("blend_liquidator_estimated_loss_total 0\n"));
         assert!(text.contains("blend_liquidator_reserved_inventory{asset=\"XLM\"} 50000000\n"));
         assert!(
             !text.contains("last_successful_scan"),
@@ -698,9 +770,14 @@ mod tests {
             at,
             SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
         );
-        m.ledger_head("POOL", 7);
+        m.ledger_head_at("POOL", 7, at);
         let status = m.pool_status("POOL").expect("recorded");
         assert_eq!(status.head, Some(7));
+        assert_eq!(
+            status.head_at,
+            Some(at),
+            "a head is worth nothing to a readiness probe without when it was read"
+        );
         assert_eq!(status.processed, None);
         assert_eq!(status.heartbeat, Some(at));
         assert!(m.render().contains(
@@ -713,18 +790,47 @@ mod tests {
         assert_eq!(escape_label("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
     }
 
+    /// A loss is its own counter, never a decrement of the profit one: a
+    /// Prometheus counter that went down would be read as a reset, and
+    /// `rate()` over that window would report a spurious jump an operator
+    /// might act on. A `force_fill` pool can land a fill whose estimate is
+    /// negative, so this is a reachable state, not a hypothetical.
+    #[test]
+    fn a_negative_estimate_counts_as_a_loss_rather_than_lowering_the_profit() {
+        let m = Metrics::new();
+        m.profit(1_000);
+        m.profit(-250);
+        let text = m.render();
+        assert!(
+            text.contains("blend_liquidator_estimated_profit_total 1000\n"),
+            "the profit counter only ever rises: {text}"
+        );
+        assert!(
+            text.contains("blend_liquidator_estimated_loss_total 250\n"),
+            "the loss is counted by magnitude, in its own counter: {text}"
+        );
+    }
+
     #[test]
     fn counters_saturate_rather_than_wrap() {
         let m = Metrics::new();
         m.profit(i128::MAX);
         m.profit(1);
         // Saturated, not wrapped: adding 1 past `i128::MAX` stays at
-        // `i128::MAX`, so the rendered value is that total scaled exactly
-        // the way `render` scales it, not some wrapped-around figure.
-        #[allow(clippy::cast_precision_loss)]
-        let expected = i128::MAX as f64 / 1e7;
+        // `i128::MAX`, so the rendered value is that total exactly.
         assert!(m.render().contains(&format!(
-            "blend_liquidator_estimated_profit_total {expected:.7}\n"
+            "blend_liquidator_estimated_profit_total {}\n",
+            i128::MAX
+        )));
+
+        let loss = Metrics::new();
+        // `i128::MIN` has no positive counterpart, so negating it
+        // saturates too rather than overflowing.
+        loss.profit(i128::MIN);
+        loss.profit(-1);
+        assert!(loss.render().contains(&format!(
+            "blend_liquidator_estimated_loss_total {}\n",
+            i128::MAX
         )));
     }
 

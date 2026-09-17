@@ -289,6 +289,8 @@ mod tests {
                 wiremock::ResponseTemplate::new(401)
                     .set_body_json(serde_json::json!({"ok": false, "description": "Unauthorized"})),
             )
+            // What was scripted was consumed: wiremock asserts it on drop.
+            .expect(1)
             .mount(&server)
             .await;
         let channel = TelegramChannel::new(Secret::new("123:abc"), "42".into())
@@ -328,6 +330,7 @@ mod tests {
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
                 serde_json::json!({"ok": true, "result": {"username": "blend_bot"}}),
             ))
+            .expect(1)
             .mount(&server)
             .await;
         let channel = TelegramChannel::new(Secret::new("123:abc"), "42".into())
@@ -338,6 +341,7 @@ mod tests {
         let broken = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .respond_with(wiremock::ResponseTemplate::new(404))
+            .expect(1)
             .mount(&broken)
             .await;
         let channel = TelegramChannel::new(Secret::new("123:abc"), "42".into())
