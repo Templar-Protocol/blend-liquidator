@@ -223,6 +223,14 @@ fi
 #    still overrides this at build time, and a config already carrying a
 #    `[build]` `jobs` key (an operator's own choice) is left untouched
 #    rather than getting a second, conflicting one appended.
+#
+#    The file-editing itself lives in scripts/cargo-jobs-config.sh, not
+#    inline here: cargo refuses to parse a *second* `[build]` header
+#    ("Cannot declare ('build',) twice"), so a config that already has a
+#    `[build]` table with some other key but no `jobs` must get `jobs`
+#    inserted into that same table, never a fresh one appended — a case
+#    worth its own tests (scripts/sandbox/test-cargo-config.sh) on temp
+#    files, not just a hand-verification in this one container.
 echo "==> Capping cargo build parallelism"
 cargo_jobs_n="$("$(dirname "$0")/../scripts/cargo-jobs.sh")" || cargo_jobs_n=""
 if [ -z "${cargo_jobs_n}" ]; then
@@ -230,24 +238,11 @@ if [ -z "${cargo_jobs_n}" ]; then
 else
 	cargo_config="${HOME}/.cargo/config.toml"
 	mkdir -p "${HOME}/.cargo"
-	touch "${cargo_config}"
-	if awk '
-		/^\[build\]/ { in_build=1; next }
-		/^\[/ { in_build=0 }
-		in_build && /^[[:space:]]*jobs[[:space:]]*=/ { found=1 }
-		END { exit !found }
-	' "${cargo_config}"; then
-		echo "    ~/.cargo/config.toml already sets [build] jobs; leaving it as configured"
-	else
-		{
-			echo ""
-			echo "# Written by scripts/cargo-jobs.sh via .devcontainer/post-create.sh: caps"
-			echo "# rustc's parallelism to this container's cgroup memory limit, so a cold"
-			echo "# build does not OOM against nproc's host core count. CARGO_BUILD_JOBS in"
-			echo "# the environment still overrides this at build time."
-			echo "[build]"
-			echo "jobs = ${cargo_jobs_n}"
-		} >>"${cargo_config}"
-		echo "    ~/.cargo/config.toml: [build] jobs = ${cargo_jobs_n}"
-	fi
+	status="$("$(dirname "$0")/../scripts/cargo-jobs-config.sh" "${cargo_config}" "${cargo_jobs_n}")" || status=""
+	case "${status}" in
+	created) echo "    ~/.cargo/config.toml: [build] jobs = ${cargo_jobs_n} (new [build] table)" ;;
+	inserted) echo "    ~/.cargo/config.toml: [build] jobs = ${cargo_jobs_n} (added to the existing [build] table)" ;;
+	unchanged) echo "    ~/.cargo/config.toml already sets [build] jobs; leaving it as configured" ;;
+	*) warn "scripts/cargo-jobs-config.sh failed; ~/.cargo/config.toml was not updated." ;;
+	esac
 fi
