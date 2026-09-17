@@ -4,7 +4,11 @@
 # the network under them is gone — keeping the file would be a live path
 # to a signing key for a network that no longer exists). Keeps
 # target/sandbox/wasm/: the fetched artefacts are keyed by content hash,
-# not by network, so there is nothing to invalidate.
+# not by network, so there is nothing to invalidate. Keeps
+# target/sandbox/run-databases too, and must: it names the Postgres
+# databases failed runs left behind, which outlive every network this
+# script tears down, and deleting the list is how they become
+# unreclaimable. The `sandbox-down` make target is what drops them.
 #
 # Safe to run whether or not the sandbox is up — a missing container or
 # env file is not an error, since "already down" is exactly what this

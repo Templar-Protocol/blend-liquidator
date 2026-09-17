@@ -79,35 +79,33 @@ sandbox-test: ## Run the end-to-end liquidation against the deployed sandbox (~5
 # run and drops it again when the run passes, so what this reclaims is
 # what failed runs kept for inspection.
 #
-# `sqlx database drop` does the dropping — sqlx-cli is in both CI and the
-# dev container, which psql is not — but it can only drop a database it
-# is given the name of, and nothing in sqlx-cli lists them. psql, when
-# there is one, lists; the compose Postgres has its own when the host
-# does not; and with neither, the sweep says what it could not do rather
-# than pretending it did.
-sandbox-down: ## Tear the sandbox down and drop the sandbox_* databases failed runs kept
+# target/sandbox/run-databases is the list, written by the test itself —
+# appended when it creates the database and the line removed when it
+# drops it. Nothing here enumerates: `sqlx database drop` does the
+# dropping (sqlx-cli is in both CI and the dev container), it can only
+# drop a name it is handed, nothing in sqlx-cli lists databases, and psql
+# is in neither place. A database kept by a run from before that file
+# existed is therefore dropped by hand, with the line printed below.
+#
+# A name that could not be dropped stays in the file: it is still on the
+# server, and a sweep that forgot it would leave it there forever.
+sandbox-down: ## Tear the sandbox down and drop the databases failed runs kept
 	./scripts/sandbox/down.sh
 	@set -u; \
-	base="$${DATABASE_URL%%\?*}"; \
-	list="SELECT datname FROM pg_database WHERE datname ~ '^sandbox_[0-9]+$$'"; \
-	if command -v psql >/dev/null 2>&1; then \
-		names=$$(psql "$$base" -tAc "$$list") || names=""; \
-	elif names=$$($(COMPOSE) exec -T postgres psql -U "$${POSTGRES_USER:-liquidator}" \
-		-d "$${POSTGRES_DB:-liquidator}" -tAc "$$list" 2>/dev/null); then \
-		:; \
+	base="$${DATABASE_URL%%\?*}"; server="$${base%/*}"; \
+	list=target/sandbox/run-databases; \
+	if [ ! -s "$$list" ]; then \
+		echo "no databases recorded in $$list — nothing to drop"; \
+		echo "for one kept by a run from before that file: sqlx database drop -y -D $$server/sandbox_<stamp>"; \
 	else \
-		echo "no psql on PATH and no running compose postgres — cannot list the sandbox databases;"; \
-		echo "drop one by name with: sqlx database drop -y -D $$base/sandbox_<stamp>"; \
-		names=""; \
-	fi; \
-	if [ -z "$$names" ]; then \
-		echo "no sandbox_* databases to drop"; \
-	else \
-		for name in $$names; do \
+		kept="$$list.kept"; : >"$$kept"; \
+		while read -r name; do \
+			[ -n "$$name" ] || continue; \
 			echo "dropping database $$name"; \
-			sqlx database drop -y --no-dotenv -D "$${base%/*}/$$name" \
-				|| echo "could not drop $$name"; \
-		done; \
+			sqlx database drop -y --no-dotenv -D "$$server/$$name" \
+				|| { echo "could not drop $$name — leaving it in $$list"; echo "$$name" >>"$$kept"; }; \
+		done <"$$list"; \
+		mv "$$kept" "$$list"; \
 	fi
 
 # up → fetch → deploy → test → down, with the teardown on the failure

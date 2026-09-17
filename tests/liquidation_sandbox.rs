@@ -33,9 +33,12 @@
 //! against a fresh network never reads a previous run's rows. A run that
 //! passes drops it again; a run that fails keeps it, because it is then the
 //! only durable record of what the bot decided, and every failure says so.
-//! `make sandbox-down` drops whatever has been kept.
+//! `make sandbox-down` drops whatever has been kept, and [`RUN_DATABASES`]
+//! is how it knows the names: this test writes them there, because the
+//! sweep has nothing to enumerate them with.
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -198,7 +201,10 @@ fn fail(bot: &Bot, message: &str) -> ! {
     println!("{}", bot.tail());
     println!("--- end of {} ---\n", bot.log.display());
     if let Some(database) = RUN_DATABASE.get() {
-        println!("the database {database} is kept for inspection — `make sandbox-down` drops it\n");
+        println!(
+            "the database {database} is kept for inspection — it is listed in {RUN_DATABASES}, \
+             and `make sandbox-down` drops what that file names\n"
+        );
     }
     panic!("{message}");
 }
@@ -325,13 +331,74 @@ fn with_database(url: &str, name: &str) -> String {
     }
 }
 
+/// Where `make sandbox-down` reads the databases it is to drop, relative to
+/// the repository root: one name per line.
+///
+/// The sweep cannot enumerate them itself — `sqlx database drop` only drops a
+/// name it is handed, nothing in sqlx-cli lists databases, and `psql` is in
+/// neither CI nor the dev container — so the only process that knows a name
+/// is the one that created it, and this is where it leaves it. Appended the
+/// moment the database exists and the line removed again when this run drops
+/// it, so what the file holds is what the server still holds.
+const RUN_DATABASES: &str = "target/sandbox/run-databases";
+
+/// Adds `name` to [`RUN_DATABASES`], creating the file if it is not there.
+///
+/// Only warns on failure: an unrecorded database is one an operator drops by
+/// hand, which is not worth failing a run that has otherwise done everything
+/// asked of it.
+fn record_run_database(root: &Path, name: &str) {
+    let path = root.join(RUN_DATABASES);
+    if let Some(parent) = path.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            println!("could not create {}: {error}", parent.display());
+            return;
+        }
+    }
+    let appended = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| writeln!(file, "{name}"));
+    match appended {
+        Ok(()) => println!("recorded {name} in {}", path.display()),
+        Err(error) => println!(
+            "could not record {name} in {}: {error} — `make sandbox-down` will not know to drop it",
+            path.display()
+        ),
+    }
+}
+
+/// Removes `name` from [`RUN_DATABASES`], leaving every other line.
+///
+/// Called only where the drop itself succeeded, so the file never claims a
+/// database that is gone. Warns rather than failing, for the reason
+/// [`record_run_database`] gives.
+fn forget_run_database(root: &Path, name: &str) {
+    let path = root.join(RUN_DATABASES);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let kept: String =
+        text.lines()
+            .filter(|line| line.trim() != name)
+            .fold(String::new(), |mut all, line| {
+                all.push_str(line);
+                all.push('\n');
+                all
+            });
+    if let Err(error) = std::fs::write(&path, kept) {
+        println!("could not rewrite {}: {error}", path.display());
+    }
+}
+
 /// Creates this run's database and migrates it, answering its URL.
 ///
 /// Migrating here rather than leaving it to the bot is what lets the row
 /// polls below treat a query error as a real failure instead of "the table
 /// may not exist yet"; `Store::migrate` is idempotent, so the bot's own run
 /// of the same migrator finds nothing to do.
-async fn create_run_database(maintenance_url: &str, name: &str) -> String {
+async fn create_run_database(root: &Path, maintenance_url: &str, name: &str) -> String {
     let maintenance = match PgPool::connect(maintenance_url).await {
         Ok(pool) => pool,
         Err(error) => panic!(
@@ -352,6 +419,9 @@ async fn create_run_database(maintenance_url: &str, name: &str) -> String {
         panic!("could not create the database {name}: {error}");
     }
     maintenance.close().await;
+    // Before the migration below, not after: from the `CREATE` onwards there
+    // is a database on the server, and every failure from here keeps it.
+    record_run_database(root, name);
 
     let url = with_database(maintenance_url, name);
     let store = match Store::connect(&url, 2).await {
@@ -371,7 +441,7 @@ async fn create_run_database(maintenance_url: &str, name: &str) -> String {
 /// A failure to drop only warns — the run itself has already passed, and
 /// turning a leaked database name into a red test would say something false
 /// about the bot; `make sandbox-down` sweeps whatever is left.
-async fn drop_run_database(maintenance_url: &str, name: &str) {
+async fn drop_run_database(root: &Path, maintenance_url: &str, name: &str) {
     let maintenance = match PgPool::connect(maintenance_url).await {
         Ok(pool) => pool,
         Err(error) => {
@@ -386,7 +456,12 @@ async fn drop_run_database(maintenance_url: &str, name: &str) {
         .execute(&maintenance)
         .await
     {
-        Ok(_) => println!("dropped the run's database {name}"),
+        Ok(_) => {
+            // Only here: a line left in the file for a database that is gone
+            // is a `make sandbox-down` that reports a failure every time.
+            forget_run_database(root, name);
+            println!("dropped the run's database {name}");
+        }
         Err(error) => println!("could not drop {name}: {error} — it is left behind"),
     }
     maintenance.close().await;
@@ -958,7 +1033,7 @@ async fn liquidation_end_to_end() {
         .unwrap_or_default();
     let database = format!("sandbox_{stamp}");
     println!("creating the run's database {database}");
-    let database_url = create_run_database(&maintenance_url, &database).await;
+    let database_url = create_run_database(&root, &maintenance_url, &database).await;
     // Set once the database exists, so every failure from here on says it
     // was kept; the success path at the bottom drops it and it is never
     // read again.
@@ -1048,5 +1123,5 @@ async fn liquidation_end_to_end() {
     // reaching this line is what "the run succeeded" means, and a database
     // nobody will read is a database worth not keeping.
     store.pool().close().await;
-    drop_run_database(&maintenance_url, &database).await;
+    drop_run_database(&root, &maintenance_url, &database).await;
 }

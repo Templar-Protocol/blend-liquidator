@@ -94,9 +94,13 @@ jobs:
       - name: Install the stellar CLI
         run: |
           set -euo pipefail
-          url=$(grep '^STELLAR_CLI_URL_X86_64=' scripts/sandbox/versions.env | cut -d= -f2-)
-          sha=$(grep '^STELLAR_CLI_SHA256_X86_64=' scripts/sandbox/versions.env | cut -d= -f2-)
-          version=$(grep '^STELLAR_CLI_VERSION=' scripts/sandbox/versions.env | cut -d= -f2-)
+          # `|| true` on each, because these run under `set -euo pipefail`:
+          # a grep that matches nothing fails, the pipeline fails with it,
+          # and the step would abort here — before the guard below that
+          # exists to say which key is missing.
+          url=$(grep '^STELLAR_CLI_URL_X86_64=' scripts/sandbox/versions.env | cut -d= -f2-) || true
+          sha=$(grep '^STELLAR_CLI_SHA256_X86_64=' scripts/sandbox/versions.env | cut -d= -f2-) || true
+          version=$(grep '^STELLAR_CLI_VERSION=' scripts/sandbox/versions.env | cut -d= -f2-) || true
           if [ -z "$url" ] || [ -z "$sha" ] || [ -z "$version" ]; then
             echo "::error::scripts/sandbox/versions.env does not pin the stellar CLI"
             exit 1
@@ -128,7 +132,10 @@ jobs:
       - name: Mask the filler's signing key
         run: |
           set -euo pipefail
-          secret=$(grep '^SANDBOX_FILLER_SECRET_KEY=' target/sandbox/sandbox.env | cut -d'"' -f2)
+          # `|| true` for the reason the CLI step above gives: without it a
+          # sandbox.env that holds no key aborts the step here rather than
+          # reaching the annotation below.
+          secret=$(grep '^SANDBOX_FILLER_SECRET_KEY=' target/sandbox/sandbox.env | cut -d'"' -f2) || true
           if [ -z "$secret" ]; then
             echo "::error::target/sandbox/sandbox.env holds no filler secret key"
             exit 1
