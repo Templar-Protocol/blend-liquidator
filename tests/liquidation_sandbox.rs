@@ -29,7 +29,7 @@
 //! **Nothing in this file may panic through `unwrap`/`expect`.** Every
 //! failure goes through [`fail`], which prints the tail of the bot's own log
 //! before it panics: a run that dies without that tail is a run nobody can
-//! diagnose. `panic!` directly is for the two refusals above, which happen
+//! diagnose. `panic!` directly is for the three refusals above, which happen
 //! before there is a bot or a log at all.
 //!
 //! One thing the assertions do not prove, so that nobody reads more into

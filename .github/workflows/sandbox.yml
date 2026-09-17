@@ -126,6 +126,7 @@ jobs:
         run: |
           ./scripts/sandbox/test-cargo-jobs.sh
           ./scripts/sandbox/test-cargo-config.sh
+          CARGO_CONFIG_TEST_NO_TOMLLIB=1 ./scripts/sandbox/test-cargo-config.sh
           ./scripts/sandbox/test-network-pinning.sh
 
       - name: Start the local network
