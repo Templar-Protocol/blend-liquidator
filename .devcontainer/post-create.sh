@@ -138,11 +138,116 @@ fi
 # 6. Warm the dependency cache, so the first build/test/clippy run does not
 #    also pay for the download.
 #
-#    NOTE for when the Stellar/Soroban stack lands: `cargo` defaults to one
-#    rustc job per core, and `nproc` reports the HOST's core count while this
-#    container has far less memory — a large dependency tree then dies with
-#    `signal: 9` from the OOM killer. The current tree is small enough not to
-#    care. If you add the `stellar` CLI or a heavy source build here, cap the
-#    job count against the cgroup memory limit at the same time.
+#    The OOM gotcha this used to warn about (cargo defaulting to one rustc
+#    job per core against `nproc`'s HOST count, in a container with far
+#    less memory) is handled by step 8 below, which caps `[build] jobs`
+#    against the cgroup memory limit — this step itself is a download, not
+#    a build, so it doesn't need the cap.
 echo "==> Warming the cargo dependency cache"
 cargo fetch || warn "cargo fetch failed; it will run again on your first build."
+
+# 7. The `stellar` CLI, pinned and checksum-verified from
+#    scripts/sandbox/versions.env (the pins Task 1 of the sandbox tier
+#    fetches wasm from). Needed only for scripts/sandbox/*.sh; nothing in
+#    the crate build depends on it, so — like cargo-deny above — a failure
+#    here only warns.
+#
+#    Downloaded to a temp dir and extracted there too, so a failed or
+#    truncated download, or a mismatched checksum, never leaves a partial
+#    binary on PATH: the move to ~/.local/bin/stellar (already on PATH in
+#    this image) is the last step, after sha256_check has passed.
+#    Idempotent: skipped outright once `stellar --version` already reports
+#    the pinned version.
+#    lib.sh's sha256_check/fetch are fatal by design (they call die(),
+#    which exits) — exactly right inside a script that must not go on
+#    using an unverified or half-downloaded file. Run in a `(…)` subshell
+#    so that exit only ends the subshell: the parent tests its status and
+#    warns, keeping this step non-fatal like every other one below the
+#    toolchain.
+#
+#    The binary itself links against libdbus at runtime (its OS-keychain
+#    identity backend, unused by this bot but still dynamically linked),
+#    and the base image does not ship it: without this, even
+#    `stellar --version` fails with "cannot open shared object file".
+echo "==> Installing the stellar CLI"
+if ! ldconfig -p | grep -qF 'libdbus-1.so.3'; then
+	sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends libdbus-1-3 ||
+		warn "libdbus-1-3 install failed; the stellar CLI will not run without it."
+fi
+if (
+	set -euo pipefail
+	sandbox_scripts_dir="$(cd "$(dirname "$0")/../scripts/sandbox" && pwd)"
+	# shellcheck source=scripts/sandbox/lib.sh
+	source "${sandbox_scripts_dir}/lib.sh"
+	# shellcheck source=scripts/sandbox/versions.env
+	source "${sandbox_scripts_dir}/versions.env"
+
+	if command -v stellar >/dev/null 2>&1 &&
+		stellar --version 2>/dev/null | grep -qF "${STELLAR_CLI_VERSION}"; then
+		echo "    stellar CLI ${STELLAR_CLI_VERSION} already installed"
+		exit 0
+	fi
+
+	case "$(uname -m)" in
+	x86_64 | amd64)
+		url="${STELLAR_CLI_URL_X86_64}"
+		sha="${STELLAR_CLI_SHA256_X86_64}"
+		;;
+	aarch64 | arm64)
+		url="${STELLAR_CLI_URL_AARCH64}"
+		sha="${STELLAR_CLI_SHA256_AARCH64}"
+		;;
+	*)
+		warn "stellar CLI: no prebuilt binary for $(uname -m); install it manually."
+		exit 1
+		;;
+	esac
+
+	tmp="$(mktemp -d)"
+	trap 'rm -rf "${tmp}"' EXIT
+
+	fetch "${url}" "${tmp}/stellar-cli.tar.gz" "${sha}"
+	tar -xzf "${tmp}/stellar-cli.tar.gz" -C "${tmp}" stellar
+	mkdir -p "${HOME}/.local/bin"
+	install -m 0755 "${tmp}/stellar" "${HOME}/.local/bin/stellar"
+	echo "    stellar CLI ${STELLAR_CLI_VERSION} installed to ${HOME}/.local/bin/stellar"
+); then
+	:
+else
+	warn "stellar CLI install failed; scripts/sandbox/*.sh will not run without it."
+fi
+
+# 8. Cap cargo's build parallelism to this container's cgroup memory limit
+#    (scripts/cargo-jobs.sh — see its header for the formula and the OOM
+#    gotcha it exists for). Written once: an environment CARGO_BUILD_JOBS
+#    still overrides this at build time, and a config already carrying a
+#    `[build]` `jobs` key (an operator's own choice) is left untouched
+#    rather than getting a second, conflicting one appended.
+echo "==> Capping cargo build parallelism"
+cargo_jobs_n="$("$(dirname "$0")/../scripts/cargo-jobs.sh")" || cargo_jobs_n=""
+if [ -z "${cargo_jobs_n}" ]; then
+	warn "scripts/cargo-jobs.sh failed; leaving ~/.cargo/config.toml untouched."
+else
+	cargo_config="${HOME}/.cargo/config.toml"
+	mkdir -p "${HOME}/.cargo"
+	touch "${cargo_config}"
+	if awk '
+		/^\[build\]/ { in_build=1; next }
+		/^\[/ { in_build=0 }
+		in_build && /^[[:space:]]*jobs[[:space:]]*=/ { found=1 }
+		END { exit !found }
+	' "${cargo_config}"; then
+		echo "    ~/.cargo/config.toml already sets [build] jobs; leaving it as configured"
+	else
+		{
+			echo ""
+			echo "# Written by scripts/cargo-jobs.sh via .devcontainer/post-create.sh: caps"
+			echo "# rustc's parallelism to this container's cgroup memory limit, so a cold"
+			echo "# build does not OOM against nproc's host core count. CARGO_BUILD_JOBS in"
+			echo "# the environment still overrides this at build time."
+			echo "[build]"
+			echo "jobs = ${cargo_jobs_n}"
+		} >>"${cargo_config}"
+		echo "    ~/.cargo/config.toml: [build] jobs = ${cargo_jobs_n}"
+	fi
+fi
