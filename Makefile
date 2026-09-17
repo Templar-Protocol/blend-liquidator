@@ -1,7 +1,8 @@
 # blend-liquidator
 
 .PHONY: help build build-clean start stop restart logs logs-tail clean shell ps stats check \
-	db-up db-down db-reset db-migrate sqlx-prepare
+	db-up db-down db-reset db-migrate sqlx-prepare \
+	sandbox sandbox-up sandbox-fetch sandbox-deploy sandbox-test sandbox-down
 
 .DEFAULT_GOAL := help
 
@@ -15,7 +16,7 @@ export DATABASE_URL
 
 help: ## Show available commands
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
-		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
+		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
 db-up: ## Start Postgres and wait for it
 	$(COMPOSE) up -d postgres
@@ -47,7 +48,124 @@ check: ## Run everything CI runs (needs `make db-up` first)
 	cargo sqlx prepare --check -- --lib --bins
 	RUSTDOCFLAGS='-D warnings' cargo doc --no-deps
 	./scripts/check-repo-invariants.sh
-	shellcheck --severity=error scripts/*.sh .devcontainer/*.sh
+	shellcheck --severity=error scripts/*.sh scripts/sandbox/*.sh .devcontainer/*.sh
+
+# ── The sandbox integration tier ────────────────────
+#
+# A throwaway Stellar network in Docker, Blend v2 deployed on it, and the
+# real binary run against it **armed**. Nothing here runs in CI's PR gate:
+# `make sandbox` takes minutes and starts containers, so it is a nightly
+# workflow (.github/workflows/sandbox.yml) and a thing you run by hand.
+#
+# Each step is its own target because each fails for its own reason — a
+# pinned image that moved, a wasm whose hash no longer matches, a
+# contract that changed — and because a developer debugging one wants to
+# repeat it without paying for the others.
+
+sandbox-up: ## Start the pinned local Stellar network in Docker
+	./scripts/sandbox/up.sh
+
+sandbox-fetch: ## Download and verify the pinned Blend v2 wasm artefacts
+	./scripts/sandbox/fetch-artifacts.sh
+
+sandbox-deploy: ## Deploy Blend v2 on the local network, with one borrower a price move from liquidation
+	./scripts/sandbox/deploy.sh
+
+sandbox-test: ## Run the end-to-end liquidation against the deployed sandbox (~5 min)
+	cargo test --test liquidation_sandbox -- --ignored --nocapture
+
+# The database sweep is here rather than in down.sh because it is not the
+# network's: the test creates one `sandbox_<unix seconds>` database per
+# run and drops it again when the run passes, so what this reclaims is
+# what failed runs kept for inspection.
+#
+# target/sandbox/run-databases is the list, written by the test itself —
+# appended when it creates the database and the line removed when it
+# drops it. Nothing here enumerates: `sqlx database drop` does the
+# dropping, it can only drop a name it is handed, nothing in sqlx-cli
+# lists databases, and psql is in neither CI nor the dev container. A
+# database kept by a run from before that file existed is therefore
+# dropped by hand, with the line printed below.
+#
+# sqlx-cli is installed by .github/workflows/ci.yml and by
+# .devcontainer/post-create.sh, both from the SQLX_CLI_VERSION pinned in
+# scripts/sandbox/versions.env — but neither is a guarantee (post-create's
+# step only warns on failure, and this target is run outside the dev
+# container too), so the sweep checks for the tool once and names it,
+# rather than reporting "could not drop" for every entry and never saying
+# why.
+#
+# A name that could not be dropped stays in the file: it is still on the
+# server, and a sweep that forgot it would leave it there forever.
+#
+# Neither the sweep nor the hint puts a URL on a command line. DATABASE_URL
+# carries a password — the committed local development one today, whatever
+# an operator exported tomorrow — and argv is world-readable through `ps`
+# and /proc/<pid>/cmdline, which is the convention CLAUDE.md states for
+# every secret this repo handles. sqlx-cli reads DATABASE_URL from the
+# environment, so the per-command assignment below is the whole fix; the
+# printed hint is in that same form so an operator following it does not
+# reintroduce what this target avoids, and prints the server with its
+# userinfo stripped besides.
+sandbox-down: ## Tear the sandbox down and drop the databases failed runs kept
+	./scripts/sandbox/down.sh
+	@set -u; \
+	base="$${DATABASE_URL%%\?*}"; server="$${base%/*}"; \
+	list=target/sandbox/run-databases; \
+	if [ ! -s "$$list" ]; then \
+		echo "no databases recorded in $$list — nothing to drop"; \
+		echo "for one kept by a run from before that file: DATABASE_URL=$$(printf '%s' "$$server" | sed -E 's#//[^@]*@#//#')/sandbox_<stamp> sqlx database drop -y --no-dotenv"; \
+		echo "  (that server has its userinfo stripped for this line — take the credentials from DATABASE_URL)"; \
+	else \
+		command -v sqlx >/dev/null 2>&1 \
+			|| { echo "sqlx-cli is not installed, so the databases in $$list cannot be dropped"; echo "  install it with: cargo install sqlx-cli --version $$(grep '^SQLX_CLI_VERSION=' scripts/sandbox/versions.env | cut -d= -f2-) --no-default-features --features postgres,rustls --locked"; exit 1; }; \
+		kept="$$list.kept"; : >"$$kept"; \
+		while read -r name; do \
+			[ -n "$$name" ] || continue; \
+			echo "dropping database $$name"; \
+			DATABASE_URL="$$server/$$name" sqlx database drop -y --no-dotenv \
+				|| { echo "could not drop $$name — leaving it in $$list"; echo "$$name" >>"$$kept"; }; \
+		done <"$$list"; \
+		mv "$$kept" "$$list"; \
+	fi
+
+# up → fetch → deploy → test → down, with the teardown on the failure
+# path too: a run that dies half way through still leaves a container and
+# an armed key behind, and the next `sandbox-up` refuses to start until
+# they are gone. SANDBOX_KEEP=1 skips it, for inspecting the network a
+# run failed against.
+#
+# The failure path runs down.sh rather than the sandbox-down target,
+# deliberately: the network goes, and this run's database stays, because
+# it is what a failed run is diagnosed from. `make sandbox-down` is what
+# reclaims it once it has been.
+#
+# sandbox-up is outside the teardown for its own reason: it refuses to
+# start when a container is already there, and that refusal is usually a
+# network somebody is still using (SANDBOX_KEEP=1 left it up). Tearing
+# that down because this run could not start would destroy exactly what
+# was being kept.
+#
+# A sandbox-down that fails after a green test fails the whole target: it
+# removes the container and sweeps the run databases, so its failure is a
+# container still holding port 8000 and databases still on the server —
+# precisely what the next run refuses on, and reporting success would hide
+# it until then.
+sandbox: ## up → fetch → deploy → test → down (SANDBOX_KEEP=1 leaves the sandbox up)
+	@$(MAKE) sandbox-up || exit $$?; \
+	status=0; \
+	$(MAKE) sandbox-fetch && $(MAKE) sandbox-deploy && $(MAKE) sandbox-test \
+		|| status=$$?; \
+	if [ -n "$${SANDBOX_KEEP:-}" ]; then \
+		echo 'SANDBOX_KEEP is set — leaving the sandbox up; make sandbox-down tears it down'; \
+	elif [ "$$status" -eq 0 ]; then \
+		$(MAKE) sandbox-down || status=$$?; \
+	else \
+		echo 'the run failed — tearing the network down and keeping its database;'; \
+		echo 'make sandbox-down drops it once you are done with it'; \
+		./scripts/sandbox/down.sh || true; \
+	fi; \
+	exit $$status
 
 build: ## Build Docker image
 	docker build -t $(IMAGE):$(TAG) -f Dockerfile .

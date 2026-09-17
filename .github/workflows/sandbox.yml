@@ -1,0 +1,192 @@
+name: Sandbox
+
+# The sandbox integration tier: a throwaway Stellar network in Docker, Blend
+# v2 deployed on it, and the real binary run against it **armed** — the one
+# place anything in this repository submits a transaction it signed.
+#
+# Nightly and on demand, never on `push` or `pull_request`. The run stands up
+# a network, deploys eight contracts and then waits out an auction's ledger
+# ramp, which is minutes of wall clock nobody would pay per PR; and what it
+# catches is the world moving — a quickstart image, a pinned wasm, a contract
+# that changed its mind — rather than a diff being wrong, which is what the
+# PR gate is for.
+#
+# Deliberately NOT in ci.yml's `ci-summary` needs list. That gate treats a
+# skipped job as a failure, which is right for a workflow where nothing is
+# conditional and wrong for one that has no pull-request run at all;
+# `devcontainer.yml` is outside it for the same reason.
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+# One sandbox at a time. The job binds host port 8000 and names its container
+# `blend-sandbox`, and up.sh refuses to start when a container by that name
+# already exists. Queued rather than cancelled: a cancelled run never reaches
+# its teardown.
+concurrency:
+  group: sandbox
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The crate's `sqlx::query!` macros are checked at compile time, and the
+  # Postgres service below is a bare database with no migrations applied —
+  # the test creates and migrates one of its own per run. So the build must
+  # use the committed .sqlx metadata; checking against the live database
+  # would fail on every query.
+  SQLX_OFFLINE: "true"
+
+jobs:
+  sandbox:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: liquidator
+          POSTGRES_PASSWORD: liquidator
+          POSTGRES_DB: liquidator
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U liquidator"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://liquidator:liquidator@127.0.0.1:5432/liquidator
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v1, reads rust-toolchain.toml
+
+      # The stellar CLI links libdbus for its OS-keychain identity backend —
+      # unused by everything here, still a dynamic dependency, so without it
+      # even `stellar --version` fails to load. The runner image has carried
+      # it so far, which is why this is a conditional install rather than an
+      # unconditional one: it does nothing when the library is there, and the
+      # day the image drops it this is the difference between a green run and
+      # a cryptic "cannot open shared object file". .devcontainer/post-create.sh
+      # does the same, for the same reason.
+      - name: Install libdbus, which the stellar CLI links at runtime
+        run: |
+          set -euo pipefail
+          if ! ldconfig -p | grep -qF 'libdbus-1.so.3'; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends libdbus-1-3
+          fi
+
+      # From scripts/sandbox/versions.env, the one file the CLI's version
+      # lives in — scripts/check-repo-invariants.sh fails if this step or the
+      # dev container's stops reading it, because two versions is two
+      # different sandboxes and only one of them is reproducible.
+      #
+      # Read by grep rather than sourced: this needs three keys, and sourcing
+      # a file to get them would put every other pin in the step's
+      # environment too. Verified before anything is extracted, and only the
+      # `stellar` binary is taken out of the tarball. x86_64 because
+      # `runs-on: ubuntu-latest` is; the aarch64 pins are the dev container's.
+      - name: Install the stellar CLI
+        run: |
+          set -euo pipefail
+          # `|| true` on each, because these run under `set -euo pipefail`:
+          # a grep that matches nothing fails, the pipeline fails with it,
+          # and the step would abort here — before the guard below that
+          # exists to say which key is missing.
+          url=$(grep '^STELLAR_CLI_URL_X86_64=' scripts/sandbox/versions.env | cut -d= -f2-) || true
+          sha=$(grep '^STELLAR_CLI_SHA256_X86_64=' scripts/sandbox/versions.env | cut -d= -f2-) || true
+          version=$(grep '^STELLAR_CLI_VERSION=' scripts/sandbox/versions.env | cut -d= -f2-) || true
+          if [ -z "$url" ] || [ -z "$sha" ] || [ -z "$version" ]; then
+            echo "::error::scripts/sandbox/versions.env does not pin the stellar CLI"
+            exit 1
+          fi
+          tmp=$(mktemp -d)
+          curl -fsSL --retry 3 -o "$tmp/stellar-cli.tar.gz" "$url"
+          echo "$sha  $tmp/stellar-cli.tar.gz" | sha256sum -c -
+          tar -xzf "$tmp/stellar-cli.tar.gz" -C "$tmp" stellar
+          sudo install -m 0755 "$tmp/stellar" /usr/local/bin/stellar
+          rm -rf "$tmp"
+          stellar --version | grep -F "$version"
+
+      # Before the network, because they need none of it and they are the
+      # only guard on two things nothing else exercises: the build-job cap's
+      # min(nproc, max(1, mem/2GiB)) formula and its [build]-declared-twice
+      # failure, and — the one that matters here — that every `stellar` call
+      # takes its network from lib.sh's flags rather than from the
+      # environment. Seconds, and after the CLI install because the last of
+      # them derives a contract id with it.
+      - name: Shell tests for the build-job cap and the network pinning
+        run: |
+          ./scripts/sandbox/test-cargo-jobs.sh
+          ./scripts/sandbox/test-cargo-config.sh
+          CARGO_CONFIG_TEST_NO_TOMLLIB=1 ./scripts/sandbox/test-cargo-config.sh
+          ./scripts/sandbox/test-network-pinning.sh
+
+      - name: Start the local network
+        run: ./scripts/sandbox/up.sh
+
+      - name: Fetch the pinned contract artefacts
+        run: ./scripts/sandbox/fetch-artifacts.sh
+
+      - name: Deploy Blend v2, leaving one borrower a price move from liquidation
+        run: ./scripts/sandbox/deploy.sh
+
+      # Immediately after the deploy that writes it, and before any step that
+      # runs the bot: target/sandbox/sandbox.env is mode 0600 and holds the
+      # filler's signing key, and from here on the key is masked for the rest
+      # of the job. Nothing below prints the file — this is the guard for
+      # everything that *could* name it by accident, in a log anyone can read.
+      # The value never reaches the log itself: the runner masks the
+      # `::add-mask::` line as it processes it.
+      - name: Mask the filler's signing key
+        run: |
+          set -euo pipefail
+          # `|| true` for the reason the CLI step above gives: without it a
+          # sandbox.env that holds no key aborts the step here rather than
+          # reaching the annotation below.
+          secret=$(grep '^SANDBOX_FILLER_SECRET_KEY=' target/sandbox/sandbox.env | cut -d'"' -f2) || true
+          if [ -z "$secret" ]; then
+            echo "::error::target/sandbox/sandbox.env holds no filler secret key"
+            exit 1
+          fi
+          echo "::add-mask::$secret"
+
+      # Its own step so a compile error is a compile error rather than five
+      # minutes into a test that never started. The test builds it too (it
+      # execs CARGO_BIN_EXE_liquidator), and finds it already built.
+      - name: Build the bot
+        run: cargo build --bin liquidator
+
+      - name: Run the end-to-end liquidation
+        run: make sandbox-test
+
+      # Logs only, and *by extension*: target/sandbox/ also holds sandbox.env
+      # — the signing key — and the fetched wasm. `*.log` is bot.log and
+      # sandbox.log, neither of which can hold a secret (the bot's `Signer`
+      # renders as its address; lib.sh's log() is never handed an argument).
+      # Uploaded artifacts are not masked, so this path is the guarantee, not
+      # the ::add-mask:: above.
+      - name: Upload the sandbox logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sandbox-logs
+          path: target/sandbox/*.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      # Always, including after a failed deploy, which leaves a container on
+      # port 8000 and a live signing key on disk. A hosted runner's VM takes
+      # both with it when the job ends, so this is mostly hygiene — but it is
+      # one line, and it is the difference between a repeatable nightly and a
+      # self-hosted runner that refuses every run after the first failure.
+      - name: Tear the sandbox down
+        if: always()
+        run: ./scripts/sandbox/down.sh

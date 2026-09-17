@@ -62,7 +62,9 @@ jobs:
   # Rust version pin fails by having CI and Docker accept syntax the declared
   # MSRV does not support, so everything is green until someone builds on the
   # minimum; a second stellar-strkey in Cargo.lock compiles cleanly and
-  # cargo-deny allows it.
+  # cargo-deny allows it; and a sandbox workflow installing one stellar CLI
+  # while the dev container installs another is green on both sides, with
+  # only the contracts they deploy disagreeing.
   # Runnable locally: ./scripts/check-repo-invariants.sh
   invariants:
     runs-on: ubuntu-latest
@@ -78,7 +80,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: shellcheck --severity=error scripts/*.sh .devcontainer/*.sh
+      - run: shellcheck --severity=error scripts/*.sh scripts/sandbox/*.sh .devcontainer/*.sh
 
   # ── CI Summary ──────────────────────────────────────
   # Aggregate gate: the single required status check on main. Requiring this

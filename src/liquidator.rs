@@ -34,8 +34,10 @@
 //! operational surface: a Telegram [`notifier::NotificationChannel`]
 //! (`notifier::telegram`) behind that same trait, dependency-free
 //! Prometheus metrics (`metrics`), and the `/healthz`/`/livez`/`/metrics`
-//! server (`http`). What is left is Phase 7's sandbox integration tier
-//! and Phase 8's docs and first release.
+//! server (`http`). Phase 7 landed the sandbox integration tier that runs
+//! all of it armed against a throwaway Stellar network
+//! (`scripts/sandbox/`, `tests/liquidation_sandbox.rs`). What is left is
+//! Phase 8's docs and first release, and a testnet soak.
 //!
 //! The repository scaffolding around it — CI gates, lint
 //! posture, dev container, release preflight — is complete and enforced
