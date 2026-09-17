@@ -9,6 +9,102 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Five knobs for the operational surface (`src/config.rs`): `PORT` and
+  `HTTP_PORT` (`PORT` wins when both are set, since it is the one a
+  deployment platform like Cloud Run controls), `HTTP_BIND_ADDR` (loopback
+  by default — Cloud Run sets it to `0.0.0.0`, since it cannot route to a
+  loopback listener), and `HEALTH_MAX_LAG_LEDGERS` (default 10, refused at
+  zero: a bot exactly at head would report not-ready on every poll-interval
+  boundary otherwise) — either port turns the HTTP server on; and
+  `TELEGRAM_BOT_TOKEN` (read from the environment only, like the signing
+  keys, never an argument) with `TELEGRAM_CHAT_ID`, both or neither, either
+  alone a startup error. `HttpConfig` and `TelegramConfig` carry them into
+  `ServiceConfig`.
+- `src/metrics.rs` (`Metrics`): the run's counters and gauges — ledger head
+  and processed, poller heartbeats, events processed, users tracked and
+  auctions open per pool, creation and fill attempts by result (`Attempt`),
+  skips by reason (`SkipLabel`, a closed five, each counted once per
+  auction *per reason* rather than once per pass over one, so an auction
+  the filler refuses on every tick cannot bury the other four reasons —
+  keyed, for every skip decided after the chain read, by the auction
+  entry's own start ledger rather than the store row's, which can lag it
+  by a whole auction),
+  estimated profit and estimated loss — two counters, as integers
+  in the pool oracle's own units, because a landed fill's estimate can be
+  negative on a `force_fill` pool and a Prometheus counter that decreases
+  is read as a reset — reserved
+  inventory per asset, unwind passes, the last successful scan per pool,
+  and notification deliveries by kind and outcome (`DeliveryLabel`) — behind
+  one `Mutex<Inner>`, synchronous and never held across an `.await`,
+  rendered to Prometheus text exposition format (`Metrics::render`, prefix
+  `blend_liquidator_`) with every closed label's series present, zero
+  included, so a dashboard never has to guess whether a missing series
+  means zero or means the bot has not run.
+- `src/http.rs`: an axum server for `/healthz` (readiness — every
+  configured pool's processed ledger within `HEALTH_MAX_LAG_LEDGERS` of the
+  observed chain head *in either direction*, so a head that far behind the
+  processed ledger — an RPC node sitting behind the cursor this bot has
+  already committed — fails rather than reading as no lag at all, that head itself read within
+  `PollerConfig::liveness_deadline`, and the store answering a ping
+  inside `PING_TIMEOUT` (5s); the head's age is the rule that makes an
+  RPC outage visible, since both ledger gauges are the process's own and
+  an outage stops them together), `/livez`
+  (liveness — every pool's poller heartbeated within
+  `PollerConfig::liveness_deadline`, which absorbs one worst-case backoff
+  so an RPC outage alone cannot fail it, with a pool that has never
+  heartbeated measured from the run's start instead — the same rule the
+  watchdog applies) and `/metrics`, served only when
+  `HttpConfig` is set and never propagating a bind failure to its caller:
+  a diagnostics port that cannot open must not stop the bot from trading.
+  Its task is spawned before the initial seed, so `/livez` is reachable
+  while a first start seeds, and the seed heartbeats every configured
+  pool through `ledger::heartbeat_while` (which `LedgerPoller::await_ack`
+  is built on) rather than leaving that window silent for the pools it
+  has not reached.
+- `Notifier` gains a bounded number of deliveries in flight
+  (`NOTIFY_IN_FLIGHT`, 10) and `Notifier::drain(budget)`, which acquires
+  every permit with a timeout and is what an exit path calls, with
+  `DRAIN_BUDGET` (10s), to give sends still in flight a bounded chance to
+  leave before the process does.
+- `src/notifier/telegram.rs` (`TelegramChannel`): the second
+  `NotificationChannel`, over `sendMessage`, with `verify` (`getMe`) for
+  `check-config` to prove a configured token works before the bot starts
+  trusting it. The bot token sits in the request path, so every
+  `reqwest::Error` this channel returns is passed through
+  `reqwest::Error::without_url()` first, and a refusal's text is built only
+  from Telegram's own `description` field, never the raw response body,
+  which echoes the request URL — token included — on some of Telegram's
+  own error pages.
+- `LedgerPoller` records a heartbeat every `poll_interval` for as long as
+  its loop is turning, the pass included — the RPC calls, the `getEvents`
+  paging and the wait for the tracker's acknowledgement alike — so the
+  backoff sleep after a failed pass is the only unstamped stretch, and the
+  chain head every pass that reads one; a run of `RPC_FAILING_AFTER` (5) consecutive failed passes
+  notifies `NotificationKind::RpcFailing` once, at the threshold, with the
+  first successful pass logging the recovery and resetting the count.
+  `Service::run` spawns a watchdog task beside the pollers
+  (`watchdog_loop`) that reports a pool whose heartbeat has gone past
+  `PollerConfig::liveness_deadline` as `NotificationKind::PollerStalled`,
+  since a poller that has stopped is exactly the thing that cannot report
+  itself.
+- `Service::run` now spawns seven kinds of task — one `LedgerPoller` per
+  pool, one tracker, one auctioneer, one filler, one watchdog, one HTTP
+  server when a port is configured, and one submission-queue worker per
+  distinct signing key when armed, the HTTP server spawned before the
+  seed pass and every other task after it — sharing one `Metrics` and one
+  `Notifier` built before the seed pass (`build_notifier`: the Telegram
+  channel when both credentials are configured, `LogChannel` otherwise);
+  every exit but the second shutdown signal and a task panic drains the
+  notifier (`finish_run`) before returning — a panic unwinds out of
+  `drain_tasks` past `finish_run`, so notifications still in flight are
+  lost with it. `Service::check_config` verifies a
+  configured Telegram token with one `getMe` call, a refusal a
+  configuration error, since spec §10 makes it the deploy smoke test.
+- The filler and its executor now report themselves: `fills_total{result}`,
+  `skips_total{reason}`, `estimated_profit_total`/`estimated_loss_total`,
+  `reserved_inventory{asset}` and `unwind_passes_total` on every `Metrics`
+  this run holds, and `NotificationKind::FillConfirmed`/`FillFailed`/
+  `UnfundedFill` alongside the queue's existing `SubmissionDropped`.
 - The unwind builder (`src/math/unwind.rs`, `plan_unwind`): the
   repay-and-withdraw request list for a position a fill has left the
   filler holding, in three steps. First, repay each liability asset the
@@ -41,11 +137,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cooldown — `FAILURE_NOTIFICATION_COOLDOWN_HOURS`, default 24 hours,
   refused at zero since there is no "no cooldown" spelling, only shorter
   ones — before handing what survives to one channel. `LogChannel`, the
-  only channel before Phase 6b's Telegram, logs at `WARN` for
-  `Severity::High` and `INFO` otherwise. A channel failure answers
-  `Delivery::Failed`, rolls back the dedup entry it optimistically
-  inserted, and never affects trading: `Notifier::notify` returns no
-  `Result`, only a `Delivery`.
+  fallback channel and the only one when no Telegram credentials are
+  configured, logs at `WARN` for `Severity::High` and `INFO` otherwise.
+  A notification that survives the cooldown answers `Delivery::Queued`
+  the moment its delivery task is spawned; a channel that then fails
+  rolls the dedup entry back inside that task and writes the
+  notification through `LogChannel` instead. None of it affects trading:
+  `Notifier::notify` returns no `Result`, only a `Delivery`, and never
+  awaits a channel.
 - The filler now unwinds. `Executor::unwind` (`src/executor.rs`) is
   `Executor::execute`'s path for the requests `plan_unwind` builds: the
   same mode guards, judged through `Submitter::simulate_only`, submitted
@@ -482,3 +581,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Dependabot ignores it, since a bump of it alone only adds a second copy;
   the check fails unless `Cargo.lock` holds exactly one — two is the signal
   to bump it in the same PR as a `stellar-xdr` that moves its own.
+
+### Changed
+
+- `Notifier::notify` no longer waits for delivery: it takes the dedup
+  entry synchronously and spawns the send behind `NOTIFY_IN_FLIGHT`'s
+  bounded semaphore, answering immediately rather than after the channel
+  does — so a channel that takes seconds to answer, or never answers,
+  delays no tick, no liquidation and no fill. `Delivery::Sent` and
+  `Delivery::Failed` are gone; `Delivery::Queued` (handed to a delivery
+  task) and `Delivery::Dropped` (no permit was free) take their place
+  alongside the unchanged `Delivery::Deduplicated`. A delivery that fails,
+  or is dropped for want of a permit, rolls back the dedup entry it
+  optimistically inserted and writes the notification through `LogChannel`
+  instead, so the operator still sees it even though nothing upstream —
+  which never waited to be told — learns whether it arrived.

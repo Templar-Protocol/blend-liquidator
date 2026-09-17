@@ -84,12 +84,14 @@ use crate::executor::{
 use crate::inventory::{read_balances, Inventory, Settlement};
 use crate::ledger::LedgerTick;
 use crate::math::fill::{
-    health_floor, plan_fill, to_oracle_units, FillDraft, FillInputs, FillTerms, PlannedFill,
+    health_floor, plan_fill, to_oracle_units, FillDraft, FillInputs, FillSkip, FillTerms,
+    PlannedFill,
 };
 use crate::math::unwind::{plan_unwind, UnwindInputs, UnwindPlan, UnwindTerms};
 use crate::math::{AuctionData, MathError, Positions, Reserve};
+use crate::metrics::{Attempt, Metrics, SkipLabel};
 use crate::notifier::{Delivery, Notification, NotificationKind, Notifier, Severity};
-use crate::queue::SubmissionQueue;
+use crate::queue::{QueueError, SubmissionQueue};
 use crate::store::{Store, StoreError, TrackedAuction};
 
 /// The whole of the auction, and the largest percent any plan may name.
@@ -216,6 +218,32 @@ pub struct FillerState {
     /// Every version of an auction this process has recorded a dry-run
     /// fill for (ruling 8), by content: see [`RecordedFill`].
     recorded_dry_run: BTreeSet<RecordedFill>,
+    /// Every `(auction, reason)` this process has already counted a
+    /// `skips_total` for: the auction by pool, account and start ledger,
+    /// and the reason by its label.
+    ///
+    /// The start ledger is the *chain entry's* for every skip decided
+    /// after the entry was read, and the row's only for the one decided
+    /// before it ([`SkipLabel::UnsupportedAssets`], where no entry has
+    /// been read). The chain can hold a new auction for an account before
+    /// the tracker has applied the events that opened it, and `kept` in
+    /// [`FillerState::prune_recorded`] keeps only keys at or past the
+    /// row's start ledger: a post-read skip keyed by the older row would
+    /// be pruned the moment the tracker caught up — while the auction is
+    /// still open — and the very same decision would count again.
+    ///
+    /// A skip is counted once per auction per reason. The filler re-makes
+    /// every one of these decisions on every tick an auction stays open —
+    /// the assets test runs before the dry-run and `due` filters, and a
+    /// planner skip clears the row's plan, which makes `due` true again —
+    /// so a reason counted per attempt would count per ledger instead,
+    /// for as long as the auction stays open, and one auction the planner
+    /// refuses forever would bury every other reason in the metric. A
+    /// *different* reason for the same auction counts again; the same one
+    /// does not until the auction closes. Pruned beside
+    /// `recorded_dry_run`, by the same rule and for the same reason: the
+    /// row going away is the only thing that ends the count.
+    counted_skips: BTreeSet<(String, String, u32, SkipLabel)>,
     /// Set by a submission that landed or may have landed, so the next
     /// pool pass re-reads the wallet however fresh its balances look.
     inventory_stale: bool,
@@ -346,12 +374,21 @@ impl FillerState {
             .filter(|row| row.auction_type == AuctionType::UserLiquidation)
             .map(|row| (row.account.as_str(), row.start_ledger))
             .collect();
-        self.recorded_dry_run.retain(|recorded| {
-            recorded.pool != pool
+        let kept = |recorded_pool: &str, account: &str, start_ledger: u32| {
+            recorded_pool != pool
                 || open
-                    .get(recorded.account.as_str())
-                    .is_some_and(|start| recorded.start_ledger >= *start)
-        });
+                    .get(account)
+                    .is_some_and(|start| start_ledger >= *start)
+        };
+        self.recorded_dry_run
+            .retain(|recorded| kept(&recorded.pool, &recorded.account, recorded.start_ledger));
+        // The same rule, because it answers the same question: an auction
+        // the pool's open rows no longer name is one nothing will decide
+        // about again, so neither set may keep it.
+        self.counted_skips
+            .retain(|(recorded_pool, account, start_ledger, _reason)| {
+                kept(recorded_pool, account, *start_ledger)
+            });
     }
 }
 
@@ -416,6 +453,23 @@ fn due(
         || tick.sequence.saturating_sub(planned_at) >= config.replan_ledgers
 }
 
+/// The `skips_total` label one planner refusal is counted under.
+///
+/// Exhaustive on purpose — a new [`FillSkip`] must be given a label here
+/// rather than silently joining whichever one a catch-all arm named.
+/// [`FillSkip::PastAuctionEnd`] is `Unprofitable` because that is what it
+/// is: the ramp is over, so there is nothing left to wait for and the lot
+/// is whatever it is. [`FillSkip::TooManyPositions`] is `Health` because
+/// what it refuses is the filler's own position, exactly as the floor
+/// does.
+fn skip_label(reason: FillSkip) -> SkipLabel {
+    match reason {
+        FillSkip::Unprofitable | FillSkip::PastAuctionEnd => SkipLabel::Unprofitable,
+        FillSkip::TooManyPositions | FillSkip::Health => SkipLabel::Health,
+        FillSkip::Unfunded => SkipLabel::Unfunded,
+    }
+}
+
 /// What one tick carries across the pools it walks.
 struct Pass<'p> {
     /// The ledger this tick is for.
@@ -447,7 +501,9 @@ struct PoolPass<'p> {
 
 /// Plans and executes the fills of every configured pool's open auctions,
 /// against one store, one chain client, one wallet and one executor.
-#[derive(Debug)]
+///
+/// Not `Debug`: [`Metrics`] is not, the same reason
+/// [`crate::ledger::LedgerPoller`] stopped being once it took one.
 pub struct Filler<'a> {
     rpc: &'a RpcClient,
     store: &'a Store,
@@ -456,13 +512,21 @@ pub struct Filler<'a> {
     executor: Executor<'a>,
     inventory: Inventory,
     notifier: Arc<Notifier>,
+    /// The run's counters and gauges. Instrumenting only: every call
+    /// through it is a lock and an integer, and nothing it answers is
+    /// read back by anything that plans, simulates or sends (spec §8).
+    metrics: Arc<Metrics>,
 }
 
 impl<'a> Filler<'a> {
     /// A filler reading `pools` through `rpc`, planning against `store`
-    /// and `inventory`, executing through `executor`, and reporting what
-    /// an unwind cannot finish through `notifier`.
+    /// and `inventory`, executing through `executor`, reporting through
+    /// `notifier` and counting into `metrics`.
     #[must_use]
+    // Every one of these is a distinct collaborator with no sensible
+    // default, and the two instruments are the run's single instances
+    // rather than anything this type could build for itself.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         rpc: &'a RpcClient,
         store: &'a Store,
@@ -471,6 +535,7 @@ impl<'a> Filler<'a> {
         executor: Executor<'a>,
         inventory: Inventory,
         notifier: Arc<Notifier>,
+        metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             rpc,
@@ -480,6 +545,7 @@ impl<'a> Filler<'a> {
             executor,
             inventory,
             notifier,
+            metrics,
         }
     }
 
@@ -531,6 +597,10 @@ impl<'a> Filler<'a> {
         }
         self.unwind_passes(&mut pass, execute, queue, shutdown)
             .await?;
+        // Once per tick, after the unwind passes: a gauge, not an
+        // accumulator, so what it reports is what this whole tick left
+        // held rather than what any one plan took mid-walk.
+        self.metrics.reserved_inventory(&self.inventory.reserved());
         Ok(pass.summary)
     }
 
@@ -544,10 +614,11 @@ impl<'a> Filler<'a> {
         shutdown: &watch::Receiver<bool>,
     ) -> Result<(), FillerError> {
         let rows = self.store.open_auctions(&pool.address).await?;
+        self.metrics.auctions_open(&pool.address, rows.len());
         pass.state.prune_recorded(&pool.address, &rows);
         let candidates: Vec<TrackedAuction> = rows
             .into_iter()
-            .filter(|row| self.considered(pool, row, pass))
+            .filter(|row| self.considered(pool, row, &mut *pass))
             .collect();
         if candidates.is_empty() {
             return Ok(());
@@ -618,13 +689,46 @@ impl<'a> Filler<'a> {
         Ok(())
     }
 
+    /// Counts one `skips_total{reason}` for this auction, once.
+    ///
+    /// Every skip the filler records goes through here, because every one
+    /// of them is a decision it re-makes on every tick the auction stays
+    /// open: counting per attempt would make each reason's rate a
+    /// function of how long an auction lived rather than of how often the
+    /// bot declined one, and the five reasons would stop being comparable
+    /// with each other. See `FillerState::counted_skips` for what the
+    /// key is and when it is forgotten.
+    ///
+    /// `start_ledger` is the auction this decision was about, and the
+    /// caller says which: the chain entry's `block` for every skip decided
+    /// after the entry was read, and `row.start_ledger` only for one
+    /// decided before it. Passing the row's for a post-read skip is the
+    /// bug — the row can lag the chain by an auction, and the key would be
+    /// pruned out from under an auction that is still open.
+    fn count_skip(
+        &self,
+        pass: &mut Pass<'_>,
+        row: &TrackedAuction,
+        start_ledger: u32,
+        reason: SkipLabel,
+    ) {
+        if pass.state.counted_skips.insert((
+            row.pool.clone(),
+            row.account.clone(),
+            start_ledger,
+            reason,
+        )) {
+            self.metrics.skip(reason);
+        }
+    }
+
     /// Step 1: whether this row is worth a chain read at all.
     ///
     /// Silent by design — it runs for every open auction of every pool on
     /// every tick, and a line per row per ledger would bury the decisions
     /// that matter. What it filtered out is the difference between the
     /// store's open auctions and the tick's summary.
-    fn considered(&self, pool: &PoolConfig, row: &TrackedAuction, pass: &Pass<'_>) -> bool {
+    fn considered(&self, pool: &PoolConfig, row: &TrackedAuction, pass: &mut Pass<'_>) -> bool {
         if row.auction_type != AuctionType::UserLiquidation {
             return false;
         }
@@ -634,6 +738,9 @@ impl<'a> Filler<'a> {
         let bid: Vec<&str> = row.bid.keys().map(String::as_str).collect();
         let lot: Vec<&str> = row.lot.keys().map(String::as_str).collect();
         if !pool.supports(&bid, &lot) {
+            // The one pre-read skip: nothing has been read, so the row
+            // is all there is to key it by.
+            self.count_skip(pass, row, row.start_ledger, SkipLabel::UnsupportedAssets);
             return false;
         }
         // On the row's own version: the cheap test, before any chain read.
@@ -916,6 +1023,21 @@ impl<'a> Filler<'a> {
                     max_percent = max_percent.get(),
                     "no fill planned for this auction"
                 );
+                self.count_skip(pass, row, auction.block, skip_label(reason));
+                // The one planner refusal an operator can do something
+                // about: every other one is the auction's own shape, and
+                // this one is the wallet's.
+                if matches!(reason, FillSkip::Unfunded) {
+                    self.notifier.notify(Notification {
+                        kind: NotificationKind::UnfundedFill,
+                        severity: Severity::Medium,
+                        pool: row.pool.clone(),
+                        account: Some(row.account.clone()),
+                        message: "the wallet cannot fund the primary asset a fill of this \
+                                  auction needs"
+                            .to_string(),
+                    });
+                }
                 self.clear_plan(row).await?;
                 pass.summary.skipped += 1;
                 Ok(None)
@@ -996,11 +1118,16 @@ impl<'a> Filler<'a> {
         queue: Option<&SubmissionQueue>,
         pass: &mut Pass<'_>,
     ) -> Result<bool, FillerError> {
-        let Some(outcome) = self.execute_once(context, row, draft, queue, pass).await? else {
+        let Some(outcome) = self
+            .execute_once(context, row, auction.block, draft, queue, pass)
+            .await?
+        else {
             return Ok(false);
         };
         match outcome {
-            ExecOutcome::Recorded(recorded) => Ok(note_recorded(row, auction, &recorded, pass)),
+            ExecOutcome::Recorded(recorded) => {
+                Ok(self.note_recorded(row, auction, &recorded, draft.est_profit, pass))
+            }
             ExecOutcome::Replan { contract_error } => {
                 tracing::info!(
                     pool = %row.pool,
@@ -1018,6 +1145,7 @@ impl<'a> Filler<'a> {
                     contract_error,
                     "this fill was refused; leaving it for the next tick"
                 );
+                self.count_skip(pass, row, auction.block, SkipLabel::ContractError);
                 pass.summary.skipped += 1;
                 Ok(false)
             }
@@ -1073,11 +1201,16 @@ impl<'a> Filler<'a> {
             );
             return Ok(false);
         }
-        let Some(outcome) = self.execute_once(context, row, &draft, queue, pass).await? else {
+        let Some(outcome) = self
+            .execute_once(context, row, auction.block, &draft, queue, pass)
+            .await?
+        else {
             return Ok(false);
         };
         Ok(match outcome {
-            ExecOutcome::Recorded(recorded) => note_recorded(row, auction, &recorded, pass),
+            ExecOutcome::Recorded(recorded) => {
+                self.note_recorded(row, auction, &recorded, draft.est_profit, pass)
+            }
             ExecOutcome::Stale => {
                 self.clear_plan(row).await?;
                 pass.state.forget(&row.pool, &row.account);
@@ -1091,6 +1224,7 @@ impl<'a> Filler<'a> {
                     outcome = ?other,
                     "the contract refused the re-plan too; leaving this auction for the next tick"
                 );
+                self.count_skip(pass, row, auction.block, SkipLabel::ContractError);
                 pass.summary.skipped += 1;
                 false
             }
@@ -1100,10 +1234,15 @@ impl<'a> Filler<'a> {
     /// Hands one draft to the executor with the settlement its mode
     /// demands. `None` means nothing was executed and the reason is
     /// already counted or logged.
+    ///
+    /// `start_ledger` is the chain entry's `block` — the auction this
+    /// draft was planned against — because both skips counted here are
+    /// decided after the entry was read. See [`Filler::count_skip`].
     async fn execute_once(
         &self,
         context: &PoolPass<'_>,
         row: &TrackedAuction,
+        start_ledger: u32,
         draft: &FillDraft,
         queue: Option<&SubmissionQueue>,
         pass: &mut Pass<'_>,
@@ -1112,6 +1251,12 @@ impl<'a> Filler<'a> {
             Ok(priority) => priority,
             Err(error) => {
                 tracing::warn!(pool = %row.pool, account = %row.account, %error, "this fill's fee tier does not compute");
+                // Nothing chain-specific refused this fill — it never
+                // reached the chain — but `ContractError` is the label for
+                // exactly this: a refusal none of the other four reasons
+                // classifies more specifically.
+                self.count_skip(pass, row, start_ledger, SkipLabel::ContractError);
+                pass.summary.skipped += 1;
                 return Ok(None);
             }
         };
@@ -1127,6 +1272,12 @@ impl<'a> Filler<'a> {
                         %error,
                         "the wallet cannot fund this fill; skipping it this tick"
                     );
+                    // A wallet shortfall, which is what `unfunded` means:
+                    // the reservation is refused because what this plan
+                    // means to spend is more than the inventory has left
+                    // unreserved, never because the chain refused
+                    // anything.
+                    self.count_skip(pass, row, start_ledger, SkipLabel::Unfunded);
                     pass.summary.skipped += 1;
                     return Ok(None);
                 }
@@ -1141,6 +1292,30 @@ impl<'a> Filler<'a> {
         match self.executor.execute(&plan, settlement, queue).await {
             Ok(outcome) => Ok(Some(outcome)),
             Err(ExecutorError::Store(error)) => Err(FillerError::Store(error)),
+            // The `fills` row was written before the submission reached
+            // the queue, so this attempt happened and it is gone rather
+            // than pending: [`QueueError::Chain`] is narrowed to a failure
+            // that provably sent nothing and has spent its retry budget.
+            // Attempted *and* failed, which is what tells it from a
+            // `TxOutcome::Unknown` — the one answer that is neither.
+            Err(ExecutorError::Queue(QueueError::Chain(error))) => {
+                tracing::warn!(
+                    pool = %row.pool,
+                    account = %row.account,
+                    %error,
+                    "the queue could not carry this fill; leaving it for the next tick"
+                );
+                self.metrics.fill(Attempt::Attempted);
+                self.metrics.fill(Attempt::Failed);
+                self.notifier.notify(Notification {
+                    kind: NotificationKind::SubmissionDropped,
+                    severity: Severity::High,
+                    pool: row.pool.clone(),
+                    account: Some(row.account.clone()),
+                    message: format!("fill dropped by the queue: {error}"),
+                });
+                Ok(None)
+            }
             Err(error) => {
                 tracing::warn!(
                     pool = %row.pool,
@@ -1165,6 +1340,111 @@ impl<'a> Filler<'a> {
             Priority::Normal
         })
     }
+
+    /// What a recorded fill leaves behind: ruling 8's "recorded once" for
+    /// a dry run, a wallet to re-read when the chain may have spent it
+    /// (ruling 14 — an `Unknown` may still land), and this fill's place in
+    /// the counters.
+    ///
+    /// Answers whether the chain applied this fill or may yet, which is
+    /// both why the wallet is re-read and why the rest of this pool's
+    /// auctions are left for the next tick: they were projected against
+    /// the borrower's positions and the filler's own as this fill has just
+    /// changed them.
+    ///
+    /// Every recorded fill is `attempted`, settled or not: a dry run's,
+    /// one no key could sign, one the contract failed. What tells them
+    /// apart is the chain's own answer — a [`TxOutcome::Failed`] (a fee
+    /// charged and no fill) and a [`TxOutcome::Expired`] (provably never
+    /// applied) are `failed`, while a [`TxOutcome::Unknown`] is neither:
+    /// it may still land, and a counter that guessed would have to be
+    /// un-counted. `est_profit` is the draft's own estimate, in the pool
+    /// oracle's units, added to the display-only running total when — and
+    /// only when — the chain says the fill landed.
+    ///
+    /// Only an [`ExecOutcome::Recorded`] reaches here, which is why
+    /// `count(*) FROM fills` can exceed `fills_total{attempted}`: the
+    /// executor writes the audit row before it enqueues anything, so a
+    /// fill the *queue's* prepare then refused ([`ExecOutcome::Refused`],
+    /// counted `skips_total{contract_error}`) or found stale
+    /// ([`ExecOutcome::Stale`], counted under no label at all) leaves a
+    /// row this never counts. The row is the record that the bot meant to
+    /// fill; the counter is the record that it handed one to the chain.
+    ///
+    /// Instrumenting only: [`Notifier::notify`] spawns its delivery rather
+    /// than awaiting a channel, so nothing here can delay or fail the pass
+    /// that called it (spec §8).
+    fn note_recorded(
+        &self,
+        row: &TrackedAuction,
+        auction: &AuctionData,
+        recorded: &FillRecorded,
+        est_profit: i128,
+        pass: &mut Pass<'_>,
+    ) -> bool {
+        pass.summary.executed += 1;
+        self.metrics.fill(Attempt::Attempted);
+        if recorded.dry_run {
+            pass.state
+                .recorded_dry_run
+                .insert(RecordedFill::of_entry(row, auction));
+        }
+        match &recorded.submission {
+            Some(TxOutcome::Succeeded { ledger, .. }) => {
+                self.metrics.fill(Attempt::Succeeded);
+                self.metrics.profit(est_profit);
+                self.notifier.notify(Notification {
+                    kind: NotificationKind::FillConfirmed,
+                    severity: Severity::Low,
+                    pool: row.pool.clone(),
+                    account: Some(row.account.clone()),
+                    message: format!("fill landed in ledger {ledger}"),
+                });
+            }
+            Some(TxOutcome::Failed { ledger, .. }) => {
+                self.metrics.fill(Attempt::Failed);
+                self.notifier.notify(Notification {
+                    kind: NotificationKind::FillFailed,
+                    severity: Severity::High,
+                    pool: row.pool.clone(),
+                    account: Some(row.account.clone()),
+                    message: format!("fill failed on chain in ledger {ledger}"),
+                });
+            }
+            // Expired is the fee-less half of the same fact: it provably
+            // never applied, so it is failed and there is no ledger to
+            // name it in.
+            Some(TxOutcome::Expired { .. }) => self.metrics.fill(Attempt::Failed),
+            Some(TxOutcome::Unknown { .. }) | None => {}
+        }
+        // The ledger an `Unknown` will land in is not known, which is
+        // exactly why it carries `None` rather than the window's own
+        // bounds: a pass may not act on a snapshot until the fill is
+        // provably in it.
+        let landed = match recorded.submission {
+            Some(TxOutcome::Succeeded { ledger, .. }) => Some(Some(ledger)),
+            Some(TxOutcome::Unknown { .. }) => Some(None),
+            _ => None,
+        };
+        if let Some(at) = landed {
+            pass.state.inventory_stale = true;
+            // Ruling 3: the fill handed this pool's position to the filler,
+            // so an unwind pass is owed one — even for an `Unknown`
+            // outcome, which may yet land. `unwind_after` is what keeps
+            // every pass until one of them, this tick's included, from
+            // planning against a snapshot that does not hold the fill.
+            pass.state.unwind_pending.insert(row.pool.clone());
+            pass.state.unwind_after.insert(row.pool.clone(), at);
+            // And whatever the last passes could not do, they were refused
+            // against a position this fill has changed — new collateral,
+            // new debt. A backoff measured against the old one would hold
+            // the new one unwound for as long as
+            // `UNWIND_BACKOFF_MAX_LEDGERS`, which is exactly what a fill
+            // must never be able to buy.
+            clear_setback(&row.pool, pass);
+        }
+        landed.is_some()
+    }
 }
 
 /// The unwind pass (spec §5, "Unwind"): the tick's seventh step, run in
@@ -1180,10 +1460,10 @@ impl<'a> Filler<'a> {
 /// the filler's wallet, its reservations and its snapshot machinery.
 ///
 /// **Ruling 3 — what makes a pool pending.** A fill in it landed, or may
-/// have ([`note_recorded`]); or this is the run's first tick, which seeds
-/// every configured pool once. A restart between a fill and its unwind must
-/// not strand the position, and an idle pass costs one snapshot and one
-/// wallet read and sends nothing. Because spec §5's step 2 withdraws the
+/// have ([`Filler::note_recorded`]); or this is the run's first tick,
+/// which seeds every configured pool once. A restart between a fill and
+/// its unwind must not strand the position, and an idle pass costs one
+/// snapshot and one wallet read and sends nothing. Because spec §5's step 2 withdraws the
 /// primary down to `min_primary_collateral`, that startup pass also trims
 /// any primary collateral above the floor to the wallet — the capital model
 /// of spec §1, "unwind to the wallet and hold".
@@ -1311,6 +1591,11 @@ impl Filler<'_> {
                 return Ok(());
             }
         };
+        // The pass happened the moment it had a pool to look at: a read
+        // that failed is not a pass, and everything below this — the
+        // submission gate, an idle position, a plan that would not build —
+        // is a pass that ran and found nothing to do.
+        self.metrics.unwind_pass();
         // Before the position is looked at at all: what this snapshot
         // shows of a pool a fill or an earlier pass has just changed means
         // nothing until the snapshot is known to hold that submission.
@@ -1397,7 +1682,7 @@ impl Filler<'_> {
             }
         };
         if plan.is_idle() {
-            self.note_idle(pool, &plan, pass).await;
+            self.note_idle(pool, &plan, pass);
             return Ok(());
         }
         if !execute {
@@ -1417,7 +1702,7 @@ impl Filler<'_> {
     /// it stops being pending. Ruling 11's notification is here, because an
     /// idle pass is the only one that can tell leftover debt from debt the
     /// next pass will repay.
-    async fn note_idle(&self, pool: &PoolConfig, plan: &UnwindPlan, pass: &mut Pass<'_>) {
+    fn note_idle(&self, pool: &PoolConfig, plan: &UnwindPlan, pass: &mut Pass<'_>) {
         pass.state.unwind_pending.remove(&pool.address);
         clear_setback(&pool.address, pass);
         if plan.remaining_liabilities.is_empty() {
@@ -1439,24 +1724,31 @@ impl Filler<'_> {
             );
             return;
         }
-        let delivery = self
-            .notifier
-            .notify(Notification {
-                kind: NotificationKind::UnwindLeftovers,
-                severity: Severity::High,
-                pool: pool.address.clone(),
-                account: None,
-                message: format!(
-                    "debt the wallet cannot repay remains in {}: {assets}",
-                    pool.address
-                ),
-            })
-            .await;
-        // A channel that failed rolls its own dedup entry back, and this
-        // one must roll back with it: suppressing the next pass on the
-        // strength of a send that never happened would lose a high-severity
-        // alert until some later pass found the pool clean.
-        if delivery == Delivery::Failed {
+        let delivery = self.notifier.notify(Notification {
+            kind: NotificationKind::UnwindLeftovers,
+            severity: Severity::High,
+            pool: pool.address.clone(),
+            account: None,
+            message: format!(
+                "debt the wallet cannot repay remains in {}: {assets}",
+                pool.address
+            ),
+        });
+        // A notification the notifier never handed to its channel rolls its
+        // own dedup entry back, and this one must roll back with it:
+        // suppressing the next pass on the strength of a send that never
+        // happened would lose a high-severity alert until some later pass
+        // found the pool clean.
+        //
+        // A delivery that fails *inside* the notifier's task is not this:
+        // `notify` has already answered `Queued`, the notifier logs the
+        // failure, writes the notification to the log itself and rolls its
+        // own entry back, and this pool stays marked as notified until a
+        // later pass finds it clean. The filler does not retry it — a
+        // notification must never affect trading (spec §8), and an alert
+        // the operator can read in the log is not worth a second pass's
+        // worth of bookkeeping.
+        if delivery == Delivery::Dropped {
             pass.state.leftovers_notified.remove(&pool.address);
         }
     }
@@ -1513,19 +1805,18 @@ impl Filler<'_> {
                     %error,
                     "this unwind could not be executed; it stays pending"
                 );
-                self.note_setback(pool, filler, &format!("the executor failed: {error}"), pass)
-                    .await;
+                self.note_setback(pool, filler, &format!("the executor failed: {error}"), pass);
                 return Ok(());
             }
         };
-        self.note_unwound(pool, filler, &outcome, pass).await;
+        self.note_unwound(pool, filler, &outcome, pass);
         Ok(())
     }
 
     /// What one [`UnwindOutcome`] means for the pending set, the tick's
     /// counts and the pool's setback run — the four arms that are
     /// setbacks, and the two that end one.
-    async fn note_unwound(
+    fn note_unwound(
         &self,
         pool: &PoolConfig,
         filler: &str,
@@ -1591,8 +1882,7 @@ impl Filler<'_> {
                     filler,
                     &format!("the submission did not land: {}", outcome.status()),
                     pass,
-                )
-                .await;
+                );
             }
             UnwindOutcome::Refused { contract_error } => {
                 tracing::info!(
@@ -1605,7 +1895,7 @@ impl Filler<'_> {
                     || "the contract refused it without a code".to_string(),
                     |code| format!("the contract refused it with error {code}"),
                 );
-                self.note_setback(pool, filler, &cause, pass).await;
+                self.note_setback(pool, filler, &cause, pass);
             }
             UnwindOutcome::Stale => {
                 tracing::warn!(
@@ -1618,8 +1908,7 @@ impl Filler<'_> {
                     filler,
                     "stale: another transaction took this key's sequence first",
                     pass,
-                )
-                .await;
+                );
             }
         }
     }
@@ -1635,13 +1924,7 @@ impl Filler<'_> {
     /// the count is the guard, and [`Notifier`]'s cooldown is the other —
     /// and a delivery that fails is the notifier's to log, because a
     /// notification must never affect trading (spec §8).
-    async fn note_setback(
-        &self,
-        pool: &PoolConfig,
-        filler: &str,
-        cause: &str,
-        pass: &mut Pass<'_>,
-    ) {
+    fn note_setback(&self, pool: &PoolConfig, filler: &str, cause: &str, pass: &mut Pass<'_>) {
         let setback = pass
             .state
             .unwind_setbacks
@@ -1665,19 +1948,17 @@ impl Filler<'_> {
         if count != UNWIND_SETBACK_ALERT {
             return;
         }
-        self.notifier
-            .notify(Notification {
-                kind: NotificationKind::SubmissionDropped,
-                severity: Severity::High,
-                pool: pool.address.clone(),
-                account: Some(filler.to_string()),
-                message: format!(
-                    "{count} unwind passes in {} have moved nothing ({cause}); the position \
-                     stays pending and the pass is backing off to every {backoff} ledgers",
-                    pool.address
-                ),
-            })
-            .await;
+        self.notifier.notify(Notification {
+            kind: NotificationKind::SubmissionDropped,
+            severity: Severity::High,
+            pool: pool.address.clone(),
+            account: Some(filler.to_string()),
+            message: format!(
+                "{count} unwind passes in {} have moved nothing ({cause}); the position stays \
+                 pending and the pass is backing off to every {backoff} ledgers",
+                pool.address
+            ),
+        });
     }
 }
 
@@ -1688,53 +1969,6 @@ impl Filler<'_> {
 /// the last one's.
 fn clear_setback(pool: &str, pass: &mut Pass<'_>) {
     pass.state.unwind_setbacks.remove(pool);
-}
-
-/// What a recorded fill leaves behind: ruling 8's "recorded once" for a
-/// dry run, and a wallet to re-read when the chain may have spent it
-/// (ruling 14 — an `Unknown` may still land).
-///
-/// Answers whether the chain applied this fill or may yet, which is both
-/// why the wallet is re-read and why the rest of this pool's auctions are
-/// left for the next tick: they were projected against the borrower's
-/// positions and the filler's own as this fill has just changed them.
-fn note_recorded(
-    row: &TrackedAuction,
-    auction: &AuctionData,
-    recorded: &FillRecorded,
-    pass: &mut Pass<'_>,
-) -> bool {
-    pass.summary.executed += 1;
-    if recorded.dry_run {
-        pass.state
-            .recorded_dry_run
-            .insert(RecordedFill::of_entry(row, auction));
-    }
-    // The ledger an `Unknown` will land in is not known, which is exactly
-    // why it carries `None` rather than the window's own bounds: a pass
-    // may not act on a snapshot until the fill is provably in it.
-    let landed = match recorded.submission {
-        Some(TxOutcome::Succeeded { ledger, .. }) => Some(Some(ledger)),
-        Some(TxOutcome::Unknown { .. }) => Some(None),
-        _ => None,
-    };
-    if let Some(at) = landed {
-        pass.state.inventory_stale = true;
-        // Ruling 3: the fill handed this pool's position to the filler, so
-        // an unwind pass is owed one — even for an `Unknown` outcome, which
-        // may yet land. `unwind_after` is what keeps every pass until one
-        // of them, this tick's included, from planning against a snapshot
-        // that does not hold the fill.
-        pass.state.unwind_pending.insert(row.pool.clone());
-        pass.state.unwind_after.insert(row.pool.clone(), at);
-        // And whatever the last passes could not do, they were refused
-        // against a position this fill has changed — new collateral, new
-        // debt. A backoff measured against the old one would hold the new
-        // one unwound for as long as `UNWIND_BACKOFF_MAX_LEDGERS`, which
-        // is exactly what a fill must never be able to buy.
-        clear_setback(&row.pool, pass);
-    }
-    landed.is_some()
 }
 
 /// Whether an unwind could move anything at all here: something to
@@ -1773,9 +2007,10 @@ mod tests {
     };
     use crate::math::fill::FillAction;
     use crate::math::unwind::UnwindAction;
-    use crate::notifier::{NotificationChannel, NotifyError};
-    use crate::queue::QueueError;
-    use stellar_xdr::ScVal;
+    use crate::notifier::{NotificationChannel, NotifyError, NOTIFY_IN_FLIGHT};
+    use stellar_xdr::{
+        ScVal, TransactionResult, TransactionResultExt, TransactionResultResult, VecM,
+    };
 
     /// A log-only notifier with a cooldown longer than any test's run:
     /// every test but `leftover_debt_notifies_once_per_pool` is about what
@@ -1783,6 +2018,227 @@ mod tests {
     /// then deduplicates.
     fn notifier() -> Arc<Notifier> {
         Arc::new(Notifier::log_only(Duration::from_hours(1)))
+    }
+
+    /// A fresh recorder. Most tests here build one and never read it:
+    /// what they are about is what the filler decides, and the counters
+    /// must cost that nothing — a filler given a recorder nobody reads
+    /// behaves exactly as one whose recorder is asserted on.
+    fn metrics() -> Arc<Metrics> {
+        Arc::new(Metrics::new())
+    }
+
+    /// One `fills_total`/`skips_total` series' current value, read out of
+    /// the rendered text so a test asserts on what an operator's
+    /// dashboard would actually scrape.
+    fn series(metrics: &Metrics, name: &str, label: &str, value: &str) -> u64 {
+        let needle = format!("blend_liquidator_{name}{{{label}=\"{value}\"}} ");
+        metrics
+            .render()
+            .lines()
+            .find_map(|line| line.strip_prefix(&needle)?.parse().ok())
+            .unwrap_or_else(|| panic!("no {name} series for {label}={value}"))
+    }
+
+    /// The `fills_total` count for one result.
+    fn fill_count(metrics: &Metrics, result: Attempt) -> u64 {
+        series(metrics, "fills_total", "result", result.as_str())
+    }
+
+    /// The `skips_total` count for one reason.
+    fn skip_count(metrics: &Metrics, reason: SkipLabel) -> u64 {
+        series(metrics, "skips_total", "reason", reason.as_str())
+    }
+
+    /// The rendered running estimated-profit total, in the pool oracle's
+    /// own units — an integer, which is what the counter carries: display
+    /// only, never a number anything here decides on.
+    fn profit_total(metrics: &Metrics) -> i128 {
+        metrics
+            .render()
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("blend_liquidator_estimated_profit_total ")?
+                    .parse()
+                    .ok()
+            })
+            .expect("the profit total is always rendered")
+    }
+
+    /// Every [`FillSkip`] has its own label, and the two pairs that share
+    /// one share it on purpose: a fill past the ramp's end is the
+    /// unprofitable case with nothing left to wait for, and one that would
+    /// take the filler past `max_positions` is refused by the filler's own
+    /// position exactly as the health floor refuses it.
+    #[test]
+    fn every_planner_skip_has_a_label() {
+        assert_eq!(skip_label(FillSkip::Unprofitable), SkipLabel::Unprofitable);
+        assert_eq!(
+            skip_label(FillSkip::PastAuctionEnd),
+            SkipLabel::Unprofitable
+        );
+        assert_eq!(skip_label(FillSkip::TooManyPositions), SkipLabel::Health);
+        assert_eq!(skip_label(FillSkip::Health), SkipLabel::Health);
+        assert_eq!(skip_label(FillSkip::Unfunded), SkipLabel::Unfunded);
+    }
+
+    /// A skip is one per auction *per reason*. The filler re-makes every
+    /// skip decision on every tick an auction stays open, so a reason
+    /// counted per attempt would count per ledger instead and one auction
+    /// the planner refuses forever would bury the other four. A
+    /// *different* reason for the same auction is a different decision and
+    /// counts again, and the auction leaving the pool's open rows is what
+    /// ends the count.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_skip_counts_once_per_auction_per_reason(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let metrics = metrics();
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            filler_config(),
+            Executor::new(&store, None, true),
+            Inventory::new(XLM.to_string(), 0),
+            notifier(),
+            Arc::clone(&metrics),
+        );
+        let tick = harness::fixture_tick();
+        let auction = auction(tick.sequence - 300);
+        let row = tracked(harness::USER_ONE, &auction);
+        let mut state = FillerState::default();
+        let mut pass = Pass {
+            tick,
+            state: &mut state,
+            summary: TickSummary::default(),
+        };
+
+        filler.count_skip(&mut pass, &row, row.start_ledger, SkipLabel::Unprofitable);
+        filler.count_skip(&mut pass, &row, row.start_ledger, SkipLabel::Unprofitable);
+        filler.count_skip(&mut pass, &row, row.start_ledger, SkipLabel::Unprofitable);
+        assert_eq!(
+            skip_count(&metrics, SkipLabel::Unprofitable),
+            1,
+            "the same auction refused for the same reason on three passes is one skip"
+        );
+
+        filler.count_skip(&mut pass, &row, row.start_ledger, SkipLabel::Health);
+        assert_eq!(
+            skip_count(&metrics, SkipLabel::Health),
+            1,
+            "a different reason for the same auction is a different decision"
+        );
+        assert_eq!(
+            skip_count(&metrics, SkipLabel::Unprofitable),
+            1,
+            "and counting it does not re-open the reason already counted"
+        );
+
+        // The row leaving the pool's open auctions is the only thing that
+        // ends the count: a later auction for the same account is a
+        // decision worth counting afresh.
+        pass.state.prune_recorded(&row.pool, &[]);
+        filler.count_skip(&mut pass, &row, row.start_ledger, SkipLabel::Unprofitable);
+        assert_eq!(
+            skip_count(&metrics, SkipLabel::Unprofitable),
+            2,
+            "an auction the pool no longer holds open is forgotten, reasons and all"
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// A skip decided *after* the chain read is keyed by the entry's own
+    /// start ledger, never the row's.
+    ///
+    /// The chain can hold a new auction for an account before the tracker
+    /// has applied the events that closed the old one and opened it, so
+    /// the row is the older ledger while the entry the filler actually
+    /// decided about is the newer. Keyed by the row's, the tracker's
+    /// catch-up prunes the key — `prune_recorded` keeps only keys at or
+    /// past the row's start ledger — while the auction is still open, and
+    /// the very same decision counts a second `skips_total`.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_post_read_skip_is_keyed_by_the_chain_auction(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        // Both past the ramp's 400th ledger in a pool that is not
+        // `force_fill`, so every plan of either is `PastAuctionEnd` — a
+        // planner skip, which is the first of the post-read sites.
+        let old = auction(tick.sequence - 600);
+        let new = auction(tick.sequence - 500);
+        store
+            .upsert_auction(&tracked(harness::USER_ONE, &old))
+            .await
+            .expect("the store still holds the old auction");
+        let rpc = ScriptedRpc::start().await;
+        harness::script_auction_entry(&rpc, harness::USER_ONE, &new, tick.sequence);
+        harness::script_snapshot(&rpc, &[]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let metrics = metrics();
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            filler_config(),
+            Executor::new(&store, None, true),
+            Inventory::new(XLM.to_string(), 0),
+            notifier(),
+            Arc::clone(&metrics),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+
+        let first = filler
+            .tick(&mut state, tick, true, None, &shutdown)
+            .await
+            .expect("the first tick");
+        assert_eq!(
+            first,
+            TickSummary {
+                skipped: 1,
+                ..TickSummary::default()
+            },
+            "the auction the chain holds is past its ramp, and the planner says so"
+        );
+        assert_eq!(skip_count(&metrics, SkipLabel::Unprofitable), 1);
+
+        // The tracker catches up: the row now names the auction the chain
+        // has held all along, and the pool still holds it open.
+        let second = later(tick, 1);
+        store
+            .upsert_auction(&TrackedAuction {
+                updated_ledger: second.sequence,
+                ..tracked(harness::USER_ONE, &new)
+            })
+            .await
+            .expect("the tracker opens the new auction");
+        harness::script_auction_entry(&rpc, harness::USER_ONE, &new, second.sequence);
+        harness::script_snapshot(&rpc, &[]);
+        let summary = filler
+            .tick(&mut state, second, true, None, &shutdown)
+            .await
+            .expect("the second tick");
+        assert_eq!(
+            summary,
+            TickSummary {
+                skipped: 1,
+                ..TickSummary::default()
+            },
+            "the decision is re-made, as it is on every tick the auction stays open"
+        );
+        assert_eq!(
+            skip_count(&metrics, SkipLabel::Unprofitable),
+            1,
+            "and it is the same auction, so it is still one skip: the key survived the \
+             tracker's catch-up because it was the entry's start ledger, not the row's"
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
     }
 
     /// The filler's position after a fill of the fixture's pool: b-tokens
@@ -1862,26 +2318,49 @@ mod tests {
     }
 
     /// A [`NotificationChannel`] that keeps what it was handed, so a test
-    /// can count what the filler actually decided to send. The first send
-    /// fails when `fail_once` is set, which is how a transient channel
-    /// failure is put in front of the filler's own dedup.
+    /// can count what the filler actually decided to send — and that can
+    /// be made to hold every send (which is how a test takes all of the
+    /// notifier's in-flight permits) or to fail the next one (which is how
+    /// a transient channel failure is put in front of the filler's own
+    /// dedup). Both are off by default.
     #[derive(Debug, Default)]
     struct Recorded {
         sent: std::sync::Mutex<Vec<Notification>>,
         fail_once: std::sync::atomic::AtomicBool,
+        held: std::sync::atomic::AtomicBool,
+        gate: tokio::sync::Notify,
     }
 
     impl Recorded {
-        /// A channel whose first delivery fails.
-        fn failing_once() -> Self {
-            Self {
-                sent: std::sync::Mutex::new(Vec::new()),
-                fail_once: std::sync::atomic::AtomicBool::new(true),
-            }
+        /// Holds every send from here on, so each one keeps its notifier
+        /// permit until [`Recorded::release`].
+        fn hold(&self) {
+            self.held.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Lets every held send finish, and every later one through.
+        fn release(&self) {
+            self.held.store(false, std::sync::atomic::Ordering::SeqCst);
+            self.gate.notify_waiters();
+        }
+
+        /// Fails the next send, once.
+        fn fail_next(&self) {
+            self.fail_once
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
         fn sent(&self) -> Vec<Notification> {
             self.sent.lock().expect("the recorder mutex").clone()
+        }
+
+        /// What it was handed of one kind, which is how the leftovers a
+        /// test is counting are told from the sends holding its permits.
+        fn sent_of(&self, kind: NotificationKind) -> Vec<Notification> {
+            self.sent()
+                .into_iter()
+                .filter(|notification| notification.kind == kind)
+                .collect()
         }
     }
 
@@ -1896,6 +2375,18 @@ mod tests {
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), NotifyError>> + Send + 'a>>
         {
             Box::pin(async move {
+                loop {
+                    // Registered *before* the flag is re-read, so a release
+                    // that lands between the two is never missed and this
+                    // send cannot hang a test.
+                    let notified = self.gate.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if !self.held.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    notified.await;
+                }
                 if self
                     .fail_once
                     .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -2059,6 +2550,15 @@ mod tests {
     /// `a_re_plan_for_a_later_ledger_is_written_and_left`.
     const FILLER_COLLATERAL: i128 = 15_900_000_000;
     const FILLER_LIABILITIES: i128 = 38_700_000_000;
+
+    /// A filler so far under its own floor that nothing the auction pays
+    /// can lift it: `FILLER_COLLATERAL` against ten times
+    /// `FILLER_LIABILITIES`. Even the whole lot at the end of the ramp,
+    /// where the bid has scaled to nothing, leaves it at 0.07 against a
+    /// 1.65 floor — so no percent and no ledger drafts, and what is left
+    /// to say about it is that more of the primary asset would have been
+    /// the difference.
+    const DROWNED_LIABILITIES: i128 = 387_000_000_000;
 
     /// The fixture's third reserve, which `POOL_TWO` does not list.
     const EURC: &str = "CDTKPWPLOURQA2SGTKTUQOWRCBZEORB4BWBOMJ3D3ZTQQSGE5F6JBQLV";
@@ -2249,6 +2749,7 @@ mod tests {
             Executor::new(&store, Some(submitter), true),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -2393,6 +2894,7 @@ mod tests {
             Executor::new(&store, Some(submitter), true),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -2466,6 +2968,7 @@ mod tests {
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -2558,6 +3061,7 @@ mod tests {
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -2657,6 +3161,7 @@ mod tests {
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -2737,6 +3242,7 @@ mod tests {
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -2797,6 +3303,7 @@ mod tests {
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -2874,6 +3381,7 @@ mod tests {
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -2930,6 +3438,7 @@ mod tests {
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -2991,6 +3500,7 @@ mod tests {
             own_addresses: BTreeSet::from([harness::USER_TWO.to_string()]),
             ..filler_config()
         };
+        let metrics = metrics();
         let filler = Filler::new(
             &client,
             &store,
@@ -2999,6 +3509,7 @@ mod tests {
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            Arc::clone(&metrics),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -3007,8 +3518,19 @@ mod tests {
             .tick(&mut state, tick, true, None, &shutdown)
             .await
             .expect("tick");
+        // A second tick over the same two rows: nothing about either has
+        // changed, and neither has what the bot decided about them.
+        let next = LedgerTick {
+            sequence: tick.sequence + 1,
+            ..tick
+        };
+        let again = filler
+            .tick(&mut state, next, true, None, &shutdown)
+            .await
+            .expect("a second tick");
 
         assert_eq!(summary, TickSummary::default());
+        assert_eq!(again, TickSummary::default());
         assert!(
             rpc.received().await.is_empty(),
             "an auction the filler would never take is filtered out of the store's own rows, \
@@ -3021,6 +3543,27 @@ mod tests {
                 .fill_ledger,
             None,
             "and nothing was planned onto it"
+        );
+        assert!(
+            metrics.render().contains(&format!(
+                "blend_liquidator_auctions_open{{pool=\"{}\"}} 2\n",
+                harness::POOL
+            )),
+            "the gauge is what the store holds open, not what survived the filter:\n{}",
+            metrics.render()
+        );
+        assert_eq!(
+            skip_count(&metrics, SkipLabel::UnsupportedAssets),
+            1,
+            "the unsupported auction is the one counted, once for the auction and not once \
+             per tick it stays open for — every reason is counted that way, and one \
+             counted at the tick rate would bury the rest. The bot's own account is \
+             filtered before the assets are ever looked at"
+        );
+        assert_eq!(
+            skip_count(&metrics, SkipLabel::Unfunded)
+                + skip_count(&metrics, SkipLabel::ContractError),
+            0
         );
         Ok(())
     }
@@ -3053,6 +3596,7 @@ mod tests {
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -3136,6 +3680,7 @@ mod tests {
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -3208,6 +3753,7 @@ mod tests {
             Executor::new(&store, Some(submitter), true),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -3288,6 +3834,7 @@ mod tests {
             Executor::new(&store, Some(submitter), false),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -3426,6 +3973,7 @@ mod tests {
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -3515,6 +4063,7 @@ mod tests {
             Executor::new(&store, Some(submitter), false),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -3595,6 +4144,7 @@ mod tests {
             BTreeMap::from([(USDC.to_string(), 1_000_000_000)]),
             Instant::now(),
         );
+        let metrics = metrics();
         let pools = vec![pool_config()];
         let filler = Filler::new(
             &client,
@@ -3609,6 +4159,7 @@ mod tests {
             Executor::new(&store, None, false),
             inventory,
             notifier(),
+            Arc::clone(&metrics),
         );
         let context = filler
             .pool_context(&pools[0], snapshot, tick)
@@ -3638,6 +4189,7 @@ mod tests {
             .execute_once(
                 &context,
                 &tracked(harness::USER_ONE, &auction),
+                auction.block,
                 &draft,
                 None,
                 &mut pass,
@@ -3654,6 +4206,16 @@ mod tests {
             },
             "a refused reservation is a decision, and it is counted as one"
         );
+        assert_eq!(
+            skip_count(&metrics, SkipLabel::Unfunded),
+            1,
+            "a wallet that moved under the plan is a shortfall, and the label says so"
+        );
+        assert_eq!(
+            skip_count(&metrics, SkipLabel::ContractError),
+            0,
+            "nothing was asked of the chain"
+        );
         let fills = sqlx::query!("SELECT count(*) AS n FROM fills")
             .fetch_one(store.pool())
             .await?;
@@ -3667,6 +4229,141 @@ mod tests {
             "and nothing was sent"
         );
         assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// The fee tier does not compute: `to_oracle_units` overflows on a
+    /// `HIGH_FEE_PROFIT_THRESHOLD` this large, `priority` answers `Err`,
+    /// and `execute_once` refuses before it ever asks the wallet or the
+    /// chain anything.
+    ///
+    /// `to_oracle_units` is `mul_floor(value, oracle_scalar, SCALAR_7)`,
+    /// and the fixture's own oracle is fixed at 7 decimals (`harness`'s
+    /// module doc), which makes `oracle_scalar == SCALAR_7` and the
+    /// conversion an identity no threshold can overflow — so this test
+    /// builds `PoolPass` directly, with a 30-decimal oracle, rather than
+    /// through `pool_context`/`PoolReader`: the only field `priority`
+    /// reads off it is `snapshot.prices`, and nothing else here needs a
+    /// chain read at all.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_fee_tier_that_overflows_skips_the_fill(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let auction = auction(tick.sequence - 300);
+        // Never dialed: `execute_once` touches neither `self.rpc` nor the
+        // network on this path.
+        let client = RpcClient::new("http://127.0.0.1:1", None).expect("client");
+        let inventory = Inventory::new(XLM.to_string(), 0);
+        inventory.record_balances(
+            BTreeMap::from([(USDC.to_string(), 10_000_000_000)]),
+            Instant::now(),
+        );
+        let metrics = metrics();
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            FillerConfig {
+                high_fee_profit_threshold: i128::MAX,
+                ..filler_config()
+            },
+            Executor::new(&store, None, true),
+            inventory,
+            notifier(),
+            Arc::clone(&metrics),
+        );
+        let snapshot = PoolSnapshot {
+            ledger: tick.sequence,
+            pool: harness::POOL.to_string(),
+            instance: crate::chain::xdr::decode::PoolInstance {
+                admin: String::new(),
+                backstop: String::new(),
+                blnd_token: String::new(),
+                name: String::new(),
+                config: crate::chain::xdr::decode::PoolConfig {
+                    oracle: String::new(),
+                    bstop_rate: 0,
+                    status: PoolStatus::Active,
+                    max_positions: 4,
+                    min_collateral: 0,
+                },
+            },
+            reserves: BTreeMap::new(),
+            asset_index: BTreeMap::new(),
+            prices: crate::math::OraclePrices::new(30, BTreeMap::new()).expect("30 decimals fit"),
+            price_timestamps: BTreeMap::new(),
+            positions: BTreeMap::new(),
+        };
+        let context = PoolPass {
+            pool: &pools[0],
+            earliest_ledger: tick.sequence + 1,
+            snapshot,
+            reserves: BTreeMap::new(),
+            filler: Positions::default(),
+            supply_allowed: false,
+            health_floor: 0,
+        };
+        let draft = FillDraft {
+            fill_ledger: tick.sequence + 1,
+            percent: FillPercent::try_from(WHOLE_AUCTION).expect("100 is in range"),
+            actions: vec![FillAction::Repay {
+                asset: USDC.to_string(),
+                amount: 10_000_000_000,
+            }],
+            to_fill: auction.clone(),
+            lot_value: 2,
+            bid_value: 1,
+            est_profit: 1,
+            spend: BTreeMap::from([(USDC.to_string(), 10_000_000_000)]),
+            projected_health: Some(20_000_000),
+        };
+        let mut state = FillerState::default();
+        let mut pass = Pass {
+            tick,
+            state: &mut state,
+            summary: TickSummary::default(),
+        };
+
+        let outcome = filler
+            .execute_once(
+                &context,
+                &tracked(harness::USER_ONE, &auction),
+                auction.block,
+                &draft,
+                None,
+                &mut pass,
+            )
+            .await
+            .expect("a fee tier that does not compute is not the tick's failure");
+
+        assert!(outcome.is_none(), "nothing was executed");
+        assert_eq!(
+            pass.summary,
+            TickSummary {
+                skipped: 1,
+                ..TickSummary::default()
+            },
+            "a refused fee tier is a decision, and it is counted as one"
+        );
+        assert_eq!(
+            skip_count(&metrics, SkipLabel::ContractError),
+            1,
+            "nothing here classifies a math overflow more specifically"
+        );
+        assert_eq!(
+            skip_count(&metrics, SkipLabel::Unfunded),
+            0,
+            "the wallet was never asked"
+        );
+        let fills = sqlx::query!("SELECT count(*) AS n FROM fills")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(
+            fills.n,
+            Some(0),
+            "nothing whose fee tier is unknown is recorded"
+        );
         Ok(())
     }
 
@@ -3701,6 +4398,7 @@ mod tests {
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -3774,6 +4472,7 @@ mod tests {
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -3872,6 +4571,12 @@ mod tests {
         script_simulate_accepted(&rpc, tick.sequence);
         let client = RpcClient::new(&rpc.url(), None).expect("client");
         let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let recorder = Arc::new(Recorded::default());
+        let notifier = Arc::new(Notifier::new(
+            Box::new(Arc::clone(&recorder)),
+            Duration::from_hours(1),
+        ));
+        let metrics = metrics();
         let pools = vec![pool_config()];
         let filler = Filler::new(
             &client,
@@ -3883,7 +4588,8 @@ mod tests {
             },
             Executor::new(&store, Some(submitter), false),
             Inventory::new(XLM.to_string(), 0),
-            notifier(),
+            Arc::clone(&notifier),
+            Arc::clone(&metrics),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -3895,6 +4601,7 @@ mod tests {
             .expect("tick");
         drop(queue);
         worker.await.expect("the worker ends with the queue");
+        assert!(notifier.drain(Duration::from_secs(5)).await);
 
         assert_eq!(
             summary,
@@ -3924,6 +4631,658 @@ mod tests {
             .fetch_one(store.pool())
             .await?;
         assert_eq!(fills.n, Some(1), "an unwind writes no row of its own");
+        assert_eq!(
+            (
+                fill_count(&metrics, Attempt::Attempted),
+                fill_count(&metrics, Attempt::Succeeded),
+                fill_count(&metrics, Attempt::Failed),
+            ),
+            (1, 1, 0),
+            "the chain landed it, so it is attempted and succeeded and nothing else"
+        );
+        assert!(
+            profit_total(&metrics) > 0,
+            "and the draft's own estimate reached the running total"
+        );
+        assert!(
+            metrics
+                .render()
+                .contains("blend_liquidator_unwind_passes_total 1\n"),
+            "the unwind pass that followed it is counted once"
+        );
+        let confirmed = recorder.sent_of(NotificationKind::FillConfirmed);
+        assert_eq!(confirmed.len(), 1, "{confirmed:?}");
+        assert_eq!(confirmed[0].severity, Severity::Low);
+        assert_eq!(confirmed[0].pool, harness::POOL);
+        assert_eq!(
+            confirmed[0].account.as_deref(),
+            Some(harness::USER_ONE),
+            "the borrower whose auction was filled, not the filler's own key"
+        );
+        assert!(
+            confirmed[0].message.contains("ledger 1"),
+            "the message names the ledger it landed in: {}",
+            confirmed[0].message
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// The chain applied the fill and it failed: a fee was charged and no
+    /// position changed hands. That is `attempted` and `failed`, never
+    /// `succeeded`, nothing reaches the profit total, and the operator is
+    /// told at `High`.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_fill_the_chain_failed_is_counted_and_notified(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let auction = auction(tick.sequence - 300);
+        store
+            .upsert_auction(&tracked(harness::USER_ONE, &auction))
+            .await
+            .expect("seed the auction");
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        harness::script_auction_entry(&rpc, harness::USER_ONE, &auction, tick.sequence);
+        harness::script_snapshot(&rpc, &[]);
+        script_empty_wallet(&rpc, tick.sequence);
+        script_simulate_prelude(&rpc, &signer, 10, tick.sequence);
+        script_simulate_accepted(&rpc, tick.sequence);
+        // Nothing landed, so nothing handed this key a position: the
+        // startup pass reads the pool, finds none, and clears it.
+        harness::script_snapshot(&rpc, &[]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let recorder = Arc::new(Recorded::default());
+        let notifier = Arc::new(Notifier::new(
+            Box::new(Arc::clone(&recorder)),
+            Duration::from_hours(1),
+        ));
+        let metrics = metrics();
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            FillerConfig {
+                dry_run: false,
+                ..filler_config()
+            },
+            Executor::new(&store, Some(submitter), false),
+            Inventory::new(XLM.to_string(), 0),
+            Arc::clone(&notifier),
+            Arc::clone(&metrics),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+        // `recording_worker`'s twin, and the one difference is the answer:
+        // the chain applied this submission and it failed.
+        let (queue, mut receiver) =
+            SubmissionQueue::new(NonZeroUsize::new(4).expect("a test capacity is never zero"));
+        let worker = tokio::spawn(async move {
+            while let Some(queued) = receiver.recv().await {
+                let _ = queued.respond.send(Ok(TxOutcome::Failed {
+                    hash: TxHash([5_u8; 32]),
+                    ledger: 9,
+                    contract_error: Some(1_207),
+                    result: TransactionResult {
+                        fee_charged: 100,
+                        result: TransactionResultResult::TxFailed(VecM::default()),
+                        ext: TransactionResultExt::V0,
+                    },
+                }));
+            }
+        });
+
+        let summary = filler
+            .tick(&mut state, tick, true, Some(&queue), &shutdown)
+            .await
+            .expect("tick");
+        drop(queue);
+        worker.await.expect("the worker ends with the queue");
+        assert!(notifier.drain(Duration::from_secs(5)).await);
+
+        assert_eq!(
+            summary,
+            TickSummary {
+                planned: 1,
+                executed: 1,
+                ..TickSummary::default()
+            },
+            "a fill the chain refused is still a fill this bot recorded"
+        );
+        assert_eq!(
+            (
+                fill_count(&metrics, Attempt::Attempted),
+                fill_count(&metrics, Attempt::Succeeded),
+                fill_count(&metrics, Attempt::Failed),
+            ),
+            (1, 0, 1)
+        );
+        assert!(
+            profit_total(&metrics) == 0,
+            "a fill that took nothing over earned nothing"
+        );
+        assert!(
+            !state.unwind_pending.contains(harness::POOL),
+            "and it handed this key no position to unwind"
+        );
+        let failed = recorder.sent_of(NotificationKind::FillFailed);
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(failed[0].severity, Severity::High);
+        assert_eq!(failed[0].pool, harness::POOL);
+        assert_eq!(failed[0].account.as_deref(), Some(harness::USER_ONE));
+        assert!(
+            failed[0].message.contains("ledger 9"),
+            "the message names the ledger it failed in: {}",
+            failed[0].message
+        );
+        assert!(
+            recorder.sent_of(NotificationKind::FillConfirmed).is_empty(),
+            "and nothing was confirmed"
+        );
+        let fill = sqlx::query!("SELECT tx_hash FROM fills")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(
+            fill.tx_hash,
+            Some(TxHash([5_u8; 32]).to_hex()),
+            "a transaction that consumed a sequence number is named whatever became of it"
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// The fee-less half of the same fact: the chain passed the ledger
+    /// bound without applying the fill, which is `attempted` and `failed`
+    /// exactly as a charged failure is — and notifies nobody. There is no
+    /// ledger to name it in and nothing was spent, so spec §7's closed set
+    /// of kinds has nothing to say about it; the counter is where an
+    /// expired fill shows up.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_fill_that_expired_is_counted_and_notifies_nobody(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let auction = auction(tick.sequence - 300);
+        store
+            .upsert_auction(&tracked(harness::USER_ONE, &auction))
+            .await
+            .expect("seed the auction");
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        harness::script_auction_entry(&rpc, harness::USER_ONE, &auction, tick.sequence);
+        harness::script_snapshot(&rpc, &[]);
+        script_empty_wallet(&rpc, tick.sequence);
+        script_simulate_prelude(&rpc, &signer, 10, tick.sequence);
+        script_simulate_accepted(&rpc, tick.sequence);
+        // It provably never applied, so this key holds no position: the
+        // startup pass reads the pool, finds none, and clears it.
+        harness::script_snapshot(&rpc, &[]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let recorder = Arc::new(Recorded::default());
+        let notifier = Arc::new(Notifier::new(
+            Box::new(Arc::clone(&recorder)),
+            Duration::from_hours(1),
+        ));
+        let metrics = metrics();
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            FillerConfig {
+                dry_run: false,
+                ..filler_config()
+            },
+            Executor::new(&store, Some(submitter), false),
+            Inventory::new(XLM.to_string(), 0),
+            Arc::clone(&notifier),
+            Arc::clone(&metrics),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+        let (queue, mut receiver) =
+            SubmissionQueue::new(NonZeroUsize::new(4).expect("a test capacity is never zero"));
+        let worker = tokio::spawn(async move {
+            while let Some(queued) = receiver.recv().await {
+                let _ = queued.respond.send(Ok(TxOutcome::Expired {
+                    hash: TxHash([5_u8; 32]),
+                    window: LedgerWindow::try_new(100, 120).expect("a window ends after it opens"),
+                    latest_ledger: 121,
+                }));
+            }
+        });
+
+        let summary = filler
+            .tick(&mut state, tick, true, Some(&queue), &shutdown)
+            .await
+            .expect("tick");
+        drop(queue);
+        worker.await.expect("the worker ends with the queue");
+        assert!(notifier.drain(Duration::from_secs(5)).await);
+
+        assert_eq!(
+            summary,
+            TickSummary {
+                planned: 1,
+                executed: 1,
+                ..TickSummary::default()
+            },
+            "a fill that never applied is still a fill this bot recorded"
+        );
+        assert_eq!(
+            (
+                fill_count(&metrics, Attempt::Attempted),
+                fill_count(&metrics, Attempt::Succeeded),
+                fill_count(&metrics, Attempt::Failed),
+            ),
+            (1, 0, 1)
+        );
+        assert!(
+            profit_total(&metrics) == 0,
+            "a fill that never applied earned nothing"
+        );
+        assert!(
+            !state.unwind_pending.contains(harness::POOL),
+            "and it handed this key no position to unwind"
+        );
+        assert!(
+            recorder.sent().is_empty(),
+            "an expired fill is counted, not announced: {:?}",
+            recorder.sent()
+        );
+        let fill = sqlx::query!("SELECT tx_hash FROM fills")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(
+            fill.tx_hash,
+            Some(TxHash([5_u8; 32]).to_hex()),
+            "a transaction that consumed a sequence number is named whatever became of it"
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// A submission the queue could not carry at all: the `fills` row was
+    /// written before it was handed over, so the attempt happened and it
+    /// is gone rather than pending — `attempted` and `failed`, and an
+    /// alert naming the account.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_fill_the_queue_dropped_is_counted_and_notified(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let auction = auction(tick.sequence - 300);
+        store
+            .upsert_auction(&tracked(harness::USER_ONE, &auction))
+            .await
+            .expect("seed the auction");
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        harness::script_auction_entry(&rpc, harness::USER_ONE, &auction, tick.sequence);
+        harness::script_snapshot(&rpc, &[]);
+        script_empty_wallet(&rpc, tick.sequence);
+        script_simulate_prelude(&rpc, &signer, 10, tick.sequence);
+        script_simulate_accepted(&rpc, tick.sequence);
+        harness::script_snapshot(&rpc, &[]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let recorder = Arc::new(Recorded::default());
+        let notifier = Arc::new(Notifier::new(
+            Box::new(Arc::clone(&recorder)),
+            Duration::from_hours(1),
+        ));
+        let metrics = metrics();
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            FillerConfig {
+                dry_run: false,
+                ..filler_config()
+            },
+            Executor::new(&store, Some(submitter), false),
+            Inventory::new(XLM.to_string(), 0),
+            Arc::clone(&notifier),
+            Arc::clone(&metrics),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+        // The one failure `QueueError::Chain` is narrowed to: it provably
+        // sent nothing, and its retry budget is spent.
+        let (queue, mut receiver) =
+            SubmissionQueue::new(NonZeroUsize::new(4).expect("a test capacity is never zero"));
+        let worker = tokio::spawn(async move {
+            while let Some(queued) = receiver.recv().await {
+                let _ = queued
+                    .respond
+                    .send(Err(QueueError::Chain(ChainError::Http(503))));
+            }
+        });
+
+        let summary = filler
+            .tick(&mut state, tick, true, Some(&queue), &shutdown)
+            .await
+            .expect("a queue that could not carry one fill is not the tick's failure");
+        drop(queue);
+        worker.await.expect("the worker ends with the queue");
+        assert!(notifier.drain(Duration::from_secs(5)).await);
+
+        assert_eq!(
+            summary,
+            TickSummary {
+                planned: 1,
+                ..TickSummary::default()
+            },
+            "nothing was executed: the executor never got an outcome to record"
+        );
+        assert_eq!(
+            (
+                fill_count(&metrics, Attempt::Attempted),
+                fill_count(&metrics, Attempt::Succeeded),
+                fill_count(&metrics, Attempt::Failed),
+            ),
+            (1, 0, 1),
+            "the row was written before the queue was asked, so the attempt happened"
+        );
+        let dropped = recorder.sent_of(NotificationKind::SubmissionDropped);
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
+        assert_eq!(dropped[0].severity, Severity::High);
+        assert_eq!(dropped[0].pool, harness::POOL);
+        assert_eq!(dropped[0].account.as_deref(), Some(harness::USER_ONE));
+        assert!(
+            dropped[0].message.contains("dropped by the queue"),
+            "{}",
+            dropped[0].message
+        );
+        let fill = sqlx::query!("SELECT tx_hash FROM fills")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(
+            fill.tx_hash, None,
+            "nothing was ever named: the envelope never left"
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// A planner skip the wallet is the cause of. The filler is so far
+    /// under its own floor that no percent and no ledger of the ramp
+    /// lifts it, and more of the primary asset is what would have — so
+    /// the skip is `Unfunded`, it is counted as one, and the operator is
+    /// told at `Medium`.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_unfunded_plan_is_counted_and_notified(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let auction = auction(tick.sequence - 300);
+        store
+            .upsert_auction(&tracked(harness::USER_ONE, &auction))
+            .await
+            .expect("seed the auction");
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        harness::script_auction_entry(&rpc, harness::USER_ONE, &auction, tick.sequence);
+        script_snapshot_positions(
+            &rpc,
+            &[(
+                signer.address(),
+                positions_entry_xdr(
+                    signer.address(),
+                    &[(2, FILLER_COLLATERAL)],
+                    &[(1, DROWNED_LIABILITIES)],
+                ),
+            )],
+        );
+        // The wallet holds nothing, which is exactly what the skip is
+        // about: the supply the projection wanted was capped at zero.
+        script_empty_wallet(&rpc, tick.sequence);
+        // Ruling 3's startup pass, on its own snapshot: no position there,
+        // so it is idle and sends nothing.
+        harness::script_snapshot(&rpc, &[]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let recorder = Arc::new(Recorded::default());
+        let notifier = Arc::new(Notifier::new(
+            Box::new(Arc::clone(&recorder)),
+            Duration::from_hours(1),
+        ));
+        let metrics = metrics();
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            filler_config(),
+            Executor::new(&store, Some(submitter), true),
+            Inventory::new(XLM.to_string(), 0),
+            Arc::clone(&notifier),
+            Arc::clone(&metrics),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+
+        let summary = filler
+            .tick(&mut state, tick, true, None, &shutdown)
+            .await
+            .expect("tick");
+        assert!(notifier.drain(Duration::from_secs(5)).await);
+
+        assert_eq!(
+            summary,
+            TickSummary {
+                skipped: 1,
+                ..TickSummary::default()
+            },
+            "nothing drafted, so nothing was planned onto the row and nothing simulated"
+        );
+        assert_eq!(skip_count(&metrics, SkipLabel::Unfunded), 1);
+        assert_eq!(
+            skip_count(&metrics, SkipLabel::Health) + skip_count(&metrics, SkipLabel::Unprofitable),
+            0,
+            "the wallet is the cause, and the label says so"
+        );
+        assert_eq!(
+            row(&store, harness::USER_ONE)
+                .await
+                .expect("the row stays")
+                .fill_ledger,
+            None,
+            "a skip clears the plan off the row"
+        );
+        let unfunded = recorder.sent_of(NotificationKind::UnfundedFill);
+        assert_eq!(unfunded.len(), 1, "{unfunded:?}");
+        assert_eq!(unfunded[0].severity, Severity::Medium);
+        assert_eq!(unfunded[0].pool, harness::POOL);
+        assert_eq!(unfunded[0].account.as_deref(), Some(harness::USER_ONE));
+        assert!(
+            unfunded[0].message.contains("cannot fund"),
+            "{}",
+            unfunded[0].message
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// Both refusal arms are `contract_error`: the first draft's, which
+    /// ends the auction's tick, and the re-plan's, which the contract has
+    /// now disagreed with twice. Counted once between them, because a
+    /// skip is one per auction per reason however many ticks re-make the
+    /// same decision.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_refused_fill_and_a_refused_re_plan_are_contract_errors(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let auction = auction(tick.sequence - 300);
+        store
+            .upsert_auction(&tracked(harness::USER_ONE, &auction))
+            .await
+            .expect("seed the auction");
+        let rpc = ScriptedRpc::start().await;
+        let signer = filler_signer();
+        let network = Network::testnet();
+        // The first tick: a refusal no re-plan addresses, so it is the
+        // whole of that auction's tick.
+        harness::script_auction_entry(&rpc, harness::USER_ONE, &auction, tick.sequence);
+        harness::script_snapshot(&rpc, &[]);
+        script_empty_wallet(&rpc, tick.sequence);
+        script_simulate_prelude(&rpc, &signer, 10, tick.sequence);
+        script_simulate_refused(&rpc, 1_207, tick.sequence);
+        harness::script_snapshot(&rpc, &[]);
+        // The second: the health check refuses the whole auction, and the
+        // contract refuses the half as well.
+        let second = later(tick, 1);
+        harness::script_auction_entry(&rpc, harness::USER_ONE, &auction, second.sequence);
+        harness::script_snapshot(&rpc, &[]);
+        script_simulate_prelude(&rpc, &signer, 10, second.sequence);
+        script_simulate_refused(&rpc, 1_205, second.sequence);
+        script_simulate_prelude(&rpc, &signer, 10, second.sequence);
+        script_simulate_refused(&rpc, 1_207, second.sequence);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let metrics = metrics();
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            filler_config(),
+            Executor::new(&store, Some(submitter), true),
+            Inventory::new(XLM.to_string(), 0),
+            notifier(),
+            Arc::clone(&metrics),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+
+        let first = filler
+            .tick(&mut state, tick, true, None, &shutdown)
+            .await
+            .expect("the first tick");
+
+        assert_eq!(
+            first,
+            TickSummary {
+                planned: 1,
+                skipped: 1,
+                ..TickSummary::default()
+            }
+        );
+        assert_eq!(
+            skip_count(&metrics, SkipLabel::ContractError),
+            1,
+            "a refusal the contract gave a code for is a contract error"
+        );
+
+        let second_summary = filler
+            .tick(&mut state, second, true, None, &shutdown)
+            .await
+            .expect("the second tick");
+
+        assert_eq!(
+            second_summary,
+            TickSummary {
+                planned: 2,
+                skipped: 1,
+                ..TickSummary::default()
+            },
+            "the refused draft and the half, and one skip for the second refusal"
+        );
+        assert_eq!(
+            skip_count(&metrics, SkipLabel::ContractError),
+            1,
+            "the same auction refused for the same reason is one skip, not one per tick it \
+             stays open for: the re-plan's refusal is the first refusal's reason again"
+        );
+        assert_eq!(
+            fill_count(&metrics, Attempt::Attempted),
+            0,
+            "nothing was ever recorded, so nothing was ever attempted"
+        );
+        let fills = sqlx::query!("SELECT count(*) AS n FROM fills")
+            .fetch_one(store.pool())
+            .await?;
+        assert_eq!(fills.n, Some(0));
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// The reserved-inventory gauge is recorded once a tick, after its
+    /// unwind passes, and it is a snapshot rather than an accumulator: a
+    /// reservation still open when the tick ends is what it shows, and the
+    /// tick after it is settled shows what the wallet then holds instead.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_ticks_open_reservations_are_gauged(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let rpc = ScriptedRpc::start().await;
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        // No auctions and no filler key: the tick reads nothing at all, so
+        // the gauge is the only thing it leaves behind.
+        let inventory = Inventory::new(XLM.to_string(), 0);
+        inventory.record_balances(
+            BTreeMap::from([(USDC.to_string(), 10_000_000_000)]),
+            Instant::now(),
+        );
+        let held = inventory
+            .reserve(&BTreeMap::from([(USDC.to_string(), 4_000_000_000)]))
+            .expect("the wallet covers it");
+        let metrics = metrics();
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            filler_config(),
+            Executor::new(&store, None, true),
+            inventory,
+            notifier(),
+            Arc::clone(&metrics),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+
+        filler
+            .tick(&mut state, tick, true, None, &shutdown)
+            .await
+            .expect("the first tick");
+
+        assert!(
+            metrics.render().contains(&format!(
+                "blend_liquidator_reserved_inventory{{asset=\"{USDC}\"}} 4000000000\n"
+            )),
+            "a reservation the tick ended with is what the gauge reports:\n{}",
+            metrics.render()
+        );
+
+        held.release();
+        filler
+            .tick(&mut state, later(tick, 1), true, None, &shutdown)
+            .await
+            .expect("the second tick");
+
+        assert!(
+            metrics.render().contains(&format!(
+                "blend_liquidator_reserved_inventory{{asset=\"{USDC}\"}} 0\n"
+            )),
+            "and a settled one is replaced rather than left at its last value:\n{}",
+            metrics.render()
+        );
+        assert!(
+            rpc.received().await.is_empty(),
+            "no key and no auctions: neither tick cost a chain read"
+        );
         assert_eq!(rpc.remaining(), 0);
         Ok(())
     }
@@ -3987,6 +5346,7 @@ mod tests {
             Executor::new(&store, Some(submitter), false),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -4132,6 +5492,7 @@ mod tests {
             Executor::new(&store, Some(submitter), false),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -4294,6 +5655,7 @@ mod tests {
             Executor::new(&store, Some(submitter), false),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -4449,6 +5811,7 @@ mod tests {
             Executor::new(&store, Some(submitter), false),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -4613,6 +5976,7 @@ mod tests {
             Executor::new(&store, Some(submitter), false),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -4719,6 +6083,7 @@ mod tests {
         script_simulate_accepted(&rpc, tick.sequence);
         let client = RpcClient::new(&rpc.url(), None).expect("client");
         let submitter = Submitter::new(&client, &network, &signer, tx_config());
+        let metrics = metrics();
         let pools = vec![pool_config()];
         let filler = Filler::new(
             &client,
@@ -4728,6 +6093,7 @@ mod tests {
             Executor::new(&store, Some(submitter), true),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            Arc::clone(&metrics),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -4747,6 +6113,12 @@ mod tests {
              it out to the wallet"
         );
         assert!(
+            metrics
+                .render()
+                .contains("blend_liquidator_unwind_passes_total 1\n"),
+            "one pass, counted once"
+        );
+        assert!(
             !state.unwind_pending.contains(harness::POOL),
             "a dry run plans it once, not on every tick until a fill lands"
         );
@@ -4764,6 +6136,12 @@ mod tests {
             rpc.calls("getLedgerEntries").len(),
             reads,
             "the seed is once per run, so a pool no longer pending costs no chain read"
+        );
+        assert!(
+            metrics
+                .render()
+                .contains("blend_liquidator_unwind_passes_total 1\n"),
+            "and a tick that made no pass counts none"
         );
         assert_eq!(rpc.remaining(), 0);
         Ok(())
@@ -4786,6 +6164,7 @@ mod tests {
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -4850,6 +6229,7 @@ mod tests {
             Executor::new(&store, Some(submitter), false),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -4899,10 +6279,17 @@ mod tests {
     /// clean. The [`Notifier`]'s cooldown is zero here so that what is being
     /// counted is the filler's own set and not the notifier's dedup.
     ///
-    /// The first delivery fails, which must not count as having notified:
-    /// the notifier rolls its own dedup entry back on a failure, and the
-    /// filler's set has to roll back with it or a high-severity alert is
-    /// lost until some later pass happens to find the pool clean.
+    /// Two notifications that never reach the channel are in the middle of
+    /// it, and the filler answers them differently on purpose. The first
+    /// pass finds every in-flight permit taken, so its notification is
+    /// *dropped*: the notifier rolls its own dedup entry back and the
+    /// filler's set has to roll back with it, or a high-severity alert is
+    /// lost until some later pass happens to find the pool clean. The
+    /// second pass's delivery *fails*, inside the notifier's task and after
+    /// `notify` has already answered `Queued`: the filler keeps the pool
+    /// marked and does not retry it, which is what the channel's own count
+    /// — taken after a `drain`, since nothing else says when the task has
+    /// run — proves.
     #[sqlx::test(migrations = "./migrations")]
     async fn leftover_debt_notifies_once_per_pool(db: sqlx::PgPool) -> sqlx::Result<()> {
         let store = Store::from_pool(db);
@@ -4922,7 +6309,7 @@ mod tests {
         script_unwind_position(&rpc, signer.address(), &[], &[(1, UNWIND_DEBT)]);
         let client = RpcClient::new(&rpc.url(), None).expect("client");
         let submitter = Submitter::new(&client, &network, &signer, tx_config());
-        let recorder = Arc::new(Recorded::failing_once());
+        let recorder = Arc::new(Recorded::default());
         let notifier = Arc::new(Notifier::new(
             Box::new(Arc::clone(&recorder)),
             Duration::ZERO,
@@ -4935,16 +6322,38 @@ mod tests {
             filler_config(),
             Executor::new(&store, Some(submitter), true),
             Inventory::new(XLM.to_string(), 0),
-            notifier,
+            Arc::clone(&notifier),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
+
+        // Every in-flight permit, taken by a send the channel is holding:
+        // the first pass's notification is the one that finds none left.
+        recorder.hold();
+        for i in 0..NOTIFY_IN_FLIGHT {
+            assert_eq!(
+                notifier.notify(Notification {
+                    kind: NotificationKind::FillConfirmed,
+                    severity: Severity::Low,
+                    pool: "pool-holding-a-permit".to_string(),
+                    account: Some(format!("acct-{i}")),
+                    message: "held until this test releases it".to_string(),
+                }),
+                Delivery::Queued
+            );
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(notifier.in_flight(), NOTIFY_IN_FLIGHT);
 
         // An idle pass clears the pool, so each tick after the first is
         // made pending again the way a landed fill would.
         for ledgers in 0..5 {
             if ledgers > 0 {
                 state.unwind_pending.insert(harness::POOL.to_string());
+            }
+            if ledgers == 1 {
+                recorder.fail_next();
             }
             let summary = filler
                 .tick(&mut state, later(tick, ledgers), true, None, &shutdown)
@@ -4956,10 +6365,47 @@ mod tests {
                 "tick {ledgers} moved nothing"
             );
             match ledgers {
-                0 => assert!(
-                    !state.leftovers_notified.contains(harness::POOL),
-                    "the delivery failed, so nothing was notified and nothing is suppressed"
-                ),
+                0 => {
+                    assert!(
+                        !state.leftovers_notified.contains(harness::POOL),
+                        "the notification was dropped, so nothing was notified and nothing is \
+                         suppressed"
+                    );
+                    // Let the held sends finish, so the next pass has a
+                    // permit to be queued on and the channel's count can be
+                    // read for what it did with each pass.
+                    recorder.release();
+                    assert!(notifier.drain(Duration::from_secs(5)).await);
+                    assert!(
+                        recorder
+                            .sent_of(NotificationKind::UnwindLeftovers)
+                            .is_empty(),
+                        "a dropped notification never reached the channel"
+                    );
+                }
+                1 => {
+                    assert!(
+                        state.leftovers_notified.contains(harness::POOL),
+                        "`notify` answered `Queued`, so this pass counts as having notified"
+                    );
+                    assert!(notifier.drain(Duration::from_secs(5)).await);
+                    assert!(
+                        recorder
+                            .sent_of(NotificationKind::UnwindLeftovers)
+                            .is_empty(),
+                        "the channel failed this one; the notifier logged it and the filler \
+                         does not retry it"
+                    );
+                }
+                2 => {
+                    assert!(state.leftovers_notified.contains(harness::POOL));
+                    assert!(
+                        recorder
+                            .sent_of(NotificationKind::UnwindLeftovers)
+                            .is_empty(),
+                        "the pool is still marked, so this pass notified nothing at all"
+                    );
+                }
                 3 => assert!(
                     !state.leftovers_notified.contains(harness::POOL),
                     "a clean pass ends the episode"
@@ -4967,13 +6413,18 @@ mod tests {
                 _ => assert!(state.leftovers_notified.contains(harness::POOL)),
             }
         }
+        assert!(notifier.drain(Duration::from_secs(5)).await);
 
-        let sent = recorder.sent();
+        let sent = recorder.sent_of(NotificationKind::UnwindLeftovers);
         assert_eq!(
             sent.len(),
-            2,
-            "the failed send did not suppress the retry, the repeat after it did not notify \
-             again, and the episode after the clean pass did: {sent:?}"
+            1,
+            "the episode after the clean pass is the only one the channel ever saw: {sent:?}"
+        );
+        assert_eq!(
+            recorder.sent().len(),
+            NOTIFY_IN_FLIGHT + 1,
+            "the sends holding the permits were delivered too"
         );
         for notification in &sent {
             assert_eq!(notification.kind, NotificationKind::UnwindLeftovers);
@@ -5013,6 +6464,7 @@ mod tests {
             Executor::new(&store, Some(submitter), true),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -5072,6 +6524,7 @@ mod tests {
             Executor::new(&store, Some(submitter), true),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -5156,7 +6609,8 @@ mod tests {
             },
             Executor::new(&store, Some(submitter), false),
             Inventory::new(XLM.to_string(), 0),
-            notifier,
+            Arc::clone(&notifier),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -5184,6 +6638,11 @@ mod tests {
             );
         }
 
+        assert!(
+            notifier.drain(Duration::from_secs(5)).await,
+            "the deliveries are spawned, so counting what the channel saw means nothing until \
+             they have finished"
+        );
         let sent = recorder.sent();
         assert_eq!(
             sent.len(),
@@ -5268,6 +6727,7 @@ mod tests {
             Executor::new(&store, Some(submitter), false),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -5359,7 +6819,8 @@ mod tests {
             filler_config(),
             Executor::new(&store, Some(submitter), true),
             Inventory::new(XLM.to_string(), 0),
-            notifier,
+            Arc::clone(&notifier),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -5385,6 +6846,11 @@ mod tests {
             7,
             "the snapshot's four oracle reads and the wallet's three balances, and nothing \
              else — a withdrawal the health margin alone would allow was never planned"
+        );
+        assert!(
+            notifier.drain(Duration::from_secs(5)).await,
+            "the deliveries are spawned, so counting what the channel saw means nothing until \
+             they have finished"
         );
         let sent = recorder.sent();
         assert_eq!(
@@ -5442,7 +6908,8 @@ mod tests {
             filler_config(),
             Executor::new(&store, Some(submitter), true),
             Inventory::new(XLM.to_string(), 0),
-            notifier,
+            Arc::clone(&notifier),
+            metrics(),
         );
         let (_flag, shutdown) = watch::channel(false);
         let mut state = FillerState::default();
@@ -5461,6 +6928,11 @@ mod tests {
         assert!(
             state.unwind_setbacks.is_empty(),
             "and the refusal before it is forgotten with it"
+        );
+        assert!(
+            notifier.drain(Duration::from_secs(5)).await,
+            "the deliveries are spawned, so counting what the channel saw means nothing until \
+             they have finished"
         );
         assert!(
             recorder.sent().is_empty(),
@@ -5504,6 +6976,7 @@ mod tests {
             Executor::new(&store, Some(submitter), false),
             Inventory::new(XLM.to_string(), 0),
             notifier(),
+            metrics(),
         );
         // Nothing to spend, so the reservation is not what this is about.
         let plan = UnwindPlan {
@@ -5583,6 +7056,7 @@ mod tests {
             Executor::new(&store, None, false),
             inventory,
             notifier(),
+            metrics(),
         );
         let plan = UnwindPlan {
             actions: vec![UnwindAction::Repay {

@@ -6,37 +6,55 @@ A liquidation bot for [Blend Protocol](https://blend.capital) lending pools on
 Stellar. It is intended to repay the debt of underwater positions and receive
 their collateral at a discount.
 
-**Status: Phase 6a.** Phase 1 landed the pure fixed-point math (`math`) and
-the ScVal/ledger-entry codecs (`chain::xdr`); Phase 2 landed the chain layer
-(`chain::rpc`, `chain::pool`, `chain::signer`, `chain::tx`); Phase 3 landed
-the Postgres store, a per-pool ledger poller and a tracker (`store`,
-`ledger`, `tracker`, `service`), so the binary validates its configuration,
-seeds its tracked-user set from the analytics API or a static file, and
-follows every configured pool — applying events and refreshing borrowers'
-health factors from chain — until it is shut down. Phase 4 landed the
-auctioneer (`auctioneer`, `queue`, `math::liquidation`): once a tick, it
-decides which tracked borrowers are liquidatable or owe bad debt, builds
-the auction the contract should accept, lets the contract judge the percent
-through simulation, records every creation it decides to make — dry-run
-or not — and, only
-when a signing key is configured and `DRY_RUN=false`, submits it through a
-per-key queue. Phase 5 landed the filler (`filler`, `executor`,
-`inventory`, `math::fill`): once a tick, it plans a fill for every open
-liquidation auction whose assets its pool configuration supports, holds its
-own position at or above `min_health_factor × HF_SAFETY_MULTIPLIER` while
-taking one over, records every fill it executes — dry-run or not — and,
-only with `DRY_RUN=false` *and* `FILLER_SECRET_KEY`, submits it on the
-filler key's queue. Phase 6a landed unwind (`math::unwind`, `notifier`,
-and the filler's unwind pass in `filler`/`executor`): after a fill lands,
-and once at startup, the filler repays the debt it holds from its wallet
-and withdraws collateral to the wallet — everything but the primary, and
-the primary down to `min_primary_collateral` — keeping its own health
-factor at or above the pool's `min_health_factor`; debt the wallet cannot
-repay notifies once per pool through the `Notifier`'s log channel, which
-is all that channel does before Phase 6b's Telegram lands. What remains
-for Phase 6b: Telegram delivery for `notifier`, its bounded in-flight
-semaphore and `drain()`, metrics, and `/healthz`/`/livez`/`/metrics`. The
-repository scaffolding is complete and enforced.
+**Status: Phase 6 complete.** Phase 1 landed the pure fixed-point math
+(`math`) and the ScVal/ledger-entry codecs (`chain::xdr`); Phase 2 landed
+the chain layer (`chain::rpc`, `chain::pool`, `chain::signer`, `chain::tx`);
+Phase 3 landed the Postgres store, a per-pool ledger poller and a tracker
+(`store`, `ledger`, `tracker`, `service`), so the binary validates its
+configuration, seeds its tracked-user set from the analytics API or a
+static file, and follows every configured pool — applying events and
+refreshing borrowers' health factors from chain — until it is shut down.
+Phase 4 landed the auctioneer (`auctioneer`, `queue`, `math::liquidation`):
+once a tick, it decides which tracked borrowers are liquidatable or owe
+bad debt, builds the auction the contract should accept, lets the contract
+judge the percent through simulation, records every creation it decides to
+make — dry-run or not — and, only when a signing key is configured and
+`DRY_RUN=false`, submits it through a per-key queue. Phase 5 landed the
+filler (`filler`, `executor`, `inventory`, `math::fill`): once a tick, it
+plans a fill for every open liquidation auction whose assets its pool
+configuration supports, holds its own position at or above
+`min_health_factor × HF_SAFETY_MULTIPLIER` while taking one over, records
+every fill it executes — dry-run or not — and, only with `DRY_RUN=false`
+*and* `FILLER_SECRET_KEY`, submits it on the filler key's queue. Phase 6a
+landed unwind (`math::unwind`, `notifier`, and the filler's unwind pass in
+`filler`/`executor`): after a fill lands, and once at startup, the filler
+repays the debt it holds from its wallet and withdraws collateral to the
+wallet — everything but the primary, and the primary down to
+`min_primary_collateral` — keeping its own health factor at or above the
+pool's `min_health_factor`; debt the wallet cannot repay notifies once per
+pool through the `Notifier`. Phase 6b landed the operational surface
+(`metrics`, `http`, `notifier::telegram`, and the rest of `notifier`,
+`ledger` and `service`): dependency-free Prometheus counters and gauges
+rendered at `/metrics`, an axum server for `/healthz` (readiness) and
+`/livez` (liveness) that runs only when `PORT` or `HTTP_PORT` is set, and
+a Telegram `NotificationChannel` behind the trait `notifier` already had.
+`Notifier::notify` is fire-and-forget now — it takes the dedup entry
+synchronously and spawns the send behind a bounded semaphore
+(`NOTIFY_IN_FLIGHT`), answering `Delivery::Queued`/`Deduplicated`/`Dropped`
+rather than waiting on the channel — and `Notifier::drain` gives whatever
+is still in flight a bounded `DRAIN_BUDGET` on every exit but the second
+shutdown signal. The poller records a heartbeat every iteration and the
+chain head every pass, and reports `NotificationKind::RpcFailing` after
+`RPC_FAILING_AFTER` consecutive failures; a watchdog task the run spawns
+beside the pollers reports a pool whose heartbeat has gone past
+`PollerConfig::liveness_deadline` as `PollerStalled`. `Service::run` spawns
+seven kinds of task — one `LedgerPoller` per pool, one tracker, one
+auctioneer, one filler, one watchdog, one HTTP server when a port is
+configured, and one submission-queue worker per distinct signing key when
+armed — and every exit but the second shutdown signal drains the notifier
+before it returns. What remains is Phase 7 (the sandbox integration tier)
+and Phase 8 (docs and the first release). The repository scaffolding is
+complete and enforced.
 
 **This bot is NOT non-custodial.** It is designed to hold a signing key and
 submit transactions itself — that is the point of a liquidation bot. Treat
@@ -71,11 +89,28 @@ make help                           # Docker Compose lifecycle
   meaningful: re-plan only at the fill ledger), `XLM_FEE_RESERVE` (decimal
   XLM, and XLM has 7 decimals, so the parsed `Decimal7` *is* stroops) and
   `HIGH_FEE_PROFIT_THRESHOLD` (in the pool oracle's units) are ordinary
-  `clap` arguments. The two signing keys — `AUCTIONEER_SECRET_KEY`, and
-  `FILLER_SECRET_KEY`, which it falls back to — are read from the
-  environment by `main.rs` and handed to `Args::signing_keys`; neither is
-  ever a clap field, like every other secret, because argv is
-  world-readable. Both are parsed at startup, so a malformed value in
+  `clap` arguments. So is the operational surface's own set: `PORT` and
+  `HTTP_PORT` (`PORT` wins when both are set, since it is the one a
+  deployment platform injects; either turns the HTTP server on and
+  neither leaves it off), `HTTP_BIND_ADDR` (loopback by default; a
+  `0.0.0.0` bind belongs behind an ingress that admits only the platform's
+  probes and scraper, since the endpoints carry no authentication and
+  `/healthz` costs a store ping per request),
+  `HEALTH_MAX_LAG_LEDGERS` (default 10, refused at zero — a bot exactly
+  at head would report not-ready on every poll-interval boundary),
+  `FAILURE_NOTIFICATION_COOLDOWN_HOURS` (refused at zero: there is no
+  "no cooldown" spelling, only shorter ones) and `TELEGRAM_CHAT_ID`,
+  which is not a secret and is an argument like the rest. `HttpConfig`
+  and `TelegramConfig` are what carry them into `ServiceConfig`.
+  The secrets are the exception, and none of them is ever a clap field,
+  because argv is world-readable — `DATABASE_URL` and `RPC_API_KEY` as
+  much as the rest: the two signing keys —
+  `AUCTIONEER_SECRET_KEY`, and `FILLER_SECRET_KEY`, which it falls back
+  to — are read from the environment by `main.rs` and handed to
+  `Args::signing_keys`, while `TELEGRAM_BOT_TOKEN` is read by
+  `Args::service` itself (it pairs with `TELEGRAM_CHAT_ID`: both or
+  neither, either alone a startup error). Both signing keys are parsed at
+  startup, so a malformed value in
   either is a startup error, and so are the two rules that pair them:
   `DRY_RUN=false` without `FILLER_SECRET_KEY` (the filler signs with its
   own key only, so an armed bot without it would create auctions and never
@@ -151,7 +186,22 @@ make help                           # Docker Compose lifecycle
   out of the RPC's retained window is reported as a `Gap` rather than
   silently caught up on, and at most once per stale cursor, since each one
   costs a full reseed; a pass that cannot prove it drained the range leaves
-  the cursor untouched.
+  the cursor untouched. An optional `Metrics` and `Notifier` (`with_metrics`,
+  `with_notifier`; both `None` from `new`) instrument the loop without
+  touching what it does: a heartbeat is recorded every `poll_interval`
+  for as long as the loop is turning, the pass included — the RPC calls,
+  the `getEvents` paging and the wait for the tracker's acknowledgement
+  alike, since working is being alive — so the backoff sleep after a
+  failed pass is the only stretch that stamps nothing, which is why
+  `max_backoff` is what the deadline budgets for and a pass's own
+  duration is not; the chain head is recorded the moment
+  `getLatestLedger` answers, and a run of `RPC_FAILING_AFTER` (5)
+  consecutive failed passes notifies `NotificationKind::RpcFailing` once,
+  at the threshold and never past it, with the first successful pass
+  logging the recovery and resetting the count. `PollerConfig::liveness_deadline`
+  (`LIVENESS_INTERVALS` poll intervals plus `max_backoff`) is what
+  `crate::http::liveness` and `crate::service::watchdog_loop` both check a
+  heartbeat's age against.
 - `src/tracker.rs` — applies chain state to the store: `Tracker::apply`
   writes an event's auction bookkeeping and returns the accounts it named;
   `Tracker::refresh` re-reads named accounts from chain in one snapshot,
@@ -224,17 +274,80 @@ make help                           # Docker Compose lifecycle
   filler that has nothing wrong with the chain state it is about to act on.
 - `src/notifier.rs` — `Notifier` deduplicates a `Notification` by `(pool,
   account, kind)` with a cooldown (`FAILURE_NOTIFICATION_COOLDOWN_HOURS`,
-  at least 1 hour and refused at zero) before handing what survives to one
-  `NotificationChannel`. `LogChannel` — the only channel before Phase 6b's
-  Telegram — is what every deployment gets; it logs at `WARN` for
-  `Severity::High` and `INFO` otherwise. A channel failure answers
-  `Delivery::Failed` and rolls back the dedup entry it optimistically
-  inserted, and never affects trading: `Notifier::notify` returns no
-  `Result`, so nothing upstream — a liquidation, a fill or an unwind
-  included — can make a decision depend on whether a notification was
-  delivered. `NotificationKind` already lists every kind spec §7 names, so
-  Phase 6b's bounded in-flight semaphore, `drain()` and Telegram channel
-  add no new variant.
+  at least 1 hour and refused at zero), then hands what survives to a
+  delivery task rather than to the channel directly: `Notifier::notify`
+  takes the dedup entry synchronously and tries a permit from a semaphore
+  of `NOTIFY_IN_FLIGHT` (10), spawning the send and answering
+  `Delivery::Queued`, `Delivery::Deduplicated` or — no permit free —
+  `Delivery::Dropped` without ever awaiting the channel; nothing upstream
+  can make a decision depend on whether a notification was delivered, or
+  wait to find out. A send that fails, or is dropped for want of a permit,
+  rolls back the dedup entry it optimistically inserted and writes the
+  notification through `LogChannel` instead, so the operator still sees
+  it. `LogChannel` is therefore not a second channel but the fallback
+  every configured channel — and an unconfigured deployment — falls back
+  to; it logs at `WARN` for `Severity::High` and `INFO` otherwise.
+  `Notifier::drain(DRAIN_BUDGET)` acquires every permit with a timeout and
+  is what an exit path calls to give in-flight sends a bounded chance to
+  leave before the process does. `pub mod telegram` is `TelegramChannel`,
+  the second `NotificationChannel`. `NotificationKind` already lists every
+  kind spec §7 names, so the semaphore, `drain()` and the Telegram channel
+  add no new variant. Must be used from inside a tokio runtime:
+  `notify` spawns.
+- `src/notifier/telegram.rs` — `TelegramChannel`: `sendMessage` for
+  delivery, `getMe` (`verify`) to prove the configured credentials work
+  before `Service::check_config` reports success. The bot token sits in
+  the request *path* (`/bot<TOKEN>/sendMessage`), never a header or the
+  body, so it is the one secret this module keeps out of everything it
+  hands back: every `reqwest::Error` is passed through
+  `reqwest::Error::without_url()` before it becomes `NotifyError` text,
+  and a refusal's text comes only from Telegram's own `description`
+  field, never the raw response body (which echoes the request URL, token
+  included, on some of Telegram's own error pages). `with_base_url` is a
+  test seam only — no argument or environment variable sets it — for
+  aiming the channel at a mock server through `TelegramConfig::base_url`.
+- `src/metrics.rs` — `Metrics`: the run's counters and gauges, one
+  `Mutex<Inner>` behind synchronous methods (no `.await` anywhere in this
+  module, so the lock is never held across one) that the poller, the
+  tracker, the auctioneer, the filler and the notifier call as the
+  corresponding event happens, and `Metrics::render` to
+  Prometheus text exposition format on demand for `/metrics`. Label sets
+  are closed enums (`Attempt`, `SkipLabel`, `DeliveryLabel`) rendered with
+  every member present, zero included, so a dashboard never has to guess
+  whether a missing series means zero or means the bot has not run yet.
+  Money is rendered as an integer in the pool oracle's own units —
+  `estimated_profit_total` and `estimated_loss_total` — never scaled by
+  an assumed number of decimals, and a landed fill's negative estimate
+  (a `force_fill` pool's) adds its magnitude to the *loss* counter rather
+  than lowering the profit one, since a Prometheus counter that decreases
+  is read as a reset. No I/O, no float and nothing panics; a poisoned
+  lock is recovered rather than propagated, the same call `notifier`'s
+  makes.
+- `src/http.rs` — the `/healthz`, `/livez` and `/metrics` server, built
+  from `HttpState` and served only when `crate::config::HttpConfig` is
+  configured (`PORT` or `HTTP_PORT`). `readiness` (`/healthz`) needs every
+  configured pool's processed ledger within `HttpState::max_lag_ledgers`
+  of the chain head this process has observed — in **either** direction,
+  since a head further than that *behind* the processed ledger is an RPC
+  node sitting behind this bot's own committed cursor and a
+  `saturating_sub` would read it as no lag at all — that head to have been
+  read within `HttpState::liveness_deadline` (`PoolStatus::head_at`,
+  stamped by `Metrics::ledger_head`), and the store to answer a ping
+  inside `PING_TIMEOUT` (5s). The head's *age* is not a nicety: both
+  ledger gauges are this process's own and an RPC outage stops both at
+  once, so a readiness that compared only the two would answer `200`
+  throughout the one failure it exists to catch. `liveness` (`/livez`)
+  needs only that every pool's poller has heartbeated within
+  `HttpState::liveness_deadline` (`PollerConfig::liveness_deadline`),
+  which already absorbs one worst-case backoff — an RPC outage the
+  poller's own backoff is riding out must not fail it — and measures a
+  pool that has *never* heartbeated from `HttpState::started` instead,
+  the same rule `watchdog_loop` applies: a poller whose first iteration
+  has not run yet is starting, not stopped. `/metrics` never fails: it renders whatever
+  `Metrics` holds, empty or not, and always answers `200`. `serve` never
+  propagates a bind failure to its caller — it logs and returns — because
+  a diagnostics port that cannot open must not stop the bot from trading
+  (spec §8).
 - `src/executor.rs` — one planned fill, from the contract's judgment to the
   audit row, the submission and the settled reservation. `Executor::execute`
   runs the mode guards first — a dry-run executor handed a live
@@ -321,25 +434,73 @@ make help                           # Docker Compose lifecycle
   top-level `unwind.rs`: the pass shares the filler's inventory, executor,
   wallet refresh and per-tick state closely enough that it lives here as a
   second `impl Filler` block, with the pure builder in `math::unwind`.
+  `Metrics` and `Notifier` are wired through every step above rather than
+  through a step of their own: `fills_total{result}` counts every recorded fill
+  (`attempted`, and `succeeded`/`failed` once the chain answers),
+  `skips_total{reason}` counts every planner and executor skip a
+  `SkipLabel` names — once per auction *per reason*, never once per tick it
+  stays open for, which is what `FillerState::counted_skips` and
+  `Filler::count_skip` are for: the filler re-makes every one of those
+  decisions every tick, so one auction the planner refuses forever would
+  otherwise bury the other four reasons. A skip decided *after* the chain
+  read is keyed by the **entry's** `block`, never the row's: the chain can
+  hold a new auction for an account before the tracker has opened it, and
+  a key on the older row is pruned the moment the tracker catches up —
+  while the auction is still open — so the same decision would count
+  twice. Only the pre-read `UnsupportedAssets` keys on the row, because
+  no entry has been read there —
+  `estimated_profit_total` adds a landed fill's `est_profit` (and
+  `estimated_loss_total` its magnitude when that estimate is negative),
+  `reserved_inventory{asset}` is re-gauged from
+  `Inventory::reserved()` after every tick, and `unwind_pass()` counts
+  every unwind attempt. `NotificationKind::FillConfirmed` (Low) and
+  `FillFailed` (High) answer a fill's `Succeeded`/`Failed`;
+  `UnfundedFill` (Medium) answers `FillSkip::Unfunded`; the queue's
+  `SubmissionDropped` (High) is this module's own, alongside the unwind
+  pass's setback alert.
 - `src/service.rs` — wiring: `Service::check_config` validates the
   configuration against the chain *and* the database (connect and ping, per
-  the spec's deployment contract) and reports without following anything;
-  `Service::run` connects and migrates the store, seeds every pool whose
-  tracked-user count or events cursor is missing, then runs five kinds of
-  task until a shutdown signal arrives and every one has returned: one
-  `LedgerPoller` per pool, one tracker task consuming their shared channel,
-  one auctioneer task, one filler task, and — only when armed — one
+  the spec's deployment contract) and reports without following anything —
+  and, when Telegram is configured, verifies it with one `getMe` call
+  (`verify_telegram`), because a refused token must fail the deploy smoke
+  test spec §10 makes this, not the first notification the operator needed
+  to see; `Service::run` connects and migrates the store, seeds every pool
+  whose tracked-user count or events cursor is missing, then runs seven
+  kinds of task until a shutdown signal arrives and every one has returned:
+  one `LedgerPoller` per pool, one tracker task consuming their shared
+  channel, one auctioneer task, one filler task, one watchdog task
+  (`spawn_watchdog`/`watchdog_loop`, reporting `NotificationKind::PollerStalled`
+  for a pool whose heartbeat has gone past `PollerConfig::liveness_deadline`
+  — it cannot be the poller's own report, because a wedged loop cannot
+  report itself), one HTTP server (`crate::http::serve`) when `PORT` or
+  `HTTP_PORT` gave the run an address — spawned *before* the seed pass,
+  alone among the tasks, because a seed of a busy pool is tens of seconds
+  during which a restart probe must still be able to reach `/livez`; the
+  seed itself heartbeats through `ledger::heartbeat_while`, for *every*
+  configured pool and not only the one it is seeding — no pool has a
+  poller yet, so one the pass has not reached would otherwise be the
+  same restart loop — and — only
+  when armed — one
   submission-queue worker per *distinct* signing key, which is what
-  `spawn_queues` is for. The tracker loop treats a `TrackerError::Store`
-  as fatal and a `Chain` or `Math` one as transient — it declines the tick,
-  and the same range is read again. Both entry points share `validate` and
-  `validate_filler`: the filler's account must exist on the network and
-  hold at least `XLM_FEE_RESERVE` of the native asset — armed, either
-  failure is a startup *error*; in dry-run each is a warning — and, armed
-  only, holding less than a pool's `min_primary_collateral` is a warning.
-  With no `FILLER_SECRET_KEY` at all there is nothing to check and the
-  warning says so: the filler plans against an empty inventory and
-  simulates nothing.
+  `spawn_queues` is for. The run's one `Metrics` and one `Notifier`
+  (`build_notifier`: the Telegram channel when both credentials are
+  configured, `LogChannel` otherwise) are built once, before the seed pass,
+  and carried together as one `Instruments` to every loop that needs both.
+  However `run` ends, it leaves through `finish_run`, which drains the
+  notifier (`Notifier::drain(DRAIN_BUDGET)`) on both the `Ok` and the `Err`
+  path — the two exits that skip it are the second `SIGINT`/`SIGTERM`
+  (`spawn_shutdown_listener`'s `exit(130)`, deliberately: a second signal
+  means now) and a task panic (`resume_on_panic` unwinds straight out of
+  `drain_tasks`, past `finish_run` entirely). The tracker loop treats a
+  `TrackerError::Store` as fatal and a `Chain` or `Math` one as transient —
+  it declines the tick, and the same range is read again. Both entry
+  points share `validate` and `validate_filler`: the filler's account must
+  exist on the network and hold at least `XLM_FEE_RESERVE` of the native
+  asset — armed, either failure is a startup *error*; in dry-run each is a
+  warning — and, armed only, holding less than a pool's
+  `min_primary_collateral` is a warning. With no `FILLER_SECRET_KEY` at all
+  there is nothing to check and the warning says so: the filler plans
+  against an empty inventory and simulates nothing.
 
   **The auctioneer and the filler are separate tasks, and must stay two.**
   Neither is inside the tracker's tick: the tracker's acknowledgement is
@@ -359,7 +520,12 @@ make help                           # Docker Compose lifecycle
 - `src/harness.rs` (`cfg(test)`) — scripted-RPC and store scaffolding shared
   by the store, ledger and tracker tests: the fixture's pool, its two
   borrowers, and the golden health factors `chain::xdr::decode`'s test
-  derives from the same contract-attested inputs.
+  derives from the same contract-attested inputs. `RecordingChannel` is
+  the `NotificationChannel` the notifier, ledger and service tests assert
+  against: it keeps every notification it accepted rather than only
+  logging it, and its `fail` flag puts a channel failure in front of
+  `Notifier`'s own rollback. Every delivery is spawned, so a test reads
+  `sent`/`sent_count` only after `Notifier::drain` has answered.
 - `migrations/` — the store's schema, embedded in the binary and applied by
   `Store::migrate`: `0001` is the initial schema (cursors, `users`,
   `auctions`); `0002` adds the `creations` audit table (every auctioneer
@@ -383,8 +549,8 @@ make help                           # Docker Compose lifecycle
   RPC through `curl`. See that directory's README.
 
 The module layout beyond this follows
-`docs/superpowers/specs/2026-09-04-blend-liquidator-bot-design.md`; what
-remains is Phase 6b's operational surface (see Status above).
+`docs/superpowers/specs/2026-09-04-blend-liquidator-bot-design.md`; see
+Status above for what remains.
 
 ## Conventions
 
@@ -654,6 +820,50 @@ remains is Phase 6b's operational surface (see Status above).
   a `Delivery`, never a `Result`, so a channel outage cannot hold up or
   fail a liquidation, a fill or an unwind — it can only mean the operator
   hears about one later than intended.
+- The Telegram bot token sits in the request *path*
+  (`/bot<TOKEN>/sendMessage`), not a header or the body, so every
+  `reqwest::Error` this crate displays anywhere near the Telegram client
+  goes through `reqwest::Error::without_url()` first. A new log line that
+  prints a raw `reqwest::Error` from `notifier::telegram` or
+  `service::telegram_channel`/`verify_telegram` leaks the token into the
+  log. The one leak this crate cannot close is `RUST_LOG=trace`: hyper's
+  byte-level logging prints the request line — `/bot<TOKEN>/sendMessage`
+  — and `tracing_subscriber`'s `log` bridge captures it. The default
+  filter and `debug` are both clear; **a Telegram-configured bot is never
+  run at TRACE.**
+- `PORT` wins over `HTTP_PORT` when both are set, because `PORT` is the
+  one a deployment platform controls (Cloud Run injects it); either alone
+  turns the HTTP server on, neither leaves it off. A bind failure never
+  stops trading: `http::serve` logs it and returns `()` — it is the task
+  `Service::run` wraps it in that answers `Ok(())` — because a
+  diagnostics port that cannot open must not stop the poller, the
+  auctioneer or the filler from running. That task is also the one thing
+  spawned *before* the initial seed: a seed of a busy pool is tens of
+  seconds, and a restart probe aimed at `/livez` must be able to reach
+  it.
+- `/livez` includes the poller's own backoff in its window
+  (`PollerConfig::liveness_deadline` is `LIVENESS_INTERVALS` poll
+  intervals plus `max_backoff`), on purpose — an RPC outage the poller's
+  backoff is already riding out must not also fail liveness. A restart
+  probe must target `/livez`, never `/healthz`: restarting on every
+  readiness blip would kill and respawn the process on exactly the
+  outages its backoff exists to ride out, while a wedged poller — which
+  `/livez` alone catches — is precisely what a restart can fix. The
+  Docker `HEALTHCHECK` stays `pgrep` for the same reason; see the
+  Dockerfile's own comment. A pool that has never heartbeated at all is
+  measured from the run's start rather than reported dead, so the initial
+  seed is not a restart loop; `/healthz` carries the mirror-image rule,
+  failing once no chain head has been read for that same window, because
+  an RPC outage freezes the lag it would otherwise be judged by — and its
+  lag bound is symmetric for the same kind of reason, a head more than
+  `max_lag_ledgers` *behind* the processed ledger being a lagging node
+  rather than a bot at chain head.
+- A `Notifier` must be used from inside a tokio runtime: `notify` spawns
+  the delivery task, and calling it outside one panics.
+- `notifications_total{kind,delivery}` is the one metric whose label set
+  is `NotificationKind::as_str` rather than a `metrics`-local enum, which
+  is why `NotificationKind` is closed (see `src/notifier.rs`'s doc): a new
+  variant there is also a new metric label, never added quietly.
 
 ## Workflow
 

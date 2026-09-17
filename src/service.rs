@@ -11,18 +11,60 @@
 //! configuration would happily submit against a pool it misread, or start
 //! armed with a filler account that does not exist.
 //!
-//! # Five kinds of task
+//! # Seven kinds of task
 //!
 //! [`Service::run`] spawns one [`LedgerPoller`] per pool, one tracker task
 //! consuming their shared channel, one auctioneer task, one filler task,
-//! and — only when armed — one submission-queue worker per distinct
-//! signing key. The queues are the subject of `spawn_queues`: one worker
-//! per key and never two, because a Soroban transaction is built against
-//! its source account's sequence number at prepare time. The filler task
-//! holds the run's one [`crate::notifier::Notifier`], built from
-//! `config.notification_cooldown` — log-only in this phase, since Telegram,
-//! the semaphore and `drain()` are Phase 6b's — and it is the notifier's
-//! only reader.
+//! one watchdog task, one HTTP server when a port is set, and — only when
+//! armed — one submission-queue worker per distinct signing key. The
+//! queues are the subject of `spawn_queues`: one worker per key and never
+//! two, because a Soroban transaction is built against its source
+//! account's sequence number at prepare time. The watchdog is
+//! `watchdog_loop`: it reads the pollers' heartbeats off the run's one
+//! [`crate::metrics::Metrics`] and reports a pool that has stopped
+//! heartbeating, and it is a task of its own because a poller that has
+//! stopped is exactly the thing that cannot report itself. The HTTP
+//! server is [`crate::http::serve`] over that same recorder and the
+//! store, and it is spawned only when `PORT` or `HTTP_PORT` gave the run
+//! an address — and, alone among the tasks, *before* the initial seed,
+//! since a seed of a busy pool is tens of seconds during which a restart
+//! probe must be able to reach `/livez` at all. Its task answers `Ok(())`
+//! however it ends, a bind failure included, because a diagnostics port
+//! that cannot open must not stop the bot from trading (spec §8).
+//!
+//! The run's one [`crate::metrics::Metrics`] and its one
+//! [`crate::notifier::Notifier`] — the latter over the Telegram channel
+//! when both credentials are configured and over
+//! [`crate::notifier::LogChannel`] otherwise, at
+//! `config.notification_cooldown` — are both constructed before the seed
+//! pass, which is the first thing that records through them and runs
+//! before every task but the HTTP server; every loop that needs both is
+//! handed them together as one `Instruments`, and the pollers, the
+//! watchdog, the HTTP server and the filler are handed those same two
+//! instances rather than instances of their own, since dedup state and
+//! gauges mean nothing split across copies. `build_notifier` is also the
+//! only place the notifier's recorder can be installed at all:
+//! [`crate::notifier::Notifier::with_metrics`] works through
+//! `Arc::get_mut`, so a notifier that has already spawned a delivery can
+//! no longer take one. Delivery is fire-and-forget: `notify` spawns
+//! behind a bounded semaphore and never awaits a channel, so no
+//! notification can delay a tick, a decision or a fill, and a channel
+//! that has stopped answering costs a bounded number of tasks and drops
+//! what does not fit.
+//!
+//! # Every exit of `run` drains
+//!
+//! What a shutdown owes the sends still in flight is
+//! [`crate::notifier::Notifier::drain`], and `finish_run` is where both
+//! of [`Service::run`]'s exits pay it: a task failure and a shutdown
+//! signal join the same way (see `drain_tasks`), so they leave the same
+//! way too — every in-flight delivery gets
+//! [`crate::notifier::DRAIN_BUDGET`] to finish, a timeout is a warning
+//! and nothing more, and the result `drain_tasks` answered is returned
+//! unchanged. The one exit that does not drain is deliberate: the *second*
+//! `SIGINT`/`SIGTERM` is answered by `spawn_shutdown_listener` with
+//! `exit(130)`, because a second signal means now and a drain is exactly
+//! the delay it is refusing.
 //!
 //! # The deciding tasks are joined to the tracker by a tick
 //!
@@ -72,21 +114,65 @@ use std::num::NonZeroUsize;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 
-use crate::auctioneer::{Auctioneer, AuctioneerConfig, AuctioneerError, PriceWatch};
+use crate::auctioneer::{
+    ActOutcome, Auctioneer, AuctioneerConfig, AuctioneerError, CreationOutcome, PriceWatch,
+};
 use crate::chain::pool::{PoolReader, PoolSnapshot};
 use crate::chain::rpc::RpcClient;
 use crate::chain::xdr::PoolStatus;
-use crate::chain::{ChainError, Network, Signer, Submitter, TxConfig};
-use crate::config::{PoolConfig, SeedConfig, ServiceConfig, Signers, SigningKeys};
+use crate::chain::{ChainError, Network, Signer, Submitter, TxConfig, TxOutcome};
+use crate::config::{
+    HttpConfig, PoolConfig, SeedConfig, ServiceConfig, Signers, SigningKeys, TelegramConfig,
+};
 use crate::executor::Executor;
 use crate::filler::{Filler, FillerConfig, FillerState};
+use crate::http::{self, HttpState};
 use crate::inventory::Inventory;
-use crate::ledger::{LedgerPoller, LedgerTick, PollerConfig, PollerMessage};
-use crate::notifier::Notifier;
-use crate::queue::{run_queue, SubmissionQueue};
-use crate::store::{events_cursor, Cursor, Store, StoreError, TrackedUser};
+use crate::ledger::{heartbeat_while, LedgerPoller, LedgerTick, PollerConfig, PollerMessage};
+use crate::metrics::{Attempt, Metrics};
+use crate::notifier::telegram::TelegramChannel;
+use crate::notifier::{
+    LogChannel, Notification, NotificationChannel, NotificationKind, Notifier, Severity,
+    DRAIN_BUDGET,
+};
+use crate::queue::{run_queue, QueueError, SubmissionQueue};
+use crate::store::{events_cursor, CreationKind, Cursor, Store, StoreError, TrackedUser};
 use crate::tracker::{AnalyticsSeed, FileSeed, SeedSource, Tracker, TrackerError};
 use crate::LiquidatorError;
+
+/// The run's instruments: the one [`Metrics`] every loop records into and
+/// the one [`Notifier`] every loop reports through, carried together so a
+/// loop that needs both takes one parameter rather than two.
+///
+/// Cloning clones the two handles and never the state behind them: a
+/// gauge means nothing split across recorders, and the notifier's dedup
+/// means nothing split across notifiers, which is why both are `Arc`s of
+/// the instances [`Service::run`] builds exactly once.
+///
+/// Nothing reached through here may affect trading (spec §8): recording
+/// is a lock and an integer, and [`Notifier::notify`] spawns its delivery
+/// rather than awaiting a channel, so no tick, decision or fill can be
+/// delayed or failed by an instrument.
+#[derive(Clone)]
+pub(crate) struct Instruments {
+    /// The run's counters and gauges.
+    pub metrics: Arc<Metrics>,
+    /// The run's notification channel.
+    pub notifier: Arc<Notifier>,
+}
+
+impl Instruments {
+    /// A fresh recorder and a log-only notifier whose cooldown no test
+    /// runs past: what the tests that call an instrumented loop but
+    /// assert on neither instrument pass.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        Self {
+            metrics: Arc::new(Metrics::new()),
+            notifier: Arc::new(Notifier::log_only(std::time::Duration::from_hours(1))),
+        }
+    }
+}
 
 /// What [`Service::check_config`] prints for one pool: how many reserves it
 /// has and which backstop it reports, once `validate` has confirmed every
@@ -431,16 +517,39 @@ fn build_seed_sources(seed: &SeedConfig) -> Result<Vec<SeedSource>, LiquidatorEr
 ///
 /// Returns the pools whose seed could not reach every source, for the
 /// tracker loop to retry on its full-scan cadence as spec §4 requires.
+///
+/// Each pool's seed is wrapped in [`heartbeat_while`] at
+/// `heartbeat_interval`, which stamps **every** configured pool — not
+/// only the one being seeded. This pass runs before any poller exists to
+/// heartbeat for itself, so without it `/livez` would have nothing but
+/// [`crate::http::HttpState::started`]'s baseline to go on for the whole
+/// of a seed that can outlast it, and a restart probe would kill the bot
+/// in the middle of the seed it would then start again — for the pool
+/// being seeded if nothing stamped, and for every pool the pass has not
+/// reached, or skipped as already followed, if only that one did.
+// One collaborator per parameter — two clients, the pools, the seed
+// sources, the batch rate, the heartbeat cadence, the shutdown flag and
+// the run's instruments — and no two of them belong together in a type of
+// their own.
+#[allow(clippy::too_many_arguments)]
 async fn seed_pools_needing_it(
     rpc: &RpcClient,
     store: &Store,
     pools: &[PoolConfig],
     sources: &[SeedSource],
     batch: u32,
+    heartbeat_interval: std::time::Duration,
     shutdown: &watch::Receiver<bool>,
+    instruments: &Instruments,
 ) -> Result<BTreeSet<String>, LiquidatorError> {
     let tracker = Tracker::new(rpc, store);
     let mut incomplete = BTreeSet::new();
+    // Every configured pool, stamped by whichever pool's seed is running:
+    // no poller exists yet for any of them, so a heartbeat only for the
+    // one being seeded would leave the rest measured from
+    // `HttpState::started` alone and fail `/livez` for the pool this pass
+    // has not reached — the same restart loop, one pool wider.
+    let addresses: Vec<&str> = pools.iter().map(|pool| pool.address.as_str()).collect();
     for pool in pools {
         if *shutdown.borrow() {
             tracing::warn!("shutdown requested; stopping before every pool was seeded");
@@ -456,9 +565,13 @@ async fn seed_pools_needing_it(
             sequence: head.sequence,
             close_time: head.close_time,
         };
-        let outcome = match tracker
-            .seed(&pool.address, sources, tick, batch, shutdown)
-            .await
+        let outcome = match heartbeat_while(
+            Some(&instruments.metrics),
+            &addresses,
+            heartbeat_interval,
+            tracker.seed(&pool.address, sources, tick, batch, shutdown),
+        )
+        .await
         {
             Ok(outcome) => outcome,
             // The same split the tracker loop makes: a store failure is
@@ -509,6 +622,16 @@ async fn seed_pools_needing_it(
                 )
                 .await?;
         }
+        // This pool's seed gauge, and only it: the tracked-user count at
+        // the top of this loop was read *before* the seed, so it is stale
+        // by the time the seed finishes — a pool with users but no cursor
+        // is seeded on a count that was never zero, and one seeded from
+        // empty has stopped being zero by here. `full_scan` sets
+        // `users_tracked` from a count taken after the seed, within one
+        // scan period.
+        instruments
+            .metrics
+            .seed_accounts_loaded(&pool.address, outcome.refresh.tracked);
         tracing::info!(
             pool = pool.address,
             tracked = outcome.refresh.tracked,
@@ -534,6 +657,90 @@ async fn connect_store(config: &ServiceConfig) -> Result<Store, LiquidatorError>
     )
     .await
     .map_err(|error| LiquidatorError::Config(format!("database: {error}")))
+}
+
+/// Builds the configured Telegram channel: the token goes to
+/// [`TelegramChannel::new`] and nowhere else, and a channel that cannot be
+/// built at all is a configuration failure.
+///
+/// The error text is safe to log: every [`crate::notifier::NotifyError`]
+/// this channel produces has already been through
+/// [`reqwest::Error::without_url`] or is built from Telegram's own
+/// `description` field, because the bot token sits in the request *path*
+/// (see [`crate::notifier::telegram`]).
+fn telegram_channel(config: &TelegramConfig) -> Result<TelegramChannel, LiquidatorError> {
+    let channel = TelegramChannel::new(config.token.clone(), config.chat_id.clone())
+        .map_err(|error| LiquidatorError::Config(format!("telegram: {error}")))?;
+    Ok(match &config.base_url {
+        Some(base) => channel.with_base_url(base.clone()),
+        None => channel,
+    })
+}
+
+/// The run's one [`Notifier`]: the Telegram channel when both credentials
+/// are configured, [`LogChannel`] otherwise, counting every delivery on
+/// `metrics`.
+///
+/// Called exactly once per run, and **before anything notifies**:
+/// [`Notifier::with_metrics`] installs through `Arc::get_mut`, so a
+/// notifier that has already spawned a delivery can no longer be given a
+/// recorder — it says so and counts nothing.
+///
+/// Logs which channel is in use and nothing else about it: the token is a
+/// secret, and the chat id is one more identifier a log line has no reason
+/// to carry.
+fn build_notifier(
+    config: &ServiceConfig,
+    metrics: Arc<Metrics>,
+) -> Result<Notifier, LiquidatorError> {
+    let channel: Box<dyn NotificationChannel> = match &config.telegram {
+        Some(telegram) => Box::new(telegram_channel(telegram)?),
+        None => Box::new(LogChannel),
+    };
+    let name = channel.name();
+    let notifier = Notifier::new(channel, config.notification_cooldown).with_metrics(metrics);
+    tracing::info!(
+        channel = name,
+        cooldown_secs = config.notification_cooldown.as_secs(),
+        "notification channel"
+    );
+    Ok(notifier)
+}
+
+/// Proves the configured Telegram credentials work, through the one Bot
+/// API call that reads nothing and changes nothing: `getMe`.
+///
+/// A refusal is a [`LiquidatorError::Config`] — exit 2, the code spec §10
+/// gives a configuration the operator must fix — and never carries the
+/// token. The only side effect [`Service::check_config`] has beyond its
+/// reads, and it is a read too.
+async fn verify_telegram(config: &ServiceConfig) -> Result<(), LiquidatorError> {
+    let Some(telegram) = &config.telegram else {
+        tracing::info!(
+            "no TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID: notifications are written to the log only"
+        );
+        return Ok(());
+    };
+    let username = telegram_channel(telegram)?
+        .verify()
+        .await
+        .map_err(|error| LiquidatorError::Config(format!("telegram: {error}")))?;
+    tracing::info!(username, "telegram reachable");
+    Ok(())
+}
+
+/// Reports whether the diagnostics server is configured, and where. Shared
+/// by both entry points so `check-config` says exactly what `run` would.
+fn log_http(http: Option<HttpConfig>) {
+    if let Some(http) = http {
+        tracing::info!(
+            bind = %http.bind,
+            max_lag_ledgers = http.max_lag_ledgers,
+            "serving /healthz, /livez and /metrics"
+        );
+    } else {
+        tracing::info!("neither PORT nor HTTP_PORT is set: /healthz, /livez and /metrics are off");
+    }
 }
 
 /// Timings the tracker loop reads every message, bundled so its functions
@@ -617,12 +824,14 @@ struct LoopState {
 ///
 /// A tick is acknowledged only once its whole effect is in the store,
 /// because that acknowledgement is what commits the poller's cursor.
+#[allow(clippy::too_many_arguments)]
 async fn handle_message(
     tracker: &Tracker<'_>,
     seed_sources: &[SeedSource],
     cadence: Cadence,
     state: &mut LoopState,
     shutdown: &watch::Receiver<bool>,
+    instruments: &Instruments,
     tick_tx: &watch::Sender<LedgerTick>,
     message: PollerMessage,
 ) -> Result<(), TrackerError> {
@@ -632,7 +841,10 @@ async fn handle_message(
             ledger,
             event,
         } => match tracker.apply(&pool, ledger, &event).await {
-            Ok(accounts) => state.pending.entry(pool).or_default().extend(accounts),
+            Ok(accounts) => {
+                instruments.metrics.events_processed(&pool, 1);
+                state.pending.entry(pool).or_default().extend(accounts);
+            }
             Err(error) => {
                 // This event is not in the store, so the range it came
                 // from must be read again: poison the pool's next tick so
@@ -650,6 +862,7 @@ async fn handle_message(
                 cadence,
                 state,
                 shutdown,
+                instruments,
                 (&pool, &accounts, tick),
             )
             .await
@@ -668,6 +881,11 @@ async fn handle_message(
                     "an event in this range did not apply; leaving the range to be re-read"
                 );
             } else {
+                // The acknowledged path and nowhere else: this gauge is
+                // the cursor the poller commits, and a tick whose
+                // acknowledgement is declined leaves that cursor where it
+                // was, for the whole range to be read again.
+                instruments.metrics.ledger_processed(&pool, tick.sequence);
                 // Answering is the only thing that lets the cursor move.
                 let _ = ack.send(());
                 // Published only now: the auctioneer's whole input is
@@ -699,6 +917,17 @@ async fn handle_message(
         }
         PollerMessage::Gap { pool, from, oldest } => {
             tracing::warn!(pool, from, oldest, "reseeding after a gap");
+            // Reported before the reseed, not after it: reseeding a busy
+            // pool is tens of seconds of sequential round trips, and the
+            // operator should learn that a range of events was lost while
+            // it is being made good rather than once it has been.
+            instruments.notifier.notify(Notification {
+                kind: NotificationKind::EventGap,
+                severity: Severity::High,
+                pool: pool.clone(),
+                account: None,
+                message: format!("events from ledger {from} to {oldest} are gone; reseeding"),
+            });
             // Recorded before the attempt and cleared only by a seed that
             // reached every source, so a reseed that fails outright is
             // retried by the full scan rather than forgotten.
@@ -737,6 +966,7 @@ async fn apply_tick(
     cadence: Cadence,
     state: &mut LoopState,
     shutdown: &watch::Receiver<bool>,
+    instruments: &Instruments,
     subject: (&str, &[String], LedgerTick),
 ) -> Result<(), TrackerError> {
     let (pool, accounts, tick) = subject;
@@ -796,6 +1026,7 @@ async fn apply_tick(
             cadence,
             state,
             shutdown,
+            instruments,
             (pool, tick),
         )
         .await
@@ -824,6 +1055,7 @@ async fn full_scan(
     cadence: Cadence,
     state: &mut LoopState,
     shutdown: &watch::Receiver<bool>,
+    instruments: &Instruments,
     subject: (&str, LedgerTick),
 ) -> Result<(), TrackerError> {
     let (pool, tick) = subject;
@@ -837,6 +1069,7 @@ async fn full_scan(
         )
         .await?;
     let user_count = store.count_users(pool).await?;
+    instruments.metrics.users_tracked(pool, user_count);
     tracing::info!(
         pool,
         user_count,
@@ -868,6 +1101,15 @@ async fn full_scan(
             state.needs_reseed.remove(pool);
         }
     }
+    // Only a scan that reached the end of the function: an owed reseed
+    // that failed above propagates instead, and
+    // `last_successful_scan_timestamp_seconds{pool}` is what an operator
+    // alerts on when scans stop finishing. Stamped for this pool alone —
+    // the scan is per pool, and a pool whose scans keep failing must not
+    // be covered by another's successes.
+    instruments
+        .metrics
+        .scan_succeeded(pool, std::time::SystemTime::now());
     Ok(())
 }
 
@@ -884,12 +1126,14 @@ async fn full_scan(
 /// function returns is what lets the auctioneer task's own `changed()`
 /// end rather than wait forever once this loop has nothing further to
 /// send.
+#[allow(clippy::too_many_arguments)]
 async fn tracker_loop(
     tracker: &Tracker<'_>,
     seed_sources: &[SeedSource],
     cadence: Cadence,
     mut state: LoopState,
     shutdown: &watch::Receiver<bool>,
+    instruments: &Instruments,
     tick_tx: watch::Sender<LedgerTick>,
     mut receiver: mpsc::Receiver<PollerMessage>,
 ) -> Result<(), TrackerError> {
@@ -910,6 +1154,7 @@ async fn tracker_loop(
             cadence,
             &mut state,
             shutdown,
+            instruments,
             &tick_tx,
             message,
         )
@@ -1160,6 +1405,13 @@ async fn full_scan_and_flag(
 /// own doc. Only [`AuctioneerError::Store`] ends the pass early and
 /// propagates, for the reason it is fatal everywhere else in this module:
 /// the bot cannot trust what it reads.
+///
+/// `instruments` is read-only to all of that: what `act` answered is
+/// counted and, for a creation the chain landed or one the queue dropped,
+/// reported — ahead of the match that owns this borrower's flag, so that
+/// no arm of it moves, clears or keeps a flag differently for having been
+/// instrumented.
+#[allow(clippy::too_many_arguments)]
 async fn recheck_batch(
     auctioneer: &Auctioneer<'_>,
     store: &Store,
@@ -1168,6 +1420,7 @@ async fn recheck_batch(
     tick: LedgerTick,
     submit: Option<&SubmissionQueue>,
     shutdown: &watch::Receiver<bool>,
+    instruments: &Instruments,
 ) -> Result<(), LiquidatorError> {
     if batch.is_empty() {
         return Ok(());
@@ -1218,10 +1471,11 @@ async fn recheck_batch(
         if *shutdown.borrow() {
             return Ok(());
         }
-        match auctioneer
+        let acted = auctioneer
             .act(pool, &account, &decision, tick, submit)
-            .await
-        {
+            .await;
+        note_act(instruments, pool, &account, &acted);
+        match acted {
             // A refusal is not a skip, and neither is a submission the chain
             // failed, expired or lost: something was owed and was not done,
             // so the flag moves forward instead of being cleared — exactly
@@ -1282,6 +1536,105 @@ async fn recheck_batch(
         }
     }
     Ok(())
+}
+
+/// Instruments what [`Auctioneer::act`] answered for one borrower, and
+/// nothing else: it is called before the match that owns that borrower's
+/// recheck flag, so no arm of that match moves, clears or keeps a flag
+/// differently for having been instrumented.
+///
+/// Two answers are worth recording. A recorded creation is
+/// [`note_creation`]'s. A [`QueueError::Chain`] is the one failure the
+/// queue narrows to a submission that provably sent nothing and has spent
+/// its retry budget — the creation is gone rather than pending, which is
+/// worth saying out loud even though the flag the caller moves forward
+/// brings the borrower back on a later pass. Every other answer — a skip,
+/// a refusal, a store, chain or math failure — is the caller's to log as
+/// it already does.
+///
+/// A dropped creation counts *both* `attempted` and `failed`, for the same
+/// reason [`note_creation`] counts `attempted` on a creation the chain
+/// failed: [`Auctioneer::act`] writes the `creations` row before it hands
+/// anything to the queue, so by the time the queue answers, the bot has
+/// decided to act and recorded the decision. Counting only `failed` would
+/// leave `creations_total{result="failed"}` above the `attempted` it is
+/// meant to be a fraction of.
+fn note_act(
+    instruments: &Instruments,
+    pool: &str,
+    account: &str,
+    acted: &Result<ActOutcome, AuctioneerError>,
+) {
+    match acted {
+        Ok(ActOutcome::Recorded(outcome)) => note_creation(instruments, pool, outcome),
+        Err(AuctioneerError::Queue(QueueError::Chain(error))) => {
+            instruments.metrics.creation(Attempt::Attempted);
+            instruments.metrics.creation(Attempt::Failed);
+            instruments.notifier.notify(Notification {
+                kind: NotificationKind::SubmissionDropped,
+                severity: Severity::High,
+                pool: pool.to_string(),
+                account: Some(account.to_string()),
+                message: format!("creation dropped by the queue: {error}"),
+            });
+        }
+        Ok(ActOutcome::Skipped(_) | ActOutcome::Refused) | Err(_) => {}
+    }
+}
+
+/// Counts one recorded creation and, when the chain landed it, reports it.
+///
+/// Called for every [`ActOutcome::Recorded`], settled or not: `attempted`
+/// means the bot decided to act and recorded the decision, which a dry
+/// run's creation, one the startup delay held back and one the chain
+/// failed all are. What tells them apart is the second count, which is
+/// the chain's answer and not the row's existence — so a
+/// [`TxOutcome::Failed`] (a fee charged and no auction) and a
+/// [`TxOutcome::Expired`] (provably never applied) are `failed`, while a
+/// [`TxOutcome::Unknown`] is neither: it may still land, and a counter
+/// that guessed would have to be un-counted.
+///
+/// Instrumenting only. [`Notifier::notify`] spawns its delivery rather
+/// than awaiting a channel, so nothing here can delay or fail the pass
+/// that called it (spec §8).
+fn note_creation(instruments: &Instruments, pool: &str, outcome: &CreationOutcome) {
+    instruments.metrics.creation(Attempt::Attempted);
+    match &outcome.submission {
+        Some(TxOutcome::Succeeded { ledger, .. }) => {
+            instruments.metrics.creation(Attempt::Succeeded);
+            let (kind, severity, message) = match outcome.kind {
+                CreationKind::Auction => {
+                    // Every auction creation names a percent; the fallback
+                    // is for the type, which allows `None` because bad
+                    // debt has none.
+                    let percent = outcome
+                        .percent
+                        .map_or_else(|| "?".to_string(), |percent| percent.get().to_string());
+                    (
+                        NotificationKind::AuctionCreated,
+                        Severity::Low,
+                        format!("liquidation auction created at {percent}% in ledger {ledger}"),
+                    )
+                }
+                CreationKind::BadDebt => (
+                    NotificationKind::BadDebtReported,
+                    Severity::Medium,
+                    format!("bad debt reported in ledger {ledger}"),
+                ),
+            };
+            instruments.notifier.notify(Notification {
+                kind,
+                severity,
+                pool: pool.to_string(),
+                account: Some(outcome.account.clone()),
+                message,
+            });
+        }
+        Some(TxOutcome::Failed { .. } | TxOutcome::Expired { .. }) => {
+            instruments.metrics.creation(Attempt::Failed);
+        }
+        Some(TxOutcome::Unknown { .. }) | None => {}
+    }
 }
 
 /// Re-raises one borrower's recheck flag one ledger past `tick`'s, so a
@@ -1460,6 +1813,7 @@ struct AuctioneerContext<'a> {
     cadence: AuctioneerCadence,
     submission_queue: Option<&'a SubmissionQueue>,
     shutdown: &'a watch::Receiver<bool>,
+    instruments: &'a Instruments,
 }
 
 /// One tick's whole effect for every configured pool: decide and act on
@@ -1562,6 +1916,7 @@ async fn auctioneer_tick(
             tick,
             submit,
             ctx.shutdown,
+            ctx.instruments,
         )
         .await?;
     }
@@ -1579,6 +1934,7 @@ async fn auctioneer_tick(
 /// gone — and this loop then has nothing further to do. A decision is not
 /// a stored effect of a ledger, so nothing this loop does ever reaches
 /// back to poison a tick already acknowledged.
+#[allow(clippy::too_many_arguments)]
 async fn auctioneer_loop(
     store: &Store,
     pools: &[String],
@@ -1587,6 +1943,7 @@ async fn auctioneer_loop(
     submission_queue: Option<&SubmissionQueue>,
     mut tick_rx: watch::Receiver<LedgerTick>,
     shutdown: &watch::Receiver<bool>,
+    instruments: &Instruments,
 ) -> Result<(), LiquidatorError> {
     let ctx = AuctioneerContext {
         store,
@@ -1595,6 +1952,7 @@ async fn auctioneer_loop(
         cadence,
         submission_queue,
         shutdown,
+        instruments,
     };
     let mut state = AuctioneerState::default();
     while tick_rx.changed().await.is_ok() {
@@ -1800,6 +2158,14 @@ impl SigningContext {
 /// drops the caller's own clone once every one holds its own — which is
 /// what lets the tracker task's channel close, and its `recv` return
 /// `None`, once (and only once) every poller has stopped.
+///
+/// Every poller records its heartbeat and its pool's chain head on the
+/// run's one `metrics`, and reports a run of failed passes through its one
+/// `notifier`. Both are shared rather than per-pool: `/livez` and
+/// [`watchdog_loop`] read one recorder for every pool, and the notifier's
+/// dedup is keyed by pool, so one instance never lets one pool's failures
+/// silence another's.
+#[allow(clippy::too_many_arguments)]
 fn spawn_pollers(
     tasks: &mut JoinSet<Result<(), LiquidatorError>>,
     rpc: &RpcClient,
@@ -1807,6 +2173,8 @@ fn spawn_pollers(
     pools: &[PoolConfig],
     poller_config: PollerConfig,
     sender: &mpsc::Sender<PollerMessage>,
+    metrics: &Arc<Metrics>,
+    notifier: &Arc<Notifier>,
     shutdown: &watch::Receiver<bool>,
 ) {
     for pool in pools {
@@ -1814,13 +2182,116 @@ fn spawn_pollers(
         let store = store.clone();
         let pool = pool.address.clone();
         let sender = sender.clone();
+        let metrics = Arc::clone(metrics);
+        let notifier = Arc::clone(notifier);
         let shutdown = shutdown.clone();
         tasks.spawn(async move {
             LedgerPoller::new(&rpc, &store, &pool, poller_config)
+                .with_metrics(metrics)
+                .with_notifier(notifier)
                 .run(sender, shutdown)
                 .await
                 .map_err(LiquidatorError::from)
         });
+    }
+}
+
+/// Spawns the watchdog: one task for the whole run, watching every
+/// poller's heartbeat rather than any pool's chain state.
+///
+/// It is the counterpart of `/livez` for a deployment that nothing probes:
+/// the same [`PollerConfig::liveness_deadline`], reported to the operator
+/// instead of to a load balancer. Spawned beside the pollers rather than
+/// inside one, because a poller that has stopped is exactly the thing that
+/// cannot report itself.
+fn spawn_watchdog(
+    tasks: &mut JoinSet<Result<(), LiquidatorError>>,
+    metrics: Arc<Metrics>,
+    notifier: Arc<Notifier>,
+    pools: Vec<String>,
+    config: PollerConfig,
+    shutdown: &watch::Receiver<bool>,
+) {
+    let shutdown = shutdown.clone();
+    tasks.spawn(async move {
+        watchdog_loop(&metrics, &notifier, &pools, config, &shutdown).await;
+        Ok(())
+    });
+}
+
+/// Reports every pool whose poller has not heartbeated within
+/// [`PollerConfig::liveness_deadline`], once per `poll_interval`, until
+/// `shutdown` flips.
+///
+/// Three things it deliberately does not do:
+///
+/// - **It does not read a missing heartbeat as a stall.** A pool with no
+///   heartbeat at all has a poller that may not have run its first
+///   iteration yet — seeding a busy pool is tens of seconds — and a
+///   watchdog that notified on that would notify on every restart.
+/// - **It does not deduplicate.** A pool that is still stalled is notified
+///   again on every pass and the notifier's own cooldown suppresses it,
+///   which is the one place in this crate that decides how often a
+///   repeating condition is worth saying out loud.
+/// - **It does not notify a recovery.** Spec §7's kinds are a closed set
+///   and none of them means "the heartbeat is back", so a pool whose
+///   poller returns is logged once. `reported` exists for exactly that
+///   once: without it the log line would repeat every pass.
+///
+/// Returns rather than erroring, always: a watchdog that failed the run
+/// would be instrumentation stopping trading (spec §8).
+pub(crate) async fn watchdog_loop(
+    metrics: &Metrics,
+    notifier: &Notifier,
+    pools: &[String],
+    config: PollerConfig,
+    shutdown: &watch::Receiver<bool>,
+) {
+    let deadline = config.liveness_deadline();
+    let mut shutdown = shutdown.clone();
+    let mut reported: BTreeSet<String> = BTreeSet::new();
+    loop {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        for pool in pools {
+            let Some(last) = metrics
+                .pool_status(pool)
+                .and_then(|status| status.heartbeat)
+            else {
+                continue;
+            };
+            let silent = now.saturating_duration_since(last);
+            if silent > deadline {
+                reported.insert(pool.clone());
+                notifier.notify(Notification {
+                    kind: NotificationKind::PollerStalled,
+                    severity: Severity::High,
+                    pool: pool.clone(),
+                    account: None,
+                    message: format!(
+                        "no poller heartbeat for {}s (limit {}s)",
+                        silent.as_secs(),
+                        deadline.as_secs()
+                    ),
+                });
+            } else if reported.remove(pool) {
+                tracing::info!(
+                    pool = %pool,
+                    silent_secs = silent.as_secs(),
+                    "the poller is heartbeating again"
+                );
+            }
+        }
+        tokio::select! {
+            () = tokio::time::sleep(config.poll_interval) => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -1935,6 +2406,7 @@ fn spawn_auctioneer(
     cadence: AuctioneerCadence,
     pools: Vec<String>,
     submission_queue: Option<SubmissionQueue>,
+    instruments: Instruments,
     tick_rx: watch::Receiver<LedgerTick>,
     shutdown: &watch::Receiver<bool>,
 ) {
@@ -1957,6 +2429,7 @@ fn spawn_auctioneer(
             submission_queue.as_ref(),
             tick_rx,
             &shutdown,
+            &instruments,
         )
         .await
     });
@@ -1969,9 +2442,12 @@ fn spawn_auctioneer(
 /// `xlm_fee_reserve` of the network's native asset, and runs
 /// [`filler_loop`] off `tick_rx` until the tracker task's sender drops.
 ///
-/// `notifier` is [`Service::run`]'s one instance, shared with nothing else:
-/// the filler is the only task that ever reports through it, so this is
-/// simply where that instance is handed in rather than built here.
+/// `notifier` and `metrics` are [`Service::run`]'s one instance of each,
+/// shared with the pollers and the watchdog: both are built there, before
+/// the first task that reports or records through them, and handed in here
+/// rather than constructed per task — the dedup the notifier's cooldown
+/// rests on is keyed by `(pool, account, kind)` and a gauge means nothing
+/// split across recorders.
 #[allow(clippy::too_many_arguments)]
 fn spawn_filler(
     tasks: &mut JoinSet<Result<(), LiquidatorError>>,
@@ -1984,6 +2460,7 @@ fn spawn_filler(
     startup_delay_ledgers: u32,
     queue: Option<SubmissionQueue>,
     notifier: Arc<Notifier>,
+    metrics: Arc<Metrics>,
     tick_rx: watch::Receiver<LedgerTick>,
     shutdown: &watch::Receiver<bool>,
 ) {
@@ -2001,7 +2478,9 @@ fn spawn_filler(
             .map(|signer| Submitter::new(&rpc, &network, signer, tx_config));
         let executor = Executor::new(&store, submitter, dry_run);
         let inventory = Inventory::new(native_asset, xlm_fee_reserve);
-        let filler = Filler::new(&rpc, &store, &pools, config, executor, inventory, notifier);
+        let filler = Filler::new(
+            &rpc, &store, &pools, config, executor, inventory, notifier, metrics,
+        );
         filler_loop(
             &filler,
             startup_delay_ledgers,
@@ -2061,6 +2540,49 @@ async fn drain_tasks(
     }
 }
 
+/// The last thing every exit of [`Service::run`] does: gives the
+/// notifications still in flight [`DRAIN_BUDGET`] to leave, then returns
+/// `result` unchanged.
+///
+/// Spec §7 asks for `drain()` on every exit path, and this is where both
+/// of `run`'s are — a task failure and a shutdown signal join the same way
+/// (see [`drain_tasks`]), so they leave the same way too. `run`'s earlier
+/// `?`s need no drain of their own: everything before the [`JoinSet`] —
+/// validation and the seed pass — records gauges and logs, and nothing
+/// there notifies, so a startup failure has nothing in flight to wait on.
+/// The one exit that deliberately does not drain is the second
+/// `SIGINT`/`SIGTERM`, which `spawn_shutdown_listener` answers with
+/// `exit(130)`: a second signal means *now*, and a drain would be exactly
+/// the delay it is refusing.
+///
+/// A drain that times out is a warning and nothing else. An instrument
+/// never affects trading (spec §8), and by here there is no trading left
+/// to affect: what it costs is a notification the operator reads in the
+/// log instead of in the channel, which [`Notifier`] has already written
+/// there.
+///
+/// Two exits skip this and leave whatever was in flight behind: the
+/// second `SIGINT`/`SIGTERM`, deliberately, per the paragraph above; and a
+/// task panic, which is not deliberate but has the same shape —
+/// `resume_on_panic` calls [`std::panic::resume_unwind`] from inside
+/// [`drain_tasks`], so the panic unwinds straight out of `Service::run`
+/// and never reaches this function at all.
+async fn finish_run(
+    result: Result<(), LiquidatorError>,
+    notifier: &Notifier,
+) -> Result<(), LiquidatorError> {
+    if notifier.drain(DRAIN_BUDGET).await {
+        tracing::info!("notifications drained");
+    } else {
+        tracing::warn!(
+            budget_secs = DRAIN_BUDGET.as_secs(),
+            in_flight = notifier.in_flight(),
+            "notifications still in flight at the drain budget; leaving them behind"
+        );
+    }
+    result
+}
+
 /// The bot's two entry points: [`run`](Service::run) follows the configured
 /// pools until shut down, and [`check_config`](Service::check_config)
 /// validates and reports without following anything. Both are associated
@@ -2098,7 +2620,14 @@ impl Service {
         let (validations, mut warnings) = validate(&rpc, &config.pools).await?;
         let signing = SigningContext::from_config(config, keys)?;
         warnings.extend(validate_filler(&rpc, config, &signing).await?);
+        log_http(config.http);
         log_validation(config, &validations, &warnings);
+        // Last, and after everything is reported: the credentials the run
+        // would trust, checked here rather than discovered at the first
+        // notification the operator needed to see. One `getMe`, which
+        // reads and changes nothing — and reporting first means a refused
+        // token does not cost the operator the rest of the report.
+        verify_telegram(config).await?;
         Ok(warnings)
     }
 
@@ -2106,9 +2635,11 @@ impl Service {
     /// every pool that needs it, then follows every configured pool — one
     /// [`LedgerPoller`] per pool, one tracker task consuming their shared
     /// channel, one auctioneer task and one filler task, each fed by the
-    /// tick the tracker publishes after it acknowledges, and — only when
-    /// armed — one submission-queue worker per distinct signing key —
-    /// until a shutdown signal arrives and every task has returned.
+    /// tick the tracker publishes after it acknowledges, one watchdog,
+    /// one HTTP server when a port is set, and — only when armed — one
+    /// submission-queue worker per distinct signing key — until a
+    /// shutdown signal arrives and every task has returned. However it
+    /// ends, it leaves through `finish_run`, which drains the notifier.
     ///
     /// `keys` holds both of `AUCTIONEER_SECRET_KEY` and
     /// `FILLER_SECRET_KEY`, either or both of which may be absent — neither
@@ -2119,6 +2650,11 @@ impl Service {
     /// Whether a submission is ever actually sent is `!config.dry_run` and
     /// a key for that role — the one gate this crate has into live
     /// trading, per the safety invariant that `DRY_RUN` defaults `true`.
+    // Wiring, not logic: this function is one `spawn_*` call per kind of
+    // task, each of which is a named function with its own docs, so
+    // splitting it further would hide the one place the run's shape — and
+    // its order — can be read end to end.
+    #[allow(clippy::too_many_lines)]
     pub async fn run(config: ServiceConfig, keys: SigningKeys) -> Result<(), LiquidatorError> {
         // Installed before anything that takes time. Seeding a busy pool
         // is tens of seconds of sequential round trips, and until this is
@@ -2143,6 +2679,64 @@ impl Service {
         warnings.extend(validate_filler(&rpc, &config, &signing).await?);
         log_validation(&config, &validations, &warnings);
 
+        // The run's one recorder and its one notifier, both built before
+        // the first thing that records or reports through them — which is
+        // the seed pass below, before any task is spawned at all — rather
+        // than beside whichever task happens to be their last caller. The
+        // notifier is built here and not a line later for a second reason:
+        // `with_metrics` installs through `Arc::get_mut`, so it must be
+        // called before any delivery has been spawned. It is log-only
+        // unless both Telegram credentials are configured; every delivery
+        // it makes is spawned behind its own semaphore rather than awaited
+        // in a tick (spec §8).
+        let metrics = Arc::new(Metrics::new());
+        let notifier = Arc::new(build_notifier(&config, Arc::clone(&metrics))?);
+        // The pair every loop that needs both is handed. The pollers and
+        // the watchdog take the two `Arc`s themselves: each uses one of
+        // them the way its own constructor already spells it.
+        let instruments = Instruments {
+            metrics: Arc::clone(&metrics),
+            notifier: Arc::clone(&notifier),
+        };
+
+        let poller_config = PollerConfig::new(config.poll_interval);
+        let pool_addresses: Vec<String> = config
+            .pools
+            .iter()
+            .map(|pool| pool.address.clone())
+            .collect();
+        let mut tasks = JoinSet::new();
+        // The diagnostics port, when one is configured, and a task of the
+        // run like any other so that a shutdown joins it with the rest.
+        //
+        // Spawned **before** the seed pass, not after it: seeding a busy
+        // pool is tens of seconds of sequential round trips, and a port
+        // that is not bound for the whole of that window is a `/livez` a
+        // restart probe cannot reach — a Kubernetes deployment without a
+        // startup probe kills the process mid-seed and it starts the same
+        // seed again, and a Cloud Run revision whose startup TCP probe
+        // never connects fails to start at all. Everything `HttpState`
+        // needs exists by here, and until the pollers run `liveness`
+        // measures a pool's silence from `started` (see
+        // [`crate::http::liveness`]), which is the same rule
+        // `watchdog_loop` applies.
+        log_http(config.http);
+        if let Some(http) = config.http {
+            let state = Arc::new(HttpState {
+                metrics: Arc::clone(&metrics),
+                store: store.clone(),
+                pools: pool_addresses.clone(),
+                max_lag_ledgers: http.max_lag_ledgers,
+                liveness_deadline: poller_config.liveness_deadline(),
+                started: std::time::Instant::now(),
+            });
+            let shutdown = shutdown_rx.clone();
+            tasks.spawn(async move {
+                http::serve(http.bind, state, shutdown).await;
+                Ok(())
+            });
+        }
+
         let seed_sources = build_seed_sources(&config.seed)?;
         let needs_reseed = seed_pools_needing_it(
             &rpc,
@@ -2150,13 +2744,13 @@ impl Service {
             &config.pools,
             &seed_sources,
             config.refresh_batch,
+            config.poll_interval,
             &shutdown_rx,
+            &instruments,
         )
         .await?;
 
         let (message_tx, message_rx) = mpsc::channel(1_024);
-        let poller_config = PollerConfig::new(config.poll_interval);
-        let mut tasks = JoinSet::new();
         spawn_pollers(
             &mut tasks,
             &rpc,
@@ -2164,6 +2758,8 @@ impl Service {
             &config.pools,
             poller_config,
             &message_tx,
+            &metrics,
+            &notifier,
             &shutdown_rx,
         );
         // Every poller now holds its own sender clone; dropping this one
@@ -2176,11 +2772,6 @@ impl Service {
         let auctioneer_config = auctioneer_config_from(&config, &signing);
         let filler_config = filler_config_from(&config, &signing);
         let auctioneer_cadence = auctioneer_cadence_from(&config);
-        let pool_addresses: Vec<String> = config
-            .pools
-            .iter()
-            .map(|pool| pool.address.clone())
-            .collect();
 
         // The deciding tasks' own view of the tick, published by the
         // tracker task only after it has acknowledged one (see
@@ -2192,6 +2783,16 @@ impl Service {
             sequence: 0,
             close_time: 0,
         });
+        // Beside the pollers, never inside one: a poller that has stopped
+        // is exactly what cannot report itself.
+        spawn_watchdog(
+            &mut tasks,
+            Arc::clone(&metrics),
+            Arc::clone(&notifier),
+            pool_addresses.clone(),
+            poller_config,
+            &shutdown_rx,
+        );
         spawn_auctioneer(
             &mut tasks,
             &rpc,
@@ -2201,13 +2802,10 @@ impl Service {
             auctioneer_cadence,
             pool_addresses,
             queues.auctioneer,
+            instruments.clone(),
             tick_rx.clone(),
             &shutdown_rx,
         );
-        // One instance for the run, log-only in this phase: Telegram, the
-        // semaphore and `drain()` are Phase 6b's. The filler is its only
-        // reader.
-        let notifier = Arc::new(Notifier::log_only(config.notification_cooldown));
         spawn_filler(
             &mut tasks,
             &rpc,
@@ -2218,7 +2816,8 @@ impl Service {
             config.xlm_fee_reserve,
             config.startup_delay_ledgers,
             queues.filler,
-            notifier,
+            Arc::clone(&notifier),
+            Arc::clone(&instruments.metrics),
             tick_rx,
             &shutdown_rx,
         );
@@ -2237,6 +2836,7 @@ impl Service {
                 cadence,
                 state,
                 &shutdown,
+                &instruments,
                 tick_tx,
                 message_rx,
             )
@@ -2244,7 +2844,11 @@ impl Service {
             .map_err(LiquidatorError::from)
         });
 
-        drain_tasks(tasks, &shutdown_tx).await
+        // Both exits — every task returned, or one failed and the rest
+        // were shut down behind it — leave through here, so the
+        // notifications the way out produced have their bounded chance to
+        // go before the process does.
+        finish_run(drain_tasks(tasks, &shutdown_tx).await, &notifier).await
     }
 }
 
@@ -2261,11 +2865,11 @@ mod tests {
     use crate::chain::rpc::RpcClient;
     use crate::chain::script::{scval_b64, transaction_data_b64, ScriptedRpc};
     use crate::chain::xdr::encode::{
-        address, i128_val, map, sc_address, symbol, to_base64, vec as sc_vec,
+        address, i128_val, map, sc_address, symbol, to_base64, vec as sc_vec, FillPercent,
     };
     use crate::chain::xdr::keys;
     use crate::chain::xdr::{AuctionType, PoolEvent};
-    use crate::chain::{TxHash, TxOutcome};
+    use crate::chain::{LedgerWindow, TxHash, TxOutcome};
     use crate::config::{ChainConfig, RunMode, Secret};
     use crate::fixture::{mainnet_fixed_v2, text};
     use crate::harness;
@@ -2836,6 +3440,24 @@ mod tests {
         }
     }
 
+    /// Instruments whose notifier records every delivery instead of
+    /// logging it, and the channel to read them back off once
+    /// [`Notifier::drain`] has let the spawned deliveries finish. The
+    /// cooldown is an hour, so a second notification of the same
+    /// `(pool, account, kind)` inside one test is a deduplication a test
+    /// can assert on rather than a race.
+    fn recording_instruments() -> (Instruments, Arc<harness::RecordingChannel>) {
+        let recording = Arc::new(harness::RecordingChannel::new(false));
+        let instruments = Instruments {
+            metrics: Arc::new(Metrics::new()),
+            notifier: Arc::new(Notifier::new(
+                Box::new(Arc::clone(&recording)),
+                std::time::Duration::from_hours(1),
+            )),
+        };
+        (instruments, recording)
+    }
+
     /// A `borrow` event for `account`, which names it and nothing else.
     fn borrow(pool: &str, account: &str) -> PollerMessage {
         PollerMessage::Event {
@@ -2922,6 +3544,7 @@ mod tests {
         let (_flag, shutdown) = watch::channel(false);
         let (tick_tx, tick_rx) = tick_watch();
         let mut state = LoopState::default();
+        let instruments = Instruments::for_tests();
 
         handle_message(
             &tracker,
@@ -2929,6 +3552,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &instruments,
             &tick_tx,
             borrow(harness::POOL, harness::USER_ONE),
         )
@@ -2943,6 +3567,22 @@ mod tests {
             0,
             "an event writes no user row: valuing is the tick's job"
         );
+        assert!(
+            instruments.metrics.render().contains(&format!(
+                "events_processed_total{{pool=\"{}\"}} 1",
+                harness::POOL
+            )),
+            "the event it applied is counted, once"
+        );
+        assert_eq!(
+            instruments
+                .metrics
+                .pool_status(harness::POOL)
+                .and_then(|status| status.processed),
+            None,
+            "and no ledger is processed yet: that gauge is the cursor the poller commits, \
+             which only an acknowledged tick moves"
+        );
 
         let tick = harness::fixture_tick();
         let (message, applied) = tick_message(harness::POOL, tick);
@@ -2952,6 +3592,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &instruments,
             &tick_tx,
             message,
         )
@@ -2984,6 +3625,14 @@ mod tests {
             Some(tick.sequence),
             "the account this tick's event named is flagged for an auctioneer decision"
         );
+        assert_eq!(
+            instruments
+                .metrics
+                .pool_status(harness::POOL)
+                .and_then(|status| status.processed),
+            Some(tick.sequence),
+            "the acknowledged tick is the ledger this pool has fully applied"
+        );
         Ok(())
     }
 
@@ -3012,6 +3661,7 @@ mod tests {
                 quiet_cadence(),
                 &mut state,
                 &shutdown,
+                &Instruments::for_tests(),
                 &tick_tx,
                 message,
             )
@@ -3026,6 +3676,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &Instruments::for_tests(),
             &tick_tx,
             message,
         )
@@ -3087,6 +3738,7 @@ mod tests {
             cadence,
             &mut state,
             &shutdown,
+            &Instruments::for_tests(),
             &tick_tx,
             message,
         )
@@ -3146,6 +3798,7 @@ mod tests {
         let (_flag, shutdown) = watch::channel(false);
         let (tick_tx, _tick_rx) = tick_watch();
         let mut state = LoopState::default();
+        let (instruments, recording) = recording_instruments();
 
         let file = write_temp_seed_file(&format!(
             "[accounts]\n\"{}\" = [\"{}\"]\n",
@@ -3168,6 +3821,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &instruments,
             &tick_tx,
             PollerMessage::Gap {
                 pool: harness::POOL.to_string(),
@@ -3199,7 +3853,14 @@ mod tests {
         };
         let (message, applied) = tick_message(harness::POOL, tick);
         handle_message(
-            &tracker, &sources, cadence, &mut state, &shutdown, &tick_tx, message,
+            &tracker,
+            &sources,
+            cadence,
+            &mut state,
+            &shutdown,
+            &instruments,
+            &tick_tx,
+            message,
         )
         .await
         .expect("the scanning tick");
@@ -3207,6 +3868,53 @@ mod tests {
         assert!(
             !state.needs_reseed.contains(harness::POOL),
             "a seed that reached every source clears the mark"
+        );
+
+        assert!(
+            instruments
+                .notifier
+                .drain(std::time::Duration::from_secs(5))
+                .await,
+            "every delivery this test's notifier spawned finished"
+        );
+        let sent = recording.sent();
+        assert_eq!(
+            sent.len(),
+            1,
+            "the gap is reported, and the reseed and the tick that followed report nothing: \
+             {sent:?}"
+        );
+        assert_eq!(sent[0].kind, NotificationKind::EventGap);
+        assert_eq!(sent[0].severity, Severity::High);
+        assert_eq!(sent[0].pool, harness::POOL);
+        assert_eq!(
+            sent[0].account, None,
+            "a gap is the pool's, never one borrower's"
+        );
+        assert!(
+            sent[0].message.contains("10") && sent[0].message.contains("400000"),
+            "the message names the range that is gone: {}",
+            sent[0].message
+        );
+        assert!(
+            instruments
+                .metrics
+                .render()
+                .contains(&format!("users_tracked{{pool=\"{}\"}} 1", harness::POOL)),
+            "the full scan published the count it read"
+        );
+        assert!(
+            instruments
+                .metrics
+                .render()
+                .lines()
+                .any(|line| line.starts_with(&format!(
+                    "blend_liquidator_last_successful_scan_timestamp_seconds{{pool=\"{}\"}} ",
+                    harness::POOL
+                ))),
+            "and stamped itself as a scan that finished, for the pool it scanned: the scan \
+             is per pool, so one pool's failing scans must not hide behind another's \
+             successes"
         );
         let _ = std::fs::remove_file(&file);
         Ok(())
@@ -3227,6 +3935,7 @@ mod tests {
         let (_flag, shutdown) = watch::channel(false);
         let (tick_tx, tick_rx) = tick_watch();
         let mut state = LoopState::default();
+        let instruments = Instruments::for_tests();
         state.pending.insert(
             harness::POOL.to_string(),
             BTreeSet::from([harness::USER_ONE.to_string()]),
@@ -3239,6 +3948,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &instruments,
             &tick_tx,
             message,
         )
@@ -3261,6 +3971,14 @@ mod tests {
                 close_time: 0
             },
             "a tick that never acknowledged is never published to the auctioneer either"
+        );
+        assert_eq!(
+            instruments
+                .metrics
+                .pool_status(harness::POOL)
+                .and_then(|status| status.processed),
+            None,
+            "nor recorded as processed: the range it covers will be read again"
         );
         Ok(())
     }
@@ -3288,6 +4006,7 @@ mod tests {
         let (_flag, shutdown) = watch::channel(false);
         let (tick_tx, _tick_rx) = tick_watch();
         let mut state = LoopState::default();
+        let instruments = Instruments::for_tests();
 
         let failing_fill = PollerMessage::Event {
             pool: harness::POOL.to_string(),
@@ -3306,6 +4025,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &instruments,
             &tick_tx,
             failing_fill,
         )
@@ -3327,6 +4047,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &instruments,
             &tick_tx,
             other_message,
         )
@@ -3347,6 +4068,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &instruments,
             &tick_tx,
             message,
         )
@@ -3360,6 +4082,15 @@ mod tests {
             !state.unapplied.contains(harness::POOL),
             "the mark is cleared once it has declined a tick"
         );
+        assert_eq!(
+            instruments
+                .metrics
+                .pool_status(harness::POOL)
+                .and_then(|status| status.processed),
+            None,
+            "a tick that declined its acknowledgement commits no cursor, so nothing records \
+             it as this pool's last processed ledger"
+        );
 
         // A second tick, with no failure in between, is acknowledged
         // normally. A flag that latched instead of clearing would stall
@@ -3371,6 +4102,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &instruments,
             &tick_tx,
             message,
         )
@@ -3379,6 +4111,14 @@ mod tests {
         assert!(
             applied.await.is_ok(),
             "with the mark cleared, a tick with no failure ahead of it is acknowledged"
+        );
+        assert_eq!(
+            instruments
+                .metrics
+                .pool_status(harness::POOL)
+                .and_then(|status| status.processed),
+            Some(harness::fixture_tick().sequence),
+            "and the acknowledged one is recorded"
         );
         Ok(())
     }
@@ -3416,6 +4156,7 @@ mod tests {
             quiet_cadence(),
             LoopState::default(),
             &shutdown,
+            &Instruments::for_tests(),
             tick_tx,
             receiver,
         )
@@ -3473,6 +4214,7 @@ mod tests {
             harness::USER_ONE
         ));
         let sources = vec![SeedSource::File(FileSeed::load(&file).expect("loads"))];
+        let instruments = Instruments::for_tests();
 
         let incomplete = seed_pools_needing_it(
             &client,
@@ -3480,12 +4222,34 @@ mod tests {
             &[pool_config(harness::POOL, USDC, &["*"], &["*"])],
             &sources,
             20,
+            std::time::Duration::from_millis(1),
             &shutdown,
+            &instruments,
         )
         .await
         .expect("seeding succeeds");
 
         assert!(incomplete.is_empty(), "the one source answered");
+        let rendered = instruments.metrics.render();
+        assert!(
+            rendered.contains(&format!(
+                "seed_accounts_loaded{{pool=\"{}\"}} 1",
+                harness::POOL
+            )),
+            "the seed publishes what it loaded, for this pool: {rendered}"
+        );
+        // The seed runs before this pool has a poller to report itself,
+        // and can outlast `/livez`'s deadline on a busy pool: what it is
+        // working on is alive, and says so.
+        assert!(
+            instruments
+                .metrics
+                .pool_status(harness::POOL)
+                .and_then(|status| status.heartbeat)
+                .is_some(),
+            "seeding a pool heartbeats for it, so a restart probe cannot read the \
+             seed as a poller that has stopped"
+        );
         let cursor = store
             .cursor(&events_cursor(harness::POOL))
             .await
@@ -3497,6 +4261,97 @@ mod tests {
         );
         assert_eq!(cursor.paging_token, None);
         assert_eq!(store.count_users(harness::POOL).await.expect("count"), 1);
+        Ok(())
+    }
+
+    /// The seed heartbeats for **every** configured pool, not only the one
+    /// it is working on.
+    ///
+    /// A pool the pass has not reached yet, or one it skipped because it
+    /// needs no seed, has no poller either — nothing is spawned until the
+    /// whole pass returns — so a heartbeat only for the pool being seeded
+    /// leaves every other pool measured from `HttpState::started` alone.
+    /// The moment that baseline passes, `/livez` fails for one of them and
+    /// a restart probe kills the bot in the middle of the seed: the
+    /// restart loop closed for the pool being seeded, still open for the
+    /// rest.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_seed_heartbeats_for_every_configured_pool(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        // Followed already — a user and a cursor — so the pass skips it
+        // without seeding, reaching the `continue` above the wrapper.
+        store
+            .upsert_user(&TrackedUser {
+                pool: POOL_B.to_string(),
+                account: harness::USER_TWO.to_string(),
+                health_factor: 20_000_000,
+                collateral: BTreeMap::new(),
+                liabilities: BTreeMap::from([(0, 1)]),
+                updated_ledger: tick.sequence,
+                recheck_ledger: None,
+            })
+            .await
+            .expect("seed a user for the followed pool");
+        store
+            .set_cursor(
+                &events_cursor(POOL_B),
+                &Cursor {
+                    ledger: tick.sequence,
+                    paging_token: None,
+                },
+            )
+            .await
+            .expect("a cursor for the followed pool");
+
+        let rpc = ScriptedRpc::start().await;
+        rpc.expect(
+            "getLatestLedger",
+            json!({"id": "aa", "protocolVersion": 27, "sequence": tick.sequence,
+                   "closeTime": tick.close_time.to_string()}),
+        );
+        harness::script_snapshot(&rpc, &[harness::USER_ONE]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let (_flag, shutdown) = watch::channel(false);
+        let file = write_temp_seed_file(&format!(
+            "[accounts]\n\"{}\" = [\"{}\"]\n",
+            harness::POOL,
+            harness::USER_ONE
+        ));
+        let sources = vec![SeedSource::File(FileSeed::load(&file).expect("loads"))];
+        let instruments = Instruments::for_tests();
+
+        // The followed pool first, so the pass has already `continue`d past
+        // it by the time the second pool's seed starts stamping.
+        let incomplete = seed_pools_needing_it(
+            &client,
+            &store,
+            &[
+                pool_config(POOL_B, USDC, &["*"], &["*"]),
+                pool_config(harness::POOL, USDC, &["*"], &["*"]),
+            ],
+            &sources,
+            20,
+            std::time::Duration::from_millis(1),
+            &shutdown,
+            &instruments,
+        )
+        .await
+        .expect("seeding succeeds");
+
+        assert!(incomplete.is_empty(), "the one source answered");
+        for pool in [harness::POOL, POOL_B] {
+            assert!(
+                instruments
+                    .metrics
+                    .pool_status(pool)
+                    .and_then(|status| status.heartbeat)
+                    .is_some(),
+                "every configured pool is heartbeated while the seed runs, the ones it \
+                 seeds and the ones it does not: {pool} has none"
+            );
+        }
+        assert_eq!(rpc.remaining(), 0, "the followed pool cost no chain read");
         Ok(())
     }
 
@@ -3536,7 +4391,14 @@ mod tests {
 
         let (message, applied) = tick_message(harness::POOL, tick);
         handle_message(
-            &tracker, &sources, cadence, &mut state, &shutdown, &tick_tx, message,
+            &tracker,
+            &sources,
+            cadence,
+            &mut state,
+            &shutdown,
+            &Instruments::for_tests(),
+            &tick_tx,
+            message,
         )
         .await
         .expect("a failing scan is not a failing tick");
@@ -3562,7 +4424,14 @@ mod tests {
         };
         let (message, applied) = tick_message(harness::POOL, next);
         handle_message(
-            &tracker, &sources, cadence, &mut state, &shutdown, &tick_tx, message,
+            &tracker,
+            &sources,
+            cadence,
+            &mut state,
+            &shutdown,
+            &Instruments::for_tests(),
+            &tick_tx,
+            message,
         )
         .await
         .expect("the following tick");
@@ -3623,7 +4492,9 @@ mod tests {
             &[pool_config(harness::POOL, USDC, &["*"], &["*"])],
             &sources,
             20,
+            std::time::Duration::from_millis(1),
             &shutdown,
+            &Instruments::for_tests(),
         )
         .await
         .expect("a source that does not answer is not fatal");
@@ -3677,7 +4548,9 @@ mod tests {
             &[pool_config(harness::POOL, USDC, &["*"], &["*"])],
             &sources,
             20,
+            std::time::Duration::from_millis(1),
             &shutdown,
+            &Instruments::for_tests(),
         )
         .await
         .expect("a chain failure while seeding is not fatal");
@@ -3917,6 +4790,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &Instruments::for_tests(),
             &tick_tx,
             borrow(harness::POOL, harness::USER_ONE),
         )
@@ -3939,6 +4813,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &Instruments::for_tests(),
             &tick_tx,
             message,
         )
@@ -4020,6 +4895,7 @@ mod tests {
             tick,
             None,
             &shutdown,
+            &Instruments::for_tests(),
         )
         .await
         .expect("a healthy borrower's pass never fails");
@@ -4048,6 +4924,7 @@ mod tests {
             tick,
             None,
             &shutdown,
+            &Instruments::for_tests(),
         )
         .await
         .expect("a second pass");
@@ -4130,6 +5007,7 @@ mod tests {
             tick,
             None,
             &shutdown,
+            &Instruments::for_tests(),
         )
         .await
         .expect("one undecidable borrower does not fail the pass");
@@ -4219,6 +5097,7 @@ mod tests {
             tick,
             None,
             &shutdown,
+            &Instruments::for_tests(),
         )
         .await
         .expect("pass one");
@@ -4244,6 +5123,7 @@ mod tests {
             next_tick,
             None,
             &shutdown,
+            &Instruments::for_tests(),
         )
         .await
         .expect("pass two");
@@ -4317,6 +5197,7 @@ mod tests {
             tick,
             None,
             &shutdown,
+            &Instruments::for_tests(),
         )
         .await
         .expect("a failed action is this borrower's failure, not the pass's");
@@ -4402,6 +5283,7 @@ mod tests {
             tick,
             None,
             &shutdown,
+            &Instruments::for_tests(),
         )
         .await
         .expect("a refusal is this borrower's answer, not the pass's failure");
@@ -4473,6 +5355,7 @@ mod tests {
             tick,
             None,
             &shutdown,
+            &Instruments::for_tests(),
         )
         .await
         .expect("a healthy borrower's pass never fails");
@@ -4685,6 +5568,7 @@ mod tests {
             }
         });
 
+        let (instruments, recording) = recording_instruments();
         let cadence = AuctioneerCadence {
             refresh_batch: 10,
             oracle_scan_ledgers: 0,
@@ -4703,6 +5587,7 @@ mod tests {
             cadence,
             submission_queue: Some(&queue),
             shutdown: &shutdown,
+            instruments: &instruments,
         };
         let mut state = AuctioneerState::default();
         let tick = harness::fixture_tick();
@@ -4748,6 +5633,34 @@ mod tests {
             recorded[0].tx_hash.is_none(),
             "but nothing was sent: the startup delay has not elapsed, so the row names no \
              transaction"
+        );
+        // Counted the same way the row reads: the bot decided and
+        // recorded, which is an attempt, and nothing was sent, which is
+        // no result at all — not a failure.
+        let rendered = instruments.metrics.render();
+        assert!(
+            rendered.contains("creations_total{result=\"attempted\"} 1"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("creations_total{result=\"succeeded\"} 0"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("creations_total{result=\"failed\"} 0"),
+            "a creation the delay held back failed at nothing: {rendered}"
+        );
+        assert!(
+            instruments
+                .notifier
+                .drain(std::time::Duration::from_secs(5))
+                .await
+        );
+        assert_eq!(
+            recording.sent_count(),
+            0,
+            "and nothing is reported for a creation that never reached the chain: {:?}",
+            recording.sent()
         );
 
         // Held back, not settled: the bot still believes this is bad debt
@@ -4796,6 +5709,44 @@ mod tests {
             None,
             "sent and succeeded, the borrower is settled and its flag cleared"
         );
+        let rendered = instruments.metrics.render();
+        assert!(
+            rendered.contains("creations_total{result=\"attempted\"} 2"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("creations_total{result=\"succeeded\"} 1"),
+            "the transaction the chain applied is the one that succeeded: {rendered}"
+        );
+        assert!(
+            rendered.contains("creations_total{result=\"failed\"} 0"),
+            "and it is not also counted as a failure: {rendered}"
+        );
+        assert!(
+            instruments
+                .notifier
+                .drain(std::time::Duration::from_secs(5))
+                .await
+        );
+        let sent = recording.sent();
+        assert_eq!(
+            sent.len(),
+            1,
+            "the creation that landed is reported, and only it: {sent:?}"
+        );
+        assert_eq!(sent[0].kind, NotificationKind::BadDebtReported);
+        assert_eq!(
+            sent[0].severity,
+            Severity::Medium,
+            "bad debt is worth looking at, not worth waking anyone"
+        );
+        assert_eq!(sent[0].pool, harness::POOL);
+        assert_eq!(sent[0].account.as_deref(), Some(account.as_str()));
+        assert!(
+            sent[0].message.contains("bad debt reported in ledger 1"),
+            "the message names the ledger it landed in: {}",
+            sent[0].message
+        );
 
         drop(queue);
         worker.await.expect("worker");
@@ -4832,6 +5783,7 @@ mod tests {
                 quiet_cadence(),
                 &mut state,
                 &shutdown,
+                &Instruments::for_tests(),
                 &tick_tx,
                 message,
             )
@@ -4896,6 +5848,7 @@ mod tests {
             tick,
             None,
             &shutdown,
+            &Instruments::for_tests(),
         )
         .await
         .expect("one undecidable borrower does not fail the pass");
@@ -4983,6 +5936,7 @@ mod tests {
             tick,
             Some(&queue),
             &shutdown,
+            &Instruments::for_tests(),
         )
         .await
         .expect("a failed submission is one borrower's, not the pass's");
@@ -5011,6 +5965,302 @@ mod tests {
             "with the hash of the transaction that failed"
         );
         Ok(())
+    }
+
+    /// A creation the queue could not carry through at all is counted as
+    /// a failure and reported. [`QueueError::Chain`] is narrowed to a
+    /// submission that provably sent nothing and has spent its retry
+    /// budget, so this creation is gone rather than pending — while the
+    /// borrower keeps its flag exactly as every other unsettled one does,
+    /// because the report is instrumenting and never a decision.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_creation_the_queue_dropped_notifies_submission_dropped(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let account = synthetic_debtor();
+        let signer = test_signer();
+        script_snapshot_bad_debt(&rpc, &account);
+        script_account_entry(&rpc, &signer);
+        script_simulate_accepted(&rpc);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let network = Network::testnet();
+        let submitter = Submitter::new(&client, &network, &signer, test_tx_config());
+        let auctioneer = Auctioneer::new(&client, &store, armed_config(), Some(submitter));
+        let (_flag, shutdown) = watch::channel(false);
+        let (instruments, recording) = recording_instruments();
+        let tick = harness::fixture_tick();
+
+        // The shape `run_queue` answers when the send was refused
+        // outright: no envelope reached the chain, and the budget this
+        // submission carried is spent.
+        let (queue, mut queue_rx) = SubmissionQueue::new(NonZeroUsize::new(8).expect("non-zero"));
+        let worker = tokio::spawn(async move {
+            while let Some(queued) = queue_rx.recv().await {
+                let _ = queued
+                    .respond
+                    .send(Err(QueueError::Chain(ChainError::Rejected(
+                        "tx_insufficient_fee".to_string(),
+                    ))));
+            }
+        });
+
+        store
+            .upsert_user(&tracked_user(&account, tick.sequence))
+            .await
+            .expect("seed the row");
+        store
+            .flag_recheck(harness::POOL, &account, tick.sequence)
+            .await
+            .expect("flag");
+        let batch = store
+            .users_needing_recheck(harness::POOL, 1)
+            .await
+            .expect("read the recheck queue");
+        recheck_batch(
+            &auctioneer,
+            &store,
+            harness::POOL,
+            &batch,
+            tick,
+            Some(&queue),
+            &shutdown,
+            &instruments,
+        )
+        .await
+        .expect("a dropped creation is one borrower's, not the pass's");
+        drop(queue);
+        worker.await.expect("worker");
+
+        assert_eq!(
+            store
+                .user(harness::POOL, &account)
+                .await
+                .expect("read")
+                .and_then(|user| user.recheck_ledger),
+            Some(tick.sequence + 1),
+            "the borrower is still owed a creation, so its flag moves forward rather than \
+             being cleared"
+        );
+        let rendered = instruments.metrics.render();
+        assert!(
+            rendered.contains("creations_total{result=\"attempted\"} 1"),
+            "the `creations` row was written before the queue was asked, so the bot did \
+             attempt this one: {rendered}"
+        );
+        assert!(
+            rendered.contains("creations_total{result=\"failed\"} 1"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("creations_total{result=\"succeeded\"} 0"),
+            "{rendered}"
+        );
+        assert!(
+            instruments
+                .notifier
+                .drain(std::time::Duration::from_secs(5))
+                .await
+        );
+        let sent = recording.sent();
+        assert_eq!(sent.len(), 1, "one dropped creation, one report: {sent:?}");
+        assert_eq!(sent[0].kind, NotificationKind::SubmissionDropped);
+        assert_eq!(
+            sent[0].severity,
+            Severity::High,
+            "a creation this bot decided on and never made is money at stake"
+        );
+        assert_eq!(sent[0].pool, harness::POOL);
+        assert_eq!(sent[0].account.as_deref(), Some(account.as_str()));
+        assert!(
+            sent[0].message.contains("rejected at send"),
+            "the queue's own error says what happened: {}",
+            sent[0].message
+        );
+        assert_eq!(
+            rpc.remaining(),
+            0,
+            "every scripted answer was used: the decision and the simulation both ran"
+        );
+        Ok(())
+    }
+
+    /// A [`CreationOutcome`] shaped as [`Auctioneer::act`] answers one.
+    /// `seed` gives each case its own account, because the notifier
+    /// deduplicates by `(pool, account, kind)` and a shared account would
+    /// silence the second case of a kind rather than test it.
+    fn creation_outcome(
+        kind: CreationKind,
+        seed: u8,
+        percent: Option<u32>,
+        submission: Option<TxOutcome>,
+    ) -> CreationOutcome {
+        CreationOutcome {
+            kind,
+            account: synthetic_account(seed),
+            percent: percent.map(|value| FillPercent::try_from(value).expect("1..=100")),
+            simulated: true,
+            creation_id: 1,
+            dry_run: false,
+            submission,
+        }
+    }
+
+    /// The submission a queue answers for a transaction the chain applied
+    /// in `ledger`.
+    fn landed(ledger: u32) -> TxOutcome {
+        TxOutcome::Succeeded {
+            hash: TxHash([9_u8; 32]),
+            ledger,
+            return_value: None,
+        }
+    }
+
+    /// A creation the chain landed is counted as an attempt *and* a
+    /// success, and reported under the kind spec §7 names for it — an
+    /// auction at its percent, bad debt at the severity its own kind
+    /// carries.
+    #[tokio::test]
+    async fn a_landed_creation_counts_and_notifies() {
+        let (instruments, recording) = recording_instruments();
+        note_creation(
+            &instruments,
+            harness::POOL,
+            &creation_outcome(CreationKind::Auction, 1, Some(42), Some(landed(7))),
+        );
+        note_creation(
+            &instruments,
+            harness::POOL,
+            &creation_outcome(CreationKind::BadDebt, 2, None, Some(landed(9))),
+        );
+        note_creation(
+            &instruments,
+            harness::POOL,
+            &creation_outcome(CreationKind::Auction, 3, None, Some(landed(11))),
+        );
+
+        let rendered = instruments.metrics.render();
+        assert!(
+            rendered.contains("creations_total{result=\"attempted\"} 3"),
+            "every recorded creation is an attempt: {rendered}"
+        );
+        assert!(
+            rendered.contains("creations_total{result=\"succeeded\"} 3"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("creations_total{result=\"failed\"} 0"),
+            "a transaction the chain applied is not also a failure: {rendered}"
+        );
+
+        assert!(
+            instruments
+                .notifier
+                .drain(std::time::Duration::from_secs(5))
+                .await
+        );
+        let sent = recording.sent();
+        assert_eq!(sent.len(), 3, "one report each: {sent:?}");
+        let about = |seed: u8| {
+            let account = synthetic_account(seed);
+            sent.iter()
+                .find(|notification| notification.account.as_deref() == Some(account.as_str()))
+                .cloned()
+                .unwrap_or_else(|| panic!("a notification about {account}: {sent:?}"))
+        };
+        let auction = about(1);
+        assert_eq!(auction.kind, NotificationKind::AuctionCreated);
+        assert_eq!(auction.severity, Severity::Low);
+        assert_eq!(auction.pool, harness::POOL);
+        assert_eq!(
+            auction.message,
+            "liquidation auction created at 42% in ledger 7"
+        );
+        let bad_debt = about(2);
+        assert_eq!(bad_debt.kind, NotificationKind::BadDebtReported);
+        assert_eq!(
+            bad_debt.severity,
+            Severity::Medium,
+            "bad debt is worth looking at, not worth waking anyone"
+        );
+        assert_eq!(bad_debt.message, "bad debt reported in ledger 9");
+        assert_eq!(
+            about(3).message,
+            "liquidation auction created at ?% in ledger 11",
+            "the percent is optional on the type, and its absence is said rather than guessed"
+        );
+    }
+
+    /// A creation the chain did not land is still an attempt, and is
+    /// reported to nobody: only what landed is worth a notification.
+    ///
+    /// The split between the two counted results is the chain's answer,
+    /// never the row's existence. `Failed` charged a fee and created no
+    /// auction and `Expired` provably never applied, so both are
+    /// failures; `Unknown` may still land, and a counter that guessed
+    /// would have to be un-counted; `None` was never sent at all — a dry
+    /// run's creation, or an armed bot holding fire.
+    #[tokio::test]
+    async fn a_creation_the_chain_did_not_land_counts_but_notifies_nobody() {
+        let (instruments, recording) = recording_instruments();
+        let window = LedgerWindow::try_new(1, 100).expect("a window");
+        for submission in [
+            Some(TxOutcome::Failed {
+                hash: TxHash([1_u8; 32]),
+                ledger: 12,
+                contract_error: Some(1_205),
+                result: TransactionResult {
+                    fee_charged: 100,
+                    result: TransactionResultResult::TxFailed(VecM::default()),
+                    ext: TransactionResultExt::V0,
+                },
+            }),
+            Some(TxOutcome::Expired {
+                hash: TxHash([2_u8; 32]),
+                window,
+                latest_ledger: 13,
+            }),
+            Some(TxOutcome::Unknown {
+                hash: TxHash([3_u8; 32]),
+                sequence: 5,
+                window,
+            }),
+            None,
+        ] {
+            note_creation(
+                &instruments,
+                harness::POOL,
+                &creation_outcome(CreationKind::Auction, 4, Some(50), submission),
+            );
+        }
+
+        let rendered = instruments.metrics.render();
+        assert!(
+            rendered.contains("creations_total{result=\"attempted\"} 4"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("creations_total{result=\"succeeded\"} 0"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("creations_total{result=\"failed\"} 2"),
+            "the failed and the expired one; the unresolved one and the one nothing sent are \
+             neither: {rendered}"
+        );
+        assert!(
+            instruments
+                .notifier
+                .drain(std::time::Duration::from_secs(5))
+                .await
+        );
+        assert_eq!(
+            recording.sent_count(),
+            0,
+            "nothing landed, so nothing is reported: {:?}",
+            recording.sent()
+        );
     }
 
     /// The auctioneer failing does not stall the cursor: a decision is not
@@ -5054,6 +6304,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &Instruments::for_tests(),
             &tick_tx,
             borrow(harness::POOL, harness::USER_ONE),
         )
@@ -5068,6 +6319,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &Instruments::for_tests(),
             &tick_tx,
             message,
         )
@@ -5124,6 +6376,7 @@ mod tests {
             tick,
             None,
             &shutdown,
+            &Instruments::for_tests(),
         )
         .await;
         assert!(
@@ -5156,6 +6409,7 @@ mod tests {
             quiet_cadence(),
             &mut state,
             &shutdown,
+            &Instruments::for_tests(),
             &tick_tx,
             message,
         )
@@ -5342,6 +6596,8 @@ mod tests {
             high_fee_profit_threshold: 1_000_000_000_000_000,
             inventory_refresh: std::time::Duration::from_secs(30),
             notification_cooldown: std::time::Duration::from_hours(24),
+            http: None,
+            telegram: None,
         }
     }
 
@@ -5615,6 +6871,7 @@ mod tests {
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
             Arc::new(Notifier::log_only(std::time::Duration::from_hours(1))),
+            Arc::new(Metrics::new()),
         );
         let (flag_tx, flag_rx) = watch::channel(false);
         let (tick_tx, tick_rx) = watch::channel(LedgerTick {
@@ -5680,6 +6937,7 @@ mod tests {
             Executor::new(&store, None, true),
             Inventory::new(XLM.to_string(), 0),
             Arc::new(Notifier::log_only(std::time::Duration::from_hours(1))),
+            Arc::new(Metrics::new()),
         );
         let (flag_tx, flag_rx) = watch::channel(false);
         let (tick_tx, tick_rx) = watch::channel(LedgerTick {
@@ -5763,6 +7021,7 @@ mod tests {
             Executor::new(&store, Some(submitter), true),
             Inventory::new(XLM.to_string(), 0),
             Arc::new(Notifier::log_only(std::time::Duration::from_hours(1))),
+            Arc::new(Metrics::new()),
         );
         let (flag_tx, flag_rx) = watch::channel(false);
         let (tick_tx, tick_rx) = watch::channel(LedgerTick {
@@ -5799,5 +7058,383 @@ mod tests {
 
         assert_eq!(rpc.remaining(), 0);
         Ok(())
+    }
+
+    /// The watchdog notifies about a poller whose heartbeat has aged past
+    /// [`PollerConfig::liveness_deadline`], once per cooldown, and says
+    /// nothing about one that keeps heartbeating — nor about a pool with
+    /// no heartbeat at all, which is a poller that has not started rather
+    /// than one that has stopped.
+    #[tokio::test]
+    async fn the_watchdog_notifies_a_stalled_poller_once_per_cooldown() {
+        const STALLED: &str = "pool-stalled";
+        const ALIVE: &str = "pool-alive";
+        const SILENT: &str = "pool-never-started";
+
+        let metrics = Arc::new(Metrics::new());
+        // `max_backoff` zero makes the deadline exactly five intervals —
+        // 100 ms — so the stale stamp below is four deadlines old and the
+        // live pool's is never more than one interval old. The margins are
+        // this wide on purpose: a loaded CI runner that starves the
+        // stamping task below for a few tens of milliseconds would
+        // otherwise turn the "alive" assertion into a flake.
+        let config = PollerConfig {
+            poll_interval: std::time::Duration::from_millis(20),
+            page_limit: 200,
+            min_backoff: std::time::Duration::from_millis(1),
+            max_backoff: std::time::Duration::ZERO,
+        };
+        assert_eq!(
+            config.liveness_deadline(),
+            std::time::Duration::from_millis(100)
+        );
+        metrics.heartbeat_at(
+            STALLED,
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(400))
+                .expect("a recent instant"),
+            std::time::SystemTime::now(),
+        );
+        // A pool whose poller is running: its own task keeps stamping,
+        // which is what a live loop does every iteration.
+        let alive = tokio::spawn({
+            let metrics = Arc::clone(&metrics);
+            async move {
+                loop {
+                    metrics.heartbeat(ALIVE);
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+            }
+        });
+
+        let recording = Arc::new(harness::RecordingChannel::new(false));
+        let notifier = Notifier::new(
+            Box::new(Arc::clone(&recording)),
+            std::time::Duration::from_hours(1),
+        );
+        let pools = vec![STALLED.to_string(), ALIVE.to_string(), SILENT.to_string()];
+        let (flag, shutdown) = watch::channel(false);
+        let stop = async {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            flag.send(true).expect("raise shutdown");
+        };
+        let ((), ()) = tokio::join!(
+            watchdog_loop(&metrics, &notifier, &pools, config, &shutdown),
+            stop
+        );
+        alive.abort();
+
+        assert!(notifier.drain(std::time::Duration::from_secs(5)).await);
+        let sent = recording.sent();
+        // Per pool, never by total count: a run of the alive pool's
+        // stamping task that the runner starved would then read as this
+        // test's own flake rather than as what it is.
+        let stalls = |pool: &str| -> Vec<Notification> {
+            sent.iter()
+                .filter(|notification| {
+                    notification.kind == NotificationKind::PollerStalled
+                        && notification.pool == pool
+                })
+                .cloned()
+                .collect()
+        };
+        let stalled = stalls(STALLED);
+        assert_eq!(
+            stalled.len(),
+            1,
+            "one stalled poller, and the cooldown suppresses every later pass: {sent:?}"
+        );
+        assert_eq!(stalled[0].severity, Severity::High);
+        assert_eq!(stalled[0].account, None);
+        assert!(
+            stalled[0].message.contains("no poller heartbeat"),
+            "the message says what is missing: {}",
+            stalled[0].message
+        );
+        assert!(
+            stalls(ALIVE).is_empty(),
+            "a poller that keeps heartbeating is not stalled: {sent:?}"
+        );
+        assert!(
+            stalls(SILENT).is_empty(),
+            "a poller that has never heartbeated has not started, which is \
+             not the same as having stopped: {sent:?}"
+        );
+    }
+
+    /// A [`NotificationChannel`] that holds every send until the test hands
+    /// it a permit: what proves a drain *waited* rather than merely
+    /// returning. Simpler than the notifier tests' own gate because
+    /// nothing here needs a send to be released and then re-held —
+    /// `release` adds the permits once and every held send proceeds.
+    struct GatedChannel {
+        gate: tokio::sync::Semaphore,
+        sent: std::sync::atomic::AtomicUsize,
+    }
+
+    impl GatedChannel {
+        fn new() -> Self {
+            Self {
+                gate: tokio::sync::Semaphore::new(0),
+                sent: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        /// Lets every held send — and every later one — through.
+        fn release(&self) {
+            self.gate.add_permits(crate::notifier::NOTIFY_IN_FLIGHT);
+        }
+
+        fn sent_count(&self) -> usize {
+            self.sent.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl crate::notifier::NotificationChannel for Arc<GatedChannel> {
+        fn name(&self) -> &'static str {
+            "gated"
+        }
+
+        fn send<'a>(
+            &'a self,
+            _notification: &'a Notification,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(), crate::notifier::NotifyError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                let permit = self.gate.acquire().await.expect("the gate is never closed");
+                permit.forget();
+                self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    /// The URL of the database `#[sqlx::test]` built for this test:
+    /// `DATABASE_URL`'s own host and credentials — the server the harness
+    /// created it on — with the per-test database name the pool itself
+    /// reports. What a test driving an entry point that takes a
+    /// [`ServiceConfig`] needs, since those connect by URL rather than
+    /// borrowing a pool.
+    ///
+    /// Read with `std::env::var`, the same source `#[sqlx::test]` itself
+    /// reads: `dotenvy` is only a transitive dependency here (`sqlx-macros`
+    /// and `sqlx-postgres` pull it), never declared in this crate's own
+    /// `Cargo.toml`, so `.env` parsing is not available to this crate's own
+    /// code and is out of scope for this helper.
+    async fn test_database_url(store: &Store) -> String {
+        let name: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(store.pool())
+            .await
+            .expect("the test database names itself");
+        let base = std::env::var("DATABASE_URL").expect("sqlx::test needs DATABASE_URL too");
+        // The query string (`?sslmode=...`, say) is not part of the
+        // database path and must survive the rebuild, not just the split.
+        let (path, query) = match base.split_once('?') {
+            Some((path, query)) => (path, Some(query)),
+            None => (base.as_str(), None),
+        };
+        let (server, _) = path
+            .rsplit_once('/')
+            .expect("DATABASE_URL carries a database path");
+        match query {
+            Some(query) => format!("{server}/{name}?{query}"),
+            None => format!("{server}/{name}"),
+        }
+    }
+
+    /// The configured credentials decide the channel, and nothing else
+    /// does: both of `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` build the
+    /// Telegram channel, and their absence leaves the run log-only. The
+    /// token reaches the channel and no rendering of the notifier.
+    #[tokio::test]
+    async fn the_notifier_is_telegram_when_configured_and_log_otherwise() {
+        let metrics = Arc::new(Metrics::new());
+        let mut config = filler_service_config(vec![filler_pool_config(0)], true, 0);
+
+        let notifier = build_notifier(&config, Arc::clone(&metrics)).expect("a log-only notifier");
+        let rendered = format!("{notifier:?}");
+        assert!(
+            rendered.contains("channel: \"log\""),
+            "no credentials is log-only: {rendered}"
+        );
+
+        config.telegram = Some(crate::config::TelegramConfig {
+            token: Secret::new("123456:a-bot-token"),
+            chat_id: "-1001".to_string(),
+            base_url: None,
+        });
+        let notifier = build_notifier(&config, metrics).expect("a telegram notifier");
+        let rendered = format!("{notifier:?}");
+        assert!(
+            rendered.contains("channel: \"telegram\""),
+            "configured credentials pick the telegram channel: {rendered}"
+        );
+        assert!(
+            !rendered.contains("a-bot-token"),
+            "the token never renders: {rendered}"
+        );
+    }
+
+    /// `check-config` proves the configured Telegram credentials work
+    /// before the bot starts trusting them: a `getMe` that answers is an
+    /// `info!` and a pass, and one that refuses is a configuration error —
+    /// exit 2 through `main` — whose message never carries the token.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn check_config_verifies_a_configured_telegram_token(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        const TOKEN: &str = "123456:a-bot-token";
+
+        let store = Store::from_pool(db);
+        let database_url = test_database_url(&store).await;
+        let rpc = ScriptedRpc::start().await;
+        // One script per `check_config` call: the scripted answers are
+        // consumed in order, and this test makes two calls.
+        for _ in 0..2 {
+            script_pool(
+                &rpc,
+                POOL_A,
+                BACKSTOP_A,
+                PoolStatus::Active.code(),
+                &[usable_reserve()],
+                LEDGER,
+            );
+        }
+
+        let telegram = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"ok": true, "result": {"id": 1, "is_bot": true, "username": "liquidator_bot"}}),
+            ))
+            // What was scripted was consumed: `check_config` verifies the
+            // token with exactly one `getMe`, and wiremock asserts it on
+            // the server's drop.
+            .expect(1)
+            .mount(&telegram)
+            .await;
+
+        let mut config =
+            filler_service_config(vec![pool_config(POOL_A, USDC, &[USDC], &["*"])], true, 0);
+        config.chain.rpc_url = rpc.url();
+        config.database_url = Secret::new(database_url);
+        config.telegram = Some(crate::config::TelegramConfig {
+            token: Secret::new(TOKEN),
+            chat_id: "-1001".to_string(),
+            base_url: Some(telegram.uri()),
+        });
+
+        let warnings = Service::check_config(
+            &config,
+            SigningKeys {
+                auctioneer: None,
+                filler: None,
+            },
+        )
+        .await
+        .expect("a reachable telegram passes the check");
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("no FILLER_SECRET_KEY")),
+            "the keyless run still reports its own warnings: {warnings:?}"
+        );
+
+        // The same configuration against a bot token Telegram refuses.
+        let refusing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(
+                json!({"ok": false, "error_code": 401, "description": "Unauthorized"}),
+            ))
+            .expect(1)
+            .mount(&refusing)
+            .await;
+        config.telegram = Some(crate::config::TelegramConfig {
+            token: Secret::new(TOKEN),
+            chat_id: "-1001".to_string(),
+            base_url: Some(refusing.uri()),
+        });
+
+        let error = Service::check_config(
+            &config,
+            SigningKeys {
+                auctioneer: None,
+                filler: None,
+            },
+        )
+        .await
+        .expect_err("a refused token fails the check");
+        assert!(
+            matches!(error, LiquidatorError::Config(_)),
+            "a credential the operator must fix is a configuration error: {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("telegram") && message.contains("401"),
+            "the message says which channel refused and how: {message}"
+        );
+        assert!(
+            !message.contains("a-bot-token"),
+            "the token never reaches an error message: {message}"
+        );
+        Ok(())
+    }
+
+    /// Every exit of the run drains the notifier before it returns, and
+    /// returns what it was given: `finish_run` waits for the sends still in
+    /// flight — proved here by a channel that holds one until the test
+    /// releases it — and passes both an `Ok` and an `Err` through
+    /// untouched.
+    #[tokio::test]
+    async fn the_run_drains_the_notifier_on_shutdown() {
+        let gated = Arc::new(GatedChannel::new());
+        let notifier = Arc::new(Notifier::new(
+            Box::new(Arc::clone(&gated)),
+            std::time::Duration::from_hours(1),
+        ));
+        assert_eq!(
+            notifier.notify(Notification {
+                kind: NotificationKind::PollerStalled,
+                severity: Severity::High,
+                pool: POOL_A.to_string(),
+                account: None,
+                message: "on its way out".to_string(),
+            }),
+            crate::notifier::Delivery::Queued
+        );
+
+        let finishing = tokio::spawn({
+            let notifier = Arc::clone(&notifier);
+            async move { finish_run(Ok(()), &notifier).await }
+        });
+        // The send is still held, so the drain cannot have finished: a
+        // `finish_run` that returned here would be one that left a
+        // notification the bot decided to send behind.
+        tokio::task::yield_now().await;
+        assert!(
+            !finishing.is_finished(),
+            "the drain waits for the send the channel is holding"
+        );
+        assert_eq!(gated.sent_count(), 0);
+
+        gated.release();
+        finishing
+            .await
+            .expect("joined")
+            .expect("an Ok is returned unchanged");
+        assert_eq!(gated.sent_count(), 1, "the held send left before the exit");
+
+        // The error path drains the same way and reports the same error.
+        let error = finish_run(
+            Err(LiquidatorError::Config("a task failed".to_string())),
+            &notifier,
+        )
+        .await
+        .expect_err("an Err is returned unchanged");
+        assert!(matches!(error, LiquidatorError::Config(message) if message == "a task failed"));
     }
 }

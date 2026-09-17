@@ -19,6 +19,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use stellar_xdr::{
@@ -74,8 +75,9 @@ fn substitute_envelope_hash(value: &mut Value, hash: &str) {
 
 /// One canned answer.
 pub(crate) enum Canned {
-    /// A JSON-RPC `result`.
-    Result(Value),
+    /// A JSON-RPC `result`, answered after `delay` — `Duration::ZERO` for
+    /// the immediate answer every ordinary script queues.
+    Result { value: Value, delay: Duration },
     /// A JSON-RPC `error` object.
     Error { code: i64, message: String },
     /// A bare HTTP status with an empty body.
@@ -112,12 +114,17 @@ impl Respond for Responder {
         let mut state = self.state.lock().expect("script mutex");
         state.calls.push((method.clone(), body["params"].clone()));
         match state.script.get_mut(&method).and_then(VecDeque::pop_front) {
-            Some(Canned::Result(mut result)) => {
+            Some(Canned::Result { mut value, delay }) => {
                 if let Some(hash) = request_envelope_hash(&body) {
-                    substitute_envelope_hash(&mut result, &hash);
+                    substitute_envelope_hash(&mut value, &hash);
                 }
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"jsonrpc": "2.0", "id": id, "result": result}))
+                let template = ResponseTemplate::new(200)
+                    .set_body_json(json!({"jsonrpc": "2.0", "id": id, "result": value}));
+                if delay.is_zero() {
+                    template
+                } else {
+                    template.set_delay(delay)
+                }
             }
             Some(Canned::Error { code, message }) => ResponseTemplate::new(200).set_body_json(
                 json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}),
@@ -160,7 +167,27 @@ impl ScriptedRpc {
 
     /// Queues a JSON-RPC `result` for `method`.
     pub(crate) fn expect(&self, method: &str, result: Value) -> &Self {
-        self.push(method, Canned::Result(result))
+        self.push(
+            method,
+            Canned::Result {
+                value: result,
+                delay: Duration::ZERO,
+            },
+        )
+    }
+
+    /// Queues a JSON-RPC `result` for `method` that the server holds for
+    /// `delay` before answering — a call that is in flight rather than
+    /// failed, which is what an RPC hanging inside its own timeouts looks
+    /// like to the client.
+    pub(crate) fn expect_delayed(&self, method: &str, result: Value, delay: Duration) -> &Self {
+        self.push(
+            method,
+            Canned::Result {
+                value: result,
+                delay,
+            },
+        )
     }
 
     /// Queues a JSON-RPC `error` for `method`.

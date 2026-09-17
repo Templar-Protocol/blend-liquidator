@@ -6,7 +6,7 @@
 A liquidation bot for [Blend Protocol](https://blend.capital) lending pools on
 [Stellar](https://stellar.org).
 
-> **Status: Phase 6a.** The bot validates its configuration, seeds its
+> **Status: Phase 6 complete.** The bot validates its configuration, seeds its
 > tracked-user set from the [Blend analytics API](https://api.blend.templarfi.org)
 > or a static file, and follows every configured pool — applying pool events
 > and refreshing borrowers' health factors from chain into a Postgres store.
@@ -21,14 +21,18 @@ A liquidation bot for [Blend Protocol](https://blend.capital) lending pools on
 > its bid plus the pool's profit margin, keeps its own position at or above
 > `min_health_factor × HF_SAFETY_MULTIPLIER` while taking one over, records
 > every fill it executes — and, only with `DRY_RUN=false` *and*
-> `FILLER_SECRET_KEY`, submits it on chain. And it now unwinds: after a
+> `FILLER_SECRET_KEY`, submits it on chain. It unwinds: after a
 > fill lands, and once at startup, it repays the debt it holds from its
 > wallet and withdraws collateral to the wallet — everything but the
 > primary asset, and the primary down to `min_primary_collateral` — while
 > keeping its health factor at or above the pool's `min_health_factor`
-> (see Safety below). What remains is Phase 6b: Telegram notifications,
-> metrics, and the `/healthz`/`/livez`/`/metrics` operational surface.
-> What *is* complete is the scaffolding around all of it — CI
+> (see Safety below). And it now reports itself: dependency-free
+> Prometheus metrics at `/metrics`, `/healthz`/`/livez` for a deployment's
+> readiness and liveness probes, and Telegram notifications alongside the
+> log — all optional, and none of it load-bearing for trading (see Running
+> it below). What remains is Phase 7 (a local sandbox integration tier
+> against deployed pool contracts) and Phase 8 (docs and the first
+> release). What *is* complete is the scaffolding around all of it — CI
 > gates, lint posture, dev container, release preflight — so the
 > liquidation logic lands into a repository that already fails loudly.
 
@@ -72,7 +76,12 @@ the debt left behind is small. An unwind that keeps being refused is
 backed off rather than retried every ledger, and the third refusal in a
 row is reported. A notification failure never blocks or delays any of
 this: debt the wallet cannot repay is reported once per pool and trading
-continues regardless of whether the report was delivered.
+continues regardless of whether the report was delivered. Delivery itself
+is fire-and-forget — a decision, a fill or an unwind never waits on
+Telegram, or on the log — and the log is the fallback under it: a
+delivery that fails, and one that finds every in-flight permit taken, is
+written there instead. So a channel that is down costs the operator a
+report read in the log rather than in the chat, and nothing else.
 
 ## Quickstart
 
@@ -92,6 +101,76 @@ docker compose up
 The published image is `ghcr.io/templar-protocol/blend-liquidator:0.1.0`. This
 repository is private, so the package is too — pulling it needs a token with
 `read:packages`.
+
+## Running it
+
+Setting `PORT` (or `HTTP_PORT`, for a deployment that does not inject
+`PORT` — `PORT` wins when both are set) turns on a small HTTP server,
+bound to `HTTP_BIND_ADDR` (`127.0.0.1` by default; Cloud Run needs
+`0.0.0.0`, since it cannot route to a loopback listener) with three
+endpoints. The endpoints carry no authentication and `/healthz` costs a
+store ping per request, so a `0.0.0.0` bind is for a platform whose
+ingress admits only its own probes and scraper — never for a public
+address.
+
+- `/healthz` — readiness. `200` once every configured pool's processed
+  ledger is within `HEALTH_MAX_LAG_LEDGERS` of the chain head this
+  process has observed — in either direction, so a head *more than* that
+  far behind the processed ledger, which is an RPC node sitting behind this bot's own
+  committed cursor, fails too — that head was read recently — within the
+  same window `/livez` uses — and the store answers a ping within five
+  seconds; otherwise `503` with the reason as plain text. The head's age
+  is what makes an RPC outage visible here: both ledger numbers are this
+  process's own, an outage stops them together, and a lag that compared
+  only the two would sit frozen at zero while the bot followed nothing.
+- `/livez` — liveness. `200` while every pool's poller has heartbeated
+  recently, independent of whether the RPC is currently answering: the
+  window absorbs one worst-case backoff, so an RPC outage the poller is
+  already riding out does not fail it. A pool whose poller has not run
+  *at all* yet is measured from the process's start instead, and the
+  initial seed heartbeats for every configured pool while it runs, so a
+  first start against a busy pool is not read as a poller that has
+  stopped — including the pools the seed has not reached yet. Only a
+  poller that has genuinely stopped making progress fails this.
+- `/metrics` — Prometheus text exposition format, prefixed
+  `blend_liquidator_`: ledger head and processed per pool, events
+  processed, users tracked and auctions open per pool, creation and fill
+  attempts by result, skips by reason, estimated profit and estimated
+  loss, reserved
+  inventory per asset, unwind passes, and notification delivery counts.
+  Always `200`.
+
+**A deployment's restart probe must target `/livez`, never `/healthz`.**
+Restarting on every readiness blip would kill and respawn the bot on
+exactly the RPC outages its own backoff exists to ride out; a wedged
+poller — which only `/livez` catches — is what a restart can actually
+fix. The server binds before the initial seed — after the store
+connects, migrates and the configuration is validated, which is the only
+part of a start it is not up for. None of this is load-bearing: an unset
+`PORT`/`HTTP_PORT` leaves the server off entirely, and a bind failure is
+logged and never stops the bot from trading.
+
+One readiness case is expected rather than wrong: when a pool's events
+cursor has fallen out of the RPC's retained window, the bot reseeds that
+pool, and its poller waits for that reseed to be applied before it polls
+again — so for the reseed's duration it reads no chain head at all and
+processes no ledger. `/healthz` answers `503` once the wait passes the
+window, with `no chain head read for Ns` as the body rather than a lag.
+That is honest readiness (the bot is not following the chain while it
+rebuilds its user set), the poller keeps heartbeating throughout so
+`/livez` stays `200`, and the `EventGap` notification names the cause.
+Alert on it, but expect it when a bot has been stopped for longer than
+the RPC's retention.
+
+Setting both `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` — both or
+neither, either alone is a startup error — makes that chat the delivery
+channel: a notification goes there, and to the log only when the delivery
+fails or a burst has taken every in-flight permit. Leave them unset and
+the log *is* the channel, and every notification goes there. The token is read from the environment only, never a
+command-line argument, exactly like the signing keys: `TELEGRAM_BOT_TOKEN`
+never appears in `--help`, argv, or a rendered config. `check-config`
+verifies a configured token with one `getMe` call before anything else
+trusts it.
 
 ## Development
 

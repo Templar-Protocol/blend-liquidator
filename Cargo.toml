@@ -23,6 +23,12 @@ path = "src/main.rs"
 # `cargo deny`'s license and advisory surface stays honest about what this
 # crate actually builds.
 [dependencies]
+# The /healthz, /livez and /metrics server. No default features: this crate
+# uses no JSON/form/query extractor and no WebSocket support, only routing
+# and plain-text responses over HTTP/1, so `http1` and `tokio` are the whole
+# feature surface — and it keeps the licence tree what `deny.toml` already
+# allows rather than pulling in whatever the defaults bring along.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 clap = { version = "4.6.0", features = ["derive", "env"] }
 # Ed25519 signing of transaction hashes.
 ed25519-dalek = "3.0"

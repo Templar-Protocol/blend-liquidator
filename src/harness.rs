@@ -1,6 +1,12 @@
 //! Test scaffolding: a scripted RPC that answers from the committed mainnet
-//! fixture, and the store to write what it says into.
+//! fixture, the store to write what it says into, and the recording
+//! notification channel the notifier, ledger and service tests assert
+//! against.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -16,6 +22,7 @@ use crate::chain::xdr::encode::{
 };
 use crate::chain::xdr::keys;
 use crate::fixture::{mainnet_fixed_v2, text};
+use crate::notifier::{Notification, NotificationChannel, NotifyError};
 
 /// The fixture's pool, its two borrowers and its USDC reserve.
 pub(crate) const POOL: &str = "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD";
@@ -397,4 +404,74 @@ pub(crate) fn contract_entry_xdr(pool: &str, key: ScVal, value: ScVal) -> String
         val: value,
     });
     to_base64(&entry).expect("entry")
+}
+
+/// A [`NotificationChannel`] that keeps what it was handed, so a test can
+/// count and read back what a task actually decided to send rather than
+/// inspecting a log line.
+///
+/// `fail` makes every send fail instead of recording it, which is how a
+/// test puts a channel failure in front of [`Notifier`]'s own rollback; it
+/// is public and atomic so a test can flip it between sends. Every
+/// delivery is spawned, so a test asserts on `sent` only after
+/// [`Notifier::drain`] has answered.
+///
+/// [`Notifier`]: crate::notifier::Notifier
+/// [`Notifier::drain`]: crate::notifier::Notifier::drain
+#[derive(Debug)]
+pub(crate) struct RecordingChannel {
+    sent: std::sync::Mutex<Vec<Notification>>,
+    /// Whether the next send — and every one after it, until a test says
+    /// otherwise — fails rather than recording.
+    pub(crate) fail: AtomicBool,
+}
+
+impl RecordingChannel {
+    /// A channel that records every send, or — with `fail` — refuses every
+    /// one.
+    pub(crate) fn new(fail: bool) -> Self {
+        Self {
+            sent: std::sync::Mutex::new(Vec::new()),
+            fail: AtomicBool::new(fail),
+        }
+    }
+
+    /// Every notification this channel accepted, in the order it took
+    /// them.
+    pub(crate) fn sent(&self) -> Vec<Notification> {
+        self.sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// How many it accepted.
+    pub(crate) fn sent_count(&self) -> usize {
+        self.sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
+impl NotificationChannel for Arc<RecordingChannel> {
+    fn name(&self) -> &'static str {
+        "recording"
+    }
+
+    fn send<'a>(
+        &'a self,
+        notification: &'a Notification,
+    ) -> Pin<Box<dyn Future<Output = Result<(), NotifyError>> + Send + 'a>> {
+        Box::pin(async move {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(NotifyError::Channel("recording channel failed".to_string()));
+            }
+            self.sent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(notification.clone());
+            Ok(())
+        })
+    }
 }
