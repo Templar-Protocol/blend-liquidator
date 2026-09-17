@@ -8,6 +8,14 @@
 # [build] table that exists but has no `jobs` key must get `jobs`
 # inserted into *that* table, never a second [build] header — cargo
 # refuses to parse a config with [build] declared twice.
+#
+# And every spelling of that table an operator's own config may already
+# use, because each one appends a second declaration if it is not
+# recognised: an indented header, a header with a trailing comment, the
+# root-level dotted form (`build.incremental = true`, where a [build]
+# header afterwards is the second declaration), and a file whose last
+# line has no terminating newline, which glues whatever is written next
+# onto it.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -129,6 +137,112 @@ if [ "${status_b2}" = "unchanged" ] && [ "${build_headers_b2}" = "1" ]; then
 else
 	bad "rerun after insert: expected unchanged/1 header, got status '${status_b2}', ${build_headers_b2} header(s)"
 fi
+
+# Case (d): an *indented* [build] header with a trailing comment. TOML
+# allows whitespace before a table header, so this is the same table by
+# every parser's reading — and a detection anchored at column 0 would miss
+# it and append a second [build], which cargo refuses to parse.
+file_d="${tmp_dir}/d.toml"
+printf '  [build]  # the operator put it here\nincremental = true\n' >"${file_d}"
+status_d="$("${cargo_jobs_config}" "${file_d}" 7)"
+build_headers_d=$(grep -c '\[build\]' "${file_d}")
+if [ "${status_d}" = "inserted" ] && [ "${build_headers_d}" = "1" ]; then
+	ok "indented [build] with a trailing comment: inserted into it, still exactly one [build] header"
+else
+	bad "indented [build] with a trailing comment: expected inserted/1 header, got status '${status_d}', ${build_headers_d} header(s)"
+fi
+if grep -qx 'jobs = 7' "${file_d}"; then
+	ok "indented [build]: jobs = 7 present"
+else
+	bad "indented [build]: jobs = 7 missing"
+fi
+assert_toml_valid "indented [build]" "${file_d}"
+
+# Case (e): the root-level dotted spelling of the same key. `build.jobs`
+# at the root *is* [build]'s jobs, so the operator's choice must win here
+# exactly as it does in case (c).
+file_e="${tmp_dir}/e.toml"
+printf 'build.jobs = 3\n' >"${file_e}"
+before_e="$(cat "${file_e}")"
+status_e="$("${cargo_jobs_config}" "${file_e}" 7)"
+after_e="$(cat "${file_e}")"
+if [ "${status_e}" = "unchanged" ] && [ "${before_e}" = "${after_e}" ]; then
+	ok "root-level build.jobs: reports unchanged and the file is byte-for-byte untouched"
+else
+	bad "root-level build.jobs: expected unchanged and no edit, got status '${status_e}' (modified: $([ "${before_e}" = "${after_e}" ] && echo no || echo yes))"
+fi
+assert_toml_valid "root-level build.jobs" "${file_e}"
+
+# Case (f): the dotted table with some other key and no jobs. A [build]
+# header appended here would declare `build` twice — TOML rejects it — so
+# the key has to be added in the dotted form the file already uses.
+file_f="${tmp_dir}/f.toml"
+printf 'build.incremental = true\n' >"${file_f}"
+status_f="$("${cargo_jobs_config}" "${file_f}" 7)"
+if [ "${status_f}" = "inserted" ]; then
+	ok "root-level build.incremental, no jobs: reports inserted"
+else
+	bad "root-level build.incremental, no jobs: expected status 'inserted', got '${status_f}'"
+fi
+if grep -qx 'build.jobs = 7' "${file_f}"; then
+	ok "root-level build.incremental: build.jobs = 7 added in dotted form"
+else
+	bad "root-level build.incremental: build.jobs = 7 missing"
+fi
+if grep -q '\[build\]' "${file_f}"; then
+	bad "root-level build.incremental: a [build] header was appended, which declares build twice"
+else
+	ok "root-level build.incremental: no [build] header appended"
+fi
+assert_toml_valid "root-level build.incremental" "${file_f}"
+
+status_f2="$("${cargo_jobs_config}" "${file_f}" 9)"
+if [ "${status_f2}" = "unchanged" ]; then
+	ok "rerun after a dotted insert: unchanged"
+else
+	bad "rerun after a dotted insert: expected unchanged, got '${status_f2}'"
+fi
+
+# Case (g): a file whose final byte is not a newline. `head -n` emits the
+# bytes verbatim, so an unterminated last line would have the comment
+# glued straight onto it — `[build]# Written by …` — which is the same
+# broken parse by the other path.
+file_g="${tmp_dir}/g.toml"
+printf '[build]' >"${file_g}"
+status_g="$("${cargo_jobs_config}" "${file_g}" 7)"
+if [ "${status_g}" = "inserted" ]; then
+	ok "unterminated last line: reports inserted"
+else
+	bad "unterminated last line: expected status 'inserted', got '${status_g}'"
+fi
+if grep -qx '\[build\]' "${file_g}"; then
+	ok "unterminated last line: [build] is still on a line of its own"
+else
+	bad "unterminated last line: [build] was glued to the inserted text — $(head -n 1 "${file_g}")"
+fi
+if grep -qx 'jobs = 7' "${file_g}"; then
+	ok "unterminated last line: jobs = 7 present"
+else
+	bad "unterminated last line: jobs = 7 missing"
+fi
+assert_toml_valid "unterminated last line" "${file_g}"
+
+# Case (h): the same unterminated final byte on the *append* path — no
+# [build] table at all, so the fresh one must start on its own line.
+file_h="${tmp_dir}/h.toml"
+printf '[net]\nretry = 2' >"${file_h}"
+status_h="$("${cargo_jobs_config}" "${file_h}" 7)"
+if [ "${status_h}" = "created" ]; then
+	ok "unterminated last line, no [build]: reports created"
+else
+	bad "unterminated last line, no [build]: expected status 'created', got '${status_h}'"
+fi
+if grep -qx 'retry = 2' "${file_h}"; then
+	ok "unterminated last line, no [build]: the pre-existing key survived on its own line"
+else
+	bad "unterminated last line, no [build]: retry = 2 was run together with what follows"
+fi
+assert_toml_valid "unterminated last line, no [build]" "${file_h}"
 
 printf '%d passed, %d failed\n' "${pass}" "${fail}"
 [ "${fail}" -eq 0 ]

@@ -587,7 +587,13 @@ make help                           # Docker Compose lifecycle
   `env_write`, which truncates and `chmod 600`s before it writes) and
   `versions.env` (every pin: the five wasm URLs with their SHA-256s, the
   `stellar` CLI release and both tarball hashes, the quickstart image by
-  digest, and `SANDBOX_PASSPHRASE`). `fetch-artifacts.sh` downloads and
+  digest, `SANDBOX_PASSPHRASE`, and `SQLX_CLI_VERSION`, which is not the
+  sandbox's but has the same two-installers problem — see the gotcha on
+  the database sweep below). `lib.sh` sources
+  `versions.env` from its own directory and no environment variable
+  selects it: that one file names the passphrase the standalone gate
+  compares against *and* the hash every artefact is verified by, so a
+  redirect would defeat both at once. `fetch-artifacts.sh` downloads and
   verifies the wasm; `up.sh` starts the pinned quickstart container
   (bound to `127.0.0.1`) and waits for its RPC to be healthy *and*
   closing ledgers; `deploy.sh` stands Blend v2 up in ten steps and
@@ -605,9 +611,13 @@ make help                           # Docker Compose lifecycle
   `memory.limit_in_bytes`, then `/proc/meminfo` (`CARGO_JOBS_NPROC` and
   `CARGO_JOBS_MEM_BYTES` override both inputs, which is what makes the
   formula testable); `cargo-jobs-config.sh` puts `jobs = N` into
-  `~/.cargo/config.toml`'s `[build]` table — creating the table, or
+  `~/.cargo/config.toml`'s `build` table — creating the table, or
   inserting into the one already there, or leaving a file that already
-  sets `jobs` byte-for-byte alone. See the OOM gotcha below.
+  sets `jobs` byte-for-byte alone — in whichever of TOML's two spellings
+  the file already uses: a `[build]` header (indented or with a trailing
+  comment counts) or root-level dotted keys (`build.incremental = true`,
+  where a `[build]` header afterwards would be the second declaration).
+  See the OOM gotcha below.
 - `.github/workflows/sandbox.yml` — the nightly run of the tier, on
   `schedule` and `workflow_dispatch` only, never `push` or
   `pull_request`, and deliberately outside `ci.yml`'s `ci-summary` needs
@@ -721,11 +731,15 @@ Status above for what remains.
   `scripts/cargo-jobs-config.sh` writes it to `~/.cargo/config.toml` as
   `[build] jobs`. **Once**: a config that already sets `jobs` in `[build]`
   is left byte-for-byte alone, an operator's own choice winning over this,
-  and a `[build]` table that exists without one gets `jobs` inserted into
-  *that* table rather than a second header appended — cargo refuses to
-  parse a config that declares `[build]` twice, which is a worse failure
-  than the OOM the cap prevents. An environment `CARGO_BUILD_JOBS` still
-  overrides the file at build time, which is what the one-liner above is.
+  and a `build` table that exists without one gets `jobs` inserted into
+  *that* table rather than a second declaration appended — cargo refuses
+  to parse a config that declares `build` twice, which is a worse failure
+  than the OOM the cap prevents. "That table" is whichever spelling the
+  file uses, an indented `[build]`, one with a trailing comment, and the
+  root-level dotted `build.<key>` form included; an unterminated last line
+  is terminated before anything is written after it. An environment
+  `CARGO_BUILD_JOBS` still overrides the file at build time, which is what
+  the one-liner above is.
 - Commit signing in the dev container: `user.signingkey` copied from the host
   is a **host path** that does not resolve inside the container. The durable
   fix is a literal `key::ssh-ed25519 ...` value in the host's `~/.gitconfig` —
@@ -1098,7 +1112,19 @@ Status above for what remains.
   `sqlx database drop` drops only a name it is handed, nothing in sqlx-cli
   lists databases, and `psql` is in neither CI nor the dev container. That
   file is the one thing under `target/sandbox/` besides the wasm that
-  `down.sh` must not delete.
+  `down.sh` must not delete. The sweep hands the URL to `sqlx` through
+  `DATABASE_URL` in the environment rather than `-D` on argv — it carries
+  a password, and `/proc/<pid>/cmdline` is world-readable — and checks for
+  `sqlx` once before it starts, so a missing tool is named once instead of
+  reported as "could not drop" per entry. `sqlx-cli` is installed by
+  `ci.yml` and by `post-create.sh`, and the two must be the same version —
+  they share the committed `.sqlx/` metadata, so a mismatch surfaces as a
+  rejected query rather than as a tool disagreement.
+  `post-create.sh` reads `versions.env`'s `SQLX_CLI_VERSION`; `ci.yml`, the
+  PR gate, names its version as a literal on its own install line; and
+  `check-repo-invariants.sh` fails unless that literal equals
+  `SQLX_CLI_VERSION` — cross-file equality, the shape the three-way Rust
+  pin already uses. Bump both together.
 
 ## Workflow
 

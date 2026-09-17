@@ -82,18 +82,31 @@ sandbox-test: ## Run the end-to-end liquidation against the deployed sandbox (~5
 # target/sandbox/run-databases is the list, written by the test itself —
 # appended when it creates the database and the line removed when it
 # drops it. Nothing here enumerates: `sqlx database drop` does the
-# dropping (sqlx-cli is in both CI and the dev container), it can only
-# drop a name it is handed, nothing in sqlx-cli lists databases, and psql
-# is in neither place. A database kept by a run from before that file
-# existed is therefore dropped by hand, with the line printed below.
+# dropping, it can only drop a name it is handed, nothing in sqlx-cli
+# lists databases, and psql is in neither CI nor the dev container. A
+# database kept by a run from before that file existed is therefore
+# dropped by hand, with the line printed below.
+#
+# sqlx-cli is installed by .github/workflows/ci.yml and by
+# .devcontainer/post-create.sh, both from the SQLX_CLI_VERSION pinned in
+# scripts/sandbox/versions.env — but neither is a guarantee (post-create's
+# step only warns on failure, and this target is run outside the dev
+# container too), so the sweep checks for the tool once and names it,
+# rather than reporting "could not drop" for every entry and never saying
+# why.
 #
 # A name that could not be dropped stays in the file: it is still on the
 # server, and a sweep that forgot it would leave it there forever.
 #
-# The hint below prints the server with its userinfo stripped. DATABASE_URL
+# Neither the sweep nor the hint puts a URL on a command line. DATABASE_URL
 # carries a password — the committed local development one today, whatever
-# an operator exported tomorrow — and a hint is not worth putting one in a
-# terminal, a CI log or a pasted issue.
+# an operator exported tomorrow — and argv is world-readable through `ps`
+# and /proc/<pid>/cmdline, which is the convention CLAUDE.md states for
+# every secret this repo handles. sqlx-cli reads DATABASE_URL from the
+# environment, so the per-command assignment below is the whole fix; the
+# printed hint is in that same form so an operator following it does not
+# reintroduce what this target avoids, and prints the server with its
+# userinfo stripped besides.
 sandbox-down: ## Tear the sandbox down and drop the databases failed runs kept
 	./scripts/sandbox/down.sh
 	@set -u; \
@@ -101,14 +114,16 @@ sandbox-down: ## Tear the sandbox down and drop the databases failed runs kept
 	list=target/sandbox/run-databases; \
 	if [ ! -s "$$list" ]; then \
 		echo "no databases recorded in $$list — nothing to drop"; \
-		echo "for one kept by a run from before that file: sqlx database drop -y -D $$(printf '%s' "$$server" | sed -E 's#//[^@]*@#//#')/sandbox_<stamp>"; \
+		echo "for one kept by a run from before that file: DATABASE_URL=$$(printf '%s' "$$server" | sed -E 's#//[^@]*@#//#')/sandbox_<stamp> sqlx database drop -y --no-dotenv"; \
 		echo "  (that server has its userinfo stripped for this line — take the credentials from DATABASE_URL)"; \
 	else \
+		command -v sqlx >/dev/null 2>&1 \
+			|| { echo "sqlx-cli is not installed, so the databases in $$list cannot be dropped"; echo "  install it with: cargo install sqlx-cli --version $$(grep '^SQLX_CLI_VERSION=' scripts/sandbox/versions.env | cut -d= -f2-) --no-default-features --features postgres,rustls --locked"; exit 1; }; \
 		kept="$$list.kept"; : >"$$kept"; \
 		while read -r name; do \
 			[ -n "$$name" ] || continue; \
 			echo "dropping database $$name"; \
-			sqlx database drop -y --no-dotenv -D "$$server/$$name" \
+			DATABASE_URL="$$server/$$name" sqlx database drop -y --no-dotenv \
 				|| { echo "could not drop $$name — leaving it in $$list"; echo "$$name" >>"$$kept"; }; \
 		done <"$$list"; \
 		mv "$$kept" "$$list"; \

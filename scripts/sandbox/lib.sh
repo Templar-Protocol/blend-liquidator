@@ -32,12 +32,40 @@ unset STELLAR_RPC_URL STELLAR_NETWORK_PASSPHRASE STELLAR_NETWORK \
 	STELLAR_ACCOUNT STELLAR_SIGN_WITH_KEY \
 	STELLAR_SIGN_WITH_LAB STELLAR_SIGN_WITH_LEDGER
 
-# sandbox_lib_dir is lib.sh's own directory, resolved once at source time
-# from BASH_SOURCE — a sourced file's $0 is the *caller's* path, not its
-# own, so BASH_SOURCE is the only way sandbox_dir() below is correct
-# however a script here is invoked (by relative path, by absolute path, or
-# via PATH).
-sandbox_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# SANDBOX_RPC_URL is ours rather than the CLI's, and unset for the same
+# reason: sandbox_set_network exports it, so it is a record of a gate this
+# process passed, never an input. Inherited from an operator's shell it
+# would be a claim about a network nothing here verified — and until the
+# gate runs there are no flags, so a CLI call made on the strength of that
+# claim would carry none and resolve the CLI's own default, a public
+# network. sandbox_require_network below tests the flags themselves for
+# the same reason; this unset is the other half.
+unset SANDBOX_RPC_URL
+
+# SANDBOX_SCRIPT_DIR is lib.sh's own directory — which is scripts/sandbox,
+# the directory every script in this tier and versions.env share —
+# resolved once at source time from BASH_SOURCE. A sourced file's $0 is
+# the *caller's* path, not its own, so BASH_SOURCE is the only way
+# sandbox_dir() and the versions.env source below are correct however a
+# script here is invoked (by relative path, by absolute path, or via
+# PATH).
+SANDBOX_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# The pins, sourced here and from nowhere else, at a path no environment
+# variable takes part in.
+#
+# versions.env supplies SANDBOX_PASSPHRASE — the single literal
+# require_standalone_network compares getNetwork's answer against — as
+# well as every wasm URL together with the SHA-256 it is verified by. An
+# override of which file that is would therefore hand over both halves at
+# once: a standalone gate that logs success on a public network, after
+# which this tier generates keys, funds them, deploys and signs there, and
+# a supply-chain check that verifies each artefact against a hash from the
+# same file that chose it. That is the same shell-inherited redirection
+# the unset above closes, so it is closed the same way: the file is this
+# directory's, and nothing reads VERSIONS_ENV.
+# shellcheck source=scripts/sandbox/versions.env
+source "${SANDBOX_SCRIPT_DIR}/versions.env"
 
 # _sandbox_emit MESSAGE… — the one place a sandbox script's prose is
 # written: a timestamped line to stderr, and, when SANDBOX_LOG names a
@@ -83,7 +111,7 @@ die() {
 # `mkdir -p`s it explicitly, since only the caller knows which
 # subdirectory (wasm/, and later the deploy artefacts) it is about to use.
 sandbox_dir() {
-	printf '%s/target/sandbox\n' "$(cd "${sandbox_lib_dir}/../.." && pwd)"
+	printf '%s/target/sandbox\n' "$(cd "${SANDBOX_SCRIPT_DIR}/../.." && pwd)"
 }
 
 # sha256_check FILE EXPECTED — dies, printing both hashes, unless FILE
@@ -190,7 +218,17 @@ wait_for_rpc() {
 sandbox_network_args=()
 
 # sandbox_require_network — dies unless the gate has run, i.e. unless
-# sandbox_set_network has exported SANDBOX_RPC_URL.
+# sandbox_set_network has built the flag array.
+#
+# It tests the array, not SANDBOX_RPC_URL: the array is what the call
+# about to be made actually uses, and it is local to this process, whereas
+# any variable is something an operator's shell can export. A guard keyed
+# on the variable would pass on an inherited value while the array was
+# still empty — the exact case it exists to refuse — so it is keyed on the
+# thing it is guarding. Four elements because sandbox_set_network builds
+# exactly --rpc-url URL --network-passphrase PASSPHRASE; a partially built
+# array is not a state this file can reach, and >= 4 says so without
+# asserting a length a later flag would break.
 #
 # Called immediately before **every** expansion of sandbox_network_args:
 # invoke() and invoke_view() here, and each direct `stellar` call in
@@ -200,7 +238,7 @@ sandbox_network_args=()
 # call goes to a public network rather than failing. The one place the
 # check itself is proved is test-network-pinning.sh.
 sandbox_require_network() {
-	[ -n "${SANDBOX_RPC_URL:-}" ] \
+	[ "${#sandbox_network_args[@]}" -ge 4 ] \
 		|| die "sandbox network not verified: call require_standalone_network first"
 }
 
@@ -214,7 +252,7 @@ sandbox_require_network() {
 # contacts.
 sandbox_set_network() {
 	[ -n "${SANDBOX_PASSPHRASE:-}" ] \
-		|| die "sandbox_set_network: SANDBOX_PASSPHRASE is unset — source versions.env before this"
+		|| die "sandbox_set_network: SANDBOX_PASSPHRASE is unset — ${SANDBOX_SCRIPT_DIR}/versions.env did not define it"
 	SANDBOX_RPC_URL=$1
 	export SANDBOX_RPC_URL
 	sandbox_network_args=(--rpc-url "${SANDBOX_RPC_URL}" --network-passphrase "${SANDBOX_PASSPHRASE}")

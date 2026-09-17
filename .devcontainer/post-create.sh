@@ -87,9 +87,10 @@ fi
 
 # 5. CI-parity tooling.
 #
-#    CI gates on both of these (.github/workflows/ci.yml's `shellcheck` and
-#    `deny` jobs), so without them locally the first sign of a violation is a
-#    red PR. Neither is needed to build the crate; both are cheap.
+#    CI gates on all three of these (.github/workflows/ci.yml's `shellcheck`
+#    and `deny` jobs, and its `test` job's sqlx steps), so without them
+#    locally the first sign of a violation is a red PR. None is needed to
+#    build the crate.
 #
 #    cargo-deny is installed from its static musl release binary rather than
 #    `cargo install`, which would compile a large dependency tree — and a musl
@@ -100,7 +101,7 @@ fi
 #    PATH. To bump: change the version and both sha256 (the .sha256 sidecars on
 #    the GitHub release).
 CARGO_DENY_VERSION="0.20.2"
-echo "==> Installing CI-parity tooling (shellcheck, cargo-deny)"
+echo "==> Installing CI-parity tooling (shellcheck, cargo-deny, sqlx-cli)"
 
 if ! command -v shellcheck >/dev/null 2>&1; then
 	sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends shellcheck ||
@@ -133,6 +134,33 @@ else
 		fi
 		rm -rf "${deny_tmp}"
 	fi
+fi
+
+#    sqlx-cli is the one tool here that has to be compiled — it publishes no
+#    release binary — so it is installed exactly as CI installs it, with the
+#    version read from scripts/sandbox/versions.env rather than spelled
+#    twice: the crate's `sqlx::query!` macros are checked against the
+#    committed offline metadata in .sqlx/, and a container regenerating that
+#    metadata on a different sqlx-cli produces a file CI rejects.
+#    `make sqlx-prepare` and `make sandbox-down`'s database sweep both need
+#    it locally. Non-fatal like the rest of this section.
+#
+#    CARGO_BUILD_JOBS is passed explicitly because this compile happens
+#    before step 8 writes the cap into ~/.cargo/config.toml, and it is
+#    exactly the kind of cold dependency tree that OOMs against nproc's host
+#    core count (see scripts/cargo-jobs.sh). An operator's own
+#    CARGO_BUILD_JOBS still wins.
+sqlx_version="$(grep -oE '^SQLX_CLI_VERSION=.+' "${workspace}/scripts/sandbox/versions.env" | cut -d= -f2- || true)"
+if [ -z "${sqlx_version}" ]; then
+	warn "scripts/sandbox/versions.env does not pin SQLX_CLI_VERSION; skipping sqlx-cli."
+elif [ "$(sqlx --version 2>/dev/null | awk '{ print $2 }')" = "${sqlx_version}" ]; then
+	echo "    sqlx-cli ${sqlx_version} already installed"
+else
+	echo "    compiling sqlx-cli ${sqlx_version} (a few minutes)"
+	CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$("${workspace}/scripts/cargo-jobs.sh" 2>/dev/null || echo 1)}" \
+		cargo install sqlx-cli --version "${sqlx_version}" \
+		--no-default-features --features postgres,rustls --locked ||
+		warn "sqlx-cli install failed; make sqlx-prepare and make sandbox-down's sweep cannot run locally."
 fi
 
 # 6. Warm the dependency cache, so the first build/test/clippy run does not

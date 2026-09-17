@@ -23,6 +23,12 @@
 # scripts/sandbox/versions.env. Two versions is two different sandboxes, one
 # of which nobody can reproduce, and nothing fails to say so.
 #
+# ONE SQLX-CLI VERSION, for the same reason and with a sharper failure: the
+# dev container and CI both install sqlx-cli, and the committed offline query
+# metadata in .sqlx/ is what they have to agree about. A container on another
+# sqlx-cli regenerates a file CI then rejects, and the diff blames the query
+# rather than the tool.
+#
 # Run it locally the same way CI does: ./scripts/check-repo-invariants.sh
 set -euo pipefail
 
@@ -96,6 +102,50 @@ for file in .devcontainer/post-create.sh .github/workflows/sandbox.yml; do
 		note "${file} reads scripts/sandbox/versions.env"
 	fi
 done
+
+echo
+echo "One sqlx-cli version"
+# Two places install sqlx-cli — CI's test job and the dev container's
+# post-create — and they must install the same one: the two sides share the
+# committed .sqlx/ offline metadata, so a container on another sqlx-cli
+# regenerates a file CI then rejects, and the diff blames the query rather
+# than the tool.
+#
+# They are held together differently, because the workflow is the PR gate and
+# is not this loop's to rewrite. post-create.sh *reads* SQLX_CLI_VERSION from
+# scripts/sandbox/versions.env; ci.yml *names the literal* on its install
+# line, and this check compares the two — the same shape as the three-way Rust
+# pin above, where the guarantee is equality across files rather than a single
+# reader.
+sqlx_version=$(grep -oE '^SQLX_CLI_VERSION=.+' scripts/sandbox/versions.env | cut -d= -f2- || true)
+if [ -z "${sqlx_version}" ]; then
+	bad "could not parse SQLX_CLI_VERSION from scripts/sandbox/versions.env"
+else
+	note "scripts/sandbox/versions.env pins sqlx-cli at ${sqlx_version}"
+fi
+
+post_create=.devcontainer/post-create.sh
+if [ ! -f "${post_create}" ]; then
+	bad "${post_create} is missing — it is one of the two places that install sqlx-cli, and it must take the version from scripts/sandbox/versions.env"
+elif ! grep -vE '^[[:space:]]*#' "${post_create}" | grep -qF 'SQLX_CLI_VERSION'; then
+	bad "${post_create} does not read SQLX_CLI_VERSION from scripts/sandbox/versions.env — it must grep or source it rather than pin its own (on a line that is not a comment)"
+elif grep -qE 'sqlx-cli[[:space:]]+--version[[:space:]]+[0-9]' "${post_create}"; then
+	bad "${post_create} names an sqlx-cli version literally — read SQLX_CLI_VERSION from scripts/sandbox/versions.env instead"
+else
+	note "${post_create} reads SQLX_CLI_VERSION from scripts/sandbox/versions.env"
+fi
+
+ci_workflow=.github/workflows/ci.yml
+ci_sqlx=$(grep -oE 'sqlx-cli[[:space:]]+--version[[:space:]]+[0-9][^[:space:]]*' "${ci_workflow}" 2>/dev/null | grep -oE '[0-9][^[:space:]]*$' || true)
+if [ ! -f "${ci_workflow}" ]; then
+	bad "${ci_workflow} is missing — it is one of the two places that install sqlx-cli"
+elif [ -z "${ci_sqlx}" ]; then
+	bad "${ci_workflow} does not install sqlx-cli at a literal version (cargo install sqlx-cli --version <X>) — that literal is what scripts/sandbox/versions.env's SQLX_CLI_VERSION (${sqlx_version}) is compared against"
+elif [ -n "${sqlx_version}" ] && [ "${ci_sqlx}" != "${sqlx_version}" ]; then
+	bad "sqlx-cli versions disagree: ${ci_workflow} installs ${ci_sqlx}, scripts/sandbox/versions.env pins SQLX_CLI_VERSION=${sqlx_version} (which .devcontainer/post-create.sh installs) — bump both together"
+else
+	note "${ci_workflow} installs sqlx-cli ${ci_sqlx}, matching versions.env"
+fi
 
 if [ "${fail}" -ne 0 ]; then
 	echo

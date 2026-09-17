@@ -17,8 +17,6 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/sandbox/lib.sh
 source "${script_dir}/lib.sh"
-# shellcheck source=scripts/sandbox/versions.env
-source "${VERSIONS_ENV:-${script_dir}/versions.env}"
 
 price=${1:-750000}
 # Only a positive integer: the oracle reports i128 prices in fixed point,

@@ -24,8 +24,6 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/sandbox/lib.sh
 source "${script_dir}/lib.sh"
-# shellcheck source=scripts/sandbox/versions.env
-source "${VERSIONS_ENV:-${script_dir}/versions.env}"
 
 command -v stellar >/dev/null 2>&1 \
 	|| die "test-network-pinning: the stellar CLI is not on PATH — .devcontainer/post-create.sh and .github/workflows/sandbox.yml install it"
@@ -114,15 +112,23 @@ fi
 # case that says it does.
 #
 # A child process, because lib.sh has already been sourced and the gate
-# already run in this shell: `env -u SANDBOX_RPC_URL` and a fresh source
-# are what "before any gate" means.
+# already run in this shell: a fresh source is what "before any gate"
+# means.
+#
+# And SANDBOX_RPC_URL is *exported into* that child, deliberately: the
+# guard must key on the flag array sandbox_set_network builds, never on a
+# variable an operator's shell can supply. An inherited SANDBOX_RPC_URL
+# that satisfied the guard would let a flagless call through — onto the
+# CLI's own default, a public network — which is the one thing the guard
+# exists to stop. lib.sh answers it twice, by unsetting the name at source
+# time and by testing the array itself; either alone would pass this case,
+# and both together are what the file promises.
 GUARD_MESSAGE="sandbox network not verified: call require_standalone_network first"
 
 before=$(
-	env -u SANDBOX_RPC_URL bash -c '
+	SANDBOX_RPC_URL=http://localhost:8000/rpc bash -c '
 		set -euo pipefail
 		source "$1/lib.sh"
-		source "$1/versions.env"
 		sandbox_require_network
 		echo "the guard let a call through before the gate"
 	' guard "${script_dir}" 2>&1
@@ -134,7 +140,7 @@ case "${before}" in
 esac
 
 if [ "${before_status}" -ne 0 ] && [ "${guard_said_so}" = yes ]; then
-	ok "a CLI call before the gate dies, naming require_standalone_network"
+	ok "a CLI call before the gate dies, naming require_standalone_network, even with SANDBOX_RPC_URL exported"
 else
 	no "a CLI call before the gate exited ${before_status} saying: ${before}"
 fi
@@ -143,9 +149,37 @@ fi
 # a subshell so that a guard that wrongly died ends the subshell rather
 # than this script, and is reported as a failure like any other.
 if (sandbox_require_network); then
-	ok "the guard passes once require_standalone_network has exported SANDBOX_RPC_URL"
+	ok "the guard passes once require_standalone_network has built the flag array"
 else
 	no "the guard refused a network this shell has already verified"
+fi
+
+# The pin file itself cannot be redirected. versions.env supplies
+# SANDBOX_PASSPHRASE — the single literal require_standalone_network
+# compares getNetwork's answer against — as well as every wasm URL and the
+# SHA-256 it is verified by, so an environment override of which file is
+# read would hand an attacker both halves at once: a gate that passes on a
+# public network, and artefacts that verify against whatever hashes that
+# same file names. lib.sh therefore resolves it from its own directory and
+# nothing else; VERSIONS_ENV names nothing.
+#
+# /dev/null is the sharpest form of the override: it parses, it is
+# readable, and it defines nothing at all, so a lib.sh that honoured it
+# would leave SANDBOX_PASSPHRASE empty rather than fail.
+STANDALONE_PASSPHRASE="Standalone Network ; February 2017"
+
+overridden=$(
+	VERSIONS_ENV=/dev/null bash -c '
+		set -euo pipefail
+		source "$1/lib.sh"
+		printf "%s" "${SANDBOX_PASSPHRASE:-}"
+	' pin "${script_dir}" 2>&1
+) || overridden="sourcing lib.sh under VERSIONS_ENV=/dev/null failed: ${overridden}"
+
+if [ "${overridden}" = "${STANDALONE_PASSPHRASE}" ]; then
+	ok "VERSIONS_ENV cannot redirect the pin file: SANDBOX_PASSPHRASE is still the standalone literal"
+else
+	no "VERSIONS_ENV=/dev/null changed the pins: SANDBOX_PASSPHRASE came back as '${overridden}', expected '${STANDALONE_PASSPHRASE}'"
 fi
 
 printf '%d passed, %d failed\n' "${pass}" "${fail}"
