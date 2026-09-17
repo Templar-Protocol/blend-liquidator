@@ -70,3 +70,74 @@ fetch() {
 	curl -fsSL --retry 3 -o "${dest}" "${url}" || die "download failed: ${url}"
 	sha256_check "${dest}" "${expected}"
 }
+
+# _sandbox_rpc_call URL METHOD — POSTs a no-params JSON-RPC 2.0 request for
+# METHOD to URL and prints the raw response body, or nothing if the
+# request could not even be made (connection refused, timeout, non-2xx).
+# Private to this file: both callers below are polling loops for which
+# "not answering yet" must be an ordinary retry, never a script-ending
+# failure, so this never dies and never propagates curl's exit status.
+_sandbox_rpc_call() {
+	local url=$1 method=$2
+	curl -fsS --max-time 5 -H 'Content-Type: application/json' \
+		-d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"${method}\"}" \
+		"${url}" 2>/dev/null || true
+}
+
+# wait_for_rpc URL — blocks until URL's JSON-RPC getHealth reports
+# status "healthy" and getLatestLedger's sequence has then advanced twice
+# — proof the node is actually closing ledgers, not just answering once
+# mid-catch-up. One 180 s budget covers both phases together. Returns 1
+# on timeout rather than dying itself, logging what it was waiting for as
+# it goes: the caller (up.sh) knows the container name and can attach its
+# log tail to a more useful failure than this generic helper could write.
+wait_for_rpc() {
+	local url=$1 deadline status body seq base_seq=0 advances=0
+	deadline=$(($(date +%s) + 180))
+
+	log "waiting for ${url} to report healthy (180s budget)"
+	status=""
+	while [ "$(date +%s)" -lt "${deadline}" ]; do
+		body=$(_sandbox_rpc_call "${url}" getHealth)
+		status=$(printf '%s' "${body}" | jq -r '.result.status // empty' 2>/dev/null) || status=""
+		[ "${status}" = "healthy" ] && break
+		sleep 2
+	done
+	if [ "${status}" != "healthy" ]; then
+		log "timed out waiting for ${url} to report healthy"
+		return 1
+	fi
+
+	log "waiting for ${url}'s ledger to advance twice"
+	while [ "${advances}" -lt 2 ]; do
+		if [ "$(date +%s)" -ge "${deadline}" ]; then
+			log "timed out waiting for ${url}'s ledger to advance"
+			return 1
+		fi
+		body=$(_sandbox_rpc_call "${url}" getLatestLedger)
+		seq=$(printf '%s' "${body}" | jq -r '.result.sequence // empty' 2>/dev/null) || seq=""
+		if [ -n "${seq}" ]; then
+			if [ "${base_seq}" -gt 0 ] && [ "${seq}" -gt "${base_seq}" ]; then
+				advances=$((advances + 1))
+			fi
+			base_seq=${seq}
+		fi
+		[ "${advances}" -lt 2 ] && sleep 2
+	done
+	log "${url} is healthy and its ledger has advanced twice"
+}
+
+# require_standalone_network URL — dies unless URL's getNetwork answers
+# exactly SANDBOX_PASSPHRASE (from versions.env — every caller sources it
+# before this). This is the one gate every later sandbox script calls
+# first: the sandbox exists to never touch a public network, so refusing
+# on any other passphrase — including no answer at all — has to happen
+# before that script does anything else, however its RPC URL got
+# configured.
+require_standalone_network() {
+	local url=$1 body passphrase
+	body=$(_sandbox_rpc_call "${url}" getNetwork)
+	passphrase=$(printf '%s' "${body}" | jq -r '.result.passphrase // empty' 2>/dev/null) || passphrase=""
+	[ -n "${passphrase}" ] || die "require_standalone_network: ${url} did not answer getNetwork"
+	[ "${passphrase}" = "${SANDBOX_PASSPHRASE}" ] || die "require_standalone_network: ${url} reports passphrase '${passphrase}', expected the sandbox's standalone passphrase '${SANDBOX_PASSPHRASE}' — refusing to touch a network that is not this sandbox's own"
+}
