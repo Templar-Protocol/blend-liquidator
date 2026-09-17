@@ -18,6 +18,11 @@
 # a stellar-xdr bump that moves its own copy still compiles against the old
 # one. This check is what says to bump Cargo.toml's in that same PR.
 #
+# ONE STELLAR CLI VERSION. The dev container and the nightly sandbox workflow
+# both install the stellar CLI, and both must take it from
+# scripts/sandbox/versions.env. Two versions is two different sandboxes, one
+# of which nobody can reproduce, and nothing fails to say so.
+#
 # Run it locally the same way CI does: ./scripts/check-repo-invariants.sh
 set -euo pipefail
 
@@ -57,6 +62,40 @@ case "${strkey}" in
 	*" "*) bad "Cargo.lock holds stellar-strkey ${strkey}, a second copy — pin Cargo.toml's to the version stellar-xdr depends on (see its comment)" ;;
 	*) note "Cargo.lock = ${strkey}, one copy" ;;
 esac
+
+echo
+echo "One stellar CLI version"
+# scripts/sandbox/versions.env holds every pin the sandbox tier builds on,
+# the stellar CLI's among them. Two places install that CLI — the dev
+# container's post-create and the nightly sandbox workflow — and both must
+# read the version from that file rather than repeat it. A workflow pinned
+# to a CLI the dev container does not have reproduces neither a failure nor
+# a success, and nothing about the disagreement names itself: both sides
+# install *a* CLI, both are green, and only the contract deployments differ.
+#
+# Two checks, because either alone passes something broken: that the file is
+# read at all (on a line that is not a comment — a stale shellcheck
+# directive is not a reference), and that neither file names a release
+# literally, which is what reading versions.env and then ignoring it looks
+# like.
+cli_version=$(grep -oE '^STELLAR_CLI_VERSION=.+' scripts/sandbox/versions.env | cut -d= -f2 || true)
+if [ -z "${cli_version}" ]; then
+	bad "could not parse STELLAR_CLI_VERSION from scripts/sandbox/versions.env"
+else
+	note "scripts/sandbox/versions.env pins the stellar CLI at ${cli_version}"
+fi
+
+for file in .devcontainer/post-create.sh .github/workflows/sandbox.yml; do
+	if [ ! -f "${file}" ]; then
+		bad "${file} is missing — it is one of the two places that install the stellar CLI, and both must take the version from scripts/sandbox/versions.env"
+	elif ! grep -vE '^[[:space:]]*#' "${file}" | grep -qF 'versions.env'; then
+		bad "${file} does not read scripts/sandbox/versions.env — the stellar CLI version (${cli_version}) lives in that one file, and ${file} must source or grep it rather than pin its own"
+	elif grep -qE 'stellar-cli-[0-9]' "${file}"; then
+		bad "${file} names a stellar CLI release literally (stellar-cli-…) — take the URL and its checksum from scripts/sandbox/versions.env instead, which is the only place the version belongs"
+	else
+		note "${file} reads scripts/sandbox/versions.env"
+	fi
+done
 
 if [ "${fail}" -ne 0 ]; then
 	echo
