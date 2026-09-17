@@ -185,11 +185,14 @@ make help                           # Docker Compose lifecycle
   costs a full reseed; a pass that cannot prove it drained the range leaves
   the cursor untouched. An optional `Metrics` and `Notifier` (`with_metrics`,
   `with_notifier`; both `None` from `new`) instrument the loop without
-  touching what it does: a heartbeat is recorded at the top of every
-  iteration — before the shutdown check and before the pass, and again
-  every `poll_interval` while `await_ack` waits for the tracker, since
-  waiting for it is being alive too — the chain head is recorded the
-  moment `getLatestLedger` answers, and a run of `RPC_FAILING_AFTER` (5)
+  touching what it does: a heartbeat is recorded every `poll_interval`
+  for as long as the loop is turning, the pass included — the RPC calls,
+  the `getEvents` paging and the wait for the tracker's acknowledgement
+  alike, since working is being alive — so the backoff sleep after a
+  failed pass is the only stretch that stamps nothing, which is why
+  `max_backoff` is what the deadline budgets for and a pass's own
+  duration is not; the chain head is recorded the moment
+  `getLatestLedger` answers, and a run of `RPC_FAILING_AFTER` (5)
   consecutive failed passes notifies `NotificationKind::RpcFailing` once,
   at the threshold and never past it, with the first successful pass
   logging the recovery and resetting the count. `PollerConfig::liveness_deadline`

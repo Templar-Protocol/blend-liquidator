@@ -70,10 +70,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from Telegram's own `description` field, never the raw response body,
   which echoes the request URL — token included — on some of Telegram's
   own error pages.
-- `LedgerPoller` records a heartbeat every iteration — and again every
-  `poll_interval` while it waits for the tracker's acknowledgement, since
-  waiting for it is being alive too — and the chain head every pass that
-  reads one; a run of `RPC_FAILING_AFTER` (5) consecutive failed passes
+- `LedgerPoller` records a heartbeat every `poll_interval` for as long as
+  its loop is turning, the pass included — the RPC calls, the `getEvents`
+  paging and the wait for the tracker's acknowledgement alike — so the
+  backoff sleep after a failed pass is the only unstamped stretch, and the
+  chain head every pass that reads one; a run of `RPC_FAILING_AFTER` (5) consecutive failed passes
   notifies `NotificationKind::RpcFailing` once, at the threshold, with the
   first successful pass logging the recovery and resetting the count.
   `Service::run` spawns a watchdog task beside the pollers
