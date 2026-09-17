@@ -307,7 +307,7 @@ impl<'a> LedgerPoller<'a> {
     ) -> Result<(), oneshot::error::RecvError> {
         heartbeat_while(
             self.metrics.as_deref(),
-            self.pool,
+            &[self.pool],
             self.config.poll_interval,
             applied,
         )
@@ -583,12 +583,13 @@ impl<'a> LedgerPoller<'a> {
     }
 }
 
-/// Runs `fut` to completion while recording `pool`'s heartbeat on
-/// `metrics` — once when the wait starts and again every `interval` until
-/// it finishes — and answers exactly what `fut` answered.
+/// Runs `fut` to completion while recording a heartbeat for every pool in
+/// `pools` on `metrics` — once when the wait starts and again every
+/// `interval` until it finishes — and answers exactly what `fut`
+/// answered.
 ///
 /// **Working is being alive.** A heartbeat says the process is still
-/// turning on this pool's behalf, and the two places that take longer
+/// turning on that pool's behalf, and the two places that take longer
 /// than [`PollerConfig::liveness_deadline`] without turning the poll loop
 /// are the wait for a tick's acknowledgement (a gap reseed, a full scan)
 /// and the initial seed, which runs before the pollers are spawned at
@@ -597,12 +598,20 @@ impl<'a> LedgerPoller<'a> {
 /// middle of the very work it was waiting on — which, on restart, it
 /// would begin again.
 ///
+/// **Every pool, not only the one being worked on.** A wait that stamped
+/// one pool would leave a run's other pools with no heartbeat at all
+/// until their own pollers exist — and the initial seed is precisely
+/// when they do not — so `/livez` would fail for whichever pool the pass
+/// has not reached yet, which is the same restart loop one pool wider.
+/// The poller's own wait passes its single pool; the seed pass passes
+/// every configured one.
+///
 /// Nothing here can change what `fut` answers or when: the output is
 /// returned unchanged, and a caller whose `metrics` is `None` records
 /// nothing at all (spec §8).
 pub async fn heartbeat_while<F: std::future::Future>(
     metrics: Option<&Metrics>,
-    pool: &str,
+    pools: &[&str],
     interval: Duration,
     fut: F,
 ) -> F::Output {
@@ -620,7 +629,9 @@ pub async fn heartbeat_while<F: std::future::Future>(
             // interval.
             _ = ticker.tick() => {
                 if let Some(metrics) = metrics {
-                    metrics.heartbeat(pool);
+                    for pool in pools {
+                        metrics.heartbeat(pool);
+                    }
                 }
             }
         }

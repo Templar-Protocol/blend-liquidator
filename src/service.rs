@@ -519,12 +519,14 @@ fn build_seed_sources(seed: &SeedConfig) -> Result<Vec<SeedSource>, LiquidatorEr
 /// tracker loop to retry on its full-scan cadence as spec §4 requires.
 ///
 /// Each pool's seed is wrapped in [`heartbeat_while`] at
-/// `heartbeat_interval`, so this pass — which runs before any poller
-/// exists to heartbeat for itself — reports the pool it is working on as
-/// alive. Without it `/livez` would have nothing but
+/// `heartbeat_interval`, which stamps **every** configured pool — not
+/// only the one being seeded. This pass runs before any poller exists to
+/// heartbeat for itself, so without it `/livez` would have nothing but
 /// [`crate::http::HttpState::started`]'s baseline to go on for the whole
 /// of a seed that can outlast it, and a restart probe would kill the bot
-/// in the middle of the seed it would then start again.
+/// in the middle of the seed it would then start again — for the pool
+/// being seeded if nothing stamped, and for every pool the pass has not
+/// reached, or skipped as already followed, if only that one did.
 // One collaborator per parameter — two clients, the pools, the seed
 // sources, the batch rate, the heartbeat cadence, the shutdown flag and
 // the run's instruments — and no two of them belong together in a type of
@@ -542,6 +544,12 @@ async fn seed_pools_needing_it(
 ) -> Result<BTreeSet<String>, LiquidatorError> {
     let tracker = Tracker::new(rpc, store);
     let mut incomplete = BTreeSet::new();
+    // Every configured pool, stamped by whichever pool's seed is running:
+    // no poller exists yet for any of them, so a heartbeat only for the
+    // one being seeded would leave the rest measured from
+    // `HttpState::started` alone and fail `/livez` for the pool this pass
+    // has not reached — the same restart loop, one pool wider.
+    let addresses: Vec<&str> = pools.iter().map(|pool| pool.address.as_str()).collect();
     for pool in pools {
         if *shutdown.borrow() {
             tracing::warn!("shutdown requested; stopping before every pool was seeded");
@@ -559,7 +567,7 @@ async fn seed_pools_needing_it(
         };
         let outcome = match heartbeat_while(
             Some(&instruments.metrics),
-            &pool.address,
+            &addresses,
             heartbeat_interval,
             tracker.seed(&pool.address, sources, tick, batch, shutdown),
         )
@@ -4247,6 +4255,97 @@ mod tests {
         );
         assert_eq!(cursor.paging_token, None);
         assert_eq!(store.count_users(harness::POOL).await.expect("count"), 1);
+        Ok(())
+    }
+
+    /// The seed heartbeats for **every** configured pool, not only the one
+    /// it is working on.
+    ///
+    /// A pool the pass has not reached yet, or one it skipped because it
+    /// needs no seed, has no poller either — nothing is spawned until the
+    /// whole pass returns — so a heartbeat only for the pool being seeded
+    /// leaves every other pool measured from `HttpState::started` alone.
+    /// The moment that baseline passes, `/livez` fails for one of them and
+    /// a restart probe kills the bot in the middle of the seed: the
+    /// restart loop closed for the pool being seeded, still open for the
+    /// rest.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_seed_heartbeats_for_every_configured_pool(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        // Followed already — a user and a cursor — so the pass skips it
+        // without seeding, reaching the `continue` above the wrapper.
+        store
+            .upsert_user(&TrackedUser {
+                pool: POOL_B.to_string(),
+                account: harness::USER_TWO.to_string(),
+                health_factor: 20_000_000,
+                collateral: BTreeMap::new(),
+                liabilities: BTreeMap::from([(0, 1)]),
+                updated_ledger: tick.sequence,
+                recheck_ledger: None,
+            })
+            .await
+            .expect("seed a user for the followed pool");
+        store
+            .set_cursor(
+                &events_cursor(POOL_B),
+                &Cursor {
+                    ledger: tick.sequence,
+                    paging_token: None,
+                },
+            )
+            .await
+            .expect("a cursor for the followed pool");
+
+        let rpc = ScriptedRpc::start().await;
+        rpc.expect(
+            "getLatestLedger",
+            json!({"id": "aa", "protocolVersion": 27, "sequence": tick.sequence,
+                   "closeTime": tick.close_time.to_string()}),
+        );
+        harness::script_snapshot(&rpc, &[harness::USER_ONE]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let (_flag, shutdown) = watch::channel(false);
+        let file = write_temp_seed_file(&format!(
+            "[accounts]\n\"{}\" = [\"{}\"]\n",
+            harness::POOL,
+            harness::USER_ONE
+        ));
+        let sources = vec![SeedSource::File(FileSeed::load(&file).expect("loads"))];
+        let instruments = Instruments::for_tests();
+
+        // The followed pool first, so the pass has already `continue`d past
+        // it by the time the second pool's seed starts stamping.
+        let incomplete = seed_pools_needing_it(
+            &client,
+            &store,
+            &[
+                pool_config(POOL_B, USDC, &["*"], &["*"]),
+                pool_config(harness::POOL, USDC, &["*"], &["*"]),
+            ],
+            &sources,
+            20,
+            std::time::Duration::from_millis(1),
+            &shutdown,
+            &instruments,
+        )
+        .await
+        .expect("seeding succeeds");
+
+        assert!(incomplete.is_empty(), "the one source answered");
+        for pool in [harness::POOL, POOL_B] {
+            assert!(
+                instruments
+                    .metrics
+                    .pool_status(pool)
+                    .and_then(|status| status.heartbeat)
+                    .is_some(),
+                "every configured pool is heartbeated while the seed runs, the ones it \
+                 seeds and the ones it does not: {pool} has none"
+            );
+        }
+        assert_eq!(rpc.remaining(), 0, "the followed pool cost no chain read");
         Ok(())
     }
 
