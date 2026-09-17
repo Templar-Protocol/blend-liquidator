@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # test-cargo-jobs.sh — shell tests for scripts/cargo-jobs.sh's job-cap
-# formula: min(nproc, max(1, mem_bytes / 2 GiB)). Run by hand and by the
-# sandbox CI workflow. Exercises the formula only through
-# CARGO_JOBS_NPROC/CARGO_JOBS_MEM_BYTES, never the real /proc or /sys
-# paths, so it is deterministic wherever it runs.
+# formula: min(nproc, max(1, mem_bytes / 2 GiB)). Run by hand and by
+# .github/workflows/sandbox.yml, before it starts a network. Exercises
+# the formula only through CARGO_JOBS_NPROC/CARGO_JOBS_MEM_BYTES, never
+# the real /proc or /sys paths, so it is deterministic wherever it runs.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

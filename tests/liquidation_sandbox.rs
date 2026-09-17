@@ -27,6 +27,17 @@
 //! diagnose. `panic!` directly is for the two refusals above, which happen
 //! before there is a bot or a log at all.
 //!
+//! One thing the assertions do not prove, so that nobody reads more into
+//! them than is there: in this scenario the fill's own request list repays
+//! the bid out of the filler's wallet, so the position it takes over
+//! arrives with no liabilities and the unwind that follows runs the
+//! withdraw step only — `"unwind planned", "actions":1,
+//! "remaining_liabilities":"[]"`. The `liabilities == 0` half of
+//! [`FillerPosition::settled`] is therefore satisfied by the fill, and the
+//! unwind's repay branch has no coverage here. The scenario that would
+//! give it some is a filler whose wallet cannot cover the bid, which is
+//! Phase 8's soak rather than this tier's one run.
+//!
 //! The database is this test's own: it creates `sandbox_<unix seconds>` on
 //! the `DATABASE_URL` server (the role has `CREATEDB`, which is what
 //! `#[sqlx::test]` already relies on) and points the bot at it, so a rerun
@@ -71,12 +82,16 @@ const CREATION_TIMEOUT: Duration = Duration::from_secs(90);
 /// This is the one budget the auction's own arithmetic sets rather than the
 /// bot's, and it is counted in *ledgers* because that is what the contract
 /// counts: the lot ramps linearly to full over the auction's first 200
-/// ledgers while the bid stays whole, so the earliest ledger at which the lot
-/// covers the bid plus the configured margin is `200 × bid_value /
-/// lot_value_at_full` — for this fixture (a 210 USDC bid against a 3202 XLM
-/// lot worth $240 at the crashed price, plus 100 bps) about 177 ledgers in.
-/// Nothing shortens it: `force_fill` caps the wait at 350 ledgers, which is
-/// later, not sooner. 190 is 177 with room for a re-plan.
+/// ledgers while the bid stays whole, so the earliest ledger at which the
+/// lot covers the bid plus the configured margin is `200 × bid_value /
+/// lot_value_at_full`. The figures are a real run's, not an illustration:
+/// the auctioneer created this scenario's auction at 69%, a bid of 207 USDC
+/// against a full lot of ~3,139 XLM worth ~$235 at the crashed price, and
+/// with the pool's 100 bps margin the fill landed at block 178. Both sides
+/// scale with the percent, so the break-even block is near-invariant across
+/// the band the percent walk lands in. Nothing shortens it: `force_fill`
+/// caps the wait at 350 ledgers, which is later, not sooner. 190 is 178
+/// with room for a re-plan.
 const FILL_LEDGERS: u32 = 190;
 
 /// What [`FILL_LEDGERS`] worth of measured close time is padded by, for the
@@ -646,12 +661,17 @@ async fn fill_budget(bot: &mut Bot, rpc: &RpcClient) -> Duration {
 /// The auctioneer's audit row for one account, once a transaction has been
 /// named for it. Postgres has no placeholder for a table name, so each
 /// audit table gets its own literal rather than one interpolated statement.
+///
+/// `dry_run = false` is redundant against a hash — a dry run simulates and
+/// submits nothing, so it can never attach one — and it is here anyway,
+/// because the mode is the whole point of this tier and a row that states
+/// it is a better witness than one that merely implies it.
 const CREATION_TX_HASH: &str = "SELECT tx_hash FROM creations \
-     WHERE pool = $1 AND account = $2 AND tx_hash IS NOT NULL LIMIT 1";
+     WHERE pool = $1 AND account = $2 AND dry_run = false AND tx_hash IS NOT NULL LIMIT 1";
 
 /// The filler's, the same shape.
 const FILL_TX_HASH: &str = "SELECT tx_hash FROM fills \
-     WHERE pool = $1 AND account = $2 AND tx_hash IS NOT NULL LIMIT 1";
+     WHERE pool = $1 AND account = $2 AND dry_run = false AND tx_hash IS NOT NULL LIMIT 1";
 
 /// Waits for `statement` to answer a transaction hash, and answers it.
 ///
@@ -886,7 +906,13 @@ async fn terminate(bot: &mut Bot) {
         Err(error) => fail(bot, &format!("could not run kill -TERM: {error}")),
     }
 
+    // `Wait::tick` cannot drive this loop: it fails on a child that has
+    // already exited, which here is the success condition. So the budget
+    // and the message come from `Wait` and the progress line is printed
+    // here, on the same [`PROGRESS_INTERVAL`] — a bot that hangs on
+    // SIGTERM must not give thirty seconds of silence and then a timeout.
     let wait = Wait::new("the bot to drain and exit", SHUTDOWN_TIMEOUT);
+    let mut last_progress = Instant::now();
     loop {
         let exited = match bot.child.as_mut().map(std::process::Child::try_wait) {
             Some(Ok(status)) => status,
@@ -908,6 +934,16 @@ async fn terminate(bot: &mut Bot) {
             fail(bot, &message);
         }
         tokio::time::sleep(POLL_INTERVAL).await;
+        if last_progress.elapsed() >= PROGRESS_INTERVAL {
+            last_progress = Instant::now();
+            let left = wait.deadline.saturating_duration_since(Instant::now());
+            println!(
+                "  still waiting for {} ({} s left of {} s)",
+                wait.what,
+                left.as_secs(),
+                wait.budget.as_secs()
+            );
+        }
     }
 }
 

@@ -17,7 +17,8 @@
 # contract id from the source account, the salt and the **network
 # passphrase** alone, which makes the id a cheap deterministic fingerprint
 # of the network the CLI thinks it is on. The only requirement is the CLI
-# itself. Run by hand.
+# itself. Run by hand and by .github/workflows/sandbox.yml, before it
+# starts a network.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

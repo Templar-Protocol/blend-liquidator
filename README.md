@@ -236,12 +236,14 @@ leaves a borrower at a health factor of ~1.19, crashes XLM's price 25% to
 put it at ~0.89, and then asserts that the bot, on its own: recorded a
 `creations` row carrying a transaction hash, recorded a `fills` row
 carrying one, left its own on-chain position with no liabilities and its
-primary collateral back at `min_primary_collateral`, reported exactly one
-succeeded creation, exactly one succeeded fill and at least one unwind
-pass at `/metrics`, and exited `0` on `SIGTERM`. What it catches is the
-world moving — a quickstart image, a pinned wasm, a contract that changed
-its mind — rather than a diff being wrong, which is what the pull-request
-gate is for.
+primary collateral back at `min_primary_collateral` (the fill's own repay
+clears the bid here, so the unwind exercises the withdraw step only — a
+filler whose wallet cannot cover the bid is the follow-up scenario, for
+the testnet soak), reported exactly one succeeded creation, exactly one
+succeeded fill and at least one unwind pass at `/metrics`, and exited `0`
+on `SIGTERM`. What it catches is the world moving — a quickstart image, a
+pinned wasm, a contract that changed its mind — rather than a diff being
+wrong, which is what the pull-request gate is for.
 
 ## Layout
 

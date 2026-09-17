@@ -5,7 +5,7 @@ name: Sandbox
 # place anything in this repository submits a transaction it signed.
 #
 # Nightly and on demand, never on `push` or `pull_request`. The run stands up
-# a network, deploys six contracts and then waits out an auction's ledger
+# a network, deploys eight contracts and then waits out an auction's ledger
 # ramp, which is minutes of wall clock nobody would pay per PR; and what it
 # catches is the world moving — a quickstart image, a pinned wasm, a contract
 # that changed its mind — rather than a diff being wrong, which is what the
@@ -112,6 +112,19 @@ jobs:
           sudo install -m 0755 "$tmp/stellar" /usr/local/bin/stellar
           rm -rf "$tmp"
           stellar --version | grep -F "$version"
+
+      # Before the network, because they need none of it and they are the
+      # only guard on two things nothing else exercises: the build-job cap's
+      # min(nproc, max(1, mem/2GiB)) formula and its [build]-declared-twice
+      # failure, and — the one that matters here — that every `stellar` call
+      # takes its network from lib.sh's flags rather than from the
+      # environment. Seconds, and after the CLI install because the last of
+      # them derives a contract id with it.
+      - name: Shell tests for the build-job cap and the network pinning
+        run: |
+          ./scripts/sandbox/test-cargo-jobs.sh
+          ./scripts/sandbox/test-cargo-config.sh
+          ./scripts/sandbox/test-network-pinning.sh
 
       - name: Start the local network
         run: ./scripts/sandbox/up.sh

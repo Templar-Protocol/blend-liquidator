@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # test-cargo-config.sh — shell tests for scripts/cargo-jobs-config.sh's
 # file-editing logic, run on temp files so nothing here ever touches a
-# real ~/.cargo/config.toml. Run by hand and by the sandbox CI workflow.
+# real ~/.cargo/config.toml. Run by hand and by
+# .github/workflows/sandbox.yml, before it starts a network.
 #
 # Exercises exactly the case that was missed the first time around: a
 # [build] table that exists but has no `jobs` key must get `jobs`

@@ -567,7 +567,13 @@ make help                           # Docker Compose lifecycle
   `MIN_PRIMARY_COLLATERAL`..=`MAX_PRIMARY_COLLATERAL` (the floor plus the
   one percent a b-token burn rounds up by, not slack), and `/metrics`
   holding exactly one succeeded creation, exactly one succeeded fill and
-  at least one unwind pass — then `SIGTERM` and exit `0`. `#[ignore]`d, so
+  at least one unwind pass — then `SIGTERM` and exit `0`. What the
+  unwind assertion does *not* prove: the fill's own request list repays
+  the bid from the filler's wallet in this scenario, so the position it
+  takes over arrives with no liabilities and the unwind runs the withdraw
+  step only — the `liabilities == 0` half is the fill's doing, and the
+  unwind's repay branch is uncovered until a scenario whose filler cannot
+  cover the bid (Phase 8's soak). `#[ignore]`d, so
   `cargo test` never starts a container, and it refuses to run at all
   unless `target/sandbox/sandbox.env` exists and names the standalone
   network. Nothing in it panics through `unwrap`/`expect`: every failure
@@ -590,7 +596,8 @@ make help                           # Docker Compose lifecycle
   `test-cargo-jobs.sh`, `test-cargo-config.sh` and
   `test-network-pinning.sh` are shell tests — the first two for the two
   scripts below, the third for the network pinning the gotcha below
-  describes — run by hand.
+  describes — run by hand and by `sandbox.yml`, which runs all three
+  before it starts a network.
 - `scripts/cargo-jobs.sh` and `scripts/cargo-jobs-config.sh` — the
   cgroup-aware build-job cap and the one thing that writes it down.
   `cargo-jobs.sh` prints `min(nproc, max(1, memory_limit / 2 GiB))`, the
@@ -1067,10 +1074,11 @@ Status above for what remains.
   price, and a caller that passed only XLM's would silently unprice USDC.
 - The sandbox test's fill budget is **measured**, never assumed. The fill
   waits on the auction's own ledger ramp — the lot ramps to full over the
-  first 200 ledgers while the bid stays whole, so for this scenario (a 210
-  USDC bid against a 3202 XLM lot worth $240 at the crashed price, plus
-  the pool's 100 bps margin) the earliest profitable ledger is about 177
-  in, and `FILL_LEDGERS` is 190, that with room for a re-plan. So
+  first 200 ledgers while the bid stays whole, so for this scenario — the
+  numbers are a real run's: an auction created at 69%, a 207 USDC bid
+  against a full lot of ~3,139 XLM worth ~$235 at the crashed price, plus
+  the pool's 100 bps margin — the earliest profitable ledger is 178 in,
+  and `FILL_LEDGERS` is 190, that with room for a re-plan. So
   `fill_budget` samples the chain head (`RpcClient::latest_ledger`, the
   RPC's `getLatestLedger`) for five seconds immediately before the wait,
   derives `FILL_LEDGERS × seconds per ledger` plus a minute, and fails *up
