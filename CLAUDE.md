@@ -575,19 +575,22 @@ make help                           # Docker Compose lifecycle
   own log first.
 - `scripts/sandbox/` — the tier's scripts, all `set -euo pipefail` and all
   sourcing `lib.sh` (log/die, `sandbox_dir`, `sha256_check`/`fetch`,
-  `wait_for_rpc`, `require_standalone_network`, the `invoke`/`invoke_view`
+  `wait_for_rpc`, `require_standalone_network` and the
+  `sandbox_network_args` flags it pins, the `invoke`/`invoke_view`
   wrappers that log a contract's *role* and never an argument, and
   `env_write`, which truncates and `chmod 600`s before it writes) and
   `versions.env` (every pin: the five wasm URLs with their SHA-256s, the
   `stellar` CLI release and both tarball hashes, the quickstart image by
   digest, and `SANDBOX_PASSPHRASE`). `fetch-artifacts.sh` downloads and
-  verifies the wasm; `up.sh` starts the pinned quickstart container, waits
-  for its RPC to be healthy *and* closing ledgers, and points the CLI's
-  `local` network at it; `deploy.sh` stands Blend v2 up in ten steps and
+  verifies the wasm; `up.sh` starts the pinned quickstart container
+  (bound to `127.0.0.1`) and waits for its RPC to be healthy *and*
+  closing ledgers; `deploy.sh` stands Blend v2 up in ten steps and
   writes `target/sandbox/sandbox.env`; `crash.sh` moves the oracle's XLM
   price; `down.sh` removes the container and `sandbox.env`.
-  `test-cargo-jobs.sh` and `test-cargo-config.sh` are shell tests for the
-  two scripts below, run by hand.
+  `test-cargo-jobs.sh`, `test-cargo-config.sh` and
+  `test-network-pinning.sh` are shell tests — the first two for the two
+  scripts below, the third for the network pinning the gotcha below
+  describes — run by hand.
 - `scripts/cargo-jobs.sh` and `scripts/cargo-jobs-config.sh` — the
   cgroup-aware build-job cap and the one thing that writes it down.
   `cargo-jobs.sh` prints `min(nproc, max(1, memory_limit / 2 GiB))`, the
@@ -988,6 +991,22 @@ Status above for what remains.
   spawns anything. The answer has to come from the node, never from
   configuration: this is the one place the bot runs armed, and the only
   thing that makes that safe is what network it is pointed at.
+
+  **And the URL it verified is the URL every `stellar` call is handed.**
+  A named network is not: the CLI resolves an ad-hoc network from
+  `STELLAR_RPC_URL` and `STELLAR_NETWORK_PASSPHRASE` *ahead of* an
+  explicit `--network`, so an operator with that pair exported — they are
+  the CLI's own documented variables — would have had the gate confirm
+  localhost while `keys generate --fund`, every deploy and every invoke
+  went to a public network, and `STELLAR_SIGN_WITH_KEY` was unopposed
+  altogether. So `lib.sh` unsets those variables at source time, and
+  `require_standalone_network` ends by exporting `SANDBOX_RPC_URL` and
+  building `sandbox_network_args` (`--rpc-url … --network-passphrase …`),
+  which every call passes and which beats the environment.
+  `scripts/sandbox/test-network-pinning.sh` is the guard: it derives a
+  contract id — the network passphrase is mixed into it — through the
+  same array in a clean environment and in a polluted one, and requires
+  the two to be equal. Nothing here may go back to `--network`.
 - The backstop and the pool factory each name the other — the backstop's
   constructor takes the factory (it asks `is_pool` before accepting a
   deposit) and the factory's takes the backstop — so one address must be

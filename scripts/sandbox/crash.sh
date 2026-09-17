@@ -20,8 +20,6 @@ source "${script_dir}/lib.sh"
 # shellcheck source=scripts/sandbox/versions.env
 source "${VERSIONS_ENV:-${script_dir}/versions.env}"
 
-: "${SANDBOX_PORT:=8000}"
-
 price=${1:-750000}
 # Only a positive integer: the oracle reports i128 prices in fixed point,
 # and a decimal here ("0.075") would be a silently different number, not
@@ -34,13 +32,26 @@ esac
 env_file="$(sandbox_dir)/sandbox.env"
 [ -f "${env_file}" ] || die "crash: ${env_file} does not exist — run scripts/sandbox/up.sh and scripts/sandbox/deploy.sh first"
 
-require_standalone_network "http://localhost:${SANDBOX_PORT}/rpc"
-
+# sandbox.env first, and the gate on the URL it names rather than on one
+# reconstructed from SANDBOX_PORT: SANDBOX_RPC_URL is what deploy.sh
+# recorded and what the bot is running against, so it is the URL that has
+# to answer the standalone passphrase. The two agree today; checking the
+# other one would be checking a network nothing here uses.
+pinned_passphrase="${SANDBOX_PASSPHRASE}"
 # shellcheck source=/dev/null
 source "${env_file}"
-for key in SANDBOX_ORACLE SANDBOX_XLM SANDBOX_USDC; do
+for key in SANDBOX_RPC_URL SANDBOX_ORACLE SANDBOX_XLM SANDBOX_USDC; do
 	[ -n "${!key:-}" ] || die "crash: ${env_file} does not define ${key}"
 done
+# The comparison passphrase stays versions.env's. sandbox.env sets
+# SANDBOX_PASSPHRASE too and has just overwritten it; an env file naming a
+# network the pins do not is exactly what this gate exists to refuse, so
+# it is a failure rather than something to quietly adopt.
+[ "${SANDBOX_PASSPHRASE}" = "${pinned_passphrase}" ] \
+	|| die "crash: ${env_file} names the passphrase '${SANDBOX_PASSPHRASE}', not the sandbox's pinned '${pinned_passphrase}' — refusing to touch a network that is not this sandbox's own"
+
+require_standalone_network "${SANDBOX_RPC_URL}"
+
 sandbox_register_role "${SANDBOX_ORACLE}" oracle
 
 # set_price_stable(prices: Vec<i128>) — positional, in the `assets` order

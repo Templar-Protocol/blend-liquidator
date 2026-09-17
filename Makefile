@@ -89,6 +89,11 @@ sandbox-test: ## Run the end-to-end liquidation against the deployed sandbox (~5
 #
 # A name that could not be dropped stays in the file: it is still on the
 # server, and a sweep that forgot it would leave it there forever.
+#
+# The hint below prints the server with its userinfo stripped. DATABASE_URL
+# carries a password — the committed local development one today, whatever
+# an operator exported tomorrow — and a hint is not worth putting one in a
+# terminal, a CI log or a pasted issue.
 sandbox-down: ## Tear the sandbox down and drop the databases failed runs kept
 	./scripts/sandbox/down.sh
 	@set -u; \
@@ -96,7 +101,8 @@ sandbox-down: ## Tear the sandbox down and drop the databases failed runs kept
 	list=target/sandbox/run-databases; \
 	if [ ! -s "$$list" ]; then \
 		echo "no databases recorded in $$list — nothing to drop"; \
-		echo "for one kept by a run from before that file: sqlx database drop -y -D $$server/sandbox_<stamp>"; \
+		echo "for one kept by a run from before that file: sqlx database drop -y -D $$(printf '%s' "$$server" | sed -E 's#//[^@]*@#//#')/sandbox_<stamp>"; \
+		echo "  (that server has its userinfo stripped for this line — take the credentials from DATABASE_URL)"; \
 	else \
 		kept="$$list.kept"; : >"$$kept"; \
 		while read -r name; do \

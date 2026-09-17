@@ -19,6 +19,12 @@
 # key is read exactly once, at the very end, straight into sandbox.env —
 # it is never echoed, never logged and never passed as an argument.
 #
+# Every CLI call here, wrapped or not, is handed lib.sh's
+# "${sandbox_network_args[@]}" — the RPC URL require_standalone_network
+# has just verified and the passphrase it verified it by. Nothing names a
+# CLI network: the environment can redirect a `--network`, and this script
+# generates keys, funds them and signs with them.
+#
 # ## Argument names and shapes
 #
 # Every name below was read from the wasm's own spec with
@@ -132,7 +138,7 @@ ALLOWANCE_UNTIL_LEDGER=500000
 generate_key() {
 	local name=$1
 	log "generating and funding ${name}"
-	stellar keys generate "${name}" --network "${SANDBOX_NETWORK}" --fund --overwrite \
+	stellar keys generate "${name}" "${sandbox_network_args[@]}" --fund --overwrite \
 		|| die "step 1 keys: stellar keys generate ${name} failed"
 }
 
@@ -178,7 +184,7 @@ deploy_wasm() {
 	local role=$1 key=$2 wasm=$3 id
 	shift 3
 	log "deploying ${role} from $(basename "${wasm}") as ${key}"
-	id=$(stellar contract deploy --network "${SANDBOX_NETWORK}" --source-account "${key}" \
+	id=$(stellar contract deploy "${sandbox_network_args[@]}" --source-account "${key}" \
 		--wasm "${wasm}" "$@") || die "deploying ${role}: stellar contract deploy failed"
 	[ -n "${id}" ] || die "deploying ${role}: stellar contract deploy printed no contract id"
 	printf '%s\n' "${id}"
@@ -194,7 +200,7 @@ deploy_wasm() {
 deploy_sac() {
 	local role=$1 key=$2 asset=$3 id
 	log "deploying ${role} as the Stellar Asset Contract for ${asset}"
-	id=$(stellar contract asset deploy --network "${SANDBOX_NETWORK}" --source-account "${key}" \
+	id=$(stellar contract asset deploy "${sandbox_network_args[@]}" --source-account "${key}" \
 		--asset "${asset}") || die "deploying ${role}: stellar contract asset deploy ${asset} failed"
 	[ -n "${id}" ] || die "deploying ${role}: stellar contract asset deploy ${asset} printed no contract id"
 	printf '%s\n' "${id}"
@@ -207,7 +213,7 @@ deploy_sac() {
 trust() {
 	local key=$1 asset=$2
 	log "opening ${key}'s trustline to ${asset%%:*}"
-	stellar tx new change-trust --network "${SANDBOX_NETWORK}" --source-account "${key}" --line "${asset}" >/dev/null \
+	stellar tx new change-trust "${sandbox_network_args[@]}" --source-account "${key}" --line "${asset}" >/dev/null \
 		|| die "opening trustlines: change-trust ${asset%%:*} for ${key} failed"
 }
 
@@ -359,7 +365,7 @@ invoke "${SANDBOX_KEY_ADMIN}" "${COMET}" init \
 ########################################################################
 
 log "=== step 5: backstop and factory ==="
-FACTORY=$(stellar contract id wasm --network "${SANDBOX_NETWORK}" \
+FACTORY=$(stellar contract id wasm "${sandbox_network_args[@]}" \
 	--salt "${FACTORY_SALT}" --source-account "${SANDBOX_KEY_ADMIN}") \
 	|| die "step 5 factory: predicting the factory's address failed"
 [ -n "${FACTORY}" ] || die "step 5 factory: stellar contract id wasm printed no address"
@@ -375,14 +381,14 @@ BACKSTOP=$(deploy_wasm backstop "${SANDBOX_KEY_ADMIN}" "${wasm_dir}/backstop_v2.
 sandbox_register_role "${BACKSTOP}" backstop
 
 log "uploading the pool wasm"
-POOL_HASH=$(stellar contract upload --network "${SANDBOX_NETWORK}" \
+POOL_HASH=$(stellar contract upload "${sandbox_network_args[@]}" \
 	--source-account "${SANDBOX_KEY_ADMIN}" --wasm "${wasm_dir}/pool_v2.0.0.wasm") \
 	|| die "step 5 pool wasm: stellar contract upload failed"
 [ -n "${POOL_HASH}" ] || die "step 5 pool wasm: stellar contract upload printed no hash"
 log "pool wasm hash ${POOL_HASH}"
 
 log "deploying the pool factory at the predicted address"
-FACTORY_DEPLOYED=$(stellar contract deploy --network "${SANDBOX_NETWORK}" \
+FACTORY_DEPLOYED=$(stellar contract deploy "${sandbox_network_args[@]}" \
 	--source-account "${SANDBOX_KEY_ADMIN}" --wasm "${wasm_dir}/pool-factory_v2.0.0.wasm" \
 	--salt "${FACTORY_SALT}" -- \
 	--pool_init_meta "{\"backstop\":\"${BACKSTOP}\",\"blnd_id\":\"${BLND}\",\"pool_hash\":\"${POOL_HASH}\"}") \
@@ -518,11 +524,22 @@ log "borrower positions: ${positions}"
 # assigned to a shell variable that outlives this heredoc, never passed as
 # an argument and never logged — which is why this is the last step and
 # why the log line below names the file rather than its contents.
+#
+# Where the heredoc itself lives is the rest of that claim: bash
+# materialises one either as a pipe (5.1 and later, for a document this
+# small) or as a temp file created 0600 and unlinked immediately, so the
+# only on-disk copy is short-lived, owner-only and already nameless. The
+# durable copy is sandbox.env, which env_write restricted before the
+# first byte reached it.
+#
+# SANDBOX_RPC_URL is written from the variable require_standalone_network
+# exported, not from a second reconstruction of the URL: what the node was
+# checked on is what the bot is pointed at.
 ########################################################################
 
 log "=== step 10: sandbox.env ==="
 env_write "${env_file}" <<EOF
-SANDBOX_RPC_URL="${rpc_url}"
+SANDBOX_RPC_URL="${SANDBOX_RPC_URL}"
 SANDBOX_PASSPHRASE="${SANDBOX_PASSPHRASE}"
 SANDBOX_POOL="${POOL}"
 SANDBOX_XLM="${XLM}"

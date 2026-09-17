@@ -11,6 +11,27 @@
 #
 # shellcheck shell=bash
 
+# The stellar CLI's own network and signing variables, unset at source time
+# — before a single function is defined, so no script here can make a CLI
+# call ahead of this.
+#
+# They are not ours to inherit. The CLI resolves an ad-hoc network from
+# STELLAR_RPC_URL and STELLAR_NETWORK_PASSPHRASE *ahead of* an explicit
+# `--network`, so an operator with the pair exported (they are the CLI's
+# documented variables, advertised on every network-taking subcommand)
+# would have this tier generate keys, fund them, deploy and invoke on
+# whatever those name, while require_standalone_network went on confirming
+# localhost. STELLAR_SIGN_WITH_KEY and its two siblings are worse still:
+# nothing here passes a --sign-with-* flag, so the environment form is
+# unopposed and the sandbox would sign with a key that is not its own.
+#
+# The flags every call passes (sandbox_network_args, below) already beat
+# all of them; this is the second half of the answer, so that a variable
+# nobody thought to override cannot decide anything either.
+unset STELLAR_RPC_URL STELLAR_NETWORK_PASSPHRASE STELLAR_NETWORK \
+	STELLAR_ACCOUNT STELLAR_SIGN_WITH_KEY \
+	STELLAR_SIGN_WITH_LAB STELLAR_SIGN_WITH_LEDGER
+
 # sandbox_lib_dir is lib.sh's own directory, resolved once at source time
 # from BASH_SOURCE — a sourced file's $0 is the *caller's* path, not its
 # own, so BASH_SOURCE is the only way sandbox_dir() below is correct
@@ -150,19 +171,54 @@ wait_for_rpc() {
 	log "${url} is healthy and its ledger has advanced twice"
 }
 
+# sandbox_network_args holds the two flags every `stellar` call below
+# passes: the RPC URL that has been proved standalone, and the passphrase
+# it was proved by. Explicit flags rather than a named network for two
+# reasons — they are the form that beats the environment (a `--network`
+# does not, see the unset above and test-network-pinning.sh), and they
+# make the URL that was checked and the URL that is used literally the
+# same string rather than two reconstructions of it.
+#
+# Empty until sandbox_set_network has run, so a call made before the gate
+# fails on a missing network rather than falling back to some default.
+sandbox_network_args=()
+
+# sandbox_set_network URL — records URL as this sandbox's RPC, exports it
+# as SANDBOX_RPC_URL (the one name the rest of the tier reads it under)
+# and builds the flag array from it.
+#
+# require_standalone_network calls this with the URL it has just verified,
+# which is the only way a script should reach it; test-network-pinning.sh
+# calls it directly, deriving a contract id offline against a URL it never
+# contacts.
+sandbox_set_network() {
+	[ -n "${SANDBOX_PASSPHRASE:-}" ] \
+		|| die "sandbox_set_network: SANDBOX_PASSPHRASE is unset — source versions.env before this"
+	SANDBOX_RPC_URL=$1
+	export SANDBOX_RPC_URL
+	sandbox_network_args=(--rpc-url "${SANDBOX_RPC_URL}" --network-passphrase "${SANDBOX_PASSPHRASE}")
+}
+
 # require_standalone_network URL — dies unless URL's getNetwork answers
 # exactly SANDBOX_PASSPHRASE (from versions.env — every caller sources it
-# before this). This is the one gate every later sandbox script calls
-# first: the sandbox exists to never touch a public network, so refusing
-# on any other passphrase — including no answer at all — has to happen
-# before that script does anything else, however its RPC URL got
-# configured.
+# before this), and on success makes URL the network every later CLI call
+# names, through sandbox_set_network. This is the one gate every later
+# sandbox script calls first: the sandbox exists to never touch a public
+# network, so refusing on any other passphrase — including no answer at
+# all — has to happen before that script does anything else, however its
+# RPC URL got configured.
+#
+# Verifying and pinning in the one function is the point: what the node
+# answered for is then exactly what every `stellar` call is handed, so the
+# gate cannot be passed about one network while the work happens on
+# another.
 require_standalone_network() {
 	local url=$1 body passphrase
 	body=$(_sandbox_rpc_call "${url}" getNetwork)
 	passphrase=$(printf '%s' "${body}" | jq -r '.result.passphrase // empty' 2>/dev/null) || passphrase=""
 	[ -n "${passphrase}" ] || die "require_standalone_network: ${url} did not answer getNetwork"
 	[ "${passphrase}" = "${SANDBOX_PASSPHRASE}" ] || die "require_standalone_network: ${url} reports passphrase '${passphrase}', expected the sandbox's standalone passphrase '${SANDBOX_PASSPHRASE}' — refusing to touch a network that is not this sandbox's own"
+	sandbox_set_network "${url}"
 }
 
 # The stellar CLI identity names deploy.sh creates and crash.sh signs
@@ -177,12 +233,6 @@ SANDBOX_KEY_ISSUER=sandbox-issuer
 SANDBOX_KEY_ADMIN=sandbox-admin
 SANDBOX_KEY_BORROWER=sandbox-borrower
 SANDBOX_KEY_FILLER=sandbox-filler
-
-# SANDBOX_NETWORK is the stellar CLI network definition every invocation
-# below names. up.sh is what points `local` at the sandbox's RPC; nothing
-# here ever passes a raw --rpc-url, so there is exactly one place a
-# sandbox script's idea of "the network" comes from.
-: "${SANDBOX_NETWORK:=local}"
 
 # SANDBOX_ROLES maps a deployed contract id to the role deploy.sh gave it
 # ("pool", "oracle", "comet", …). invoke() reads it so a log line can name
@@ -217,7 +267,7 @@ invoke() {
 	shift 3
 	role="${SANDBOX_ROLES[${contract}]:-unregistered contract}"
 	log "invoke ${fn} on ${role} as ${key}"
-	stellar contract invoke --network "${SANDBOX_NETWORK}" --source-account "${key}" \
+	stellar contract invoke "${sandbox_network_args[@]}" --source-account "${key}" \
 		--id "${contract}" --send=yes -- "${fn}" "$@" \
 		|| die "invoke ${fn} on ${role} (${contract}) as ${key} failed"
 }
@@ -232,7 +282,7 @@ invoke_view() {
 	shift 3
 	role="${SANDBOX_ROLES[${contract}]:-unregistered contract}"
 	log "view ${fn} on ${role} as ${key}"
-	stellar contract invoke --network "${SANDBOX_NETWORK}" --source-account "${key}" \
+	stellar contract invoke "${sandbox_network_args[@]}" --source-account "${key}" \
 		--id "${contract}" --send=no -- "${fn}" "$@" \
 		|| die "view ${fn} on ${role} (${contract}) as ${key} failed"
 }
