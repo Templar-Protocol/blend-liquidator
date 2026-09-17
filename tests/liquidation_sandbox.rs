@@ -30,9 +30,10 @@
 //! The database is this test's own: it creates `sandbox_<unix seconds>` on
 //! the `DATABASE_URL` server (the role has `CREATEDB`, which is what
 //! `#[sqlx::test]` already relies on) and points the bot at it, so a rerun
-//! against a fresh network never reads a previous run's rows. It is left
-//! behind deliberately — it is the evidence of the run, and it costs nothing
-//! but a name.
+//! against a fresh network never reads a previous run's rows. A run that
+//! passes drops it again; a run that fails keeps it, because it is then the
+//! only durable record of what the bot decided, and every failure says so.
+//! `make sandbox-down` drops whatever has been kept.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -61,20 +62,36 @@ const HEALTHY_TIMEOUT: Duration = Duration::from_mins(1);
 /// to flag the borrower, then the percent walk, then the submission.
 const CREATION_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// How long the filler has to take the auction, measured from the creation
-/// row appearing.
+/// How many ledgers the filler has to wait for before it can take the
+/// auction at a profit.
 ///
-/// This is the one timeout the auction's own arithmetic sets rather than the
-/// bot's. The lot ramps linearly to full over the auction's first 200
+/// This is the one budget the auction's own arithmetic sets rather than the
+/// bot's, and it is counted in *ledgers* because that is what the contract
+/// counts: the lot ramps linearly to full over the auction's first 200
 /// ledgers while the bid stays whole, so the earliest ledger at which the lot
 /// covers the bid plus the configured margin is `200 × bid_value /
 /// lot_value_at_full` — for this fixture (a 210 USDC bid against a 3202 XLM
 /// lot worth $240 at the crashed price, plus 100 bps) about 177 ledgers in.
-/// The sandbox closes one ledger a second, so a *correct* filler waits close
-/// to three minutes here and there is no configuration that shortens it:
-/// `force_fill` caps the wait at 350 ledgers, which is later, not sooner.
-/// Five minutes is that with room for a re-plan.
-const FILL_TIMEOUT: Duration = Duration::from_mins(5);
+/// Nothing shortens it: `force_fill` caps the wait at 350 ledgers, which is
+/// later, not sooner. 190 is 177 with room for a re-plan.
+const FILL_LEDGERS: u32 = 190;
+
+/// What [`FILL_LEDGERS`] worth of measured close time is padded by, for the
+/// bot's own cadences either side of the fill itself.
+const FILL_SLACK: Duration = Duration::from_mins(1);
+
+/// The most the fill may ever be given, however slowly the sandbox closes
+/// ledgers. A sandbox that would need longer is reported as such, up front,
+/// rather than waited out.
+const FILL_TIMEOUT_CAP: Duration = Duration::from_mins(10);
+
+/// How long the close-rate sample runs for before the fill wait.
+const CLOSE_RATE_SAMPLE: Duration = Duration::from_secs(5);
+
+/// The longest the sample waits for a single ledger to close before giving
+/// up on measuring at all. A sandbox that closes nothing in this long is not
+/// one the fill could ever happen on.
+const CLOSE_RATE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long the unwind has to leave the filler with no liabilities and the
 /// primary asset down to its floor, measured from the fill row appearing.
@@ -161,6 +178,13 @@ impl Bot {
     }
 }
 
+/// This run's database, once it exists, so [`fail`] can say it was kept.
+///
+/// A `static` rather than a field of [`Bot`] because it outlives the bot:
+/// the failures worth inspecting a database for include the ones that
+/// happen after the process is gone.
+static RUN_DATABASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 /// Prints the tail of the bot's log and panics.
 ///
 /// Every failure after the bot is spawned goes through here. The tail comes
@@ -173,6 +197,9 @@ fn fail(bot: &Bot, message: &str) -> ! {
     );
     println!("{}", bot.tail());
     println!("--- end of {} ---\n", bot.log.display());
+    if let Some(database) = RUN_DATABASE.get() {
+        println!("the database {database} is kept for inspection — `make sandbox-down` drops it\n");
+    }
     panic!("{message}");
 }
 
@@ -337,6 +364,34 @@ async fn create_run_database(maintenance_url: &str, name: &str) -> String {
     url
 }
 
+/// Drops this run's database, on the success path only.
+///
+/// Called after the bot has exited and this test's own pool is closed:
+/// Postgres refuses to drop a database anything is still connected to.
+/// A failure to drop only warns — the run itself has already passed, and
+/// turning a leaked database name into a red test would say something false
+/// about the bot; `make sandbox-down` sweeps whatever is left.
+async fn drop_run_database(maintenance_url: &str, name: &str) {
+    let maintenance = match PgPool::connect(maintenance_url).await {
+        Ok(pool) => pool,
+        Err(error) => {
+            println!("could not connect to drop {name}: {error} — it is left behind");
+            return;
+        }
+    };
+    // Identifiers take no bind parameter; `name` is `sandbox_` and
+    // `SystemTime`'s seconds, the same audit `create_run_database` makes.
+    let statement = format!("DROP DATABASE \"{name}\"");
+    match sqlx::raw_sql(sqlx::AssertSqlSafe(statement))
+        .execute(&maintenance)
+        .await
+    {
+        Ok(_) => println!("dropped the run's database {name}"),
+        Err(error) => println!("could not drop {name}: {error} — it is left behind"),
+    }
+    maintenance.close().await;
+}
+
 /// The `POOLS_TOML` the bot follows: one pool, USDC bid, any lot, the
 /// primary asset floor the unwind is asserted against.
 fn pools_toml(pool: &str, xlm: &str, usdc: &str) -> String {
@@ -442,6 +497,77 @@ async fn wait_for_ready(bot: &mut Bot, http: &reqwest::Client) {
     }
 }
 
+/// Measures the sandbox's ledger close rate and derives the fill's budget
+/// from it.
+///
+/// The fill waits on the chain's clock, not the bot's: the lot ramp needs
+/// [`FILL_LEDGERS`] ledgers whatever they cost in seconds. The quickstart
+/// image closes one a second today, and a constant written around that
+/// becomes a flake the day it does not — a slower runner would fail here
+/// with "the filler never filled", which is a true statement about the
+/// wrong thing. So the rate is measured, the budget derived, and a sandbox
+/// too slow to finish inside [`FILL_TIMEOUT_CAP`] is reported now rather
+/// than in ten minutes' time.
+async fn fill_budget(bot: &mut Bot, rpc: &RpcClient) -> Duration {
+    let first = match rpc.latest_ledger().await {
+        Ok(ledger) => ledger.sequence,
+        Err(error) => fail(bot, &format!("could not read the latest ledger: {error}")),
+    };
+    println!("sampling the sandbox's ledger close rate from ledger {first}");
+
+    let started = Instant::now();
+    let last = loop {
+        tokio::time::sleep(POLL_INTERVAL).await;
+        let latest = match rpc.latest_ledger().await {
+            Ok(ledger) => ledger.sequence,
+            Err(error) => fail(bot, &format!("could not read the latest ledger: {error}")),
+        };
+        // Both conditions, because one ledger in five seconds measures a
+        // rate as badly as five seconds measures a ledger that takes ten.
+        if started.elapsed() >= CLOSE_RATE_SAMPLE && latest > first {
+            break latest;
+        }
+        if started.elapsed() >= CLOSE_RATE_TIMEOUT {
+            if latest <= first {
+                let message = format!(
+                    "the sandbox closed no ledger in {} s (still at {latest}) — nothing the \
+                     filler waits for can happen on it",
+                    CLOSE_RATE_TIMEOUT.as_secs()
+                );
+                fail(bot, &message);
+            }
+            break latest;
+        }
+    };
+
+    let elapsed = started.elapsed().as_secs_f64();
+    let closed = f64::from(last.saturating_sub(first));
+    let per_ledger = elapsed / closed;
+    let ramp = match Duration::try_from_secs_f64(f64::from(FILL_LEDGERS) * per_ledger) {
+        Ok(ramp) => ramp,
+        Err(error) => fail(
+            bot,
+            &format!("a close rate of {per_ledger} s per ledger is not a duration: {error}"),
+        ),
+    };
+    let budget = ramp.saturating_add(FILL_SLACK);
+    println!(
+        "the sandbox closed {closed} ledgers in {elapsed:.1} s — one every {per_ledger:.2} s; the \
+         fill needs about {FILL_LEDGERS}, so its budget is {} s",
+        budget.as_secs()
+    );
+    if budget > FILL_TIMEOUT_CAP {
+        let message = format!(
+            "the sandbox closes a ledger every {per_ledger:.2} s; this scenario needs ~\
+             {FILL_LEDGERS} ledgers, which is {} s — past the {} s this test will wait",
+            budget.as_secs(),
+            FILL_TIMEOUT_CAP.as_secs()
+        );
+        fail(bot, &message);
+    }
+    budget
+}
+
 /// The auctioneer's audit row for one account, once a transaction has been
 /// named for it. Postgres has no placeholder for a table name, so each
 /// audit table gets its own literal rather than one interpolated statement.
@@ -488,8 +614,52 @@ async fn wait_for_tx_hash(
     }
 }
 
-/// The filler's XLM collateral in underlying and whether it still owes
-/// anything, read from one pool snapshot.
+/// What the filler holds in the pool: its primary-asset collateral in
+/// underlying, how many liabilities are left, and whether it has a position
+/// at all.
+///
+/// `present` is what keeps "the filler has no position" from reading as a
+/// finished unwind. An absent position satisfies every upper bound this test
+/// has, and it is exactly the shape a filler that withdrew past its own
+/// floor would leave behind — the failure most worth catching here, since
+/// the floor is the operator's stated minimum rather than a preference.
+#[derive(Debug, Clone, Copy)]
+struct FillerPosition {
+    collateral: i128,
+    liabilities: usize,
+    present: bool,
+}
+
+impl std::fmt::Display for FillerPosition {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.present {
+            write!(
+                formatter,
+                "{} liabilities and {} stroops of XLM collateral",
+                self.liabilities, self.collateral
+            )
+        } else {
+            write!(formatter, "no position in the pool at all")
+        }
+    }
+}
+
+impl FillerPosition {
+    /// The unwind has finished: the debt it took on is repaid and the
+    /// primary collateral is back at its floor — *at* it, not merely under
+    /// the ceiling. [`MIN_PRIMARY_COLLATERAL`] is the pool's own
+    /// `min_primary_collateral` and the planner rounds every withdrawal so
+    /// the position never drops below it, so anything under that is a bug in
+    /// the unwind rather than slack to be tolerated.
+    fn settled(self) -> bool {
+        self.present
+            && self.liabilities == 0
+            && self.collateral >= MIN_PRIMARY_COLLATERAL
+            && self.collateral <= MAX_PRIMARY_COLLATERAL
+    }
+}
+
+/// The filler's position, read from one pool snapshot.
 ///
 /// The b-token amount is converted through the snapshot's own reserves,
 /// accrued to now exactly as every task in the bot values a position: a
@@ -500,20 +670,28 @@ async fn filler_position(
     pool: &str,
     filler: &str,
     xlm: &str,
-) -> Result<(i128, usize), String> {
+) -> Result<FillerPosition, String> {
     let snapshot = PoolReader::new(rpc, pool)
         .snapshot(&[filler])
         .await
         .map_err(|error| format!("could not read the pool: {error}"))?;
     let Some(positions) = snapshot.positions.get(filler) else {
-        return Ok((0, 0));
+        return Ok(FillerPosition {
+            collateral: 0,
+            liabilities: 0,
+            present: false,
+        });
     };
     let liabilities = positions.liabilities.len();
     let Some(index) = snapshot.asset_index.get(xlm).copied() else {
         return Err(format!("{xlm} is not a reserve of {pool}"));
     };
     let Some(b_tokens) = positions.collateral.get(&index).copied() else {
-        return Ok((0, liabilities));
+        return Ok(FillerPosition {
+            collateral: 0,
+            liabilities,
+            present: true,
+        });
     };
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -528,12 +706,16 @@ async fn filler_position(
     let collateral = reserve
         .to_asset_from_b_token(b_tokens)
         .map_err(|error| format!("could not convert the filler's b-tokens: {error}"))?;
-    Ok((collateral, liabilities))
+    Ok(FillerPosition {
+        collateral,
+        liabilities,
+        present: true,
+    })
 }
 
-/// Waits until the unwind has left the filler with no liabilities and no
-/// more than [`MAX_PRIMARY_COLLATERAL`] of the primary asset, and answers
-/// what it holds.
+/// Waits until the unwind has left the filler with no liabilities and the
+/// primary asset back inside [`MIN_PRIMARY_COLLATERAL`]..=[`MAX_PRIMARY_COLLATERAL`],
+/// and answers what it holds.
 async fn wait_for_unwind(
     bot: &mut Bot,
     rpc: &RpcClient,
@@ -550,21 +732,21 @@ async fn wait_for_unwind(
         // below: a run that times out here has to say what the filler was
         // actually holding, or "the unwind never finished" is unfalsifiable.
         let seen = match filler_position(rpc, pool, filler, xlm).await {
-            Ok((collateral, liabilities)) => {
-                if liabilities == 0 && collateral <= MAX_PRIMARY_COLLATERAL {
-                    println!(
-                        "the filler holds {collateral} stroops of XLM collateral and no \
-                         liabilities at {:.1} s",
-                        bot.elapsed()
-                    );
-                    return collateral;
+            Ok(position) => {
+                if position.settled() {
+                    println!("the filler holds {position} at {:.1} s", bot.elapsed());
+                    return position.collateral;
                 }
-                format!("{liabilities} liabilities, {collateral} stroops of XLM collateral")
+                position.to_string()
             }
             Err(error) => error,
         };
         if !wait.tick(bot).await {
-            let message = format!("{} (last read: {seen})", wait.timed_out());
+            let message = format!(
+                "{} (last read: {seen}; expected 0 liabilities and {MIN_PRIMARY_COLLATERAL}..=\
+                 {MAX_PRIMARY_COLLATERAL} stroops of XLM collateral)",
+                wait.timed_out()
+            );
             fail(bot, &message);
         }
     }
@@ -777,6 +959,10 @@ async fn liquidation_end_to_end() {
     let database = format!("sandbox_{stamp}");
     println!("creating the run's database {database}");
     let database_url = create_run_database(&maintenance_url, &database).await;
+    // Set once the database exists, so every failure from here on says it
+    // was kept; the success path at the bottom drops it and it is never
+    // read again.
+    let _ = RUN_DATABASE.set(database.clone());
 
     let sandbox_dir = root.join("target/sandbox");
     let seed_path = sandbox_dir.join("seed.toml");
@@ -831,12 +1017,16 @@ async fn liquidation_end_to_end() {
         &borrower,
     )
     .await;
+    // Measured, not assumed: the fill waits on the auction's ledger ramp,
+    // so its budget is however long this sandbox takes to close that many
+    // ledgers.
+    let budget = fill_budget(&mut bot, &rpc).await;
     let fill = wait_for_tx_hash(
         &mut bot,
         &store,
         FILL_TX_HASH,
         "the filler to take that auction",
-        FILL_TIMEOUT,
+        budget,
         &pool,
         &borrower,
     )
@@ -853,4 +1043,10 @@ async fn liquidation_end_to_end() {
          collateral left",
         bot.elapsed()
     );
+
+    // Last, and only here: everything above either passed or panicked, so
+    // reaching this line is what "the run succeeded" means, and a database
+    // nobody will read is a database worth not keeping.
+    store.pool().close().await;
+    drop_run_database(&maintenance_url, &database).await;
 }

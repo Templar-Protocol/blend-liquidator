@@ -56,16 +56,14 @@ fi
 
 require_standalone_network "${rpc_url}"
 
-# The artefacts are content-hashed and network-independent, so a present
-# set is reused; a single missing file re-runs the whole fetch, which
-# skips everything it already has.
-for wasm in pool_v2.0.0.wasm backstop_v2.0.0.wasm pool-factory_v2.0.0.wasm comet.wasm mock_sep_40_oracle.wasm; do
-	if [ ! -f "${wasm_dir}/${wasm}" ]; then
-		log "${wasm} is missing, running fetch-artifacts.sh"
-		"${script_dir}/fetch-artifacts.sh" >/dev/null || die "fetching artefacts: fetch-artifacts.sh failed"
-		break
-	fi
-done
+# Unconditionally, every run: fetch-artifacts.sh is idempotent and
+# re-verifies every hash, downloading only what is missing or no longer
+# matches. Testing for the files here instead — which this did — accepts a
+# present file whose bytes have since changed, which is the one thing the
+# pinned hashes exist to catch, and costs nothing when they are all
+# already there.
+log "verifying the pinned contract artefacts"
+"${script_dir}/fetch-artifacts.sh" >/dev/null || die "fetching artefacts: fetch-artifacts.sh failed"
 
 mkdir -p "${sandbox_root}"
 : >"${sandbox_root}/sandbox.log" || die "preparing the log: could not create ${sandbox_root}/sandbox.log"
@@ -136,6 +134,36 @@ generate_key() {
 	log "generating and funding ${name}"
 	stellar keys generate "${name}" --network "${SANDBOX_NETWORK}" --fund --overwrite \
 		|| die "step 1 keys: stellar keys generate ${name} failed"
+}
+
+# require_funded NAME ADDRESS — dies unless the network actually holds
+# ADDRESS as an account.
+#
+# `stellar keys generate --fund` exits 0 whether or not friendbot answered:
+# funding is best-effort to it, so a friendbot that failed leaves a
+# perfectly valid key with no account behind it and the first symptom is a
+# deploy or an invoke failing two steps later with "account not found",
+# under the wrong step's name. This is that failure, named where it
+# happened.
+#
+# Horizon's /accounts/<G> is the check because friendbot is the same
+# service on the same port: if Horizon cannot answer, nothing funded
+# anything. Retried for a few seconds only — friendbot returns once its
+# transaction is in a closed ledger, so a miss here is Horizon's ingestion
+# lagging by a ledger, never a slow account.
+require_funded() {
+	local name=$1 address=$2 deadline body
+	deadline=$(($(date +%s) + 30))
+	while :; do
+		body=$(curl -fsS --max-time 5 "http://localhost:${SANDBOX_PORT}/accounts/${address}" 2>/dev/null) || body=""
+		if [ "$(printf '%s' "${body}" | jq -r '.id // empty' 2>/dev/null)" = "${address}" ]; then
+			log "${name} is funded"
+			return 0
+		fi
+		[ "$(date +%s)" -lt "${deadline}" ] || break
+		sleep 1
+	done
+	die "step 1 keys: friendbot did not fund ${name} (${address}) — http://localhost:${SANDBOX_PORT}/accounts/${address} holds no such account after 30s"
 }
 
 # deploy_wasm ROLE KEY WASM [-- constructor args…] — deploys WASM as KEY
@@ -227,6 +255,11 @@ log "issuer ${ISSUER}"
 log "admin ${ADMIN}"
 log "borrower ${BORROWER}"
 log "filler ${FILLER}"
+
+require_funded "${SANDBOX_KEY_ISSUER}" "${ISSUER}"
+require_funded "${SANDBOX_KEY_ADMIN}" "${ADMIN}"
+require_funded "${SANDBOX_KEY_BORROWER}" "${BORROWER}"
+require_funded "${SANDBOX_KEY_FILLER}" "${FILLER}"
 
 ########################################################################
 # 2. Tokens
