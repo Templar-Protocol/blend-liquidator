@@ -6,7 +6,7 @@
 A liquidation bot for [Blend Protocol](https://blend.capital) lending pools on
 [Stellar](https://stellar.org).
 
-> **Status: Phase 6 complete.** The bot validates its configuration, seeds its
+> **Status: Phase 7 complete.** The bot validates its configuration, seeds its
 > tracked-user set from the [Blend analytics API](https://api.blend.templarfi.org)
 > or a static file, and follows every configured pool — applying pool events
 > and refreshing borrowers' health factors from chain into a Postgres store.
@@ -30,11 +30,15 @@ A liquidation bot for [Blend Protocol](https://blend.capital) lending pools on
 > Prometheus metrics at `/metrics`, `/healthz`/`/livez` for a deployment's
 > readiness and liveness probes, and Telegram notifications alongside the
 > log — all optional, and none of it load-bearing for trading (see Running
-> it below). What remains is Phase 7 (a local sandbox integration tier
-> against deployed pool contracts) and Phase 8 (docs and the first
-> release). What *is* complete is the scaffolding around all of it — CI
-> gates, lint posture, dev container, release preflight — so the
-> liquidation logic lands into a repository that already fails loudly.
+> it below). And it is proved end to end: a nightly sandbox run deploys
+> Blend v2 on a throwaway Stellar network in Docker, crashes a price, and
+> runs this binary against it armed until it has created the auction,
+> filled it and unwound the position it took (see Testing below). What
+> remains is Phase 8 (the docs set, the deployment contract and the first
+> release tag) and a testnet soak. What *is* complete is the scaffolding
+> around all of it — CI gates, lint posture, dev container, release
+> preflight — so nothing lands into a repository that does not already
+> fail loudly.
 
 ## Safety
 
@@ -182,8 +186,62 @@ make help      # Docker Compose lifecycle
 
 The dev container (`.devcontainer/`) pins its base image by digest and its
 features by exact version, installs the toolchain from `rust-toolchain.toml`,
-and sets up `shellcheck` and `cargo-deny` so CI's gates are reproducible
-locally.
+and sets up `shellcheck`, `cargo-deny` and the `stellar` CLI so CI's gates
+are reproducible locally. It also caps cargo's build parallelism against the
+container's own memory limit (`scripts/cargo-jobs.sh`), since `nproc` inside
+a container reports the host's cores and a cold build fanned out that wide
+is how you meet the OOM killer.
+
+## Testing
+
+Three tiers, and only the first two run on a pull request.
+
+**Unit tests**, inline in every module and run by `make check`. The pure
+arithmetic is pinned against `tests/fixtures/mainnet-fixed-v2.json`, one
+mainnet ledger's entries together with the contract's own answers at that
+ledger: accruing the stored reserves must reproduce `get_reserve` to the
+stroop, and decoding the stored positions must reproduce `get_positions`.
+The store's tests need a live Postgres and are not skipped without one
+(`make db-up` first) — `#[sqlx::test]` creates a database per test.
+
+**The scripted RPC server** (`src/chain/script.rs`), which the chain tests
+drive the *real* client through: the restore path, `TRY_AGAIN_LATER`, a
+timeout and every decoded contract error, with no network and nothing
+mocked below the wire format.
+
+**The sandbox**, a throwaway Stellar network in Docker with Blend v2
+deployed on it and this binary run against it **armed** — the one place
+anything in this repository signs and sends a transaction:
+
+```bash
+make sandbox        # up → fetch → deploy → test → down, about five minutes
+make sandbox-down   # tear it down by hand (SANDBOX_KEEP=1 left it up)
+```
+
+It needs Docker, the `stellar` CLI (the dev container installs it; it is
+pinned and checksum-verified from `scripts/sandbox/versions.env`), and a
+Postgres at `DATABASE_URL` — the test creates and migrates a database of
+its own per run. Everything it deploys comes from wasm pinned by SHA-256,
+and every script refuses to proceed unless the RPC's own `getNetwork`
+answers the standalone network's passphrase, so none of it can be pointed
+at a public network. The keys it generates are funded by friendbot and
+belong to a network that is gone the moment it is torn down; the bot's copy
+of the filler's key lives in `target/sandbox/sandbox.env` at mode `0600`,
+and the teardown deletes it.
+
+The same run is the nightly `Sandbox` workflow (`schedule` and
+`workflow_dispatch` only — never a pull request, so it is deliberately
+outside the `CI Summary` gate). It deploys the pool with two reserves,
+leaves a borrower at a health factor of ~1.19, crashes XLM's price 25% to
+put it at ~0.89, and then asserts that the bot, on its own: recorded a
+`creations` row carrying a transaction hash, recorded a `fills` row
+carrying one, left its own on-chain position with no liabilities and its
+primary collateral back at `min_primary_collateral`, reported exactly one
+succeeded creation, exactly one succeeded fill and at least one unwind
+pass at `/metrics`, and exited `0` on `SIGTERM`. What it catches is the
+world moving — a quickstart image, a pinned wasm, a contract that changed
+its mind — rather than a diff being wrong, which is what the pull-request
+gate is for.
 
 ## Layout
 
@@ -192,7 +250,8 @@ locally.
 | `src/liquidator.rs` | Library root and error taxonomy |
 | `src/config.rs` | CLI and environment configuration |
 | `src/main.rs` | Binary entry point |
-| `scripts/` | Repo-invariant and release preflight checks, review tooling |
+| `scripts/` | Repo-invariant and release preflight checks, review tooling, the sandbox tier |
+| `tests/` | Fixtures, and the sandbox tier's end-to-end test |
 | `docs/` | Design specs |
 
 ## Licence

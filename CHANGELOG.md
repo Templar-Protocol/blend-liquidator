@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The sandbox integration tier (`scripts/sandbox/`,
+  `tests/liquidation_sandbox.rs`, and the `sandbox*` make targets): a
+  throwaway Stellar network from a digest-pinned `stellar/quickstart`
+  image, Blend v2 deployed on it from release wasm pinned by SHA-256
+  (pool, backstop, pool factory, Comet and a mock SEP-40 oracle, with
+  `versions.env` holding every pin), two reserves, and a borrower left at
+  a health factor of ~1.19 that `crash.sh` takes to ~0.89 with a 25% move
+  in XLM's price. `make sandbox` is up → fetch → deploy → test → down in
+  about five minutes; the test spawns the real binary **armed**
+  (`DRY_RUN=false`, a signing key) against that network — the only place
+  in this repository anything signs and sends a transaction — and asserts
+  a `creations` row with a transaction hash, a `fills` row with one, the
+  filler's own position left with no liabilities and its primary
+  collateral back at `min_primary_collateral`, `/metrics` holding exactly
+  one succeeded creation, exactly one succeeded fill and at least one
+  unwind pass, and exit `0` on `SIGTERM`. It is `#[ignore]`d and refuses
+  to start unless `target/sandbox/sandbox.env` exists and names the
+  standalone network, the same check every script makes against the RPC's
+  own `getNetwork` before it speaks to a node; the keys are generated per
+  run, funded by friendbot, and the filler's secret reaches the bot
+  through a mode-`0600` file under `target/` that the teardown deletes.
+  The fill's budget is measured from the sandbox's own ledger close rate
+  rather than assumed, and each run gets its own `sandbox_<unix seconds>`
+  database — dropped when it passes, kept when it fails and listed in
+  `target/sandbox/run-databases` for `make sandbox-down` to reclaim.
+- The dev container gains the `stellar` CLI and a cgroup-aware build-job
+  cap. The CLI is a checksum-verified release binary taken from the
+  pins in `scripts/sandbox/versions.env` — the one file its version lives
+  in, which `scripts/check-repo-invariants.sh` now enforces against both
+  places that install it — with `libdbus-1-3` installed alongside it,
+  since the binary links it at runtime and will not even report its own
+  version without it. The cap is `scripts/cargo-jobs.sh`'s `min(nproc,
+  max(1, memory_limit / 2 GiB))`, read from the cgroup rather than from
+  `/proc/meminfo`, written once into `~/.cargo/config.toml`'s `[build]
+  jobs` by `scripts/cargo-jobs-config.sh` — into an existing `[build]`
+  table rather than a second one, since cargo refuses to parse a config
+  that declares it twice, and never over a `jobs` key that is already
+  there. An environment `CARGO_BUILD_JOBS` still wins at build time.
+- `.github/workflows/sandbox.yml`: the tier run nightly and on
+  `workflow_dispatch`, never on `push` or `pull_request`, and deliberately
+  outside `CI Summary`'s needs list — that gate reads a skipped job as a
+  failure, which is right for a workflow where nothing is conditional and
+  wrong for one with no pull-request run to skip. One sandbox at a time
+  (`concurrency`, queued rather than cancelled, since a cancelled run
+  never reaches its teardown), the filler's key masked immediately after
+  the deploy that writes it, `target/sandbox/*.log` uploaded by a path
+  that cannot name the key rather than by a mask that artifacts do not
+  honour, and the teardown on `always()`.
 - Five knobs for the operational surface (`src/config.rs`): `PORT` and
   `HTTP_PORT` (`PORT` wins when both are set, since it is the one a
   deployment platform like Cloud Run controls), `HTTP_BIND_ADDR` (loopback

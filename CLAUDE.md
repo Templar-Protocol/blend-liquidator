@@ -6,7 +6,7 @@ A liquidation bot for [Blend Protocol](https://blend.capital) lending pools on
 Stellar. It is intended to repay the debt of underwater positions and receive
 their collateral at a discount.
 
-**Status: Phase 6 complete.** Phase 1 landed the pure fixed-point math
+**Status: Phase 7 complete.** Phase 1 landed the pure fixed-point math
 (`math`) and the ScVal/ledger-entry codecs (`chain::xdr`); Phase 2 landed
 the chain layer (`chain::rpc`, `chain::pool`, `chain::signer`, `chain::tx`);
 Phase 3 landed the Postgres store, a per-pool ledger poller and a tracker
@@ -52,9 +52,18 @@ seven kinds of task — one `LedgerPoller` per pool, one tracker, one
 auctioneer, one filler, one watchdog, one HTTP server when a port is
 configured, and one submission-queue worker per distinct signing key when
 armed — and every exit but the second shutdown signal drains the notifier
-before it returns. What remains is Phase 7 (the sandbox integration tier)
-and Phase 8 (docs and the first release). The repository scaffolding is
-complete and enforced.
+before it returns. Phase 7 landed the sandbox integration tier
+(`scripts/sandbox/`, `tests/liquidation_sandbox.rs`,
+`.github/workflows/sandbox.yml`) and the dev-container additions it needs
+(`scripts/cargo-jobs.sh`, the `stellar` CLI): a throwaway Stellar network
+in Docker, Blend v2 deployed on it from pinned wasm with one borrower a
+price move from liquidation, and the real binary run against it **armed**
+— the only place in this repository anything signs and sends a
+transaction — asserting on chain and in the store that it created the
+auction, filled it, unwound the position it took, and counted all three.
+What remains is Phase 8 (the docs set, the deployment contract and the
+first release tag) and the testnet soak the spec's §9 ends with. The
+repository scaffolding is complete and enforced.
 
 **This bot is NOT non-custodial.** It is designed to hold a signing key and
 submit transactions itself — that is the point of a liquidation bot. Treat
@@ -70,6 +79,7 @@ cargo test --lib --bins             # unit tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 make sqlx-prepare                   # after changing a query in src/store.rs
+make sandbox                        # the whole sandbox tier, ~5 min (Docker + stellar CLI)
 make help                           # Docker Compose lifecycle
 ```
 
@@ -547,6 +557,58 @@ make help                           # Docker Compose lifecycle
   health factors.
 - `examples/capture_fixture.rs` — refreshes `tests/fixtures/` from a live
   RPC through `curl`. See that directory's README.
+- `tests/liquidation_sandbox.rs` — the sandbox tier's one test, and the
+  only place the bot is run with `DRY_RUN=false` and a signing key. It
+  spawns the built binary against the local network `up.sh` starts and
+  `deploy.sh` populates, waits for `/healthz`, runs `crash.sh`, and
+  asserts in order: a `creations` row for the borrower carrying a
+  `tx_hash`, a `fills` row carrying one, the filler's own on-chain
+  position left with no liabilities and its XLM collateral back inside
+  `MIN_PRIMARY_COLLATERAL`..=`MAX_PRIMARY_COLLATERAL` (the floor plus the
+  one percent a b-token burn rounds up by, not slack), and `/metrics`
+  holding exactly one succeeded creation, exactly one succeeded fill and
+  at least one unwind pass — then `SIGTERM` and exit `0`. `#[ignore]`d, so
+  `cargo test` never starts a container, and it refuses to run at all
+  unless `target/sandbox/sandbox.env` exists and names the standalone
+  network. Nothing in it panics through `unwrap`/`expect`: every failure
+  after the spawn goes through `fail`, which prints the tail of the bot's
+  own log first.
+- `scripts/sandbox/` — the tier's scripts, all `set -euo pipefail` and all
+  sourcing `lib.sh` (log/die, `sandbox_dir`, `sha256_check`/`fetch`,
+  `wait_for_rpc`, `require_standalone_network`, the `invoke`/`invoke_view`
+  wrappers that log a contract's *role* and never an argument, and
+  `env_write`, which truncates and `chmod 600`s before it writes) and
+  `versions.env` (every pin: the five wasm URLs with their SHA-256s, the
+  `stellar` CLI release and both tarball hashes, the quickstart image by
+  digest, and `SANDBOX_PASSPHRASE`). `fetch-artifacts.sh` downloads and
+  verifies the wasm; `up.sh` starts the pinned quickstart container, waits
+  for its RPC to be healthy *and* closing ledgers, and points the CLI's
+  `local` network at it; `deploy.sh` stands Blend v2 up in ten steps and
+  writes `target/sandbox/sandbox.env`; `crash.sh` moves the oracle's XLM
+  price; `down.sh` removes the container and `sandbox.env`.
+  `test-cargo-jobs.sh` and `test-cargo-config.sh` are shell tests for the
+  two scripts below, run by hand.
+- `scripts/cargo-jobs.sh` and `scripts/cargo-jobs-config.sh` — the
+  cgroup-aware build-job cap and the one thing that writes it down.
+  `cargo-jobs.sh` prints `min(nproc, max(1, memory_limit / 2 GiB))`, the
+  limit read from cgroup v2's `memory.max`, then v1's
+  `memory.limit_in_bytes`, then `/proc/meminfo` (`CARGO_JOBS_NPROC` and
+  `CARGO_JOBS_MEM_BYTES` override both inputs, which is what makes the
+  formula testable); `cargo-jobs-config.sh` puts `jobs = N` into
+  `~/.cargo/config.toml`'s `[build]` table — creating the table, or
+  inserting into the one already there, or leaving a file that already
+  sets `jobs` byte-for-byte alone. See the OOM gotcha below.
+- `.github/workflows/sandbox.yml` — the nightly run of the tier, on
+  `schedule` and `workflow_dispatch` only, never `push` or
+  `pull_request`, and deliberately outside `ci.yml`'s `ci-summary` needs
+  list: that gate reads a skipped job as a failure, which is right for a
+  workflow where nothing is conditional and wrong for one that has no
+  pull-request run to skip. One run at a time — a `concurrency` group of
+  `sandbox`, with `cancel-in-progress: false` — because the job binds host
+  port 8000 and a cancelled run never reaches its teardown. It masks the filler's key
+  (`::add-mask::`) immediately after the deploy that writes it and before
+  anything runs the bot, and uploads `target/sandbox/*.log` — a path, not
+  a mask, because uploaded artifacts are not masked.
 
 The module layout beyond this follows
 `docs/superpowers/specs/2026-09-04-blend-liquidator-bot-design.md`; see
@@ -610,7 +672,9 @@ Status above for what remains.
 - **`CI Summary` treats a skipped job as a failure.** Nothing in `ci.yml` is
   path-filtered or conditionally gated, so a skipped job means a condition
   regressed. `devcontainer.yml` is path-filtered, which is exactly why it is
-  kept out of that gate.
+  kept out of that gate, and `sandbox.yml` is outside it for the same kind
+  of reason: it runs on `schedule` and `workflow_dispatch` only, so on a
+  pull request there is no run of it for the gate to wait on at all.
 - **The maths agrees with the contract, and a fixture proves it — for what
   the contract actually attests.** `tests/fixtures/mainnet-fixed-v2.json`
   holds one mainnet ledger's entries *and* the contract's own answers at
@@ -639,16 +703,49 @@ Status above for what remains.
 
   The debug-info knob is **per profile**, so `cargo install` (release profile)
   needs `CARGO_PROFILE_RELEASE_DEBUG=0` instead.
+
+  The dev container caps it without being asked:
+  `post-create.sh` runs `scripts/cargo-jobs.sh` — `min(nproc, max(1,
+  memory_limit / 2 GiB))`, the limit taken from the cgroup where there is
+  one rather than from `/proc/meminfo`, which reports the host's — and
+  `scripts/cargo-jobs-config.sh` writes it to `~/.cargo/config.toml` as
+  `[build] jobs`. **Once**: a config that already sets `jobs` in `[build]`
+  is left byte-for-byte alone, an operator's own choice winning over this,
+  and a `[build]` table that exists without one gets `jobs` inserted into
+  *that* table rather than a second header appended — cargo refuses to
+  parse a config that declares `[build]` twice, which is a worse failure
+  than the OOM the cap prevents. An environment `CARGO_BUILD_JOBS` still
+  overrides the file at build time, which is what the one-liner above is.
 - Commit signing in the dev container: `user.signingkey` copied from the host
   is a **host path** that does not resolve inside the container. The durable
   fix is a literal `key::ssh-ed25519 ...` value in the host's `~/.gitconfig` —
   it copies in verbatim on every rebuild and needs no script. See
   `.devcontainer/git-signing.sh`.
-- The `stellar` CLI is deliberately **not** in the dev container yet: it is a
-  multi-minute source build on every rebuild, and nothing invokes it. It stays
-  out until Phase 7's sandbox integration tier (the spec's section 9) needs it
-  to deploy the pool contracts locally; add it — and a cgroup-aware build-job
-  cap alongside it — in that phase.
+- The `stellar` CLI in the dev container is a **verified release binary,
+  never a source build**: building it from source is minutes on every
+  rebuild, for a tool only `scripts/sandbox/*.sh` invokes.
+  `.devcontainer/post-create.sh` fetches the tarball for the machine's
+  architecture from `scripts/sandbox/versions.env`, checks its SHA-256
+  through `lib.sh`'s `fetch` (fatal on a mismatch, in a subshell so the
+  step stays non-fatal like every other one below the toolchain) and only
+  then installs `~/.local/bin/stellar`, skipping the whole thing once
+  `stellar --version` already reports the pinned version. The version
+  lives in exactly one file: `versions.env`. Both places that install the
+  CLI — `post-create.sh` and `.github/workflows/sandbox.yml` — read it
+  from there, and `scripts/check-repo-invariants.sh` fails unless each of
+  them does, on a line that is not a comment (a stale `# shellcheck
+  source=` directive is not a reference) and without naming a
+  `stellar-cli-<version>` release literally. Two CLI versions is two
+  different sandboxes, one of which nobody can reproduce, and nothing
+  about that disagreement names itself: both sides install *a* CLI and
+  both are green.
+- The `stellar` binary links `libdbus` at runtime — its OS-keychain
+  identity backend, which nothing here uses and which is a dynamic
+  dependency regardless — so on a Debian-family image without
+  `libdbus-1-3` even `stellar --version` fails with "cannot open shared
+  object file". `post-create.sh` and `sandbox.yml` both install it behind
+  the same `ldconfig -p | grep -qF libdbus-1.so.3` test, a no-op wherever
+  the image already carries it (the GitHub runner does, so far).
 - Money is `i128` in each asset's own decimals, but the scales differ by
   field: v2 rates (`b_rate`, `d_rate`) are 12 decimals, factors and
   utilisation are 7, prices are in the oracle's own decimals (7 on the
@@ -864,6 +961,111 @@ Status above for what remains.
   is `NotificationKind::as_str` rather than a `metrics`-local enum, which
   is why `NotificationKind` is closed (see `src/notifier.rs`'s doc): a new
   variant there is also a new metric label, never added quietly.
+- The sandbox is the only thing in this repository that ever generates a
+  signing key, and every one of them is for a network that exists for the
+  length of a run. `deploy.sh` generates and friendbot-funds four
+  `stellar keys` identities (`sandbox-issuer`, `sandbox-admin`,
+  `sandbox-borrower`, `sandbox-filler` — the names live in `lib.sh`
+  because `crash.sh` has to sign as the admin and only `deploy.sh` knows
+  what it generated), then asserts through Horizon that each account
+  exists: `stellar keys generate --fund` exits `0` whether or not
+  friendbot answered, so without that check an unfunded account first
+  surfaces two steps later as "account not found" under the wrong step's
+  name. Only the filler's secret leaves the keystore — read once, in the
+  last step, straight into `target/sandbox/sandbox.env` (mode 0600, under
+  the git-ignored `target/`), never echoed, never logged, never an
+  argument — and `down.sh` deletes that file, because a signing key for a
+  network that no longer exists is a live-looking path to nothing. The
+  identities themselves stay in the operator's
+  `~/.config/stellar/identity/` under the `sandbox-` prefix, and the next
+  `deploy.sh` overwrites them.
+- **No sandbox script talks to a node it has not proved is the standalone
+  network.** `require_standalone_network` — the RPC's own `getNetwork`
+  answering `versions.env`'s `SANDBOX_PASSPHRASE`, `Standalone Network ;
+  February 2017` — is the first thing `up.sh`, `deploy.sh` and `crash.sh`
+  say to one, and `tests/liquidation_sandbox.rs` makes the same check on
+  the Rust side, against `sandbox.env`, before it creates a database or
+  spawns anything. The answer has to come from the node, never from
+  configuration: this is the one place the bot runs armed, and the only
+  thing that makes that safe is what network it is pointed at.
+- The backstop and the pool factory each name the other — the backstop's
+  constructor takes the factory (it asks `is_pool` before accepting a
+  deposit) and the factory's takes the backstop — so one address must be
+  known before it exists. `deploy.sh` predicts the factory's with
+  `stellar contract id wasm --salt … --source-account …`, which derives
+  the id from the account, the salt and the network passphrase and *not*
+  from the wasm; deploys the backstop against the prediction; deploys the
+  factory with that same salt; and dies unless the deployed id is the
+  predicted one. That last check is what makes the prediction safe — a
+  mismatch means a backstop trusting a factory that does not exist, which
+  would refuse every deposit. The salts are fixed literals rather than
+  random on purpose, and are still unique per run, because the id takes
+  the deploying account too and every run generates fresh keys.
+- The emitter is not deployed at all; the admin's address stands in for
+  it. It matters only to BLND emissions, which this sandbox never starts,
+  and the backstop never calls the address it is given unless
+  `drop()`/`distribute()` is invoked. A scenario that starts emissions
+  would need the real one.
+- **The pool leaves Setup through `set_status(0)`, not `update_status()`.**
+  The contract's `execute_update_pool_status` panics with
+  `StatusNotAllowed` (1204) whenever the current status is 6 (Setup) —
+  verified against this exact wasm — so `update_status` cannot be the way
+  out of Setup at all. `execute_set_pool_status(0)` reaches 0 (Admin
+  Active) in one call and enforces the identical condition, panicking with
+  the same 1204 unless the backstop threshold is met and queued
+  withdrawals are under 50%; the `get_config` read straight after it is
+  what proves the threshold *was* met rather than the call having been a
+  no-op. Reserves are configured before it for a related reason:
+  `queue_set_reserve`/`set_reserve` impose a timelock outside Setup.
+- A fresh standalone network has no contracts at all, the native asset's
+  included, and none of the plumbing a real network's accounts already
+  carry. `deploy.sh` deploys the XLM SAC like any other
+  (`stellar contract asset deploy --asset native`) or every XLM read
+  answers "Contract not found"; it opens `change-trust` trustlines for the
+  admin, the filler and the borrower, because a classic asset's SAC mints
+  into a trustline and refuses an account without one (the borrower is
+  never minted to — the pool pays it the USDC it borrows, which needs the
+  trustline just the same); and it has the admin `approve` Comet for both
+  tokens before `join_pool`, because Comet moves the caller's tokens with
+  `transfer_from`, which checks a real allowance even where the
+  transaction's own source account already satisfies the auth.
+- The scenario is exactly one price move wide, and the numbers are load
+  bearing. The borrower supplies 5,000 XLM of collateral at $0.10 and
+  borrows 300 USDC: XLM's `c_factor` of 0.75 values the collateral at
+  $375, USDC's `l_factor` of 0.95 values the debt at ~$315.8, and the
+  health factor is ~1.19 — nothing to liquidate, `LIQ_HF_THRESHOLD` being
+  0.998. `crash.sh`'s default price of `750000` (the oracle reports 7
+  decimals, so $0.075) takes the collateral to $281.25 and the health
+  factor to ~0.89. It re-sends USDC's unchanged price alongside it because
+  `set_price_stable` takes the whole vector positionally, in the `assets`
+  order `set_data` was given (`[XLM, USDC]`): there is no way to set one
+  price, and a caller that passed only XLM's would silently unprice USDC.
+- The sandbox test's fill budget is **measured**, never assumed. The fill
+  waits on the auction's own ledger ramp — the lot ramps to full over the
+  first 200 ledgers while the bid stays whole, so for this scenario (a 210
+  USDC bid against a 3202 XLM lot worth $240 at the crashed price, plus
+  the pool's 100 bps margin) the earliest profitable ledger is about 177
+  in, and `FILL_LEDGERS` is 190, that with room for a re-plan. So
+  `fill_budget` samples the chain head (`RpcClient::latest_ledger`, the
+  RPC's `getLatestLedger`) for five seconds immediately before the wait,
+  derives `FILL_LEDGERS × seconds per ledger` plus a minute, and fails *up
+  front*, naming the rate it measured, when that exceeds the ten-minute
+  cap. A constant written around "quickstart closes a ledger a second"
+  becomes a flake the day it does not, and it fails as "the filler never
+  filled" — a true statement about the wrong thing.
+- The sandbox test creates its own database per run, `sandbox_<unix
+  seconds>` on the `DATABASE_URL` server, and migrates it before the bot
+  starts — so a rerun never reads a previous run's rows, and a query error
+  in an assertion is a real failure rather than "the table may not exist
+  yet". A run that passes drops it. A run that **fails keeps it**, because
+  it is then the only durable record of what the bot decided, and every
+  failure says so. The name is appended to `target/sandbox/run-databases`
+  the moment the `CREATE` lands and the line removed when the run's own
+  drop succeeds, which is how `make sandbox-down` knows what to sweep:
+  `sqlx database drop` drops only a name it is handed, nothing in sqlx-cli
+  lists databases, and `psql` is in neither CI nor the dev container. That
+  file is the one thing under `target/sandbox/` besides the wasm that
+  `down.sh` must not delete.
 
 ## Workflow
 
@@ -879,6 +1081,10 @@ Status above for what remains.
 - `pools.example.toml`, `seed.example.toml` — annotated examples of the
   `POOLS_FILE`/`POOLS_TOML` and `SEED_FILE` formats, referenced from
   `.env.example`.
-- `scripts/` — repo-invariant and release preflight checks, review tooling.
+- `scripts/` — repo-invariant and release preflight checks, review tooling,
+  the build-job cap (`cargo-jobs.sh`, `cargo-jobs-config.sh`) and the
+  sandbox tier (`sandbox/`).
+- `tests/` — the fixtures the math is pinned against, and
+  `liquidation_sandbox.rs`, the tier's one `#[ignore]`d end-to-end test.
 - `docs/` — design specs.
-- `.github/workflows/` — CI and release automation.
+- `.github/workflows/` — CI, release automation and the nightly sandbox run.
