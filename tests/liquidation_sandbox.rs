@@ -7,10 +7,15 @@
 //! than convenient:
 //!
 //! - it refuses to run at all unless `target/sandbox/sandbox.env` exists
-//!   (the message names the two scripts that write it), and
+//!   (the message names the two scripts that write it),
 //! - it refuses unless that file's `SANDBOX_PASSPHRASE` is the standalone
-//!   network's. Both refusals fire before anything is spawned, so a
-//!   misconfigured run can never point an armed bot at a real network.
+//!   network's, and
+//! - it refuses unless the RPC at that file's `SANDBOX_RPC_URL` answers
+//!   `getNetwork` with the same passphrase. The file is a claim; the node
+//!   is the fact, and only the second of those decides which network a
+//!   signing key is handed to. All three refusals fire before a database
+//!   is created or anything is spawned, so a misconfigured run can never
+//!   point an armed bot at a real network.
 //!
 //! It is `#[ignore]`d: `cargo test` must never start Docker containers, and
 //! nothing here runs without the sandbox already up. Run it by hand, or from
@@ -446,6 +451,13 @@ async fn create_run_database(root: &Path, maintenance_url: &str, name: &str) -> 
     if let Err(error) = store.migrate().await {
         panic!("could not migrate the run's database {name}: {error}");
     }
+    // Closed, never merely dropped: `Drop` cannot do the I/O that sends
+    // Postgres a termination, so a dropped pool's backends stay attached
+    // until a keepalive timeout notices. `drop_run_database` runs long
+    // before that, and `DROP DATABASE` refuses while anything is still
+    // connected — so without this close the success path leaks exactly the
+    // database it was written to reclaim.
+    store.pool().close().await;
     url
 }
 
@@ -950,9 +962,12 @@ async fn terminate(bot: &mut Bot) {
 /// Reads `sandbox.env` and refuses the run unless it names the standalone
 /// network.
 ///
-/// Both refusals live here, before the caller has created a database or
-/// spawned anything: this test arms a bot with a real signing key, and the
-/// only thing that makes that safe is the network it points at.
+/// Both of the file's refusals live here, before the caller has created a
+/// database or spawned anything: this test arms a bot with a real signing
+/// key, and the only thing that makes that safe is the network it points
+/// at. What the file *claims* is only half of that, so
+/// [`require_standalone_rpc`] asks the node itself before the caller goes
+/// any further.
 fn sandbox_env(env_path: &Path) -> BTreeMap<String, String> {
     let Ok(text) = std::fs::read_to_string(env_path) else {
         panic!(
@@ -970,6 +985,55 @@ fn sandbox_env(env_path: &Path) -> BTreeMap<String, String> {
         env_path.display()
     );
     env
+}
+
+/// Refuses the run unless the RPC at `url` answers `getNetwork` with
+/// [`STANDALONE_PASSPHRASE`].
+///
+/// [`sandbox_env`] checks a *file*, which an edit or a stale deploy can make
+/// say anything; this checks the node that the armed bot — `DRY_RUN=false`,
+/// with a real signing key — is about to submit to. They are the same gate
+/// `scripts/sandbox/lib.sh`'s `require_standalone_network` is on the shell
+/// side, and this is the Rust side of it: whatever wrote `sandbox.env`, the
+/// endpoint itself has to be this sandbox's own.
+///
+/// Every failure is a refusal, an unreachable RPC included: "could not ask"
+/// is not "it is the sandbox". Called before the run's database is created
+/// and long before anything is spawned, so a refusal here leaves nothing
+/// behind.
+async fn require_standalone_rpc(url: &str) {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => panic!("could not build an HTTP client to check {url}: {error}"),
+    };
+    let request = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "getNetwork" });
+    let response = match client.post(url).json(&request).send().await {
+        Ok(response) => response,
+        Err(error) => panic!(
+            "{url} did not answer getNetwork ({error}) — refusing to arm the bot against an RPC \
+             this test could not verify; is scripts/sandbox/up.sh's container running?"
+        ),
+    };
+    let body = match response.json::<serde_json::Value>().await {
+        Ok(body) => body,
+        Err(error) => panic!("{url} answered getNetwork with something that is not JSON: {error}"),
+    };
+    let passphrase = body
+        .get("result")
+        .and_then(|result| result.get("passphrase"))
+        .and_then(serde_json::Value::as_str);
+    let Some(passphrase) = passphrase else {
+        panic!("{url} answered getNetwork without a result.passphrase: {body}")
+    };
+    assert_eq!(
+        passphrase, STANDALONE_PASSPHRASE,
+        "{url} reports the network passphrase {passphrase:?}, not the sandbox's standalone one \
+         — refusing to run an armed bot against a network that is not this sandbox's own"
+    );
+    println!("{url} answered getNetwork with the standalone passphrase");
 }
 
 /// Runs `scripts/sandbox/crash.sh`, which moves the oracle's XLM price and
@@ -1059,6 +1123,11 @@ async fn liquidation_end_to_end() {
     let borrower = required(&env, "SANDBOX_BORROWER").to_string();
     let filler = required(&env, "SANDBOX_FILLER").to_string();
     let rpc_url = required(&env, "SANDBOX_RPC_URL").to_string();
+
+    // Ordered with the two refusals `sandbox_env` just made, and for the
+    // same reason: nothing below this line may run against an endpoint
+    // whose own answer has not been checked.
+    require_standalone_rpc(&rpc_url).await;
 
     let Ok(maintenance_url) = std::env::var("DATABASE_URL") else {
         panic!("DATABASE_URL is not set — the store tests need it too; see `make db-up`")

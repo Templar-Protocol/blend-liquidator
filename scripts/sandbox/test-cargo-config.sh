@@ -12,10 +12,16 @@
 # And every spelling of that table an operator's own config may already
 # use, because each one appends a second declaration if it is not
 # recognised: an indented header, a header with a trailing comment, the
-# root-level dotted form (`build.incremental = true`, where a [build]
-# header afterwards is the second declaration), and a file whose last
-# line has no terminating newline, which glues whatever is written next
-# onto it.
+# root-level dotted form (`build.incremental = true`, and `build .
+# incremental = true`, where a [build] header afterwards is the second
+# declaration), a dotted key whose value spans several lines, which an
+# insert must never be placed inside, and a file whose last line has no
+# terminating newline, which glues whatever is written next onto it.
+#
+# CARGO_CONFIG_TEST_NO_TOMLLIB=1 runs every case through
+# assert_toml_valid's dependency-free fallback instead of python3's
+# tomllib, which is how that branch is exercised on a host that has
+# tomllib. Both modes must end with a tally and "0 failed".
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,28 +40,62 @@ bad() {
 	fail=$((fail + 1))
 }
 
-# assert_toml_valid DESC FILE — parses FILE as TOML with python3's
-# tomllib (3.11+, present in this container) if available; otherwise
-# falls back to the weaker but dependency-free check that FILE names the
-# [build] table exactly once, which is the specific defect this test
-# suite exists to catch.
+# count_lines PATTERN FILE — how many of FILE's lines match the extended
+# regular expression PATTERN, printed, and 0 rather than a failure when
+# none do.
+#
+# `grep -c` exits 1 on "no matches", and a bare `x=$(grep -c …)` takes that
+# status — which under this file's `set -euo pipefail` ends the whole suite
+# there and then, with no FAIL line and no tally, so a correct
+# cargo-jobs-config.sh would read as an unexplained regression. Nothing in
+# this suite may abort: every judgement goes through ok/bad.
+count_lines() {
+	local count
+	count=$(grep -cE "$1" "$2" 2>/dev/null || true)
+	# Empty only if grep failed outright (an unreadable file), which is a
+	# count of nothing either way.
+	printf '%s\n' "${count:-0}"
+}
+
+# assert_toml_valid DESC FILE — parses FILE as TOML with python3's tomllib
+# (3.11+, present in this container) when it is available; otherwise falls
+# back to the weaker but dependency-free check below.
+#
+# CARGO_CONFIG_TEST_NO_TOMLLIB=1 forces that fallback. It is what exercises
+# the fallback on a host that does have tomllib — sandbox.yml's runner
+# always does — so the branch is not left to run only where nobody is
+# looking.
+#
+# The fallback counts `build` declarations in both of TOML's spellings,
+# with the same whitespace tolerance cargo-jobs-config.sh matches them by,
+# and asserts the two things it can: at most one `[build]` header, since
+# two is the "Cannot declare ('build',) twice" parse error this suite
+# exists to catch, and at least one declaration overall, since the key has
+# to have landed somewhere. Zero headers is correct by design for the
+# dotted cases. What it cannot see is a value split across an insert —
+# only a real parser can — which is why tomllib is the preferred path
+# rather than a nicety.
 assert_toml_valid() {
 	local desc=$1 file=$2
-	if command -v python3 >/dev/null 2>&1 &&
+	if [ -z "${CARGO_CONFIG_TEST_NO_TOMLLIB:-}" ] &&
+		command -v python3 >/dev/null 2>&1 &&
 		python3 -c 'import tomllib' >/dev/null 2>&1; then
 		if python3 -c 'import tomllib,sys; tomllib.load(open(sys.argv[1], "rb"))' "${file}" 2>/dev/null; then
 			ok "${desc}: parses as TOML"
 		else
 			bad "${desc}: does not parse as TOML"
 		fi
+		return
+	fi
+	local headers dotted
+	headers=$(count_lines '^[[:space:]]*\[[[:space:]]*build[[:space:]]*\][[:space:]]*(#.*)?$' "${file}")
+	dotted=$(count_lines '^[[:space:]]*build[[:space:]]*\.[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*=' "${file}")
+	if [ "${headers}" -gt 1 ]; then
+		bad "${desc}: ${headers} [build] headers, which declares build twice (regex fallback)"
+	elif [ "$((headers + dotted))" -lt 1 ]; then
+		bad "${desc}: neither a [build] header nor a root-level build.* key (regex fallback)"
 	else
-		local build_headers
-		build_headers=$(grep -c '^\[build\]' "${file}")
-		if [ "${build_headers}" = "1" ]; then
-			ok "${desc}: exactly one [build] header (python3/tomllib unavailable, used the regex fallback)"
-		else
-			bad "${desc}: expected exactly one [build] header, found ${build_headers} (python3/tomllib unavailable, used the regex fallback)"
-		fi
+		ok "${desc}: ${headers} [build] header(s), ${dotted} dotted build.* line(s) (regex fallback)"
 	fi
 }
 
@@ -243,6 +283,91 @@ else
 	bad "unterminated last line, no [build]: retry = 2 was run together with what follows"
 fi
 assert_toml_valid "unterminated last line, no [build]" "${file_h}"
+
+# Case (i): the dotted spelling with whitespace around the dot. TOML
+# ignores whitespace either side of a dot-separated key's parts, so
+# `build . incremental` declares exactly the same table as
+# `build.incremental` — and a detection that misses it appends a [build]
+# header, which is the second declaration cargo refuses to parse.
+file_i="${tmp_dir}/i.toml"
+printf 'build . incremental = true\n' >"${file_i}"
+status_i="$("${cargo_jobs_config}" "${file_i}" 7)"
+if [ "${status_i}" = "inserted" ]; then
+	ok "spaced dotted key, no jobs: reports inserted"
+else
+	bad "spaced dotted key, no jobs: expected status 'inserted', got '${status_i}'"
+fi
+if grep -qx 'build.jobs = 7' "${file_i}"; then
+	ok "spaced dotted key: build.jobs = 7 added in dotted form"
+else
+	bad "spaced dotted key: build.jobs = 7 missing"
+fi
+if grep -q '\[build\]' "${file_i}"; then
+	bad "spaced dotted key: a [build] header was appended, which declares build twice"
+else
+	ok "spaced dotted key: no [build] header appended"
+fi
+assert_toml_valid "spaced dotted key" "${file_i}"
+
+# Case (j): the same whitespace on the key this script would otherwise
+# set. `build . jobs` is `build.jobs`, so the operator's value wins here
+# exactly as it does in cases (c) and (e).
+file_j="${tmp_dir}/j.toml"
+printf 'build . jobs = 3\n' >"${file_j}"
+before_j="$(cat "${file_j}")"
+status_j="$("${cargo_jobs_config}" "${file_j}" 7)"
+after_j="$(cat "${file_j}")"
+if [ "${status_j}" = "unchanged" ] && [ "${before_j}" = "${after_j}" ]; then
+	ok "spaced build . jobs: reports unchanged and the file is byte-for-byte untouched"
+else
+	bad "spaced build . jobs: expected unchanged and no edit, got status '${status_j}' (modified: $([ "${before_j}" = "${after_j}" ] && echo no || echo yes))"
+fi
+assert_toml_valid "spaced build . jobs" "${file_j}"
+
+# Case (k): a dotted key whose value spans several lines. Only the opening
+# line matches a `build.<key> =` pattern, so an insert placed *after* the
+# last matching line lands between the `[` and the array's elements and
+# splits the value in half — a file no TOML parser accepts, which is the
+# same unusable ~/.cargo/config.toml as a doubled declaration by another
+# route. Inserting *before* the first dotted line cannot land inside any
+# value, whatever shape it has.
+file_k="${tmp_dir}/k.toml"
+printf 'build.rustflags = [\n  "-C", "target-cpu=native",\n]\n' >"${file_k}"
+status_k="$("${cargo_jobs_config}" "${file_k}" 7)"
+if [ "${status_k}" = "inserted" ]; then
+	ok "multi-line dotted value: reports inserted"
+else
+	bad "multi-line dotted value: expected status 'inserted', got '${status_k}'"
+fi
+if grep -qx 'build.jobs = 7' "${file_k}"; then
+	ok "multi-line dotted value: build.jobs = 7 added in dotted form"
+else
+	bad "multi-line dotted value: build.jobs = 7 missing"
+fi
+# The array, verbatim: the line after the opening bracket must still be
+# its first element, not anything this script wrote.
+after_open_k="$(awk '/^build\.rustflags = \[$/ { getline; print; exit }' "${file_k}")"
+if [ "${after_open_k}" = '  "-C", "target-cpu=native",' ]; then
+	ok "multi-line dotted value: the array's own lines are untouched"
+else
+	bad "multi-line dotted value: the insert split the array — the line after '[' is '${after_open_k}'"
+fi
+jobs_line_k="$(grep -n -x 'build.jobs = 7' "${file_k}" | cut -d: -f1)"
+rustflags_line_k="$(grep -n -x 'build.rustflags = \[' "${file_k}" | cut -d: -f1)"
+if [ -n "${jobs_line_k}" ] && [ -n "${rustflags_line_k}" ] &&
+	[ "${jobs_line_k}" -lt "${rustflags_line_k}" ]; then
+	ok "multi-line dotted value: build.jobs was inserted above the first dotted line"
+else
+	bad "multi-line dotted value: expected build.jobs above build.rustflags, got lines '${jobs_line_k}' and '${rustflags_line_k}'"
+fi
+assert_toml_valid "multi-line dotted value" "${file_k}"
+
+status_k2="$("${cargo_jobs_config}" "${file_k}" 9)"
+if [ "${status_k2}" = "unchanged" ]; then
+	ok "rerun after a multi-line dotted insert: unchanged"
+else
+	bad "rerun after a multi-line dotted insert: expected unchanged, got '${status_k2}'"
+fi
 
 printf '%d passed, %d failed\n' "${pass}" "${fail}"
 [ "${fail}" -eq 0 ]

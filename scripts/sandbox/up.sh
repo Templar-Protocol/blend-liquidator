@@ -15,6 +15,13 @@
 # first is the only way to a clean network, and guessing at "already
 # fine" here is exactly how a stale ledger state gets mistaken for a
 # fresh one.
+#
+# A container this invocation created and then could not bring up is
+# removed before the script dies, which is the other half of that refusal:
+# `make sandbox` exits the moment `sandbox-up` fails and so never reaches
+# `down.sh`, so without this the next run would refuse on a container
+# nothing ever used. Only a container created *here* is ever removed — a
+# pre-existing one is still the refusal above.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,13 +48,28 @@ docker run -d \
 	--local --enable core,rpc,horizon >/dev/null \
 	|| die "docker run failed for ${image}"
 
+# Armed only once `docker run` has succeeded, and disarmed only once the
+# network is up and verified, so the window it covers is exactly "this
+# script created the container and did not finish" — `wait_for_rpc`
+# returning non-zero, `require_standalone_network`'s own `die`, and any
+# other failure `set -e` ends the script on. `docker rm -f` swallows its
+# own failure: the script is already dying with a message that names the
+# real reason, and a removal that could not run is not a better one.
+remove_created_container() {
+	log "removing '${SANDBOX_CONTAINER}', which this run created and could not bring up"
+	docker rm -f "${SANDBOX_CONTAINER}" >/dev/null 2>&1 || true
+}
+trap remove_created_container EXIT
+
 if ! wait_for_rpc "${rpc_url}"; then
 	log "last 50 lines of ${SANDBOX_CONTAINER}'s log:"
 	docker logs --tail 50 "${SANDBOX_CONTAINER}" >&2 || true
-	die "${rpc_url} never became healthy within the budget — container '${SANDBOX_CONTAINER}' is still running; run scripts/sandbox/down.sh to clean up"
+	die "${rpc_url} never became healthy within the budget — removing the container this run created; see the log lines above, then run scripts/sandbox/up.sh again"
 fi
 
 require_standalone_network "${rpc_url}"
+
+trap - EXIT
 
 log "sandbox is up"
 printf '%s\n' "${rpc_url}"

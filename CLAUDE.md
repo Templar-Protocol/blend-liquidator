@@ -579,26 +579,34 @@ make help                           # Docker Compose lifecycle
   network. Nothing in it panics through `unwrap`/`expect`: every failure
   after the spawn goes through `fail`, which prints the tail of the bot's
   own log first.
-- `scripts/sandbox/` — the tier's scripts, all `set -euo pipefail` and all
-  sourcing `lib.sh` (log/die, `sandbox_dir`, `sha256_check`/`fetch`,
-  `wait_for_rpc`, `require_standalone_network` and the
-  `sandbox_network_args` flags it pins, the `invoke`/`invoke_view`
-  wrappers that log a contract's *role* and never an argument, and
-  `env_write`, which truncates and `chmod 600`s before it writes) and
-  `versions.env` (every pin: the five wasm URLs with their SHA-256s, the
-  `stellar` CLI release and both tarball hashes, the quickstart image by
-  digest, `SANDBOX_PASSPHRASE`, and `SQLX_CLI_VERSION`, which is not the
-  sandbox's but has the same two-installers problem — see the gotcha on
-  the database sweep below). `lib.sh` sources
-  `versions.env` from its own directory and no environment variable
-  selects it: that one file names the passphrase the standalone gate
-  compares against *and* the hash every artefact is verified by, so a
-  redirect would defeat both at once. `fetch-artifacts.sh` downloads and
-  verifies the wasm; `up.sh` starts the pinned quickstart container
-  (bound to `127.0.0.1`) and waits for its RPC to be healthy *and*
-  closing ledgers; `deploy.sh` stands Blend v2 up in ten steps and
-  writes `target/sandbox/sandbox.env`; `crash.sh` moves the oracle's XLM
-  price; `down.sh` removes the container and `sandbox.env`.
+- `scripts/sandbox/` — the tier's scripts, all `set -euo pipefail`. Every
+  one that drives the sandbox itself — `fetch-artifacts.sh`, `up.sh`,
+  `deploy.sh`, `crash.sh`, `down.sh` and `test-network-pinning.sh` —
+  sources `lib.sh`, and through it `versions.env`; `test-cargo-jobs.sh`
+  and `test-cargo-config.sh` source neither, because what they test is
+  `scripts/cargo-jobs*.sh`, which reaches no network and no pin. `lib.sh`
+  holds log/die, `sandbox_dir`, `sha256_check`/`fetch`, `wait_for_rpc`,
+  `require_standalone_network` and the `sandbox_network_args` flags it
+  pins, the `invoke`/`invoke_view` wrappers that log a contract's *role*
+  and never an argument, and `env_write`, which truncates and `chmod
+  600`s before it writes. `versions.env` holds every pin: the five wasm
+  URLs with their SHA-256s, the `stellar` CLI release and both tarball
+  hashes, the quickstart image by digest, `SANDBOX_PASSPHRASE`, and
+  `SQLX_CLI_VERSION`, which is not the sandbox's but has the same
+  two-installers problem — see the gotcha on the database sweep below.
+  `lib.sh` sources `versions.env` from its own directory and no
+  environment variable selects it: that one file names the passphrase the
+  standalone gate compares against *and* the hash every artefact is
+  verified by, so a redirect would defeat both at once.
+  `fetch-artifacts.sh` downloads and verifies the wasm; `up.sh` starts the
+  pinned quickstart container (bound to `127.0.0.1`), waits for its RPC to
+  be healthy *and* closing ledgers, and removes the container again if
+  either that wait or the standalone gate fails — a container it created
+  and could not bring up is its to clean up, since `make sandbox` never
+  reaches `down.sh` on that path and the next run refuses on it;
+  `deploy.sh` stands Blend v2 up in ten steps and writes
+  `target/sandbox/sandbox.env`; `crash.sh` moves the oracle's XLM price;
+  `down.sh` removes the container and `sandbox.env`.
   `test-cargo-jobs.sh`, `test-cargo-config.sh` and
   `test-network-pinning.sh` are shell tests — the first two for the two
   scripts below, the third for the network pinning the gotcha below
@@ -616,8 +624,13 @@ make help                           # Docker Compose lifecycle
   sets `jobs` byte-for-byte alone — in whichever of TOML's two spellings
   the file already uses: a `[build]` header (indented or with a trailing
   comment counts) or root-level dotted keys (`build.incremental = true`,
-  where a `[build]` header afterwards would be the second declaration).
-  See the OOM gotcha below.
+  and `build . incremental = true`, since TOML ignores the whitespace
+  around a dot and a spelling that goes unrecognised gets a second `build`
+  declaration appended). The key lands directly under a header, and
+  directly *above* the first dotted line — above, because a dotted value
+  may span several lines, of which only the opening one matches anything,
+  so a position after the last match can fall inside a value and a
+  position before a line never can. See the OOM gotcha below.
 - `.github/workflows/sandbox.yml` — the nightly run of the tier, on
   `schedule` and `workflow_dispatch` only, never `push` or
   `pull_request`, and deliberately outside `ci.yml`'s `ci-summary` needs
@@ -736,8 +749,11 @@ Status above for what remains.
   to parse a config that declares `build` twice, which is a worse failure
   than the OOM the cap prevents. "That table" is whichever spelling the
   file uses, an indented `[build]`, one with a trailing comment, and the
-  root-level dotted `build.<key>` form included; an unterminated last line
-  is terminated before anything is written after it. An environment
+  root-level dotted `build.<key>` form — whitespace around the dot
+  included — among them; the dotted insert goes above the first such line,
+  never after the last, so a value spanning several lines cannot be split
+  in two; and an unterminated last line is terminated before anything is
+  written after it. An environment
   `CARGO_BUILD_JOBS` still overrides the file at build time, which is what
   the one-liner above is.
 - Commit signing in the dev container: `user.signingkey` copied from the host

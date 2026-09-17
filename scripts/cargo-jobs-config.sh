@@ -8,10 +8,10 @@
 #     FILE): append a fresh [build] table, with jobs = N and a comment
 #     naming this script. Prints "created".
 #   - a `build` table exists but sets no `jobs` key anywhere inside it:
-#     insert the same comment and the key immediately under the line that
-#     declared the table, leaving every other line in the file —
-#     including any other key already in the table — exactly where it
-#     was. Prints "inserted".
+#     insert the same comment and the key against the line that declared
+#     the table — where exactly depends on the spelling, see below —
+#     leaving every other line in the file, including any other key
+#     already in the table, exactly where it was. Prints "inserted".
 #   - a `build` table already sets `jobs` (any value, anywhere in the
 #     table): FILE is left byte-for-byte untouched — an operator's own
 #     choice, or an earlier run of this script, wins. Prints "unchanged".
@@ -25,10 +25,18 @@
 #     column 0; the key is inserted under the header as plain `jobs = N`.
 #   - root-level dotted keys — `build.incremental = true` — where `build`
 #     is declared by the dotted key itself and a `[build]` header
-#     afterwards would be the second declaration. The key is inserted
-#     after the last such line, in the same dotted form, as
-#     `build.jobs = N`. Only at the root: `build.jobs` under some other
-#     table header is that table's key, not this one.
+#     afterwards would be the second declaration. TOML ignores whitespace
+#     around the dot, so `build . incremental = true` is that same
+#     declaration and is matched too. The key is inserted immediately
+#     *before* the first such line, in the same dotted form, as
+#     `build.jobs = N`. Before, not after: a dotted key's value may span
+#     several lines (`build.rustflags = [` … `]`), only the opening line
+#     of which matches anything here, so inserting after the last match
+#     can land between a `[` and its elements and split a value in half —
+#     a file no parser accepts, the same unusable config as a doubled
+#     declaration. A position before a line is never inside a value.
+#     Only at the root: `build.jobs` under some other table header is that
+#     table's key, not this one.
 #
 # A FILE whose last line is unterminated gets a newline first, before
 # anything is inserted after it or appended to it — otherwise the comment
@@ -77,14 +85,19 @@ read -r has_build has_jobs style lineno < <(awk '
 	/^[ \t]*\[/ { in_build = 0; at_root = 0; next }
 	in_build && /^[ \t]*jobs[ \t]*=/ { has_jobs = 1; next }
 	# The dotted spelling, at the root only: under another header these
-	# belong to that table instead.
-	at_root && /^[ \t]*build\.[A-Za-z0-9_-]+[ \t]*=/ {
-		dotted_lineno = NR
-		if ($0 ~ /^[ \t]*build\.jobs[ \t]*=/) { has_jobs = 1 }
+	# belong to that table instead. Whitespace is allowed either side of
+	# the dot, because TOML allows it and `build . incremental = true`
+	# declares exactly the same table.
+	at_root && /^[ \t]*build[ \t]*\.[ \t]*[A-Za-z0-9_-]+[ \t]*=/ {
+		if (!dotted_lineno) { dotted_lineno = NR }
+		if ($0 ~ /^[ \t]*build[ \t]*\.[ \t]*jobs[ \t]*=/) { has_jobs = 1 }
 	}
+	# lineno is "insert after this line", so the dotted style reports the
+	# line *before* its first match — 0 when that match is line 1, which
+	# the splice below reads as "insert at the top".
 	END {
 		if (build_lineno) { style = 1; lineno = build_lineno }
-		else if (dotted_lineno) { style = 2; lineno = dotted_lineno }
+		else if (dotted_lineno) { style = 2; lineno = dotted_lineno - 1 }
 		else { style = 0; lineno = 0 }
 		printf "%d %d %d %d\n", (style ? 1 : 0), has_jobs, style, lineno
 	}
@@ -104,8 +117,11 @@ if [ -s "${file}" ] && [ -n "$(tail -c 1 "${file}")" ]; then
 fi
 
 if [ "${has_build}" = "1" ]; then
-	# Insert under the line that declared the table — never a second
-	# declaration of our own — in that declaration's own spelling.
+	# Insert into the table already declared — never a second declaration
+	# of our own — in that declaration's own spelling: directly under a
+	# `[build]` header, and directly above the first root-level dotted
+	# `build.` line, which is the one position that cannot fall inside a
+	# multi-line value.
 	if [ "${style}" = "2" ]; then
 		key="build.jobs"
 	else

@@ -259,8 +259,9 @@ sandbox_set_network() {
 }
 
 # require_standalone_network URL — dies unless URL's getNetwork answers
-# exactly SANDBOX_PASSPHRASE (from versions.env — every caller sources it
-# before this), and on success makes URL the network every later CLI call
+# exactly SANDBOX_PASSPHRASE — which this file sources from
+# versions.env in its own directory, and which no caller supplies or can
+# redirect — and on success makes URL the network every later CLI call
 # names, through sandbox_set_network. This is the one gate every later
 # sandbox script calls first: the sandbox exists to never touch a public
 # network, so refusing on any other passphrase — including no answer at

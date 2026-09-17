@@ -184,8 +184,12 @@ cargo fetch || warn "cargo fetch failed; it will run again on your first build."
 #    truncated download, or a mismatched checksum, never leaves a partial
 #    binary on PATH: the move to ~/.local/bin/stellar (already on PATH in
 #    this image) is the last step, after sha256_check has passed.
-#    Idempotent: skipped outright once `stellar --version` already reports
-#    the pinned version.
+#    Idempotent: skipped outright once `stellar version --only-version`
+#    prints exactly the pinned version. Exact equality, not a substring
+#    match: a prerelease such as 28.0.0-rc.1 contains the pinned 28.0.0 and
+#    would otherwise be kept. An installed CLI too old to know
+#    `--only-version` prints nothing to stdout, the comparison fails, and
+#    the install proceeds — which is the wanted answer for it too.
 #    lib.sh's sha256_check/fetch are fatal by design (they call die(),
 #    which exits) — exactly right inside a script that must not go on
 #    using an unverified or half-downloaded file. Run in a `(…)` subshell
@@ -211,7 +215,7 @@ if (
 	source "${sandbox_scripts_dir}/versions.env"
 
 	if command -v stellar >/dev/null 2>&1 &&
-		stellar --version 2>/dev/null | grep -qF "${STELLAR_CLI_VERSION}"; then
+		[ "$(stellar version --only-version 2>/dev/null)" = "${STELLAR_CLI_VERSION}" ]; then
 		echo "    stellar CLI ${STELLAR_CLI_VERSION} already installed"
 		exit 0
 	fi

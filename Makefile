@@ -145,6 +145,12 @@ sandbox-down: ## Tear the sandbox down and drop the databases failed runs kept
 # network somebody is still using (SANDBOX_KEEP=1 left it up). Tearing
 # that down because this run could not start would destroy exactly what
 # was being kept.
+#
+# A sandbox-down that fails after a green test fails the whole target: it
+# removes the container and sweeps the run databases, so its failure is a
+# container still holding port 8000 and databases still on the server —
+# precisely what the next run refuses on, and reporting success would hide
+# it until then.
 sandbox: ## up → fetch → deploy → test → down (SANDBOX_KEEP=1 leaves the sandbox up)
 	@$(MAKE) sandbox-up || exit $$?; \
 	status=0; \
@@ -153,7 +159,7 @@ sandbox: ## up → fetch → deploy → test → down (SANDBOX_KEEP=1 leaves the
 	if [ -n "$${SANDBOX_KEEP:-}" ]; then \
 		echo 'SANDBOX_KEEP is set — leaving the sandbox up; make sandbox-down tears it down'; \
 	elif [ "$$status" -eq 0 ]; then \
-		$(MAKE) sandbox-down; \
+		$(MAKE) sandbox-down || status=$$?; \
 	else \
 		echo 'the run failed — tearing the network down and keeping its database;'; \
 		echo 'make sandbox-down drops it once you are done with it'; \
