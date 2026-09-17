@@ -1035,7 +1035,13 @@ Status above for what remains.
   withdrawals are under 50%; the `get_config` read straight after it is
   what proves the threshold *was* met rather than the call having been a
   no-op. Reserves are configured before it for a related reason:
-  `queue_set_reserve`/`set_reserve` impose a timelock outside Setup.
+  `queue_set_reserve`/`set_reserve` impose a timelock outside Setup. The
+  pool it leaves behind reports status 0, and the bot treats that as
+  active: `Service::validate` warns only past `AdminActive`, because the
+  contract's `Pool::require_action_allowed` refuses borrow and cancel only
+  above status 1 and supply only above 3, so 0 and 1 are the same thing to
+  everything the bot does — and 0 is where any admin-activated pool sits,
+  a new mainnet pool included. `deploy.sh` accordingly accepts 0 or 1.
 - A fresh standalone network has no contracts at all, the native asset's
   included, and none of the plumbing a real network's accounts already
   carry. `deploy.sh` deploys the XLM SAC like any other

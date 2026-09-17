@@ -463,12 +463,16 @@ log "reserves: ${reserve_list}"
 # execute_update_pool_status panics with StatusNotAllowed (1204) whenever
 # the current status is 6, and verified so here against this exact wasm.
 # The contracts' own fixture leaves Setup with set_status(3) followed by
-# update_status(), which lands on 1 (Active) — but the tier's verification
-# wants 0 (Admin Active), and execute_set_pool_status(0) reaches it in one
-# call while enforcing the identical condition: it panics with the same
-# 1204 unless the backstop threshold is met and queued withdrawals are
-# under 50%. So set_status 0 it is, and get_config below is what proves
-# the threshold was met.
+# update_status(), which lands on 1 (Active); execute_set_pool_status(0)
+# reaches 0 (Admin Active) in one call while enforcing the identical
+# condition — it panics with the same 1204 unless the backstop threshold
+# is met and queued withdrawals are under 50%. So set_status 0 it is, and
+# get_config below is what proves the threshold was met.
+#
+# 0 rather than the fixture's 1 costs nothing: the contract's
+# require_action_allowed treats 0 and 1 identically for everything this
+# tier exercises, and the bot's own validate accepts both (see
+# src/service.rs).
 ########################################################################
 
 log "=== step 8: backstop funding ==="
@@ -482,8 +486,17 @@ invoke "${SANDBOX_KEY_ADMIN}" "${POOL}" set_status --pool_status 0 >/dev/null
 
 config=$(invoke_view "${SANDBOX_KEY_ADMIN}" "${POOL}" get_config)
 status=$(json_field "${config}" '.status' "step 8 activation")
-[ "${status}" = "0" ] || die "step 8 activation: the pool reports status ${status}, not 0 (Active) — the backstop threshold was not met: ${config}"
-log "pool is active: ${config}"
+# 0 or 1, not 0 alone: this calls set_status(0), so 0 is what it expects,
+# but 0 (Admin Active) and 1 (Active) are the same thing to everything the
+# bot does — the contract's require_action_allowed refuses borrow and
+# cancel only above 1 — and the assertion here is that the pool left Setup
+# at all, which either answers. A `case`, not `-le`, because a non-numeric
+# answer must fail as a bad status rather than as an arithmetic error.
+case "${status}" in
+0 | 1) ;;
+*) die "step 8 activation: the pool reports status ${status}, not 0 (Admin Active) or 1 (Active) — the backstop threshold was not met: ${config}" ;;
+esac
+log "pool is active (status ${status}): ${config}"
 
 ########################################################################
 # 9. Liquidity and the borrower

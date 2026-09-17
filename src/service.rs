@@ -192,8 +192,9 @@ pub struct PoolValidation {
 /// answers, that they share one backstop (a filler's position is shared
 /// across every pool it follows, so it cannot serve two), and that the
 /// assets each pool config names are reserves it can actually use. A pool
-/// that is not active, or an asset the oracle does not price, is a warning:
-/// neither stops the bot from following the pool, only from acting on it.
+/// that is neither active nor admin-active, or an asset the oracle does not
+/// price, is a warning: neither stops the bot from following the pool, only
+/// from acting on it.
 async fn validate(
     rpc: &RpcClient,
     pools: &[PoolConfig],
@@ -223,10 +224,20 @@ async fn validate(
         validate_supported_assets(&pool.address, &pool.supported_bid, &snapshot)?;
         validate_supported_assets(&pool.address, &pool.supported_lot, &snapshot)?;
 
-        if snapshot.instance.config.status != PoolStatus::Active {
+        // `AdminActive` (0) and `Active` (1) are one thing to this bot.
+        // The contract's `Pool::require_action_allowed` refuses borrow and
+        // auction-cancel only at a status *above* 1 and supply only above
+        // 3, so nothing the bot does — creating an auction, filling one,
+        // repaying, withdrawing — can tell 0 from 1. An admin-activated
+        // pool is also the ordinary state of a newly deployed one
+        // (`set_status(0)` is how a pool leaves Setup), so warning about
+        // it teaches an operator to read these warnings as noise, which is
+        // the opposite of what they are for.
+        let status = snapshot.instance.config.status;
+        if status != PoolStatus::Active && status != PoolStatus::AdminActive {
             warnings.push(format!(
-                "pool {}: status is {:?}, not active",
-                pool.address, snapshot.instance.config.status
+                "pool {}: status is {status:?}, not active",
+                pool.address
             ));
         }
         // The contract refuses an auction naming more assets than
@@ -3153,9 +3164,14 @@ mod tests {
         Ok(())
     }
 
-    /// A non-active pool status is a warning that still lets validation
-    /// succeed, not an error: a frozen or on-ice pool must let the bot
-    /// start and warn, not refuse to start.
+    /// A status the pool cannot borrow at is a warning that still lets
+    /// validation succeed, not an error: an on-ice or frozen pool must let
+    /// the bot start and warn, not refuse to start.
+    ///
+    /// `AdminOnIce` (2) rather than something deeper because it is the
+    /// boundary: it is the first status past the two the contract treats
+    /// as operational, so a warning that started one status early or one
+    /// late would show up here.
     #[sqlx::test(migrations = "./migrations")]
     async fn a_non_active_pool_status_is_a_warning_not_an_error(
         db: sqlx::PgPool,
@@ -3166,7 +3182,7 @@ mod tests {
             &rpc,
             POOL_A,
             BACKSTOP_A,
-            PoolStatus::Frozen.code(),
+            PoolStatus::AdminOnIce.code(),
             &[usable_reserve()],
             LEDGER,
         );
@@ -3186,9 +3202,42 @@ mod tests {
             warnings,
             vec![format!(
                 "pool {POOL_A}: status is {:?}, not active",
-                PoolStatus::Frozen
+                PoolStatus::AdminOnIce
             )],
             "the warning must name the pool and its actual status"
+        );
+        Ok(())
+    }
+
+    /// An admin-activated pool draws no warning at all.
+    ///
+    /// Status 0 and status 1 are operationally identical for everything
+    /// this bot does — `Pool::require_action_allowed` refuses borrow and
+    /// cancel only past 1 and supply only past 3 — and 0 is where a pool
+    /// lands when its admin activates it, which is the ordinary state of a
+    /// new mainnet pool and of the sandbox tier's own. Warning about it
+    /// teaches an operator to read the startup warnings as noise.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_admin_active_pool_status_is_not_a_warning(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let _store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        script_pool(
+            &rpc,
+            POOL_A,
+            BACKSTOP_A,
+            PoolStatus::AdminActive.code(),
+            &[usable_reserve()],
+            LEDGER,
+        );
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let pool = pool_config(POOL_A, USDC, &[USDC], &["*"]);
+
+        let (validations, warnings) = validate(&client, &[pool]).await.expect("validate");
+        assert_eq!(validations.len(), 1);
+        assert_eq!(validations[0].pool, POOL_A);
+        assert!(
+            warnings.is_empty(),
+            "an admin-activated pool is active for everything the bot does: {warnings:?}"
         );
         Ok(())
     }
