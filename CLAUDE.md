@@ -89,11 +89,24 @@ make help                           # Docker Compose lifecycle
   meaningful: re-plan only at the fill ledger), `XLM_FEE_RESERVE` (decimal
   XLM, and XLM has 7 decimals, so the parsed `Decimal7` *is* stroops) and
   `HIGH_FEE_PROFIT_THRESHOLD` (in the pool oracle's units) are ordinary
-  `clap` arguments. The two signing keys — `AUCTIONEER_SECRET_KEY`, and
-  `FILLER_SECRET_KEY`, which it falls back to — are read from the
-  environment by `main.rs` and handed to `Args::signing_keys`; neither is
-  ever a clap field, like every other secret, because argv is
-  world-readable. Both are parsed at startup, so a malformed value in
+  `clap` arguments. So is the operational surface's own set: `PORT` and
+  `HTTP_PORT` (`PORT` wins when both are set, since it is the one a
+  deployment platform injects; either turns the HTTP server on and
+  neither leaves it off), `HTTP_BIND_ADDR` (loopback by default),
+  `HEALTH_MAX_LAG_LEDGERS` (default 10, refused at zero — a bot exactly
+  at head would report not-ready on every poll-interval boundary),
+  `FAILURE_NOTIFICATION_COOLDOWN_HOURS` (refused at zero: there is no
+  "no cooldown" spelling, only shorter ones) and `TELEGRAM_CHAT_ID`,
+  which is not a secret and is an argument like the rest. `HttpConfig`
+  and `TelegramConfig` are what carry them into `ServiceConfig`.
+  The three secrets are the exception, and none of them is ever a clap
+  field, because argv is world-readable: the two signing keys —
+  `AUCTIONEER_SECRET_KEY`, and `FILLER_SECRET_KEY`, which it falls back
+  to — are read from the environment by `main.rs` and handed to
+  `Args::signing_keys`, while `TELEGRAM_BOT_TOKEN` is read by
+  `Args::service` itself (it pairs with `TELEGRAM_CHAT_ID`: both or
+  neither, either alone a startup error). Both signing keys are parsed at
+  startup, so a malformed value in
   either is a startup error, and so are the two rules that pair them:
   `DRY_RUN=false` without `FILLER_SECRET_KEY` (the filler signs with its
   own key only, so an armed bot without it would create auctions and never
@@ -295,18 +308,32 @@ make help                           # Docker Compose lifecycle
   are closed enums (`Attempt`, `SkipLabel`, `DeliveryLabel`) rendered with
   every member present, zero included, so a dashboard never has to guess
   whether a missing series means zero or means the bot has not run yet.
-  No I/O and nothing panics; a poisoned lock is recovered rather than
-  propagated, the same call `notifier`'s makes.
+  Money is rendered as an integer in the pool oracle's own units —
+  `estimated_profit_total` and `estimated_loss_total` — never scaled by
+  an assumed number of decimals, and a landed fill's negative estimate
+  (a `force_fill` pool's) adds its magnitude to the *loss* counter rather
+  than lowering the profit one, since a Prometheus counter that decreases
+  is read as a reset. No I/O, no float and nothing panics; a poisoned
+  lock is recovered rather than propagated, the same call `notifier`'s
+  makes.
 - `src/http.rs` — the `/healthz`, `/livez` and `/metrics` server, built
   from `HttpState` and served only when `crate::config::HttpConfig` is
   configured (`PORT` or `HTTP_PORT`). `readiness` (`/healthz`) needs every
   configured pool's processed ledger within `HttpState::max_lag_ledgers`
-  of the chain head this process has observed, and the store to answer a
-  ping; `liveness` (`/livez`) needs only that every pool's poller has
-  heartbeated within `HttpState::liveness_deadline`
-  (`PollerConfig::liveness_deadline`), which already absorbs one
-  worst-case backoff — an RPC outage the poller's own backoff is riding
-  out must not fail it. `/metrics` never fails: it renders whatever
+  of the chain head this process has observed, that head to have been
+  read within `HttpState::liveness_deadline` (`PoolStatus::head_at`,
+  stamped by `Metrics::ledger_head`), and the store to answer a ping
+  inside `PING_TIMEOUT` (5s). The head's *age* is not a nicety: both
+  ledger gauges are this process's own and an RPC outage stops both at
+  once, so a readiness that compared only the two would answer `200`
+  throughout the one failure it exists to catch. `liveness` (`/livez`)
+  needs only that every pool's poller has heartbeated within
+  `HttpState::liveness_deadline` (`PollerConfig::liveness_deadline`),
+  which already absorbs one worst-case backoff — an RPC outage the
+  poller's own backoff is riding out must not fail it — and measures a
+  pool that has *never* heartbeated from `HttpState::started` instead,
+  the same rule `watchdog_loop` applies: a poller whose first iteration
+  has not run yet is starting, not stopped. `/metrics` never fails: it renders whatever
   `Metrics` holds, empty or not, and always answers `200`. `serve` never
   propagates a bind failure to its caller — it logs and returns — because
   a diagnostics port that cannot open must not stop the bot from trading
@@ -401,8 +428,11 @@ make help                           # Docker Compose lifecycle
   through a step of their own: `fills_total{result}` counts every recorded fill
   (`attempted`, and `succeeded`/`failed` once the chain answers),
   `skips_total{reason}` counts every planner and executor skip a
-  `SkipLabel` names, `estimated_profit_total` adds a landed fill's
-  `est_profit`, `reserved_inventory{asset}` is re-gauged from
+  `SkipLabel` names — once per auction, never once per tick it stays open
+  for, which is what `FillerState::counted_unsupported` is for —
+  `estimated_profit_total` adds a landed fill's `est_profit` (and
+  `estimated_loss_total` its magnitude when that estimate is negative),
+  `reserved_inventory{asset}` is re-gauged from
   `Inventory::reserved()` after every tick, and `unwind_pass()` counts
   every unwind attempt. `NotificationKind::FillConfirmed` (Low) and
   `FillFailed` (High) answer a fill's `Succeeded`/`Failed`;
@@ -424,7 +454,12 @@ make help                           # Docker Compose lifecycle
   for a pool whose heartbeat has gone past `PollerConfig::liveness_deadline`
   — it cannot be the poller's own report, because a wedged loop cannot
   report itself), one HTTP server (`crate::http::serve`) when `PORT` or
-  `HTTP_PORT` gave the run an address, and — only when armed — one
+  `HTTP_PORT` gave the run an address — spawned *before* the seed pass,
+  alone among the tasks, because a seed of a busy pool is tens of seconds
+  during which a restart probe must still be able to reach `/livez`; the
+  seed itself heartbeats per pool through `ledger::heartbeat_while`, so
+  that window reports honest progress rather than silence — and — only
+  when armed — one
   submission-queue worker per *distinct* signing key, which is what
   `spawn_queues` is for. The run's one `Metrics` and one `Notifier`
   (`build_notifier`: the Telegram channel when both credentials are
@@ -770,13 +805,21 @@ Status above for what remains.
   goes through `reqwest::Error::without_url()` first. A new log line that
   prints a raw `reqwest::Error` from `notifier::telegram` or
   `service::telegram_channel`/`verify_telegram` leaks the token into the
-  log.
+  log. The one leak this crate cannot close is `RUST_LOG=trace`: hyper's
+  byte-level logging prints the request line — `/bot<TOKEN>/sendMessage`
+  — and `tracing_subscriber`'s `log` bridge captures it. The default
+  filter and `debug` are both clear; **a Telegram-configured bot is never
+  run at TRACE.**
 - `PORT` wins over `HTTP_PORT` when both are set, because `PORT` is the
   one a deployment platform controls (Cloud Run injects it); either alone
   turns the HTTP server on, neither leaves it off. A bind failure never
-  stops trading: `http::serve` logs it and returns `Ok(())`, because a
+  stops trading: `http::serve` logs it and returns `()` — it is the task
+  `Service::run` wraps it in that answers `Ok(())` — because a
   diagnostics port that cannot open must not stop the poller, the
-  auctioneer or the filler from running.
+  auctioneer or the filler from running. That task is also the one thing
+  spawned *before* the initial seed: a seed of a busy pool is tens of
+  seconds, and a restart probe aimed at `/livez` must be able to reach
+  it.
 - `/livez` includes the poller's own backoff in its window
   (`PollerConfig::liveness_deadline` is `LIVENESS_INTERVALS` poll
   intervals plus `max_backoff`), on purpose — an RPC outage the poller's
@@ -786,7 +829,11 @@ Status above for what remains.
   outages its backoff exists to ride out, while a wedged poller — which
   `/livez` alone catches — is precisely what a restart can fix. The
   Docker `HEALTHCHECK` stays `pgrep` for the same reason; see the
-  Dockerfile's own comment.
+  Dockerfile's own comment. A pool that has never heartbeated at all is
+  measured from the run's start rather than reported dead, so the initial
+  seed is not a restart loop; `/healthz` carries the mirror-image rule,
+  failing once no chain head has been read for that same window, because
+  an RPC outage freezes the lag it would otherwise be judged by.
 - A `Notifier` must be used from inside a tokio runtime: `notify` spawns
   the delivery task, and calling it outside one panics.
 - `notifications_total{kind,delivery}` is the one metric whose label set

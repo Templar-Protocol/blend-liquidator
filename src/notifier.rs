@@ -255,10 +255,16 @@ fn lock(recent: &Mutex<Recent>) -> MutexGuard<'_, Recent> {
 /// behind an `Arc` rather than borrowed.
 struct Inner {
     channel: Box<dyn NotificationChannel>,
-    /// Written through when the configured channel refuses a notification,
-    /// or when there was no permit to hand it one. Held rather than
-    /// constructed on the spot so that "there is always a fallback" is a
-    /// property of the type and not of two call sites remembering.
+    /// Written through when the configured channel refuses a notification
+    /// inside a delivery task. Held rather than constructed on the spot so
+    /// that "there is always a fallback" is a property of the type and not
+    /// of a call site remembering.
+    ///
+    /// It is not the only fallback *site*: the no-permit path in
+    /// [`Notifier::notify_at`] is synchronous and never reaches a task, so
+    /// it calls [`LogChannel::emit`] — the whole of this channel's `send`
+    /// — directly rather than awaiting this field. Both paths therefore
+    /// write the same line; this field is the one the task uses.
     fallback: LogChannel,
     cooldown: Duration,
     recent: Mutex<Recent>,
@@ -462,9 +468,13 @@ impl Notifier {
     /// [`DRAIN_BUDGET`], so a notification the bot decided to send on its
     /// way out has a bounded chance to leave before the process does.
     ///
-    /// Acquires every permit and releases them again, so a notification
-    /// sent *during* a drain is not blocked by it — draining is a wait,
-    /// not a close.
+    /// Acquires every permit and releases them again: draining is a wait,
+    /// not a close, so the notifier still works afterwards. A
+    /// notification raised *during* a drain does not wait for it either —
+    /// it finds no permit, because this holds each one as it is released,
+    /// and is `Dropped` to the log, which is what a shutdown owes it: the
+    /// operator sees the line, and nothing on the way out is delayed by a
+    /// channel that may never answer.
     pub async fn drain(&self, budget: Duration) -> bool {
         // `NOTIFY_IN_FLIGHT` is 10; the saturating fallback is unreachable
         // and asks for more permits than exist rather than panicking.

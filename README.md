@@ -111,13 +111,20 @@ endpoints:
 
 - `/healthz` — readiness. `200` once every configured pool's processed
   ledger is within `HEALTH_MAX_LAG_LEDGERS` of the chain head this
-  process has observed and the store answers a ping; otherwise `503` with
-  the reason as plain text.
+  process has observed, that head was read recently — within the same
+  window `/livez` uses — and the store answers a ping within five
+  seconds; otherwise `503` with the reason as plain text. The head's age
+  is what makes an RPC outage visible here: both ledger numbers are this
+  process's own, an outage stops them together, and a lag that compared
+  only the two would sit frozen at zero while the bot followed nothing.
 - `/livez` — liveness. `200` while every pool's poller has heartbeated
   recently, independent of whether the RPC is currently answering: the
   window absorbs one worst-case backoff, so an RPC outage the poller is
-  already riding out does not fail it. Only a poller that has genuinely
-  stopped making progress fails this.
+  already riding out does not fail it. A pool whose poller has not run
+  *at all* yet is measured from the process's start instead, and the
+  initial seed heartbeats for the pool it is working on, so a first start
+  against a busy pool is not read as a poller that has stopped. Only a
+  poller that has genuinely stopped making progress fails this.
 - `/metrics` — Prometheus text exposition format, prefixed
   `blend_liquidator_`: ledger head and processed per pool, events
   processed, users tracked and auctions open per pool, creation and fill
@@ -129,9 +136,18 @@ endpoints:
 Restarting on every readiness blip would kill and respawn the bot on
 exactly the RPC outages its own backoff exists to ride out; a wedged
 poller — which only `/livez` catches — is what a restart can actually
-fix. None of this is load-bearing: an unset `PORT`/`HTTP_PORT` leaves the
-server off entirely, and a bind failure is logged and never stops the bot
-from trading.
+fix. The server binds before the initial seed, so `/livez` is reachable
+for the whole of a first start. None of this is load-bearing: an unset
+`PORT`/`HTTP_PORT` leaves the server off entirely, and a bind failure is
+logged and never stops the bot from trading.
+
+One readiness case is expected rather than wrong: when a pool's events
+cursor has fallen out of the RPC's retained window, the bot reseeds that
+pool, and for the duration of the reseed its processed ledger stands
+still while the chain head advances — so `/healthz` answers `503` until
+the reseed finishes. That is honest readiness (the bot is not caught up),
+and the `EventGap` notification names the cause. Alert on it, but expect
+it when a bot has been stopped for longer than the RPC's retention.
 
 Setting both `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` — both or
 neither, either alone is a startup error — sends every notification to

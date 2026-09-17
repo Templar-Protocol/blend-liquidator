@@ -23,7 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `src/metrics.rs` (`Metrics`): the run's counters and gauges — ledger head
   and processed, poller heartbeats, events processed, users tracked and
   auctions open per pool, creation and fill attempts by result (`Attempt`),
-  skips by reason (`SkipLabel`, a closed five), estimated profit, reserved
+  skips by reason (`SkipLabel`, a closed five, each counted once per
+  auction or borrower decided against rather than once per pass over
+  one), estimated profit and estimated loss — two counters, as integers
+  in the pool oracle's own units, because a landed fill's estimate can be
+  negative on a `force_fill` pool and a Prometheus counter that decreases
+  is read as a reset — reserved
   inventory per asset, unwind passes, the last successful scan, and
   notification deliveries by kind and outcome (`DeliveryLabel`) — behind
   one `Mutex<Inner>`, synchronous and never held across an `.await`,
@@ -33,12 +38,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   means zero or means the bot has not run.
 - `src/http.rs`: an axum server for `/healthz` (readiness — every
   configured pool's processed ledger within `HEALTH_MAX_LAG_LEDGERS` of the
-  observed chain head, and the store answering a ping), `/livez`
+  observed chain head, that head itself read within
+  `PollerConfig::liveness_deadline`, and the store answering a ping
+  inside `PING_TIMEOUT` (5s); the head's age is the rule that makes an
+  RPC outage visible, since both ledger gauges are the process's own and
+  an outage stops them together), `/livez`
   (liveness — every pool's poller heartbeated within
   `PollerConfig::liveness_deadline`, which absorbs one worst-case backoff
-  so an RPC outage alone cannot fail it) and `/metrics`, served only when
+  so an RPC outage alone cannot fail it, with a pool that has never
+  heartbeated measured from the run's start instead — the same rule the
+  watchdog applies) and `/metrics`, served only when
   `HttpConfig` is set and never propagating a bind failure to its caller:
   a diagnostics port that cannot open must not stop the bot from trading.
+  Its task is spawned before the initial seed, so `/livez` is reachable
+  for the whole of a first start, and the seed heartbeats per pool
+  through `ledger::heartbeat_while` (which `LedgerPoller::await_ack` is
+  built on) rather than leaving that window silent.
 - `Notifier` gains a bounded number of deliveries in flight
   (`NOTIFY_IN_FLIGHT`, 10) and `Notifier::drain(budget)`, which acquires
   every permit with a timeout and is what an exit path calls, with
@@ -67,7 +82,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Service::run` now spawns seven kinds of task — one `LedgerPoller` per
   pool, one tracker, one auctioneer, one filler, one watchdog, one HTTP
   server when a port is configured, and one submission-queue worker per
-  distinct signing key when armed — sharing one `Metrics` and one
+  distinct signing key when armed, the HTTP server spawned before the
+  seed pass and every other task after it — sharing one `Metrics` and one
   `Notifier` built before the seed pass (`build_notifier`: the Telegram
   channel when both credentials are configured, `LogChannel` otherwise);
   every exit but the second shutdown signal drains the notifier
@@ -75,7 +91,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configured Telegram token with one `getMe` call, a refusal a
   configuration error, since spec §10 makes it the deploy smoke test.
 - The filler and its executor now report themselves: `fills_total{result}`,
-  `skips_total{reason}`, `estimated_profit_total`,
+  `skips_total{reason}`, `estimated_profit_total`/`estimated_loss_total`,
   `reserved_inventory{asset}` and `unwind_passes_total` on every `Metrics`
   this run holds, and `NotificationKind::FillConfirmed`/`FillFailed`/
   `UnfundedFill` alongside the queue's existing `SubmissionDropped`.
@@ -113,10 +129,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ones — before handing what survives to one channel. `LogChannel`, the
   fallback channel and the only one when no Telegram credentials are
   configured, logs at `WARN` for `Severity::High` and `INFO` otherwise.
-  A channel failure answers
-  `Delivery::Failed`, rolls back the dedup entry it optimistically
-  inserted, and never affects trading: `Notifier::notify` returns no
-  `Result`, only a `Delivery`.
+  A notification that survives the cooldown answers `Delivery::Queued`
+  the moment its delivery task is spawned; a channel that then fails
+  rolls the dedup entry back inside that task and writes the
+  notification through `LogChannel` instead. None of it affects trading:
+  `Notifier::notify` returns no `Result`, only a `Delivery`, and never
+  awaits a channel.
 - The filler now unwinds. `Executor::unwind` (`src/executor.rs`) is
   `Executor::execute`'s path for the requests `plan_unwind` builds: the
   same mode guards, judged through `Submitter::simulate_only`, submitted
