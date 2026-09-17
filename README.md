@@ -108,12 +108,15 @@ Setting `PORT` (or `HTTP_PORT`, for a deployment that does not inject
 `PORT` — `PORT` wins when both are set) turns on a small HTTP server,
 bound to `HTTP_BIND_ADDR` (`127.0.0.1` by default; Cloud Run needs
 `0.0.0.0`, since it cannot route to a loopback listener) with three
-endpoints:
+endpoints. The endpoints carry no authentication and `/healthz` costs a
+store ping per request, so a `0.0.0.0` bind is for a platform whose
+ingress admits only its own probes and scraper — never for a public
+address.
 
 - `/healthz` — readiness. `200` once every configured pool's processed
   ledger is within `HEALTH_MAX_LAG_LEDGERS` of the chain head this
-  process has observed — in either direction, so a head that far *behind*
-  the processed ledger, which is an RPC node sitting behind this bot's own
+  process has observed — in either direction, so a head *more than* that
+  far behind the processed ledger, which is an RPC node sitting behind this bot's own
   committed cursor, fails too — that head was read recently — within the
   same window `/livez` uses — and the store answers a ping within five
   seconds; otherwise `503` with the reason as plain text. The head's age

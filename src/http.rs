@@ -196,12 +196,6 @@ pub async fn readiness(state: &HttpState, now: Instant) -> Result<(), String> {
         // probe. Past the bound it is the same failure in the other
         // direction — the head being read is not the chain's — and a
         // `saturating_sub` alone read it as no lag at all.
-        // Symmetric, and deliberately not a bare `checked_sub` to a
-        // `503`: a node a ledger or two behind the cursor this bot has
-        // already committed is ordinary, and failing on it would flap the
-        // probe. Past the bound it is the same failure in the other
-        // direction — the head being read is not the chain's — and a
-        // `saturating_sub` alone read it as no lag at all.
         let ahead = processed.saturating_sub(head);
         if ahead > max_lag_ledgers {
             return Err(format!(

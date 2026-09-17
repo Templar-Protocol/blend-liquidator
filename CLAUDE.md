@@ -92,7 +92,10 @@ make help                           # Docker Compose lifecycle
   `clap` arguments. So is the operational surface's own set: `PORT` and
   `HTTP_PORT` (`PORT` wins when both are set, since it is the one a
   deployment platform injects; either turns the HTTP server on and
-  neither leaves it off), `HTTP_BIND_ADDR` (loopback by default),
+  neither leaves it off), `HTTP_BIND_ADDR` (loopback by default; a
+  `0.0.0.0` bind belongs behind an ingress that admits only the platform's
+  probes and scraper, since the endpoints carry no authentication and
+  `/healthz` costs a store ping per request),
   `HEALTH_MAX_LAG_LEDGERS` (default 10, refused at zero — a bot exactly
   at head would report not-ready on every poll-interval boundary),
   `FAILURE_NOTIFICATION_COOLDOWN_HOURS` (refused at zero: there is no
