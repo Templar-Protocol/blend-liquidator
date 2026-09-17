@@ -62,15 +62,18 @@ impl Attempt {
     }
 }
 
-/// Why the auctioneer or the filler skipped a tracked borrower without
-/// acting. A closed set, rendered the same way [`Attempt`] is: all five
-/// `skips_total` series every time, zero included.
+/// Why the filler skipped an auction without taking it. A closed set,
+/// rendered the same way [`Attempt`] is: all five `skips_total` series
+/// every time, zero included. The auctioneer's own `SkipReason` is not
+/// counted here — [`Metrics::skip`] has no auctioneer call site.
 ///
-/// Each is counted once per auction or borrower the bot decided against,
-/// never once per pass over one: a caller whose decision is re-made every
-/// tick — the filler's open-auction walk — remembers what it has already
-/// counted, so one open auction a pool does not support cannot bury every
-/// other reason in the same metric.
+/// Counted once per auction *per reason*, never once per pass over one:
+/// the filler re-makes every one of these decisions on every tick an
+/// auction stays open, so it remembers what it has already counted (see
+/// `FillerState::counted_skips`) and one auction the planner refuses
+/// forever cannot bury the other four. A different reason for the same
+/// auction counts again; the same reason does not until the auction
+/// closes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SkipLabel {
     /// The auction or fill needs an asset this pool's configuration does
@@ -180,6 +183,7 @@ struct PoolRecord {
     users_tracked: Option<i64>,
     auctions_open: Option<usize>,
     seed_accounts_loaded: Option<usize>,
+    last_successful_scan: Option<SystemTime>,
 }
 
 /// The state behind [`Metrics`]'s one mutex.
@@ -198,7 +202,6 @@ struct Inner {
     loss_total: i128,
     reserved_inventory: BTreeMap<String, i128>,
     unwind_passes: u64,
-    last_successful_scan: Option<SystemTime>,
     notifications: BTreeMap<(NotificationKind, DeliveryLabel), u64>,
 }
 
@@ -213,7 +216,6 @@ impl Inner {
             loss_total: 0,
             reserved_inventory: BTreeMap::new(),
             unwind_passes: 0,
-            last_successful_scan: None,
             notifications: BTreeMap::new(),
         }
     }
@@ -377,7 +379,9 @@ impl Metrics {
         *slot = slot.saturating_add(1);
     }
 
-    /// Counts one skipped borrower with the given reason.
+    /// Counts one skipped auction with the given reason. Its caller owes
+    /// the deduplication [`SkipLabel`] documents: one per auction per
+    /// reason, not one per pass over it.
     pub fn skip(&self, reason: SkipLabel) {
         let mut inner = lock(&self.inner);
         let slot = &mut inner.skips[reason as usize];
@@ -425,11 +429,20 @@ impl Metrics {
         inner.unwind_passes = inner.unwind_passes.saturating_add(1);
     }
 
-    /// Records that a full scan succeeded at wall-clock time `at`. Absent
-    /// until this is called at least once: see
+    /// Records that `pool`'s full scan succeeded at wall-clock time `at`.
+    ///
+    /// Per pool, because the scan is: one unlabelled series would stay
+    /// fresh on one pool's successes while another's scans failed every
+    /// cadence, and "scans have stopped finishing" is exactly what an
+    /// operator alerts on this for. A pool is absent from the series
+    /// until this is called for it at least once: see
     /// `last_successful_scan_timestamp_seconds` in [`Metrics::render`].
-    pub fn scan_succeeded(&self, at: SystemTime) {
-        lock(&self.inner).last_successful_scan = Some(at);
+    pub fn scan_succeeded(&self, pool: &str, at: SystemTime) {
+        lock(&self.inner)
+            .pools
+            .entry(pool.to_string())
+            .or_default()
+            .last_successful_scan = Some(at);
     }
 
     /// Counts one notification's delivery outcome, by kind and by how it
@@ -619,9 +632,9 @@ impl Metrics {
         header(
             &mut out,
             "skips_total",
-            "Tracked borrowers skipped without acting, by reason. One per auction or borrower \
-             the bot decided not to take, never one per pass over it, so the reasons are \
-             comparable with each other.",
+            "Auctions the filler skipped without taking, by reason. One per auction the \
+             filler decided not to take, per reason, never one per pass over it, so the \
+             reasons are comparable with each other.",
             "counter",
         );
         for reason in SkipLabel::ALL {
@@ -688,18 +701,31 @@ impl Metrics {
             inner.unwind_passes
         );
 
-        if let Some(at) = inner.last_successful_scan {
+        // The one per-pool series whose header is conditional: a pool
+        // that has never finished a scan carries no sample, and until one
+        // pool has, the metric is not there at all.
+        if inner
+            .pools
+            .values()
+            .any(|record| record.last_successful_scan.is_some())
+        {
             header(
                 &mut out,
                 "last_successful_scan_timestamp_seconds",
-                "Wall-clock time the last full scan succeeded.",
+                "Wall-clock time a pool's last full scan succeeded.",
                 "gauge",
             );
-            let seconds = at.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-            let _ = writeln!(
-                out,
-                "{METRIC_PREFIX}last_successful_scan_timestamp_seconds {seconds}"
-            );
+            for (pool, record) in &inner.pools {
+                if let Some(at) = record.last_successful_scan {
+                    let seconds = at.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                    let _ = writeln!(
+                        out,
+                        "{METRIC_PREFIX}last_successful_scan_timestamp_seconds{{pool=\"{}\"}} \
+                         {seconds}",
+                        escape_label(pool)
+                    );
+                }
+            }
         }
 
         header(
@@ -783,6 +809,39 @@ mod tests {
         assert!(m.render().contains(
             "blend_liquidator_poller_heartbeat_timestamp_seconds{pool=\"POOL\"} 1700000000\n"
         ));
+    }
+
+    /// The full scan is per pool, and so is the gauge that says one
+    /// finished. One unlabelled series would stay fresh on the pool whose
+    /// scans succeed while the pool beside it failed every cadence, and
+    /// an operator alerting on "scans have stopped finishing" would never
+    /// hear about the second one.
+    #[test]
+    fn a_scan_that_finished_is_stamped_for_its_own_pool() {
+        let m = Metrics::new();
+        assert!(
+            !m.render().contains("last_successful_scan"),
+            "absent until some pool's scan succeeded"
+        );
+        m.scan_succeeded(
+            "A",
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        );
+        // Recorded for B by something else, so B exists in the map and is
+        // still missing from this series.
+        m.users_tracked("B", 3);
+        let text = m.render();
+        assert!(
+            text.contains(
+                "blend_liquidator_last_successful_scan_timestamp_seconds{pool=\"A\"} \
+                 1700000000\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            !text.contains("last_successful_scan_timestamp_seconds{pool=\"B\"}"),
+            "a pool whose scans have never finished carries no sample at all: {text}"
+        );
     }
 
     #[test]

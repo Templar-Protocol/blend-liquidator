@@ -138,6 +138,14 @@ pub const PING_TIMEOUT: Duration = Duration::from_secs(5);
 /// also the `503` body. Checked in configuration order, so the earliest
 /// pool with a problem is what a caller sees.
 ///
+/// **A failed ping says only that it failed.** `StoreError::Query`
+/// renders sqlx's own text — the role, the database name, a TLS error
+/// naming an internal hostname — and this body reaches anyone who can
+/// reach the port, which on a hosted runtime is whatever `0.0.0.0` means
+/// there. So the cause is logged and the body is fixed text, the same
+/// treatment `StoreError::Connect` already gives its own cause. The
+/// timeout body stays as it is: it names a budget, not a server.
+///
 /// **The head's age is a rule, not a nicety.** Both ledger gauges are
 /// this process's own: `ledger_head` moves only when a pass actually read
 /// a head, and `ledger_processed` only when a tick was acknowledged. An
@@ -177,7 +185,12 @@ pub async fn readiness(state: &HttpState, now: Instant) -> Result<(), String> {
         }
     }
     match tokio::time::timeout(PING_TIMEOUT, state.store.ping()).await {
-        Ok(result) => result.map_err(|error| format!("store: {error}")),
+        // The cause goes to the log, never into the body: see the doc
+        // above.
+        Ok(result) => result.map_err(|error| {
+            tracing::warn!(%error, "readiness ping failed");
+            "store: ping failed".to_string()
+        }),
         Err(_) => Err(format!(
             "store: ping timed out after {}s",
             PING_TIMEOUT.as_secs()
@@ -321,6 +334,13 @@ mod tests {
         assert!(
             refused.starts_with("store: "),
             "the store's failure is named as the store's: {refused}"
+        );
+        assert!(
+            !refused.contains("database"),
+            "and says only that, never sqlx's own text: the body reaches anyone who can \
+             reach the port, and this one is bound to 0.0.0.0 on a hosted runtime, so the \
+             role, the database name and any hostname in the cause stay in the log: \
+             {refused}"
         );
         Ok(())
     }

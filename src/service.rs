@@ -1103,11 +1103,13 @@ async fn full_scan(
     }
     // Only a scan that reached the end of the function: an owed reseed
     // that failed above propagates instead, and
-    // `last_successful_scan_timestamp_seconds` is what an operator alerts
-    // on when scans stop finishing.
+    // `last_successful_scan_timestamp_seconds{pool}` is what an operator
+    // alerts on when scans stop finishing. Stamped for this pool alone —
+    // the scan is per pool, and a pool whose scans keep failing must not
+    // be covered by another's successes.
     instruments
         .metrics
-        .scan_succeeded(std::time::SystemTime::now());
+        .scan_succeeded(pool, std::time::SystemTime::now());
     Ok(())
 }
 
@@ -3906,9 +3908,13 @@ mod tests {
                 .metrics
                 .render()
                 .lines()
-                .any(|line| line
-                    .starts_with("blend_liquidator_last_successful_scan_timestamp_seconds ")),
-            "and stamped itself as a scan that finished"
+                .any(|line| line.starts_with(&format!(
+                    "blend_liquidator_last_successful_scan_timestamp_seconds{{pool=\"{}\"}} ",
+                    harness::POOL
+                ))),
+            "and stamped itself as a scan that finished, for the pool it scanned: the scan \
+             is per pool, so one pool's failing scans must not hide behind another's \
+             successes"
         );
         let _ = std::fs::remove_file(&file);
         Ok(())

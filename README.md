@@ -78,9 +78,10 @@ row is reported. A notification failure never blocks or delays any of
 this: debt the wallet cannot repay is reported once per pool and trading
 continues regardless of whether the report was delivered. Delivery itself
 is fire-and-forget — a decision, a fill or an unwind never waits on
-Telegram, or on the log — so a channel that is down, or a burst past the
-bounded number of deliveries in flight, costs the operator a delayed or
-dropped report and nothing else.
+Telegram, or on the log — and the log is the fallback under it: a
+delivery that fails, and one that finds every in-flight permit taken, is
+written there instead. So a channel that is down costs the operator a
+report read in the log rather than in the chat, and nothing else.
 
 ## Quickstart
 
@@ -157,9 +158,10 @@ Alert on it, but expect it when a bot has been stopped for longer than
 the RPC's retention.
 
 Setting both `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` — both or
-neither, either alone is a startup error — sends every notification to
-that chat as well as the log; leave them unset and every notification is
-logged only. The token is read from the environment only, never a
+neither, either alone is a startup error — makes that chat the delivery
+channel: a notification goes there, and to the log only when the delivery
+fails or a burst has taken every in-flight permit. Leave them unset and
+the log *is* the channel, and every notification goes there. The token is read from the environment only, never a
 command-line argument, exactly like the signing keys: `TELEGRAM_BOT_TOKEN`
 never appears in `--help`, argv, or a rendered config. `check-config`
 verifies a configured token with one `getMe` call before anything else

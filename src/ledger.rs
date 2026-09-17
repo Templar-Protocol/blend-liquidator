@@ -27,9 +27,10 @@
 //! broken RPC stalls visibly instead of silently losing ledgers.
 //!
 //! What the loop reports about itself is instrumentation and nothing more:
-//! a heartbeat every iteration — and every `poll_interval` of a wait for a
-//! tracker that has not answered yet, because waiting for one is being
-//! alive — the chain head every pass that read one, and one
+//! a heartbeat every `poll_interval` for as long as the loop is turning,
+//! the pass included — a pass waiting on the RPC, paging a backlog or
+//! waiting on a tracker that has not answered yet is being alive, not
+//! stalling — the chain head every pass that read one, and one
 //! [`NotificationKind::RpcFailing`] per run of [`RPC_FAILING_AFTER`]
 //! failed passes. None of it is awaited, none of it can fail a pass, and a
 //! poller given neither recorder behaves exactly as one given both
@@ -124,14 +125,20 @@ impl PollerConfig {
     /// How long `/livez` (see [`crate::http`]) waits without a heartbeat
     /// before declaring this pool's poller dead.
     ///
-    /// A healthy poller heartbeats roughly every `poll_interval`, but an
-    /// RPC outage backs its loop off up to `max_backoff` between attempts
-    /// (see the module doc), and a gap or a transient store error can cost
-    /// another interval or two before the next heartbeat lands. Spec §7:
-    /// an RPC outage must not by itself fail `/livez` — only a poller that
-    /// has stopped making progress entirely should. `LIVENESS_INTERVALS`
-    /// intervals plus one worst-case backoff is generous enough to absorb
-    /// that without also absorbing a genuinely stuck poller.
+    /// [`LedgerPoller::run`] stamps the heartbeat every `poll_interval`
+    /// throughout a pass — the RPC calls, the `getEvents` paging and the
+    /// wait for the tracker's acknowledgement alike — so the backoff
+    /// sleep after a failed pass is the only stretch of the loop that
+    /// stamps nothing, which is why `max_backoff` is what this budgets
+    /// for and the pass's own duration is not. That matters because the
+    /// RPC client's timeouts are far larger than this deadline's
+    /// interval term: ten seconds to connect and thirty to answer, so a
+    /// blackholing RPC would otherwise fail `/livez` on the duration of
+    /// a single call. Spec §7: an RPC outage must not by itself fail
+    /// `/livez` — only a poller that has stopped making progress
+    /// entirely should. `LIVENESS_INTERVALS` intervals past one
+    /// worst-case backoff absorbs a gap or a transient store error
+    /// without also absorbing a genuinely stuck poller.
     #[must_use]
     pub fn liveness_deadline(&self) -> Duration {
         self.poll_interval * LIVENESS_INTERVALS + self.max_backoff
@@ -298,6 +305,12 @@ impl<'a> LedgerPoller<'a> {
     /// the middle of the very seed it was waiting on — which, on restart,
     /// it would begin again.
     ///
+    /// Wrapped here as well as around the whole pass in
+    /// [`LedgerPoller::run`], because this is [`LedgerPoller::poll_once`]'s
+    /// own liveness: a caller driving a pass directly, rather than through
+    /// `run`'s loop, would otherwise leave the longest wait in it
+    /// unstamped.
+    ///
     /// Answers exactly what awaiting the receiver answers, and nothing
     /// here touches what that means: a dropped sender is still "not
     /// applied", and the cursor still moves only on an answer.
@@ -318,13 +331,19 @@ impl<'a> LedgerPoller<'a> {
     /// outage never advances the cursor, so nothing is skipped.
     ///
     /// Every iteration records a heartbeat first, before the shutdown
-    /// check and before the pass: the heartbeat is this loop's own
-    /// liveness, not the pass's, which is what lets `/livez` (see
-    /// [`crate::http::liveness`]) tell an RPC outage — where the loop
-    /// keeps turning and backing off — from a poller that has stopped
-    /// turning at all. A run of [`RPC_FAILING_AFTER`] failed passes is
-    /// notified once, at the threshold, and the counter is reset by the
-    /// first pass that succeeds.
+    /// check and before the pass, and the pass itself runs inside
+    /// [`heartbeat_while`] so one goes on being stamped every
+    /// `poll_interval` for as long as the pass lasts — a hanging RPC
+    /// call, a long `getEvents` backlog and a tracker that has not
+    /// answered yet are all the loop working, not the loop stopped, and
+    /// the RPC's own timeouts are longer than the interval term of
+    /// [`PollerConfig::liveness_deadline`]. What that leaves unstamped is
+    /// the backoff sleep, which the deadline budgets for explicitly: so
+    /// `/livez` (see [`crate::http::liveness`]) still tells an RPC outage
+    /// — where the loop keeps turning and backing off — from a poller
+    /// that has stopped turning at all. A run of [`RPC_FAILING_AFTER`]
+    /// failed passes is notified once, at the threshold, and the counter
+    /// is reset by the first pass that succeeds.
     pub async fn run(
         &mut self,
         sender: mpsc::Sender<PollerMessage>,
@@ -332,14 +351,27 @@ impl<'a> LedgerPoller<'a> {
     ) -> Result<(), LedgerError> {
         let mut backoff = self.config.min_backoff;
         let mut failures: u32 = 0;
+        // Cloned out of `self` once: the pass below borrows `self`
+        // mutably, and the wrap around it needs the recorder and the pool
+        // at the same time.
+        let metrics = self.metrics.clone();
+        let pool = self.pool;
+        let interval = self.config.poll_interval;
         loop {
-            if let Some(metrics) = &self.metrics {
-                metrics.heartbeat(self.pool);
+            if let Some(metrics) = &metrics {
+                metrics.heartbeat(pool);
             }
             if *shutdown.borrow_and_update() {
                 return Ok(());
             }
-            let wait = match self.poll_once(&sender).await {
+            let wait = match heartbeat_while(
+                metrics.as_deref(),
+                &[pool],
+                interval,
+                self.poll_once(&sender),
+            )
+            .await
+            {
                 Ok(_) => {
                     if failures >= RPC_FAILING_AFTER {
                         tracing::info!(pool = self.pool, failures, "rpc recovered");
@@ -1501,6 +1533,101 @@ mod tests {
                 .heartbeat
                 .is_some(),
             "the iteration that polled recorded a heartbeat"
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// The pool's last heartbeat, which every liveness check reads.
+    fn heartbeat_of(metrics: &Metrics) -> std::time::Instant {
+        metrics
+            .pool_status(POOL)
+            .expect("a status")
+            .heartbeat
+            .expect("a heartbeat")
+    }
+
+    /// A pass waiting on the RPC is the poller working, not stalling, so
+    /// the heartbeat is stamped for the whole of it rather than once at
+    /// the top of the iteration that began it.
+    ///
+    /// The RPC client's own timeouts — ten seconds to connect, thirty to
+    /// answer — are longer than the `LIVENESS_INTERVALS` intervals
+    /// [`PollerConfig::liveness_deadline`] budgets beyond one backoff, so
+    /// a hanging RPC stamped only at the top would push the gap past the
+    /// deadline: `/livez` would answer 503 and `watchdog_loop` would
+    /// report a stall for a poller doing exactly what it is designed to
+    /// do. A long catch-up pass pages `getEvents` the same way.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_slow_poll_keeps_heartbeating(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        // Sixty poll intervals of an RPC that has taken the call and not
+        // yet answered it — a request inside its own timeout, which is
+        // what the client sees during a blackhole.
+        rpc.expect_delayed("getHealth", health(103, 1), Duration::from_millis(300));
+        rpc.expect("getLatestLedger", latest(103, 1_788_645_403));
+        rpc.expect(
+            "getEvents",
+            json!({"latestLedger": 103, "cursor": "103-1", "events": []}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let metrics = Arc::new(Metrics::new());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        let (flag, watch) = tokio::sync::watch::channel(false);
+        let config = PollerConfig {
+            poll_interval: Duration::from_millis(5),
+            ..config()
+        };
+        let mut poller =
+            LedgerPoller::new(&client, &store, POOL, config).with_metrics(Arc::clone(&metrics));
+
+        let run = poller.run(sender, watch);
+        let drain = async {
+            while let Some(message) = receiver.recv().await {
+                let _ = record(message, true);
+            }
+        };
+        let observe = async {
+            // Six poll intervals in, with the pass still inside its first
+            // call: whatever is stamped now is the iteration's own.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let first = heartbeat_of(&metrics);
+            assert!(
+                rpc.calls("getLatestLedger").is_empty(),
+                "the pass is still waiting on its first call"
+            );
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let during = heartbeat_of(&metrics);
+            assert!(
+                rpc.calls("getLatestLedger").is_empty(),
+                "and still waiting on it"
+            );
+            assert!(
+                during > first,
+                "the heartbeat keeps being stamped while the pass waits on the RPC, \
+                 rather than only when the iteration began"
+            );
+            for _ in 0..2_000 {
+                if !rpc.calls("getEvents").is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            flag.send(true).expect("flag");
+        };
+        let (result, (), ()) = tokio::join!(run, drain, observe);
+        result.expect("run");
+
+        assert_eq!(
+            store
+                .cursor(&events_cursor(POOL))
+                .await
+                .expect("cursor")
+                .expect("set")
+                .ledger,
+            103,
+            "the slow pass still finished, and the acknowledgement moved the cursor"
         );
         assert_eq!(rpc.remaining(), 0);
         Ok(())

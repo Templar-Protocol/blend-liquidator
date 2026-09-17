@@ -218,19 +218,22 @@ pub struct FillerState {
     /// Every version of an auction this process has recorded a dry-run
     /// fill for (ruling 8), by content: see [`RecordedFill`].
     recorded_dry_run: BTreeSet<RecordedFill>,
-    /// Every auction this process has already counted a
-    /// `skips_total{unsupported_assets}` for, by pool, account and start
-    /// ledger.
+    /// Every `(auction, reason)` this process has already counted a
+    /// `skips_total` for: the auction by pool, account and start ledger,
+    /// and the reason by its label.
     ///
-    /// The assets test runs before the dry-run and `due` filters, for
-    /// every open row of every pool on every tick — so without this one
-    /// auction a pool's configuration does not support would count a skip
-    /// per ledger, for as long as it stays open, while every other reason
-    /// counts once per planning attempt. One unsupported auction would
-    /// then bury all four of them. Pruned beside `recorded_dry_run`, by
-    /// the same rule and for the same reason: the row going away is the
-    /// only thing that ends the count.
-    counted_unsupported: BTreeSet<(String, String, u32)>,
+    /// A skip is counted once per auction per reason. The filler re-makes
+    /// every one of these decisions on every tick an auction stays open —
+    /// the assets test runs before the dry-run and `due` filters, and a
+    /// planner skip clears the row's plan, which makes `due` true again —
+    /// so a reason counted per attempt would count per ledger instead,
+    /// for as long as the auction stays open, and one auction the planner
+    /// refuses forever would bury every other reason in the metric. A
+    /// *different* reason for the same auction counts again; the same one
+    /// does not until the auction closes. Pruned beside
+    /// `recorded_dry_run`, by the same rule and for the same reason: the
+    /// row going away is the only thing that ends the count.
+    counted_skips: BTreeSet<(String, String, u32, SkipLabel)>,
     /// Set by a submission that landed or may have landed, so the next
     /// pool pass re-reads the wallet however fresh its balances look.
     inventory_stale: bool,
@@ -372,8 +375,8 @@ impl FillerState {
         // The same rule, because it answers the same question: an auction
         // the pool's open rows no longer name is one nothing will decide
         // about again, so neither set may keep it.
-        self.counted_unsupported
-            .retain(|(recorded_pool, account, start_ledger)| {
+        self.counted_skips
+            .retain(|(recorded_pool, account, start_ledger, _reason)| {
                 kept(recorded_pool, account, *start_ledger)
             });
     }
@@ -676,6 +679,26 @@ impl<'a> Filler<'a> {
         Ok(())
     }
 
+    /// Counts one `skips_total{reason}` for this auction, once.
+    ///
+    /// Every skip the filler records goes through here, because every one
+    /// of them is a decision it re-makes on every tick the auction stays
+    /// open: counting per attempt would make each reason's rate a
+    /// function of how long an auction lived rather than of how often the
+    /// bot declined one, and the five reasons would stop being comparable
+    /// with each other. See `FillerState::counted_skips` for what the
+    /// key is and when it is forgotten.
+    fn count_skip(&self, pass: &mut Pass<'_>, row: &TrackedAuction, reason: SkipLabel) {
+        if pass.state.counted_skips.insert((
+            row.pool.clone(),
+            row.account.clone(),
+            row.start_ledger,
+            reason,
+        )) {
+            self.metrics.skip(reason);
+        }
+    }
+
     /// Step 1: whether this row is worth a chain read at all.
     ///
     /// Silent by design — it runs for every open auction of every pool on
@@ -692,17 +715,7 @@ impl<'a> Filler<'a> {
         let bid: Vec<&str> = row.bid.keys().map(String::as_str).collect();
         let lot: Vec<&str> = row.lot.keys().map(String::as_str).collect();
         if !pool.supports(&bid, &lot) {
-            // Once per auction, not once per tick it stays open for: this
-            // test runs over every open row of every pool on every tick,
-            // and every other `skips_total` reason counts per planning
-            // attempt. See `FillerState::counted_unsupported`.
-            if pass.state.counted_unsupported.insert((
-                row.pool.clone(),
-                row.account.clone(),
-                row.start_ledger,
-            )) {
-                self.metrics.skip(SkipLabel::UnsupportedAssets);
-            }
+            self.count_skip(pass, row, SkipLabel::UnsupportedAssets);
             return false;
         }
         // On the row's own version: the cheap test, before any chain read.
@@ -985,7 +998,7 @@ impl<'a> Filler<'a> {
                     max_percent = max_percent.get(),
                     "no fill planned for this auction"
                 );
-                self.metrics.skip(skip_label(reason));
+                self.count_skip(pass, row, skip_label(reason));
                 // The one planner refusal an operator can do something
                 // about: every other one is the auction's own shape, and
                 // this one is the wallet's.
@@ -1104,7 +1117,7 @@ impl<'a> Filler<'a> {
                     contract_error,
                     "this fill was refused; leaving it for the next tick"
                 );
-                self.metrics.skip(SkipLabel::ContractError);
+                self.count_skip(pass, row, SkipLabel::ContractError);
                 pass.summary.skipped += 1;
                 Ok(false)
             }
@@ -1180,7 +1193,7 @@ impl<'a> Filler<'a> {
                     outcome = ?other,
                     "the contract refused the re-plan too; leaving this auction for the next tick"
                 );
-                self.metrics.skip(SkipLabel::ContractError);
+                self.count_skip(pass, row, SkipLabel::ContractError);
                 pass.summary.skipped += 1;
                 false
             }
@@ -1206,7 +1219,7 @@ impl<'a> Filler<'a> {
                 // reached the chain — but `ContractError` is the label for
                 // exactly this: a refusal none of the other four reasons
                 // classifies more specifically.
-                self.metrics.skip(SkipLabel::ContractError);
+                self.count_skip(pass, row, SkipLabel::ContractError);
                 pass.summary.skipped += 1;
                 return Ok(None);
             }
@@ -1228,7 +1241,7 @@ impl<'a> Filler<'a> {
                     // means to spend is more than the inventory has left
                     // unreserved, never because the chain refused
                     // anything.
-                    self.metrics.skip(SkipLabel::Unfunded);
+                    self.count_skip(pass, row, SkipLabel::Unfunded);
                     pass.summary.skipped += 1;
                     return Ok(None);
                 }
@@ -2031,6 +2044,75 @@ mod tests {
         assert_eq!(skip_label(FillSkip::TooManyPositions), SkipLabel::Health);
         assert_eq!(skip_label(FillSkip::Health), SkipLabel::Health);
         assert_eq!(skip_label(FillSkip::Unfunded), SkipLabel::Unfunded);
+    }
+
+    /// A skip is one per auction *per reason*. The filler re-makes every
+    /// skip decision on every tick an auction stays open, so a reason
+    /// counted per attempt would count per ledger instead and one auction
+    /// the planner refuses forever would bury the other four. A
+    /// *different* reason for the same auction is a different decision and
+    /// counts again, and the auction leaving the pool's open rows is what
+    /// ends the count.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_skip_counts_once_per_auction_per_reason(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let metrics = metrics();
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            filler_config(),
+            Executor::new(&store, None, true),
+            Inventory::new(XLM.to_string(), 0),
+            notifier(),
+            Arc::clone(&metrics),
+        );
+        let tick = harness::fixture_tick();
+        let auction = auction(tick.sequence - 300);
+        let row = tracked(harness::USER_ONE, &auction);
+        let mut state = FillerState::default();
+        let mut pass = Pass {
+            tick,
+            state: &mut state,
+            summary: TickSummary::default(),
+        };
+
+        filler.count_skip(&mut pass, &row, SkipLabel::Unprofitable);
+        filler.count_skip(&mut pass, &row, SkipLabel::Unprofitable);
+        filler.count_skip(&mut pass, &row, SkipLabel::Unprofitable);
+        assert_eq!(
+            skip_count(&metrics, SkipLabel::Unprofitable),
+            1,
+            "the same auction refused for the same reason on three passes is one skip"
+        );
+
+        filler.count_skip(&mut pass, &row, SkipLabel::Health);
+        assert_eq!(
+            skip_count(&metrics, SkipLabel::Health),
+            1,
+            "a different reason for the same auction is a different decision"
+        );
+        assert_eq!(
+            skip_count(&metrics, SkipLabel::Unprofitable),
+            1,
+            "and counting it does not re-open the reason already counted"
+        );
+
+        // The row leaving the pool's open auctions is the only thing that
+        // ends the count: a later auction for the same account is a
+        // decision worth counting afresh.
+        pass.state.prune_recorded(&row.pool, &[]);
+        filler.count_skip(&mut pass, &row, SkipLabel::Unprofitable);
+        assert_eq!(
+            skip_count(&metrics, SkipLabel::Unprofitable),
+            2,
+            "an auction the pool no longer holds open is forgotten, reasons and all"
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
     }
 
     /// The filler's position after a fill of the fixture's pool: b-tokens
@@ -3348,9 +3430,9 @@ mod tests {
             skip_count(&metrics, SkipLabel::UnsupportedAssets),
             1,
             "the unsupported auction is the one counted, once for the auction and not once \
-             per tick it stays open for — every other reason counts per planning attempt, \
-             and a reason counted at the tick rate would bury them all. The bot's own \
-             account is filtered before the assets are ever looked at"
+             per tick it stays open for — every reason is counted that way, and one \
+             counted at the tick rate would bury the rest. The bot's own account is \
+             filtered before the assets are ever looked at"
         );
         assert_eq!(
             skip_count(&metrics, SkipLabel::Unfunded)
@@ -4905,7 +4987,9 @@ mod tests {
 
     /// Both refusal arms are `contract_error`: the first draft's, which
     /// ends the auction's tick, and the re-plan's, which the contract has
-    /// now disagreed with twice.
+    /// now disagreed with twice. Counted once between them, because a
+    /// skip is one per auction per reason however many ticks re-make the
+    /// same decision.
     #[sqlx::test(migrations = "./migrations")]
     async fn a_refused_fill_and_a_refused_re_plan_are_contract_errors(
         db: sqlx::PgPool,
@@ -4989,8 +5073,9 @@ mod tests {
         );
         assert_eq!(
             skip_count(&metrics, SkipLabel::ContractError),
-            2,
-            "the re-plan's refusal is counted the same way the first one is"
+            1,
+            "the same auction refused for the same reason is one skip, not one per tick it \
+             stays open for: the re-plan's refusal is the first refusal's reason again"
         );
         assert_eq!(
             fill_count(&metrics, Attempt::Attempted),

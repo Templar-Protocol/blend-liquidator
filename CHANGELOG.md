@@ -24,13 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and processed, poller heartbeats, events processed, users tracked and
   auctions open per pool, creation and fill attempts by result (`Attempt`),
   skips by reason (`SkipLabel`, a closed five, each counted once per
-  auction or borrower decided against rather than once per pass over
-  one), estimated profit and estimated loss — two counters, as integers
+  auction *per reason* rather than once per pass over one, so an auction
+  the filler refuses on every tick cannot bury the other four reasons),
+  estimated profit and estimated loss — two counters, as integers
   in the pool oracle's own units, because a landed fill's estimate can be
   negative on a `force_fill` pool and a Prometheus counter that decreases
   is read as a reset — reserved
-  inventory per asset, unwind passes, the last successful scan, and
-  notification deliveries by kind and outcome (`DeliveryLabel`) — behind
+  inventory per asset, unwind passes, the last successful scan per pool,
+  and notification deliveries by kind and outcome (`DeliveryLabel`) — behind
   one `Mutex<Inner>`, synchronous and never held across an `.await`,
   rendered to Prometheus text exposition format (`Metrics::render`, prefix
   `blend_liquidator_`) with every closed label's series present, zero
@@ -87,8 +88,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seed pass and every other task after it — sharing one `Metrics` and one
   `Notifier` built before the seed pass (`build_notifier`: the Telegram
   channel when both credentials are configured, `LogChannel` otherwise);
-  every exit but the second shutdown signal drains the notifier
-  (`finish_run`) before returning. `Service::check_config` verifies a
+  every exit but the second shutdown signal and a task panic drains the
+  notifier (`finish_run`) before returning — a panic unwinds out of
+  `drain_tasks` past `finish_run`, so notifications still in flight are
+  lost with it. `Service::check_config` verifies a
   configured Telegram token with one `getMe` call, a refusal a
   configuration error, since spec §10 makes it the deploy smoke test.
 - The filler and its executor now report themselves: `fills_total{result}`,

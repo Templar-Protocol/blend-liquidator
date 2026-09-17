@@ -429,8 +429,11 @@ make help                           # Docker Compose lifecycle
   through a step of their own: `fills_total{result}` counts every recorded fill
   (`attempted`, and `succeeded`/`failed` once the chain answers),
   `skips_total{reason}` counts every planner and executor skip a
-  `SkipLabel` names — once per auction, never once per tick it stays open
-  for, which is what `FillerState::counted_unsupported` is for —
+  `SkipLabel` names — once per auction *per reason*, never once per tick it
+  stays open for, which is what `FillerState::counted_skips` and
+  `Filler::count_skip` are for: the filler re-makes every one of those
+  decisions every tick, so one auction the planner refuses forever would
+  otherwise bury the other four reasons —
   `estimated_profit_total` adds a landed fill's `est_profit` (and
   `estimated_loss_total` its magnitude when that estimate is negative),
   `reserved_inventory{asset}` is re-gauged from
