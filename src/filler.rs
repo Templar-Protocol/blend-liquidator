@@ -222,6 +222,16 @@ pub struct FillerState {
     /// `skips_total` for: the auction by pool, account and start ledger,
     /// and the reason by its label.
     ///
+    /// The start ledger is the *chain entry's* for every skip decided
+    /// after the entry was read, and the row's only for the one decided
+    /// before it ([`SkipLabel::UnsupportedAssets`], where no entry has
+    /// been read). The chain can hold a new auction for an account before
+    /// the tracker has applied the events that opened it, and `kept` in
+    /// [`FillerState::prune_recorded`] keeps only keys at or past the
+    /// row's start ledger: a post-read skip keyed by the older row would
+    /// be pruned the moment the tracker caught up — while the auction is
+    /// still open — and the very same decision would count again.
+    ///
     /// A skip is counted once per auction per reason. The filler re-makes
     /// every one of these decisions on every tick an auction stays open —
     /// the assets test runs before the dry-run and `due` filters, and a
@@ -688,11 +698,24 @@ impl<'a> Filler<'a> {
     /// bot declined one, and the five reasons would stop being comparable
     /// with each other. See `FillerState::counted_skips` for what the
     /// key is and when it is forgotten.
-    fn count_skip(&self, pass: &mut Pass<'_>, row: &TrackedAuction, reason: SkipLabel) {
+    ///
+    /// `start_ledger` is the auction this decision was about, and the
+    /// caller says which: the chain entry's `block` for every skip decided
+    /// after the entry was read, and `row.start_ledger` only for one
+    /// decided before it. Passing the row's for a post-read skip is the
+    /// bug — the row can lag the chain by an auction, and the key would be
+    /// pruned out from under an auction that is still open.
+    fn count_skip(
+        &self,
+        pass: &mut Pass<'_>,
+        row: &TrackedAuction,
+        start_ledger: u32,
+        reason: SkipLabel,
+    ) {
         if pass.state.counted_skips.insert((
             row.pool.clone(),
             row.account.clone(),
-            row.start_ledger,
+            start_ledger,
             reason,
         )) {
             self.metrics.skip(reason);
@@ -715,7 +738,9 @@ impl<'a> Filler<'a> {
         let bid: Vec<&str> = row.bid.keys().map(String::as_str).collect();
         let lot: Vec<&str> = row.lot.keys().map(String::as_str).collect();
         if !pool.supports(&bid, &lot) {
-            self.count_skip(pass, row, SkipLabel::UnsupportedAssets);
+            // The one pre-read skip: nothing has been read, so the row
+            // is all there is to key it by.
+            self.count_skip(pass, row, row.start_ledger, SkipLabel::UnsupportedAssets);
             return false;
         }
         // On the row's own version: the cheap test, before any chain read.
@@ -998,7 +1023,7 @@ impl<'a> Filler<'a> {
                     max_percent = max_percent.get(),
                     "no fill planned for this auction"
                 );
-                self.count_skip(pass, row, skip_label(reason));
+                self.count_skip(pass, row, auction.block, skip_label(reason));
                 // The one planner refusal an operator can do something
                 // about: every other one is the auction's own shape, and
                 // this one is the wallet's.
@@ -1093,7 +1118,10 @@ impl<'a> Filler<'a> {
         queue: Option<&SubmissionQueue>,
         pass: &mut Pass<'_>,
     ) -> Result<bool, FillerError> {
-        let Some(outcome) = self.execute_once(context, row, draft, queue, pass).await? else {
+        let Some(outcome) = self
+            .execute_once(context, row, auction.block, draft, queue, pass)
+            .await?
+        else {
             return Ok(false);
         };
         match outcome {
@@ -1117,7 +1145,7 @@ impl<'a> Filler<'a> {
                     contract_error,
                     "this fill was refused; leaving it for the next tick"
                 );
-                self.count_skip(pass, row, SkipLabel::ContractError);
+                self.count_skip(pass, row, auction.block, SkipLabel::ContractError);
                 pass.summary.skipped += 1;
                 Ok(false)
             }
@@ -1173,7 +1201,10 @@ impl<'a> Filler<'a> {
             );
             return Ok(false);
         }
-        let Some(outcome) = self.execute_once(context, row, &draft, queue, pass).await? else {
+        let Some(outcome) = self
+            .execute_once(context, row, auction.block, &draft, queue, pass)
+            .await?
+        else {
             return Ok(false);
         };
         Ok(match outcome {
@@ -1193,7 +1224,7 @@ impl<'a> Filler<'a> {
                     outcome = ?other,
                     "the contract refused the re-plan too; leaving this auction for the next tick"
                 );
-                self.count_skip(pass, row, SkipLabel::ContractError);
+                self.count_skip(pass, row, auction.block, SkipLabel::ContractError);
                 pass.summary.skipped += 1;
                 false
             }
@@ -1203,10 +1234,15 @@ impl<'a> Filler<'a> {
     /// Hands one draft to the executor with the settlement its mode
     /// demands. `None` means nothing was executed and the reason is
     /// already counted or logged.
+    ///
+    /// `start_ledger` is the chain entry's `block` — the auction this
+    /// draft was planned against — because both skips counted here are
+    /// decided after the entry was read. See [`Filler::count_skip`].
     async fn execute_once(
         &self,
         context: &PoolPass<'_>,
         row: &TrackedAuction,
+        start_ledger: u32,
         draft: &FillDraft,
         queue: Option<&SubmissionQueue>,
         pass: &mut Pass<'_>,
@@ -1219,7 +1255,7 @@ impl<'a> Filler<'a> {
                 // reached the chain — but `ContractError` is the label for
                 // exactly this: a refusal none of the other four reasons
                 // classifies more specifically.
-                self.count_skip(pass, row, SkipLabel::ContractError);
+                self.count_skip(pass, row, start_ledger, SkipLabel::ContractError);
                 pass.summary.skipped += 1;
                 return Ok(None);
             }
@@ -1241,7 +1277,7 @@ impl<'a> Filler<'a> {
                     // means to spend is more than the inventory has left
                     // unreserved, never because the chain refused
                     // anything.
-                    self.count_skip(pass, row, SkipLabel::Unfunded);
+                    self.count_skip(pass, row, start_ledger, SkipLabel::Unfunded);
                     pass.summary.skipped += 1;
                     return Ok(None);
                 }
@@ -2080,16 +2116,16 @@ mod tests {
             summary: TickSummary::default(),
         };
 
-        filler.count_skip(&mut pass, &row, SkipLabel::Unprofitable);
-        filler.count_skip(&mut pass, &row, SkipLabel::Unprofitable);
-        filler.count_skip(&mut pass, &row, SkipLabel::Unprofitable);
+        filler.count_skip(&mut pass, &row, row.start_ledger, SkipLabel::Unprofitable);
+        filler.count_skip(&mut pass, &row, row.start_ledger, SkipLabel::Unprofitable);
+        filler.count_skip(&mut pass, &row, row.start_ledger, SkipLabel::Unprofitable);
         assert_eq!(
             skip_count(&metrics, SkipLabel::Unprofitable),
             1,
             "the same auction refused for the same reason on three passes is one skip"
         );
 
-        filler.count_skip(&mut pass, &row, SkipLabel::Health);
+        filler.count_skip(&mut pass, &row, row.start_ledger, SkipLabel::Health);
         assert_eq!(
             skip_count(&metrics, SkipLabel::Health),
             1,
@@ -2105,11 +2141,101 @@ mod tests {
         // ends the count: a later auction for the same account is a
         // decision worth counting afresh.
         pass.state.prune_recorded(&row.pool, &[]);
-        filler.count_skip(&mut pass, &row, SkipLabel::Unprofitable);
+        filler.count_skip(&mut pass, &row, row.start_ledger, SkipLabel::Unprofitable);
         assert_eq!(
             skip_count(&metrics, SkipLabel::Unprofitable),
             2,
             "an auction the pool no longer holds open is forgotten, reasons and all"
+        );
+        assert_eq!(rpc.remaining(), 0);
+        Ok(())
+    }
+
+    /// A skip decided *after* the chain read is keyed by the entry's own
+    /// start ledger, never the row's.
+    ///
+    /// The chain can hold a new auction for an account before the tracker
+    /// has applied the events that closed the old one and opened it, so
+    /// the row is the older ledger while the entry the filler actually
+    /// decided about is the newer. Keyed by the row's, the tracker's
+    /// catch-up prunes the key — `prune_recorded` keeps only keys at or
+    /// past the row's start ledger — while the auction is still open, and
+    /// the very same decision counts a second `skips_total`.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_post_read_skip_is_keyed_by_the_chain_auction(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        // Both past the ramp's 400th ledger in a pool that is not
+        // `force_fill`, so every plan of either is `PastAuctionEnd` — a
+        // planner skip, which is the first of the post-read sites.
+        let old = auction(tick.sequence - 600);
+        let new = auction(tick.sequence - 500);
+        store
+            .upsert_auction(&tracked(harness::USER_ONE, &old))
+            .await
+            .expect("the store still holds the old auction");
+        let rpc = ScriptedRpc::start().await;
+        harness::script_auction_entry(&rpc, harness::USER_ONE, &new, tick.sequence);
+        harness::script_snapshot(&rpc, &[]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let metrics = metrics();
+        let pools = vec![pool_config()];
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            filler_config(),
+            Executor::new(&store, None, true),
+            Inventory::new(XLM.to_string(), 0),
+            notifier(),
+            Arc::clone(&metrics),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+
+        let first = filler
+            .tick(&mut state, tick, true, None, &shutdown)
+            .await
+            .expect("the first tick");
+        assert_eq!(
+            first,
+            TickSummary {
+                skipped: 1,
+                ..TickSummary::default()
+            },
+            "the auction the chain holds is past its ramp, and the planner says so"
+        );
+        assert_eq!(skip_count(&metrics, SkipLabel::Unprofitable), 1);
+
+        // The tracker catches up: the row now names the auction the chain
+        // has held all along, and the pool still holds it open.
+        let second = later(tick, 1);
+        store
+            .upsert_auction(&TrackedAuction {
+                updated_ledger: second.sequence,
+                ..tracked(harness::USER_ONE, &new)
+            })
+            .await
+            .expect("the tracker opens the new auction");
+        harness::script_auction_entry(&rpc, harness::USER_ONE, &new, second.sequence);
+        harness::script_snapshot(&rpc, &[]);
+        let summary = filler
+            .tick(&mut state, second, true, None, &shutdown)
+            .await
+            .expect("the second tick");
+        assert_eq!(
+            summary,
+            TickSummary {
+                skipped: 1,
+                ..TickSummary::default()
+            },
+            "the decision is re-made, as it is on every tick the auction stays open"
+        );
+        assert_eq!(
+            skip_count(&metrics, SkipLabel::Unprofitable),
+            1,
+            "and it is the same auction, so it is still one skip: the key survived the \
+             tracker's catch-up because it was the entry's start ledger, not the row's"
         );
         assert_eq!(rpc.remaining(), 0);
         Ok(())
@@ -4063,6 +4189,7 @@ mod tests {
             .execute_once(
                 &context,
                 &tracked(harness::USER_ONE, &auction),
+                auction.block,
                 &draft,
                 None,
                 &mut pass,
@@ -4202,6 +4329,7 @@ mod tests {
             .execute_once(
                 &context,
                 &tracked(harness::USER_ONE, &auction),
+                auction.block,
                 &draft,
                 None,
                 &mut pass,

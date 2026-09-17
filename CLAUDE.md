@@ -324,7 +324,10 @@ make help                           # Docker Compose lifecycle
   from `HttpState` and served only when `crate::config::HttpConfig` is
   configured (`PORT` or `HTTP_PORT`). `readiness` (`/healthz`) needs every
   configured pool's processed ledger within `HttpState::max_lag_ledgers`
-  of the chain head this process has observed, that head to have been
+  of the chain head this process has observed — in **either** direction,
+  since a head further than that *behind* the processed ledger is an RPC
+  node sitting behind this bot's own committed cursor and a
+  `saturating_sub` would read it as no lag at all — that head to have been
   read within `HttpState::liveness_deadline` (`PoolStatus::head_at`,
   stamped by `Metrics::ledger_head`), and the store to answer a ping
   inside `PING_TIMEOUT` (5s). The head's *age* is not a nicety: both
@@ -436,7 +439,13 @@ make help                           # Docker Compose lifecycle
   stays open for, which is what `FillerState::counted_skips` and
   `Filler::count_skip` are for: the filler re-makes every one of those
   decisions every tick, so one auction the planner refuses forever would
-  otherwise bury the other four reasons —
+  otherwise bury the other four reasons. A skip decided *after* the chain
+  read is keyed by the **entry's** `block`, never the row's: the chain can
+  hold a new auction for an account before the tracker has opened it, and
+  a key on the older row is pruned the moment the tracker catches up —
+  while the auction is still open — so the same decision would count
+  twice. Only the pre-read `UnsupportedAssets` keys on the row, because
+  no entry has been read there —
   `estimated_profit_total` adds a landed fill's `est_profit` (and
   `estimated_loss_total` its magnitude when that estimate is negative),
   `reserved_inventory{asset}` is re-gauged from
@@ -842,7 +851,10 @@ Status above for what remains.
   measured from the run's start rather than reported dead, so the initial
   seed is not a restart loop; `/healthz` carries the mirror-image rule,
   failing once no chain head has been read for that same window, because
-  an RPC outage freezes the lag it would otherwise be judged by.
+  an RPC outage freezes the lag it would otherwise be judged by — and its
+  lag bound is symmetric for the same kind of reason, a head more than
+  `max_lag_ledgers` *behind* the processed ledger being a lagging node
+  rather than a bot at chain head.
 - A `Notifier` must be used from inside a tokio runtime: `notify` spawns
   the delivery task, and calling it outside one panics.
 - `notifications_total{kind,delivery}` is the one metric whose label set

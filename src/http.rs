@@ -15,8 +15,10 @@
 //! different questions.** [`readiness`] checks that every configured pool
 //! has processed at least one ledger, that a chain head has been read for
 //! it within [`HttpState::liveness_deadline`], that its processed ledger
-//! is within [`HttpState::max_lag_ledgers`] of that head, and that the
-//! store answers a ping inside [`PING_TIMEOUT`] — it fails during an
+//! is within [`HttpState::max_lag_ledgers`] of that head **in either
+//! direction** — a head further than that *behind* the processed ledger is
+//! a node behind this bot's own cursor, and fails the same way — and that
+//! the store answers a ping inside [`PING_TIMEOUT`] — it fails during an
 //! ordinary RPC hiccup or a lagging store, conditions the poller's own
 //! backoff already recovers from without help. The head's *age* is what
 //! makes the first of those true: both ledger gauges are written by this
@@ -133,8 +135,8 @@ pub const PING_TIMEOUT: Duration = Duration::from_secs(5);
 /// `/healthz`'s answer: `Ok` when every pool in [`HttpState::pools`] has
 /// processed at least one ledger, has had a chain head read for it within
 /// [`HttpState::liveness_deadline`], and is within
-/// [`HttpState::max_lag_ledgers`] of that head — and the store answers a
-/// ping inside [`PING_TIMEOUT`]. Otherwise the first failure, which is
+/// [`HttpState::max_lag_ledgers`] of that head *in either direction* — and
+/// the store answers a ping inside [`PING_TIMEOUT`]. Otherwise the first failure, which is
 /// also the `503` body. Checked in configuration order, so the earliest
 /// pool with a problem is what a caller sees.
 ///
@@ -154,6 +156,17 @@ pub const PING_TIMEOUT: Duration = Duration::from_secs(5);
 /// of the one failure it exists to catch. `now` is what tells that apart
 /// from a bot genuinely at chain head, which is why this signature takes
 /// a clock.
+///
+/// **The lag bound is symmetric.** A processed ledger *ahead* of the
+/// observed head is the RPC node answering `getLatestLedger` sitting
+/// behind the cursor this bot has already committed — a lagging replica
+/// behind a load balancer — and a `saturating_sub` read that as no lag at
+/// all, so a fresh `head_at` made it answer `200` while the poller could
+/// not advance. Past [`HttpState::max_lag_ledgers`] it is therefore the
+/// same failure in the other direction. Within the bound it still reads
+/// as zero rather than as a failure: a node one or two ledgers behind is
+/// ordinary, and a bare `checked_sub` to a `503` would flap the probe on
+/// it.
 pub async fn readiness(state: &HttpState, now: Instant) -> Result<(), String> {
     let max_lag_ledgers = state.max_lag_ledgers;
     let limit = state.liveness_deadline.as_secs();
@@ -176,6 +189,25 @@ pub async fn readiness(state: &HttpState, now: Instant) -> Result<(), String> {
                     "{pool}: no chain head read for {secs}s (limit {limit}s)"
                 ));
             }
+        }
+        // Symmetric, and deliberately not a bare `checked_sub` to a
+        // `503`: a node a ledger or two behind the cursor this bot has
+        // already committed is ordinary, and failing on it would flap the
+        // probe. Past the bound it is the same failure in the other
+        // direction — the head being read is not the chain's — and a
+        // `saturating_sub` alone read it as no lag at all.
+        // Symmetric, and deliberately not a bare `checked_sub` to a
+        // `503`: a node a ledger or two behind the cursor this bot has
+        // already committed is ordinary, and failing on it would flap the
+        // probe. Past the bound it is the same failure in the other
+        // direction — the head being read is not the chain's — and a
+        // `saturating_sub` alone read it as no lag at all.
+        let ahead = processed.saturating_sub(head);
+        if ahead > max_lag_ledgers {
+            return Err(format!(
+                "{pool}: the observed chain head {head} is {ahead} ledgers behind the \
+                 processed ledger {processed} (limit {max_lag_ledgers})"
+            ));
         }
         let lag = head.saturating_sub(processed);
         if lag > max_lag_ledgers {
@@ -323,6 +355,29 @@ mod tests {
         );
         metrics.ledger_processed("B", 90);
         assert_eq!(readiness(&state, now).await, Ok(()));
+
+        // The bound is symmetric. A processed ledger *ahead* of the head
+        // is a node behind the cursor this bot already committed — a
+        // lagging replica behind a load balancer — and `saturating_sub`
+        // read that as no lag at all, so `/healthz` said ready while the
+        // poller could not advance. Within the bound it still reads as
+        // zero: an ordinary one-ledger node lag must not flap the probe.
+        metrics.ledger_processed("B", 110);
+        assert_eq!(
+            readiness(&state, now).await,
+            Ok(()),
+            "exactly the limit ahead of the head is still ready"
+        );
+        metrics.ledger_processed("B", 111);
+        assert_eq!(
+            readiness(&state, now).await,
+            Err(
+                "B: the observed chain head 100 is 11 ledgers behind the processed ledger \
+                 111 (limit 10)"
+                    .into()
+            )
+        );
+        metrics.ledger_processed("B", 90);
 
         // The ping is a rule of its own, and a store that refuses is the
         // one failure no gauge can report: without this the ping could be

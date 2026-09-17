@@ -25,7 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   auctions open per pool, creation and fill attempts by result (`Attempt`),
   skips by reason (`SkipLabel`, a closed five, each counted once per
   auction *per reason* rather than once per pass over one, so an auction
-  the filler refuses on every tick cannot bury the other four reasons),
+  the filler refuses on every tick cannot bury the other four reasons —
+  keyed, for every skip decided after the chain read, by the auction
+  entry's own start ledger rather than the store row's, which can lag it
+  by a whole auction),
   estimated profit and estimated loss — two counters, as integers
   in the pool oracle's own units, because a landed fill's estimate can be
   negative on a `force_fill` pool and a Prometheus counter that decreases
@@ -39,7 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   means zero or means the bot has not run.
 - `src/http.rs`: an axum server for `/healthz` (readiness — every
   configured pool's processed ledger within `HEALTH_MAX_LAG_LEDGERS` of the
-  observed chain head, that head itself read within
+  observed chain head *in either direction*, so a head that far behind the
+  processed ledger — an RPC node sitting behind the cursor this bot has
+  already committed — fails rather than reading as no lag at all, that head itself read within
   `PollerConfig::liveness_deadline`, and the store answering a ping
   inside `PING_TIMEOUT` (5s); the head's age is the rule that makes an
   RPC outage visible, since both ledger gauges are the process's own and

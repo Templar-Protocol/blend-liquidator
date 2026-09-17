@@ -112,8 +112,10 @@ endpoints:
 
 - `/healthz` — readiness. `200` once every configured pool's processed
   ledger is within `HEALTH_MAX_LAG_LEDGERS` of the chain head this
-  process has observed, that head was read recently — within the same
-  window `/livez` uses — and the store answers a ping within five
+  process has observed — in either direction, so a head that far *behind*
+  the processed ledger, which is an RPC node sitting behind this bot's own
+  committed cursor, fails too — that head was read recently — within the
+  same window `/livez` uses — and the store answers a ping within five
   seconds; otherwise `503` with the reason as plain text. The head's age
   is what makes an RPC outage visible here: both ledger numbers are this
   process's own, an outage stops them together, and a lag that compared
