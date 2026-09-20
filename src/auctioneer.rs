@@ -580,7 +580,15 @@ impl<'a> Auctioneer<'a> {
         let Some(data) = snapshot.position_data(account, valued_at)? else {
             return Ok(Decision::Skip(SkipReason::NoLiabilities));
         };
-        if data.liability_base > 0 && data.collateral_base == 0 {
+        // The contract's own gate, read the same way it reads it:
+        // `check_and_handle_user_bad_debt` returns early unless the
+        // borrower has liabilities *and* `collateral_raw == 0`
+        // (`pool/src/pool/bad_debt.rs:56-58`). `collateral_base` is
+        // c-factor weighted, so a borrower holding a zero-factor reserve
+        // has `collateral_base == 0` with collateral still there, and
+        // proposing `bad_debt` for it costs a simulation and a flag for
+        // an answer that is always 1200.
+        if data.liability_base > 0 && data.collateral_raw == 0 {
             return Ok(Decision::BadDebt);
         }
         // `health_factor` is `None` only when there are no liabilities. A
@@ -1015,16 +1023,9 @@ impl<'a> Auctioneer<'a> {
         let bid: Vec<&str> = plan.bid.iter().map(String::as_str).collect();
         let lot: Vec<&str> = plan.lot.iter().map(String::as_str).collect();
         let build = |percent: FillPercent| {
-            new_auction_op(
-                pool,
-                AuctionType::UserLiquidation,
-                account,
-                &bid,
-                &lot,
-                percent,
-            )
-            .map_err(ChainError::from)
-            .map_err(AuctioneerError::from)
+            new_auction_op(pool, account, &bid, &lot, percent)
+                .map_err(ChainError::from)
+                .map_err(AuctioneerError::from)
         };
 
         let Some(submitter) = self.submitter.as_ref() else {
@@ -1635,6 +1636,92 @@ mod tests {
             .await
             .expect("decide");
         assert_eq!(decisions, vec![(account, Decision::BadDebt)]);
+        Ok(())
+    }
+
+    /// None of the fixture's three reserves has `c_factor == 0` — they are
+    /// `7_500_000` (index 0, XLM), `9_500_000` (index 1, USDC) and
+    /// `9_500_000` (index 2) — so this exercises the fallback the task
+    /// brief allows: a position sized so the weighted value floors to zero
+    /// while the raw value does not, on real fixture numbers rather than an
+    /// edited fixture.
+    ///
+    /// `to_effective_asset_from_b_token` applies the collateral factor
+    /// *before* the oracle price: one b-token converts to 1 unit of
+    /// underlying on every reserve here (`b_rate` is ~1.0), and
+    /// `floor(1 * c_factor / 1e7)` is 0 on all three (0.75 and 0.95 both
+    /// floor away at that size) — so `collateral_base`'s contribution from
+    /// a single b-token is 0 everywhere, regardless of price. What decides
+    /// whether `collateral_raw` (no factor, priced directly) survives
+    /// instead is `floor(price * 1 / reserve.scalar)`, which needs a price
+    /// at or above the reserve's own scalar (`10^decimals`, `1e7` here) to
+    /// floor to anything but 0 too. Reserve 0 prices at 1_778_617 (~$0.18)
+    /// and reserve 1 at 9_999_165 (~$1.00 less a rounding hair) — both
+    /// still floor their raw contribution to 0, no divergence at all.
+    /// `DUST_C_FACTOR_INDEX` (reserve 2) prices at 11_613_052 (~$1.16):
+    /// `floor(11_613_052 * 1 / 10_000_000) == 1`. One b-token of it is
+    /// therefore collateral worth 1 raw unit to the contract's gate and 0
+    /// to the health factor — the same case a zero `c_factor` would have
+    /// made trivially, had the fixture held one.
+    const DUST_C_FACTOR_INDEX: u32 = 2;
+
+    /// The contract gates its default path on `collateral_raw`, not on
+    /// the c-factor-weighted `collateral_base`
+    /// (`pool/src/pool/bad_debt.rs:56-58` returns early unless the
+    /// borrower has liabilities *and* `collateral_raw == 0`). A borrower
+    /// holding a dust amount of `DUST_C_FACTOR_INDEX` therefore has
+    /// `collateral_base == 0` (the weighted value floors away) and
+    /// `collateral_raw > 0` (the raw, priced value does not): deciding on
+    /// the weighted value proposes a `bad_debt` the contract answers 1200,
+    /// costing a simulation and a flag every scan.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn collateral_the_factor_zeroes_is_still_collateral(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let account = synthetic_account(3);
+        // One b-token: the smallest position this pool can hold, and the
+        // size worked out above to float `collateral_raw` above zero while
+        // `collateral_base` stays at it.
+        let collateral = &[(DUST_C_FACTOR_INDEX, 1)];
+        let liabilities = &[(1, 10_000_000_000)];
+
+        // Once to read the position data directly and prove the premise,
+        // once more for `decide` — each round of `script_snapshot_with_positions`
+        // answers exactly one `PoolReader::snapshot` call.
+        script_snapshot_with_positions(&rpc, &account, collateral, liabilities);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let snapshot = PoolReader::new(&client, POOL)
+            .snapshot(&[&account])
+            .await
+            .expect("snapshot");
+        let tick = harness::fixture_tick();
+        let valued_at = snapshot.valued_at(tick.close_time);
+        let data = snapshot
+            .position_data(&account, valued_at)
+            .expect("position data")
+            .expect("account holds positions");
+        assert_eq!(
+            data.collateral_base, 0,
+            "the c-factor-weighted value floors away at this size"
+        );
+        assert!(
+            data.collateral_raw > 0,
+            "the raw value must survive for this to be the case the fix targets"
+        );
+
+        script_snapshot_with_positions(&rpc, &account, collateral, liabilities);
+        let auctioneer = Auctioneer::new(&client, &store, config(BTreeSet::new()), None);
+        let decisions = auctioneer
+            .decide(POOL, &[tracked_user(&account)], tick)
+            .await
+            .expect("decide");
+        assert_ne!(
+            decisions[0].1,
+            Decision::BadDebt,
+            "raw collateral remains, so the contract would refuse bad_debt with 1200"
+        );
         Ok(())
     }
 
