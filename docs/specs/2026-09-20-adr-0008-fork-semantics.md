@@ -300,7 +300,7 @@ in five specifics. Recording them so they are not re-introduced:
    is the closed interval `[1.03, 1.15]`. Read as an open interval,
    "(1.03, 1.15)" names the accepted set's *interior* and silently drops its
    two endpoints, which is the one place the distinction changes an answer.
-   The crate's constants are the right numbers; §4-K is where the crate still
+   The crate's constants are the right numbers; §4-J is where the crate still
    reads the endpoints the old way.
 4. **`bad_debt` is declared but never emitted** on the fork — zero call sites
    (`pool/src/events.rs:157-160`). The briefing's rule "if this pool emits
@@ -422,17 +422,13 @@ a `Positions` holder now. It cannot be liquidated (1211, stock) and its row is
 deleted for having no liabilities, so this saves a chain read per scan rather
 than fixing a bug.
 
-**I. Re-check the unwind against the new `Withdraw` health check.** §2.6.
-`math::unwind` already projects the health factor for the collateral path, so
-this is probably already safe — but "probably" is not the standard for a
-request type that previously could not fail this way. It needs a test.
-
-**J. Point the documentation at the fork.** CLAUDE.md's contract-derived
+**I. Point the documentation at the fork.** CLAUDE.md's contract-derived
 gotchas, the design spec's "Invariants specific to Blend", and the crate-level
 docs all cite stock behaviour.
 
-**K. Reconcile `TARGET_HF`'s band with the closed window.** §3.3 is not a
-stock-versus-fork difference, so §4-J's documentation sweep does not cover it,
+**J. Reconcile `TARGET_HF`'s band with the closed window.** §3's third
+correction is not a stock-versus-fork difference, so §4-I's documentation
+sweep does not cover it,
 and it is not documentation alone: `src/config.rs:176` **enforces** the old
 reading, refusing to start when `TARGET_HF >= 1.15`, while the contract accepts
 exactly 1.15. Three doc comments state the same thing — `src/config.rs:149-150`
@@ -525,7 +521,7 @@ describe stock semantics and have to be rewritten immediately.
 
 The design spec's phase list therefore becomes:
 
-8. The ADR-0008 fork reconciliation: §4 A through K.
+8. The ADR-0008 fork reconciliation: §4 A through J.
 9. Documentation (`README`, `docs/configuration.md`, `docs/deploy.md`,
    `docs/architecture.md`), `CHANGELOG`, the deployment contract, first release
    tag.

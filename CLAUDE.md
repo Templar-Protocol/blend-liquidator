@@ -881,7 +881,7 @@ Status above for what remains.
   the adjustment loop must not treat either endpoint as a rejection. **The
   crate still reads it the old way and enforces that**: `TARGET_HF`'s parser
   refuses `1.15` at startup and its doc comments say "at or above", which
-  §4-K of the fork spec is the item for. The constants are right; the band
+  §4-J of the fork spec is the item for. The constants are right; the band
   around them is not yet.
   `TARGET_HF`'s default of `1.06` sits between them with room for a ledger or
   two of drift before the auction is filled.
