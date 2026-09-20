@@ -633,7 +633,17 @@ impl<'a> Filler<'a> {
         if live.is_empty() || *shutdown.borrow() {
             return Ok(());
         }
-        let accounts: Vec<&str> = self.executor.filler().into_iter().collect();
+        // The filler's own account, and every live auction's borrower: a
+        // full fill runs the contract's default path over the borrower
+        // inside the filler's own transaction, and `plan_fill` projects
+        // what that does to the reserves it then values the filler
+        // against. `PoolReader::snapshot` answers for every account it is
+        // handed, so this widens the `getLedgerEntries` it was already
+        // making rather than adding a round trip.
+        let mut accounts: Vec<&str> = self.executor.filler().into_iter().collect();
+        accounts.extend(live.iter().map(|(row, _)| row.account.as_str()));
+        accounts.sort_unstable();
+        accounts.dedup();
         let snapshot = match reader.snapshot(&accounts).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -947,15 +957,23 @@ impl<'a> Filler<'a> {
     fn plan(
         &self,
         context: &PoolPass<'_>,
+        account: &str,
         auction: &AuctionData,
         max_percent: FillPercent,
     ) -> Result<PlannedFill, MathError> {
         let wallet = self.inventory.available();
+        // A borrower the snapshot holds no entry for has no position to
+        // default, so an empty one is the truthful reading rather than a
+        // refusal: the snapshot was asked for this account, and "no
+        // entry" is how the ledger spells a position that holds nothing.
+        let empty = Positions::default();
+        let borrower = context.snapshot.positions.get(account).unwrap_or(&empty);
         let inputs = FillInputs {
             reserves: &context.reserves,
             asset_index: &context.snapshot.asset_index,
             prices: &context.snapshot.prices,
             filler: &context.filler,
+            borrower,
             wallet: &wallet,
             auction,
             earliest_ledger: context.earliest_ledger,
@@ -1013,7 +1031,7 @@ impl<'a> Filler<'a> {
         max_percent: FillPercent,
         pass: &mut Pass<'_>,
     ) -> Result<Option<FillDraft>, FillerError> {
-        match self.plan(context, auction, max_percent) {
+        match self.plan(context, &row.account, auction, max_percent) {
             Ok(PlannedFill::Fill(draft)) => Ok(Some(draft)),
             Ok(PlannedFill::Skip(reason)) => {
                 tracing::debug!(

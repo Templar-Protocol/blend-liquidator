@@ -8,16 +8,19 @@
 //! and pays; *effective* values, after collateral and liability factors,
 //! are what the contract's health check reads.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use ethnum::I256;
 
 use super::auction::{
-    bid_modifier, lot_modifier, scale_auction, AuctionData, RAMP_BLOCKS, RAMP_END_BLOCKS,
+    bid_modifier, lot_modifier, scale_auction, AuctionData, ScaledAuction, RAMP_BLOCKS,
+    RAMP_END_BLOCKS,
 };
 use super::fixed::{div_ceil, mul_ceil, mul_floor, MathError, SCALAR_7};
 use super::position::{calculate_position_data, OraclePrices, PositionData, Positions};
 use super::reserve::Reserve;
+use super::setoff::project_default;
 use crate::chain::xdr::encode::FillPercent;
 
 /// The latest delay, in ledgers from an auction's start, a `force_fill`
@@ -199,6 +202,21 @@ pub struct FillInputs<'a> {
     pub prices: &'a OraclePrices,
     /// The filler's own positions in this pool before the fill.
     pub filler: &'a Positions,
+    /// The borrower's positions in this pool before the fill, at the same
+    /// ledger as every other field.
+    ///
+    /// A **full** fill runs the contract's default path over the borrower
+    /// inside the filler's own transaction, and that path can cut a
+    /// reserve's `b_rate` before `validate_submit` checks the filler's
+    /// health. Without the borrower there is no way to project it, and the
+    /// projection is an upper bound rather than an equality — a miss the
+    /// contract answers with `InvalidHf` (1205). See
+    /// [`crate::math::setoff`].
+    ///
+    /// An account the pool holds no position for is an empty `Positions`,
+    /// never an absent field: a borrower with nothing has nothing to
+    /// default.
+    pub borrower: &'a Positions,
     /// What the filler's wallet may spend, per asset: its balance less the
     /// fee reserve and every live reservation.
     pub wallet: &'a BTreeMap<String, i128>,
@@ -480,6 +498,66 @@ pub(crate) fn add_to<K: Ord>(
     Ok(())
 }
 
+/// Subtracts `amount` from `index`'s entry, checked, removing the entry
+/// once nothing is left of it — what the contract's `rm_positions` does
+/// once a balance reaches zero.
+///
+/// The removal is not tidiness: [`project_default`]'s gate reads
+/// `collateral_raw == 0`, and a zero entry left in the map would also have
+/// to be priced by `calculate_position_data`, so an emptied key and an
+/// absent one must be the same position.
+///
+/// An amount larger than the entry holds is a transfer the contract itself
+/// refuses (`BalanceError`), so no fill this could mis-model is one the
+/// chain would accept; leaving nothing behind is the reading that expects
+/// the default path to run, which is the side that cannot cost the filler
+/// a refused fill.
+fn remove_from(map: &mut BTreeMap<u32, i128>, index: u32, amount: i128) -> Result<(), MathError> {
+    let Some(held) = map.get(&index).copied() else {
+        return Ok(());
+    };
+    let left = held.checked_sub(amount).ok_or(MathError::Overflow)?;
+    if left > 0 {
+        map.insert(index, left);
+    } else {
+        map.remove(&index);
+    }
+    Ok(())
+}
+
+/// The pool's reserves as a **full** fill of `to_fill` would leave them:
+/// the borrower's collateral and liabilities reduced by what the fill takes
+/// over, then the contract's default path run over what is left
+/// ([`project_default`]).
+///
+/// The borrower's `supply` travels in as the snapshot read it. A fill moves
+/// only collateral and liabilities, and the plain supply is exactly what
+/// the default path's set-off step spends before anything is destroyed.
+///
+/// # Errors
+///
+/// Whatever [`project_default`] raises, propagated rather than read as "no
+/// default": collateral the oracle cannot price leaves the haircut
+/// unknowable, and assuming it does not apply is the optimistic direction
+/// this whole projection exists to close — the contract refuses such a fill
+/// anyway. `InvalidInput` or `MissingReserve` for an auction asset this
+/// pool does not list, from [`reserve_for`].
+fn defaulted_reserves(
+    inputs: &FillInputs<'_>,
+    to_fill: &AuctionData,
+) -> Result<BTreeMap<u32, Reserve>, MathError> {
+    let mut borrower = inputs.borrower.clone();
+    for (asset, b_tokens) in &to_fill.lot {
+        let (index, _) = reserve_for(inputs, asset)?;
+        remove_from(&mut borrower.collateral, index, *b_tokens)?;
+    }
+    for (asset, d_tokens) in &to_fill.bid {
+        let (index, _) = reserve_for(inputs, asset)?;
+        remove_from(&mut borrower.liabilities, index, *d_tokens)?;
+    }
+    Ok(project_default(inputs.reserves, inputs.prices, &borrower)?.reserves)
+}
+
 /// Projects a fill of `percent` at `ledger` exactly, with the requests
 /// after it in the order the executor sends them:
 ///
@@ -499,6 +577,17 @@ pub(crate) fn add_to<K: Ord>(
 /// `spend` records is first debited from a copy of the wallet that no
 /// debit takes below zero, so a projection never spends more of an asset
 /// than the wallet holds.
+///
+/// A **full** fill — one the scaling leaves no remainder of, which is the
+/// fill the contract deletes the auction on — is valued against
+/// [`defaulted_reserves`] rather than the snapshot's own: the contract runs
+/// the borrower's default path inside this same transaction, before it
+/// checks the filler's health. Only that last valuation moves. Every
+/// conversion above it stays on the reserves as read, because the contract
+/// performs those conversions first — and where one of them does not
+/// (`to_b_token_down` of the supply, which a cut `b_rate` would mint *more*
+/// b-tokens for), the reserves as read are the smaller answer, which is the
+/// side of the projection that cannot cost the filler a refused fill.
 fn project(
     terms: &FillTerms,
     inputs: &FillInputs<'_>,
@@ -506,7 +595,8 @@ fn project(
     percent: FillPercent,
     supply: i128,
 ) -> Result<Projection, MathError> {
-    let to_fill = scale_auction(inputs.auction, ledger, percent.get())?.to_fill;
+    let ScaledAuction { to_fill, remaining } =
+        scale_auction(inputs.auction, ledger, percent.get())?;
     let mut positions = inputs.filler.clone();
     for (asset, b_tokens) in &to_fill.lot {
         let (index, _) = reserve_for(inputs, asset)?;
@@ -582,7 +672,15 @@ fn project(
         }
     }
 
-    let data = calculate_position_data(inputs.reserves, inputs.prices, &positions)?;
+    // `remaining` is `None` for exactly the fills the contract deletes the
+    // auction on, and those are the ones that run the borrower's default
+    // path. A partial fill runs none of it and is valued as read.
+    let reserves = if remaining.is_none() {
+        Cow::Owned(defaulted_reserves(inputs, &to_fill)?)
+    } else {
+        Cow::Borrowed(inputs.reserves)
+    };
+    let data = calculate_position_data(&reserves, inputs.prices, &positions)?;
     Ok(Projection {
         to_fill,
         positions,
@@ -998,10 +1096,38 @@ mod plan_tests {
         FillPercent::try_from(value).expect("1..=100")
     }
 
+    /// A plan against a borrower that holds nothing: the default path
+    /// needs liabilities to reach, so every case below that is not about
+    /// the haircut is projected against the reserves as read.
     fn plan(
         terms: &FillTerms,
         pool: &Pool,
         filler: &Positions,
+        wallet: &BTreeMap<String, i128>,
+        auction: &AuctionData,
+        earliest_ledger: u32,
+        max_percent: FillPercent,
+    ) -> PlannedFill {
+        plan_against(
+            terms,
+            pool,
+            filler,
+            &Positions::default(),
+            wallet,
+            auction,
+            earliest_ledger,
+            max_percent,
+        )
+    }
+
+    /// The same, against a named borrower — what a full fill's default
+    /// path is projected over.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_against(
+        terms: &FillTerms,
+        pool: &Pool,
+        filler: &Positions,
+        borrower: &Positions,
         wallet: &BTreeMap<String, i128>,
         auction: &AuctionData,
         earliest_ledger: u32,
@@ -1014,6 +1140,7 @@ mod plan_tests {
                 asset_index: &pool.asset_index,
                 prices: &pool.prices,
                 filler,
+                borrower,
                 wallet,
                 auction,
                 earliest_ledger,
@@ -1035,6 +1162,30 @@ mod plan_tests {
     fn well_collateralised() -> Positions {
         Positions {
             collateral: BTreeMap::from([(1, 100_000_000_000)]),
+            ..Positions::default()
+        }
+    }
+
+    /// The same pool with a real supply behind USDC: 100,000 USDC of
+    /// b-tokens at a rate of 1.0, of which [`well_collateralised`] holds a
+    /// tenth. `b_rate` only moves for a reserve that has b-tokens to
+    /// charge a default to, and the haircut is the destroyed debt divided
+    /// by exactly this `b_supply`.
+    fn pool_with_usdc_supply() -> Pool {
+        let mut pool = pool();
+        let usdc = pool.reserves.get_mut(&1).expect("the USDC reserve");
+        usdc.data.b_supply = 1_000_000_000_000;
+        usdc.data.d_supply = 10_000_000_000;
+        pool
+    }
+
+    /// A borrower whose whole position is this auction: `collateral` is
+    /// the share of the lot a fill of `percent` hands over, and the debt
+    /// is the whole 1,000 USDC the auction bids for.
+    fn borrower(collateral: i128) -> Positions {
+        Positions {
+            collateral: BTreeMap::from([(0, collateral)]),
+            liabilities: BTreeMap::from([(1, 10_000_000_000)]),
             ..Positions::default()
         }
     }
@@ -1639,5 +1790,149 @@ mod plan_tests {
                 }
             }
         }
+    }
+
+    /// A 100% fill runs the borrower's default path inside the filler's
+    /// own transaction, cutting the reserve's `b_rate` before
+    /// `validate_submit` checks health. A projection against the pre-fill
+    /// reserves is therefore an upper bound, and planning from it earns
+    /// `InvalidHf` (1205) from the contract — which the fork's own test
+    /// suite asserts happens
+    /// (`test-suites/tests/test_pool_default_orphan_scenarios.rs:760-765`).
+    #[test]
+    fn a_full_fill_that_defaults_the_borrower_projects_the_haircut() {
+        let pool = pool_with_usdc_supply();
+        let terms = FillTerms {
+            profit_bps: 20_000,
+            ..terms()
+        };
+        // At 267 ledgers in, the lot modifier is whole and the bid
+        // modifier is 0.665: the fill takes all 20,000 XLM of the lot and
+        // 665 of the 1,000 USDC of debt, and nothing of the auction is
+        // left, so the contract deletes it and runs the default path.
+        //
+        // (a) The borrower's whole position is this auction. The fill
+        // leaves them no collateral and 335 USDC still owed, which the
+        // default path destroys: 3_350_000_000 over a `b_supply` of
+        // 1_000_000_000_000 cuts `b_rate` by
+        // ceil(3_350_000_000 x 1e12 / 1e12) = 3_350_000_000, from 1.0 to
+        // 0.99665.
+        let defaulting = borrower(200_000_000_000);
+        // (b) The same borrower with 100 XLM of collateral left over.
+        // `collateral_raw` is then not zero, the contract's gate stays
+        // shut, and no rate moves.
+        let solvent = borrower(201_000_000_000);
+
+        let plan_at = |positions: &Positions| {
+            draft(plan_against(
+                &terms,
+                &pool,
+                &well_collateralised(),
+                positions,
+                &BTreeMap::new(),
+                &auction(),
+                START + 1,
+                percent(100),
+            ))
+        };
+        let with = plan_at(&defaulting);
+        let without = plan_at(&solvent);
+
+        // Same auction, same filler, same reserves: the fill itself is
+        // identical, and the only difference is whether what it leaves
+        // behind is valued through the haircut.
+        assert_eq!(with.fill_ledger, START + 267);
+        assert_eq!(with.percent, percent(100));
+        assert_eq!(
+            (
+                with.fill_ledger,
+                with.percent,
+                &with.to_fill,
+                with.est_profit
+            ),
+            (
+                without.fill_ledger,
+                without.percent,
+                &without.to_fill,
+                without.est_profit
+            )
+        );
+        assert!(
+            with.actions.is_empty() && without.actions.is_empty(),
+            "the wallet is empty, so neither plan sends anything after the fill"
+        );
+
+        // Without the haircut: the filler's 10,000 USDC of collateral is
+        // $9,500 effective beside the lot's $1,500, over $700 of
+        // effective liability (665 / 0.95, exactly) — 110e9 / 7e9.
+        assert_eq!(without.projected_health, Some(157_142_857));
+        // With it: the same 1e11 b-tokens are worth 9,966.5 USDC, so
+        // $9,468.175 effective and 109_681_750_000 of collateral against
+        // the same 7e9 — the liability side is `d_rate`, which no default
+        // moves.
+        assert_eq!(with.projected_health, Some(156_688_214));
+        assert!(
+            with.projected_health < without.projected_health,
+            "the haircut can only lower the projection: {:?} against {:?}",
+            with.projected_health,
+            without.projected_health
+        );
+
+        // The control really is the un-haircut projection, not merely a
+        // different one: a borrower with nothing to default plans the
+        // same as a borrower the gate turns away.
+        assert_eq!(
+            without,
+            draft(plan(
+                &terms,
+                &pool,
+                &well_collateralised(),
+                &BTreeMap::new(),
+                &auction(),
+                START + 1,
+                percent(100),
+            ))
+        );
+    }
+
+    /// A partial fill is not a full fill: the auction stays on the ledger,
+    /// the contract runs no default path, and no haircut applies.
+    #[test]
+    fn a_partial_fill_projects_no_haircut() {
+        let pool = pool_with_usdc_supply();
+        let terms = FillTerms {
+            profit_bps: 20_000,
+            ..terms()
+        };
+        // Collateral of exactly what a 50% fill hands over, so the
+        // borrower is left owing 668.75 USDC against nothing at all: the
+        // gate a full fill opens would open here too, and only the
+        // remainder the scaling leaves keeps the default path from
+        // running. A projection that read the gate without reading the
+        // remainder would haircut this one.
+        let defaulting = borrower(100_000_000_000);
+        let partial = draft(plan_against(
+            &terms,
+            &pool,
+            &well_collateralised(),
+            &defaulting,
+            &BTreeMap::new(),
+            &auction(),
+            START + 1,
+            percent(50),
+        ));
+        let unmodelled = draft(plan(
+            &terms,
+            &pool,
+            &well_collateralised(),
+            &BTreeMap::new(),
+            &auction(),
+            START + 1,
+            percent(50),
+        ));
+
+        assert_eq!(partial.percent, percent(50));
+        assert_eq!(partial.fill_ledger, START + 267);
+        assert_eq!(partial, unmodelled);
     }
 }
