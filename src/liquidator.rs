@@ -45,7 +45,7 @@
 //! already fails loudly.
 //!
 //! The module layout follows the design spec at
-//! `docs/superpowers/specs/2026-09-04-blend-liquidator-bot-design.md`.
+//! `docs/specs/2026-09-04-blend-liquidator-bot-design.md`.
 
 pub mod auctioneer;
 pub mod chain;

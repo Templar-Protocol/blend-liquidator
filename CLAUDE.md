@@ -644,7 +644,7 @@ make help                           # Docker Compose lifecycle
   a mask, because uploaded artifacts are not masked.
 
 The module layout beyond this follows
-`docs/superpowers/specs/2026-09-04-blend-liquidator-bot-design.md`; see
+`docs/specs/2026-09-04-blend-liquidator-bot-design.md`; see
 Status above for what remains.
 
 ## Conventions
@@ -1161,5 +1161,11 @@ Status above for what remains.
   sandbox tier (`sandbox/`).
 - `tests/` — the fixtures the math is pinned against, and
   `liquidation_sandbox.rs`, the tier's one `#[ignore]`d end-to-end test.
-- `docs/` — design specs.
+- `docs/specs/` — the design specs, the durable half of the documentation
+  and the authority every plan argues from. Committed.
+- `docs/plans/` — per-phase implementation plans. Working documents that go
+  stale the moment their phase merges, so they are **gitignored**: kept on
+  disk for the phase that is running, never committed.
+- `docs/tmp/` — scratch: briefings and notes being worked through. Also
+  **gitignored**, and never a source of truth for anything.
 - `.github/workflows/` — CI, release automation and the nightly sandbox run.
