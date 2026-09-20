@@ -525,7 +525,7 @@ describe stock semantics and have to be rewritten immediately.
 
 The design spec's phase list therefore becomes:
 
-8. The ADR-0008 fork reconciliation: §4 A through J.
+8. The ADR-0008 fork reconciliation: §4 A through K.
 9. Documentation (`README`, `docs/configuration.md`, `docs/deploy.md`,
    `docs/architecture.md`), `CHANGELOG`, the deployment contract, first release
    tag.

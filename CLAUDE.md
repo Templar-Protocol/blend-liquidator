@@ -916,9 +916,13 @@ Status above for what remains.
 - An auction's 400th ledger is the end of its ramp: from there the bid
   modifier is zero and the lot is complete, so there is nothing left to
   wait for — but a fill is still a position takeover that must pass the
-  health check, so `plan_fill` answers `PastAuctionEnd` unless the pool
-  sets `force_fill`. **On the fork this refusal gives away the best fill
-  there is** and is scheduled to change: at `block_dif >= 400` the scaled
+  health check. `plan_fill`'s gate is `earliest - start > RAMP_END_BLOCKS`
+  (`src/math/fill.rs`), **strictly greater**, so it plans at exactly 400
+  and answers `PastAuctionEnd` from 401 on unless the pool sets
+  `force_fill`. The bot therefore reaches the start of the free region and
+  no further: an auction it first sees at `block_dif` 450 is refused
+  outright, although filling it would cost nothing. **On the fork that
+  refusal gives away the best fill there is** and is scheduled to change: at `block_dif >= 400` the scaled
   bid is not merely zero, it is *absent* (a zero amount is never stored),
   so the filler takes the whole lot and assumes no liability at all. There
   is no fill cutoff at all: `fill_auction` guards only the auction type and
