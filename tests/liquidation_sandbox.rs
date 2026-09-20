@@ -41,7 +41,7 @@
 //! [`FillerPosition::settled`] is therefore satisfied by the fill, and the
 //! unwind's repay branch has no coverage here. The scenario that would
 //! give it some is a filler whose wallet cannot cover the bid, which is
-//! Phase 8's soak rather than this tier's one run.
+//! the testnet soak — Phase 9's — rather than this tier's one run.
 //!
 //! The database is this test's own: it creates `sandbox_<unix seconds>` on
 //! the `DATABASE_URL` server (the role has `CREATEDB`, which is what

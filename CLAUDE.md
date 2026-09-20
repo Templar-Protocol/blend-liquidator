@@ -591,7 +591,7 @@ make help                           # Docker Compose lifecycle
   takes over arrives with no liabilities and the unwind runs the withdraw
   step only — the `liabilities == 0` half is the fill's doing, and the
   unwind's repay branch is uncovered until a scenario whose filler cannot
-  cover the bid (Phase 8's soak). `#[ignore]`d, so
+  cover the bid (the testnet soak, now Phase 9's). `#[ignore]`d, so
   `cargo test` never starts a container, and it refuses to run at all
   unless `target/sandbox/sandbox.env` exists and names the standalone
   network. Nothing in it panics through `unwrap`/`expect`: every failure
@@ -878,7 +878,11 @@ Status above for what remains.
   partial liquidation). Both comparisons are strict (`is_hf_over` is `>`,
   `is_hf_under` is `<`), so the accepted window is the *closed* interval and
   a health factor of exactly `1_1500000` or exactly `1_0300000` is legal —
-  the adjustment loop must not treat either endpoint as a rejection.
+  the adjustment loop must not treat either endpoint as a rejection. **The
+  crate still reads it the old way and enforces that**: `TARGET_HF`'s parser
+  refuses `1.15` at startup and its doc comments say "at or above", which
+  §4-K of the fork spec is the item for. The constants are right; the band
+  around them is not yet.
   `TARGET_HF`'s default of `1.06` sits between them with room for a ledger or
   two of drift before the auction is filled.
 - `PoolSnapshot::position_data` accrues a **clone** of `self.reserves`
@@ -916,8 +920,12 @@ Status above for what remains.
   sets `force_fill`. **On the fork this refusal gives away the best fill
   there is** and is scheduled to change: at `block_dif >= 400` the scaled
   bid is not merely zero, it is *absent* (a zero amount is never stored),
-  so the filler takes the whole lot and assumes no liability at all, and
-  the auction stays fillable until `del_auction` becomes legal at 500. See
+  so the filler takes the whole lot and assumes no liability at all. There
+  is no fill cutoff at all: `fill_auction` guards only the auction type and
+  `user == filler`, so a fill at 400, 500 or 1000 is equally valid for as
+  long as the entry exists. What 500 changes is that `delete_stale_auction`
+  stops refusing — it is permissionless but deletes nothing by itself, so
+  past 500 waiting races a deletion rather than another filler. See
   §2.5 and §4-F of `docs/specs/2026-09-20-adr-0008-fork-semantics.md`, which
   narrow `force_fill` to its delay cap alone.
   As it stands, `force_fill` means two things at once: fill past the 400th
@@ -1214,14 +1222,23 @@ reasoning and the work each one implies, is
   which makes this crate's normalisation a no-op — but read the decimals
   anyway, because the codec is shared with stock-pinned fixtures.
 - **`RequestType::Withdraw` (1) now health-checks** whenever the same user
-  owes anything in that reserve. Stock had no such rule and only
-  `WithdrawCollateral` (3) forced it, so an unwind path that could not fail
-  this way now can.
-- **`1220 ExceededSupplyCap` is reachable and unhandled.** ADR-0008 seals each
-  reserve's stress-priced supply cap at $25k and a pool's sum at $50k. The
-  code falls into `Executor::execute`'s catch-all `Refused` branch, which
-  re-plans without ever lowering the supply, so a capped reserve re-plans
-  forever.
+  owes anything in that reserve, where stock had no such rule. **This bot
+  never sends that request type** — it appears once in the crate, in
+  `encode`'s discriminant-ordering test — so nothing it does changes. Both
+  unwind actions and every fill request build `WithdrawCollateral` (3),
+  `Repay`, `SupplyCollateral` or the fill itself, and `WithdrawCollateral`
+  already forced the check on stock. Worth knowing so an unwind's 1205 is not
+  misdiagnosed as this.
+- **`1220 ExceededSupplyCap` is reachable and the planner cannot see it.**
+  ADR-0008 seals each reserve's stress-priced supply cap at $25k and a pool's
+  sum at $50k. The executor is already right about it — `refusal` maps
+  everything but 1205 and 1224 to `Refused`, which counts
+  `SkipLabel::ContractError` and leaves the auction for the next tick, and
+  **does not re-plan**; only `Replan` does that, and only by lowering the
+  percent. The gap is in `plan_fill`, which has no notion of a cap, so
+  `Filler::due`'s `REPLAN_LEDGERS` cadence rebuilds the same over-cap supply
+  and earns the same 1220 for as long as the auction is open. Do not fix this
+  by adding a re-plan to `Refused`: that arm carries every unhandled code.
 - **`flash_loan`, `update_pool` and `set_emissions_config` all panic `1200`**,
   as do six backstop emissions exports (ADR-0011), with their ABIs preserved.
   The bot calls none of them; `flash_loan` matters only as a closed door.

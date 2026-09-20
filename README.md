@@ -34,8 +34,11 @@ A liquidation bot for [Blend Protocol](https://blend.capital) lending pools on
 > Blend v2 on a throwaway Stellar network in Docker, crashes a price, and
 > runs this binary against it armed until it has created the auction,
 > filled it and unwound the position it took (see Testing below). What
-> remains is Phase 8 (the docs set, the deployment contract and the first
-> release tag) and a testnet soak. What *is* complete is the scaffolding
+> remains is Phase 8, reconciling the bot with the ADR-0008 fork of the
+> Blend contracts that is now its source of truth
+> (`docs/specs/2026-09-20-adr-0008-fork-semantics.md`), then Phase 9 (the
+> docs set, the deployment contract and the first release tag) and a
+> testnet soak. What *is* complete is the scaffolding
 > around all of it — CI gates, lint posture, dev container, release
 > preflight — so nothing lands into a repository that does not already
 > fail loudly.

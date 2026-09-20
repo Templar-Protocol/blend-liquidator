@@ -203,16 +203,28 @@ assumes no liabilities at all. The fork asserts this literally
 `assert!(filled.bid.is_empty())`). There is no zero-amount guard anywhere on
 that path.
 
-The auction stays fillable from 400 until it is deleted. `del_auction` is
-**stock, permissionless and refuses with 1200 before `block_dif` reaches 500**
-(`pool/src/auctions/auction.rs:99-112`; `pool/src/contract.rs:571-577` has no
-`require_auth`). So `400..500` is a hundred-ledger window in which a fill costs
-nothing and anybody may take it.
+**There is no fill cutoff.** `fill_auction` guards only the auction type and
+`user == filler_state.address`; `block_dif` appears nowhere in it, and inside
+`scale_auction` only in the modifier arithmetic. So a fill at `block_dif` 400,
+500 or 1000 is equally valid, and equally free, for as long as the auction
+entry exists.
 
-The bot today refuses that whole window: `plan_fill` answers `PastAuctionEnd`
-past 400 unless the pool sets `force_fill`, and `fill_delay` searches for the
-*earliest* ledger at which the lot covers the bid plus the margin. That is the
-right objective against stock and the wrong one here — it pays a real bid to
+What happens at 500 is that `delete_stale_auction` stops refusing:
+`if auction.block + 500 > e.ledger().sequence() { panic_with_error!(BadRequest) }`
+(`pool/src/auctions/auction.rs:99-112`). It is stock, and permissionless
+(`pool/src/contract.rs:571-577` has no `require_auth`), but it deletes nothing
+by itself — somebody has to call it. So 500 is where waiting stops being a race
+against another filler and starts being a race against anyone willing to spend
+a transaction deleting the auction.
+
+The bot today reaches the *start* of the free region and no further.
+`plan_fill`'s gate is `earliest - start > RAMP_END_BLOCKS`
+(`src/math/fill.rs:365`), strictly greater, so it can plan at exactly 400 and
+answers `PastAuctionEnd` from 401 on unless the pool sets `force_fill`. An
+auction this bot first sees at `block_dif` 450 is therefore refused outright,
+although filling it would cost nothing. Separately, `fill_delay` searches for
+the *earliest* ledger at which the lot covers the bid plus the margin, which is
+the right objective against stock and the wrong one here: it pays a real bid to
 win a race the bot could instead win for free a few minutes later.
 
 It is a race, though, and that is the whole trade-off. Waiting to 400
@@ -235,13 +247,19 @@ The bot calls none of these. `flash_loan` matters only as a closed door: the
 design spec's "no flash loans" is now the contract's position too, and the seam
 §11 keeps is dead on a fork pool.
 
-Two refusals do reach the bot:
+One new refusal reaches the bot, and one only looks as though it does:
 
 - **`RequestType::Withdraw` (1) now health-checks** when the same user owes
-  anything in that reserve (`pool/src/pool/actions.rs:319-323`). Stock had no
-  such line; `WithdrawCollateral` (3) already forced it. An unwind that
-  withdraws plain supply from a reserve it still owes in can now fail 1205
-  where it previously could not.
+  anything in that reserve (`pool/src/pool/actions.rs:319-323`), where stock
+  had no such line. **This bot never sends that request type**, so nothing
+  about its behaviour changes: `RequestType::Withdraw` appears once in the
+  crate, in the discriminant-ordering test at `src/chain/xdr/encode.rs:346`.
+  Both unwind actions and every fill request build `WithdrawCollateral` (3),
+  `Repay`, `SupplyCollateral` or `FillUserLiquidationAuction`
+  (`src/executor.rs:224-281`), and `WithdrawCollateral` already forced the
+  check on stock. It is recorded because an unwind that fails 1205 must not be
+  misdiagnosed as this, and because a future request builder could walk into
+  it.
 - **Supply caps.** ADR-0008 caps each reserve's stress-priced `supply_cap` at
   25,000 USD and a pool's sum at 50,000 USD. `apply_supply` and
   `apply_supply_collateral` raise **1220 `ExceededSupplyCap`**, which this
@@ -278,9 +296,12 @@ in five specifics. Recording them so they are not re-introduced:
 3. **The health-factor window is closed, not open.** The comparisons are
    `is_hf_over(1_1500000)` with `>` and `is_hf_under(1_0300000)` with `<`
    (`pool/src/pool/health_factor.rs:93,106`), so a post-liquidation health
-   factor of exactly 1.15 or exactly 1.03 is **accepted**. "(1.03, 1.15)"
-   describes the rejected region. The crate's constants are already the right
-   numbers.
+   factor of exactly 1.15 or exactly 1.03 is **accepted** and the accepted set
+   is the closed interval `[1.03, 1.15]`. Read as an open interval,
+   "(1.03, 1.15)" names the accepted set's *interior* and silently drops its
+   two endpoints, which is the one place the distinction changes an answer.
+   The crate's constants are the right numbers; §4-K is where the crate still
+   reads the endpoints the old way.
 4. **`bad_debt` is declared but never emitted** on the fork — zero call sites
    (`pool/src/events.rs:157-160`). The briefing's rule "if this pool emits
    stock's `bad_debt`, the wrong wasm is deployed" is therefore sound, and
@@ -349,24 +370,52 @@ it.** §2.2. The bot already holds the borrower's positions and the reserve, so
 the defaulted amount and the resulting `b_rate` loss are computable exactly;
 modelling it restores the "project exactly" invariant rather than leaning on a
 1205 and a halved re-plan. Where modelling is not worth its complexity, the
-fallback is explicit: do not fill 100% of an auction whose borrower would be
-left with `collateral_raw == 0`. Whichever is chosen, it must be a decision in
-`math::fill` with a test, not an emergent behaviour of the executor.
+fallback is explicit: do not fill 100% of an auction whose borrower the fill
+would leave with liabilities and `collateral_raw == 0`, which is exactly the
+contract's own gate read the other way round
+(`pool/src/pool/bad_debt.rs:56-58` returns early unless both hold).
+
+That predicate is **necessary but not sufficient**, and the difference is worth
+not losing: reaching the default path is not the same as defaulting. Step 1's
+set-off can clear the debt entirely from the borrower's own supply in the debt
+reserve, in which case `had_default` stays false, no `defaulted_debt` is
+emitted and `b_rate` never moves. So the fallback declines some fills that were
+in fact safe. That is the safe direction, and it is a cost, not a free choice.
+Modelling is what avoids paying it.
+
+Whichever is chosen, it must be a decision in `math::fill` with a test — and if
+it is the modelling, the test must pin the rounding, since `b_rate_loss` is
+`fixed_div_ceil(default_amount, b_supply)` and rounds **up**
+(`pool/src/pool/user.rs:102-119`). Not an emergent behaviour of the executor.
 
 **F. Make the fill objective a configured choice.** §2.5. Add a per-pool
 setting selecting between the earliest profitable ledger — today's behaviour,
 correct where competition is real — and the free-fill point at `block_dif =
-400`. Default to the free fill, per the briefing. Extend the fillable window
-from `0..=400` to `0..500`, the `del_auction` boundary, since the whole of
-`400..500` is free. `force_fill` then loses its "fill past the end" meaning and
-keeps only its delay cap; that is a narrowing of a flag, and its doc comment
-and CLAUDE.md entry both have to move with it.
+400`. Default to the free fill, per the briefing. Remove the upper bound on the
+fillable window rather than moving it: the contract has no fill cutoff at 400,
+at 500 or anywhere, so `PastAuctionEnd` should stop being a refusal and 500
+should become a *staleness warning* — past it anyone may delete the auction, so
+a plan aimed past 500 is racing a deletion rather than a filler. `force_fill`
+then loses its "fill past the end" meaning and keeps only its delay cap; that
+is a narrowing of a flag, and its doc comment and CLAUDE.md entry both have to
+move with it.
 
-**G. Handle 1220 `ExceededSupplyCap`.** It currently falls into
-`Executor::execute`'s catch-all `Refused` branch, which re-plans without ever
-lowering the supply — so a capped reserve re-plans forever. It must lower the
-supply the way 1205 lowers the percent, or skip with a reason a `SkipLabel`
-names.
+**G. Handle 1220 `ExceededSupplyCap`.** `refusal` maps every code but 1205 and
+1224 to `ExecOutcome::Refused` (`src/executor.rs:407-414`), and the filler's
+handler for that variant does **not** re-plan: it counts
+`SkipLabel::ContractError` and leaves the auction for the next tick
+(`src/filler.rs:1141-1150`). So the executor is already correct and already
+"skips with a reason a `SkipLabel` names" — do not add a re-plan to `Refused`,
+which would change behaviour for every unhandled code at once.
+
+The defect is a tick further out. `Filler::due` re-plans the row on the
+`REPLAN_LEDGERS` cadence, the planner has no notion of a supply cap, so it
+rebuilds the same over-cap supply and earns the same 1220 for as long as the
+auction stays open. The acceptance criterion is therefore about the *plan*:
+`plan_fill`'s supply-escalation step must know the reserve's remaining cap
+headroom and size the supply under it, or decline the escalation and say so
+with its own `FillSkip`. A 1220 reaching the executor at all should be the
+unexpected case.
 
 **H. Add the pool's own contract address to the bot's own-address set.** It is
 a `Positions` holder now. It cannot be liquidated (1211, stock) and its row is
@@ -381,6 +430,24 @@ request type that previously could not fail this way. It needs a test.
 **J. Point the documentation at the fork.** CLAUDE.md's contract-derived
 gotchas, the design spec's "Invariants specific to Blend", and the crate-level
 docs all cite stock behaviour.
+
+**K. Reconcile `TARGET_HF`'s band with the closed window.** §3.3 is not a
+stock-versus-fork difference, so §4-J's documentation sweep does not cover it,
+and it is not documentation alone: `src/config.rs:176` **enforces** the old
+reading, refusing to start when `TARGET_HF >= 1.15`, while the contract accepts
+exactly 1.15. Three doc comments state the same thing — `src/config.rs:149-150`
+and `:166-167` ("at or above `1.15`", "`[1.03, 1.15)` is exactly the set of
+values that name an outcome the contract can accept") and
+`src/auctioneer.rs:980-982`.
+
+The bound itself may well stay. Aiming a liquidation at the ceiling leaves no
+room for the drift between planning and fill that `TARGET_HF`'s default of 1.06
+exists to absorb, so one notch inside the contract's band is a defensible
+choice. What cannot stay is the *reason given for it*: "The bounds are the
+contract's own and nothing narrower" is now false, and a knob whose refusal
+message misstates the contract will be widened by the next person who checks.
+Either widen the bound to the contract's real band or keep it and say plainly
+that it is the bot's own margin — but not both readings in one crate.
 
 ---
 
