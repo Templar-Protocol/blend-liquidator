@@ -922,12 +922,13 @@ Status above for what remains.
   `force_fill`. The bot therefore reaches the start of the free region and
   no further: an auction it first sees at `block_dif` 450 is refused
   outright, although filling it would cost nothing. **On the fork that
-  refusal gives away the best fill there is** and is scheduled to change: at `block_dif >= 400` the scaled
-  bid is not merely zero, it is *absent* (a zero amount is never stored),
-  so the filler takes the whole lot and assumes no liability at all. There
-  is no fill cutoff at all: `fill_auction` guards only the auction type and
-  `user == filler`, so a fill at 400, 500 or 1000 is equally valid for as
-  long as the entry exists. What 500 changes is that `delete_stale_auction`
+  refusal gives away the best fill there is** and is scheduled to change:
+  at `block_dif >= 400` the scaled bid is not merely zero, it is *absent*,
+  because a zero amount is never stored, so the filler takes the whole lot
+  and assumes no liability at all. There is no fill cutoff anywhere:
+  `fill_auction` guards only the auction type and `user == filler`, so a
+  fill at 400, 500 or 1000 is equally valid for as long as the entry
+  exists. What 500 changes is that `delete_stale_auction`
   stops refusing — it is permissionless but deletes nothing by itself, so
   past 500 waiting races a deletion rather than another filler. See
   §2.5 and §4-F of `docs/specs/2026-09-20-adr-0008-fork-semantics.md`, which
