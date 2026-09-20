@@ -37,7 +37,9 @@
 //! server (`http`). Phase 7 landed the sandbox integration tier that runs
 //! all of it armed against a throwaway Stellar network
 //! (`scripts/sandbox/`, `tests/liquidation_sandbox.rs`). What is left is
-//! Phase 8's docs and first release, and a testnet soak.
+//! Phase 8, the ADR-0008 fork reconciliation
+//! (`docs/specs/2026-09-20-adr-0008-fork-semantics.md`), then Phase 9's
+//! docs and first release, and a testnet soak.
 //!
 //! The repository scaffolding around it — CI gates, lint
 //! posture, dev container, release preflight — is complete and enforced
@@ -45,7 +47,7 @@
 //! already fails loudly.
 //!
 //! The module layout follows the design spec at
-//! `docs/superpowers/specs/2026-09-04-blend-liquidator-bot-design.md`.
+//! `docs/specs/2026-09-04-blend-liquidator-bot-design.md`.
 
 pub mod auctioneer;
 pub mod chain;

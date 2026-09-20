@@ -6,6 +6,19 @@ A liquidation bot for [Blend Protocol](https://blend.capital) lending pools on
 Stellar. It is intended to repay the debt of underwater positions and receive
 their collateral at a discount.
 
+**The source of truth for pool behaviour is
+`Templar-Protocol/blend-contracts-v2`** — the ADR-0008 / ADR-0011 security
+fork — not `blend-capital/blend-contracts-v2`, which Phases 1 through 7 were
+built against. Most of the fork is byte-identical to stock, this crate's whole
+arithmetic port included, so the change is narrower than it sounds; what it
+does change, and what the bot still has to do about it, is
+`docs/specs/2026-09-20-adr-0008-fork-semantics.md`. Read that before touching
+anything contract-derived. The fork is **not deployed anywhere yet**: its pull
+request is a draft whose first line reads "SECURITY GATE OPEN: not ready for
+publication, release, deployment, activation, or handling funds", and it
+publishes no release, which is why the sandbox tier below still pins stock
+wasm.
+
 **Status: Phase 7 complete.** Phase 1 landed the pure fixed-point math
 (`math`) and the ScVal/ledger-entry codecs (`chain::xdr`); Phase 2 landed
 the chain layer (`chain::rpc`, `chain::pool`, `chain::signer`, `chain::tx`);
@@ -61,9 +74,14 @@ price move from liquidation, and the real binary run against it **armed**
 — the only place in this repository anything signs and sends a
 transaction — asserting on chain and in the store that it created the
 auction, filled it, unwound the position it took, and counted all three.
-What remains is Phase 8 (the docs set, the deployment contract and the
-first release tag) and the testnet soak the spec's §9 ends with. The
-repository scaffolding is complete and enforced.
+What remains is **Phase 8, the ADR-0008 fork reconciliation** — the work
+`docs/specs/2026-09-20-adr-0008-fork-semantics.md` §4 lists, which sequences
+ahead of the documentation set because the documentation would otherwise
+describe stock semantics and need rewriting at once — then Phase 9 (the docs
+set, the deployment contract and the first release tag) and the testnet soak
+the design spec's §9 ends with. Everything Phases 1 through 7 built still
+stands: the fork leaves this crate's whole arithmetic port byte-identical.
+The repository scaffolding is complete and enforced.
 
 **This bot is NOT non-custodial.** It is designed to hold a signing key and
 submit transactions itself — that is the point of a liquidation bot. Treat
@@ -573,7 +591,7 @@ make help                           # Docker Compose lifecycle
   takes over arrives with no liabilities and the unwind runs the withdraw
   step only — the `liabilities == 0` half is the fill's doing, and the
   unwind's repay branch is uncovered until a scenario whose filler cannot
-  cover the bid (Phase 8's soak). `#[ignore]`d, so
+  cover the bid (the testnet soak, now Phase 9's). `#[ignore]`d, so
   `cargo test` never starts a container, and it refuses to run at all
   unless `target/sandbox/sandbox.env` exists and names the standalone
   network. Nothing in it panics through `unwrap`/`expect`: every failure
@@ -644,7 +662,7 @@ make help                           # Docker Compose lifecycle
   a mask, because uploaded artifacts are not masked.
 
 The module layout beyond this follows
-`docs/superpowers/specs/2026-09-04-blend-liquidator-bot-design.md`; see
+`docs/specs/2026-09-04-blend-liquidator-bot-design.md`; see
 Status above for what remains.
 
 ## Conventions
@@ -855,10 +873,18 @@ Status above for what remains.
   refusal in dry-run and only proceeds when armed, behind the queue.
 - The contract's own auction bounds, which `Auctioneer::act` adjusts the
   percent against rather than predicting: a post-liquidation health factor
-  at or above `1_1500000` is `InvalidLiqTooLarge` (error code `1213`), and
+  **above** `1_1500000` is `InvalidLiqTooLarge` (error code `1213`), and
   below `1_0300000` is `InvalidLiqTooSmall` (`1214`, raised only for a
-  partial liquidation). `TARGET_HF`'s default of `1.06` sits between them
-  with room for a ledger or two of drift before the auction is filled.
+  partial liquidation). Both comparisons are strict (`is_hf_over` is `>`,
+  `is_hf_under` is `<`), so the accepted window is the *closed* interval and
+  a health factor of exactly `1_1500000` or exactly `1_0300000` is legal —
+  the adjustment loop must not treat either endpoint as a rejection. **The
+  crate still reads it the old way and enforces that**: `TARGET_HF`'s parser
+  refuses `1.15` at startup and its doc comments say "at or above", which
+  §4-J of the fork spec is the item for. The constants are right; the band
+  around them is not yet.
+  `TARGET_HF`'s default of `1.06` sits between them with room for a ledger or
+  two of drift before the auction is filled.
 - `PoolSnapshot::position_data` accrues a **clone** of `self.reserves`
   before valuing a position, so `snapshot.reserves` itself is never
   accrued and stays exactly as read. Anything that values positions
@@ -890,13 +916,29 @@ Status above for what remains.
 - An auction's 400th ledger is the end of its ramp: from there the bid
   modifier is zero and the lot is complete, so there is nothing left to
   wait for — but a fill is still a position takeover that must pass the
-  health check, so `plan_fill` answers `PastAuctionEnd` unless the pool
-  sets `force_fill`. `force_fill` means two things at once: fill past the
-  400th ledger at all, *and* cap both the profit delay and the health
-  escalation at 350 ledgers (`FORCE_FILL_MAX_DELAY`), so the fill happens
-  no later than that however little the lot then covers. What it does not
-  mean is "fill regardless of profit": the margin still decides *when*,
-  and the health floor still decides *whether*.
+  health check. `plan_fill`'s gate is `earliest - start > RAMP_END_BLOCKS`
+  (`src/math/fill.rs`), **strictly greater**, so it plans at exactly 400
+  and answers `PastAuctionEnd` from 401 on unless the pool sets
+  `force_fill`. The bot therefore reaches the start of the free region and
+  no further: an auction it first sees at `block_dif` 450 is refused
+  outright, although filling it would cost nothing. **On the fork that
+  refusal gives away the best fill there is** and is scheduled to change:
+  at `block_dif >= 400` the scaled bid is not merely zero, it is *absent*,
+  because a zero amount is never stored, so the filler takes the whole lot
+  and assumes no liability at all. There is no fill cutoff anywhere:
+  `fill_auction` guards only the auction type and `user == filler`, so a
+  fill at 400, 500 or 1000 is equally valid for as long as the entry
+  exists. What 500 changes is that `delete_stale_auction`
+  stops refusing — it is permissionless but deletes nothing by itself, so
+  past 500 waiting races a deletion rather than another filler. See
+  §2.5 and §4-F of `docs/specs/2026-09-20-adr-0008-fork-semantics.md`, which
+  narrow `force_fill` to its delay cap alone.
+  As it stands, `force_fill` means two things at once: fill past the 400th
+  ledger at all, *and* cap both the profit delay and the health escalation
+  at 350 ledgers (`FORCE_FILL_MAX_DELAY`), so the fill happens no later than
+  that however little the lot then covers. What it does not mean is "fill
+  regardless of profit": the margin still decides *when*, and the health
+  floor still decides *whether*.
 - `WITHDRAW_ALL` is `i64::MAX`, and that is the safe spelling of "all",
   not a saturation. `WithdrawCollateral` burns `min(to_b_token_up(amount),
   position)` and recomputes `tokens_out` from the cap, so any amount above
@@ -1142,6 +1184,81 @@ Status above for what remains.
   `SQLX_CLI_VERSION` — cross-file equality, the shape the three-way Rust
   pin already uses. Bump both together.
 
+## The fork's gotchas
+
+Verified against `Templar-Protocol/blend-contracts-v2` PR #3 at head
+`54afdae`, side by side with stock at `v2.0.0`. The long form, with the
+reasoning and the work each one implies, is
+`docs/specs/2026-09-20-adr-0008-fork-semantics.md`; these are the traps.
+
+- **A 100% fill can cut the filler's own health factor, and the snapshot
+  cannot see it coming.** On the fork a full fill runs
+  `check_and_handle_user_bad_debt`, which destroys the borrower's residual
+  debt by *reducing the reserve's `b_rate`* — in the filler's own
+  transaction, before `validate_submit` checks health. Every holder of
+  collateral in that reserve, the filler included, is worth less at check
+  time than the plan projected. So `plan_fill`'s "project the post-fill
+  position exactly" is an **upper bound** on the fork, not an equality, and
+  the miss surfaces as `1205 InvalidHf`. Today's half-percent re-plan
+  survives it only by accident — a half fill is not a full fill, so the
+  default never runs. This is the single most important difference; nothing
+  else on this list can lose money.
+- **Only three events are new**: `debt_setoff`, `collateral_orphaned` and
+  `orphan_settled`. `defaulted_debt` is **stock**, and this crate already
+  decodes it correctly — do not "add" it. The topic shapes differ and the
+  borrower is not in a fixed position: `collateral_orphaned` carries the
+  user in topic 1 and the asset in topic 2, while the other two carry no
+  user at all, so a decoder that assumes "asset is always topic 1" mis-reads
+  it silently, both being addresses.
+- **A `bad_debt` event on a fork pool means stock wasm is deployed.** The
+  event is still declared and has zero call sites, so it can never be
+  emitted. Treat one as a deployment alarm, never as something to act on.
+- **The bad-debt *auction* is dead; the `bad_debt` *call* is not.** Creating
+  or filling any auction type other than `UserLiquidation` raises `1200`, so
+  `AuctionType::BadDebt` and `Interest` can never be built. But
+  `bad_debt(user)` is kept and rewired, and is now the only way to clear a
+  defaulted borrower — `CreationKind::BadDebt` names that call and stays.
+- **`del_auction` and the 500-block staleness rule are stock**, byte-identical
+  and permissionless, refusing with `1200` until `block_dif` reaches 500.
+  Nothing here is a fork invention, and the bot could always have used them.
+- **The oracle must report exactly 7 decimals** or every priced call panics
+  `1210`, and a future-dated price is now rejected as well as one over 24
+  hours old. `PositionData.scalar` is therefore always `10^7` on a fork pool,
+  which makes this crate's normalisation a no-op — but read the decimals
+  anyway, because the codec is shared with stock-pinned fixtures.
+- **`RequestType::Withdraw` (1) now health-checks** whenever the same user
+  owes anything in that reserve, where stock had no such rule. **This bot
+  never sends that request type** — it appears once in the crate, in
+  `encode`'s discriminant-ordering test — so nothing it does changes. Both
+  unwind actions and every fill request build `WithdrawCollateral` (3),
+  `Repay`, `SupplyCollateral` or the fill itself, and `WithdrawCollateral`
+  already forced the check on stock. Worth knowing so an unwind's 1205 is not
+  misdiagnosed as this.
+- **`1220 ExceededSupplyCap` is reachable and the planner cannot see it.**
+  ADR-0008 seals each reserve's stress-priced supply cap at $25k and a pool's
+  sum at $50k. The executor is already right about it — `refusal` maps
+  everything but 1205 and 1224 to `Refused`, which counts
+  `SkipLabel::ContractError` and leaves the auction for the next tick, and
+  **does not re-plan**; only `Replan` does that, and only by lowering the
+  percent. The gap is in `plan_fill`, which has no notion of a cap, so
+  `Filler::due`'s `REPLAN_LEDGERS` cadence rebuilds the same over-cap supply
+  and earns the same 1220 for as long as the auction is open. Do not fix this
+  by adding a re-plan to `Refused`: that arm carries every unhandled code.
+- **`flash_loan`, `update_pool` and `set_emissions_config` all panic `1200`**,
+  as do six backstop emissions exports (ADR-0011), with their ABIs preserved.
+  The bot calls none of them; `flash_loan` matters only as a closed door.
+- **The pool contract's own address is a `Positions` holder now** — confiscated
+  collateral lands there as `supply`, never collateral or liabilities. It
+  cannot be liquidated (`1211`, stock) and its row is deleted for having no
+  liabilities, so it costs a chain read rather than causing a bug.
+- **`gulp` is repurposed and effectively unreachable**: permissionless, always
+  returns zero, and raises `1200` while the reserve has any outstanding debt —
+  which is always, for a reserve anybody borrows from. Orphaned collateral is
+  dead capital, and the bot deliberately does not chase it.
+- **`bstop_rate` must be zero at initialize** (`1201` otherwise), which
+  `scripts/sandbox/deploy.sh` will have to satisfy before it can stand a fork
+  pool up.
+
 ## Workflow
 
 1. Branch → PR against `main`.
@@ -1161,5 +1278,11 @@ Status above for what remains.
   sandbox tier (`sandbox/`).
 - `tests/` — the fixtures the math is pinned against, and
   `liquidation_sandbox.rs`, the tier's one `#[ignore]`d end-to-end test.
-- `docs/` — design specs.
+- `docs/specs/` — the design specs, the durable half of the documentation
+  and the authority every plan argues from. Committed.
+- `docs/plans/` — per-phase implementation plans. Working documents that go
+  stale the moment their phase merges, so they are **gitignored**: kept on
+  disk for the phase that is running, never committed.
+- `docs/tmp/` — scratch: briefings and notes being worked through. Also
+  **gitignored**, and never a source of truth for anything.
 - `.github/workflows/` — CI, release automation and the nightly sandbox run.

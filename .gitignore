@@ -2,3 +2,14 @@
 .env
 *.log
 .claude/worktrees/
+
+# Scratch. `docs/tmp/` is a landing strip for briefings and notes being
+# worked through; nothing in it is a source of truth and nothing in it is
+# reviewed.
+/docs/tmp/
+
+# Implementation plans are per-phase working documents: they argue from a
+# spec in `docs/specs/`, which is the durable artefact, and they go stale
+# the moment their phase merges. Kept on disk for the phase that is running,
+# never committed.
+/docs/plans/

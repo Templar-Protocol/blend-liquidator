@@ -4,6 +4,11 @@
 **Status:** design approved section by section in review; written spec pending
 review
 **Predecessor:** [2026-09-03 repository scaffold](2026-09-03-blend-liquidator-scaffold-design.md)
+**Amended by:** [2026-09-20 ADR-0008 fork semantics](2026-09-20-adr-0008-fork-semantics.md),
+which moves the source of truth to `Templar-Protocol/blend-contracts-v2` and
+supersedes this document wherever the two disagree. Read it alongside this one:
+it is narrow, but it reaches §1's Blend invariants, §4's bad-debt decision,
+§5's fill ledger and health-bounded plan, and §12's phase list.
 
 ## What this is
 
@@ -779,7 +784,10 @@ dry-run against testnet:
    submitted.
 6. `unwind.rs`, `notifier.rs`, `metrics.rs`, `http.rs`, `check-config`.
 7. The sandbox integration tier and the dev-container additions.
-8. Documentation (`README`, `docs/configuration.md`, `docs/deploy.md`,
+8. The ADR-0008 fork reconciliation: the work listed in §4 of the fork
+   semantics amendment. It sequences *before* the documentation phase,
+   because documentation written first would describe stock semantics.
+9. Documentation (`README`, `docs/configuration.md`, `docs/deploy.md`,
    `docs/architecture.md`), `CHANGELOG`, the deployment contract, first
    release tag.
 
