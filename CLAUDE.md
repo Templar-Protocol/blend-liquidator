@@ -918,12 +918,14 @@ Status above for what remains.
   bid is not merely zero, it is *absent* (a zero amount is never stored),
   so the filler takes the whole lot and assumes no liability at all, and
   the auction stays fillable until `del_auction` becomes legal at 500. See
-  §2.5 and §4-F of `docs/specs/2026-09-20-adr-0008-fork-semantics.md`. `force_fill` means two things at once: fill past the
-  400th ledger at all, *and* cap both the profit delay and the health
-  escalation at 350 ledgers (`FORCE_FILL_MAX_DELAY`), so the fill happens
-  no later than that however little the lot then covers. What it does not
-  mean is "fill regardless of profit": the margin still decides *when*,
-  and the health floor still decides *whether*.
+  §2.5 and §4-F of `docs/specs/2026-09-20-adr-0008-fork-semantics.md`, which
+  narrow `force_fill` to its delay cap alone.
+  As it stands, `force_fill` means two things at once: fill past the 400th
+  ledger at all, *and* cap both the profit delay and the health escalation
+  at 350 ledgers (`FORCE_FILL_MAX_DELAY`), so the fill happens no later than
+  that however little the lot then covers. What it does not mean is "fill
+  regardless of profit": the margin still decides *when*, and the health
+  floor still decides *whether*.
 - `WITHDRAW_ALL` is `i64::MAX`, and that is the safe spelling of "all",
   not a saturation. `WithdrawCollateral` burns `min(to_b_token_up(amount),
   position)` and recomputes `tokens_out` from the cap, so any amount above
