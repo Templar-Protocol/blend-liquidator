@@ -965,6 +965,7 @@ fn draft(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::{ReserveConfig, ReserveData, SCALAR_12};
 
     /// The closed form is the smallest delay that meets the margin: it
     /// meets it, and the ledger before does not. `meets_margin` is
@@ -1086,6 +1087,139 @@ mod tests {
             100_000_000
         );
         assert_eq!(to_oracle_units(100_000_000, 1_000_000).unwrap(), 10_000_000);
+    }
+
+    /// A reserve at a non-unit `b_rate`, built by hand with no pool,
+    /// auction or filler position anywhere near it: [`supply_headroom`] is
+    /// private but not behind anything else, and calling it directly is
+    /// what actually pins its search against `to_b_token_down` and
+    /// `to_asset_from_b_token`, worked out longhand, rather than against
+    /// itself.
+    ///
+    /// The naive `supply_cap − total_supply()` this function's own doc
+    /// comment warns against does *not* breach the cap when followed —
+    /// minting rounds down and converting back rounds down again, so
+    /// `to_asset_from_b_token(to_b_token_down(a)) ≤ a` for every `a`, and
+    /// supplying exactly the naive estimate can only under-fill, never
+    /// over-fill. What it gets wrong is leaving real headroom unused: at
+    /// `b_rate = 1.1`, minting 10,000,000,000 underlying rounds down to
+    /// ⌊10,000,000,000 × 10 / 11⌋ = ⌊100,000,000,000 / 11⌋ = 9,090,909,090
+    /// b-tokens, which converts back to ⌊9,090,909,090 × 11 / 10⌋ =
+    /// ⌊99,999,999,990 / 10⌋ = 9,999,999,999 — one stroop short of
+    /// 10,000,000,000. So with a fresh reserve (`total_supply() = 0`) and
+    /// `supply_cap = 9,999,999,999`, the naive estimate is exactly
+    /// `9,999,999,999 − 0 = 9,999,999,999`: one stroop less than what the
+    /// reserve can actually still take. A regression that reverted
+    /// [`supply_headroom`] to that subtraction would return 9,999,999,999
+    /// here and fail this test's first assertion.
+    ///
+    /// One more stroop (10,000,000,001) mints ⌊100,000,000,010 / 11⌋ =
+    /// 9,090,909,091, which converts back to ⌊100,000,000,001 / 10⌋ =
+    /// 10,000,000,000 — over the cap — so 10,000,000,000 is not merely
+    /// safe, it is the most this reserve allows.
+    #[test]
+    fn supply_headroom_is_exact_not_naive_subtraction() {
+        let reserve = Reserve::new(
+            "X".to_string(),
+            ReserveConfig {
+                index: 0,
+                decimals: 7,
+                c_factor: 7_500_000,
+                l_factor: 7_500_000,
+                util: 0,
+                max_util: 9_500_000,
+                r_base: 0,
+                r_one: 0,
+                r_two: 0,
+                r_three: 0,
+                reactivity: 0,
+                supply_cap: 9_999_999_999,
+                enabled: true,
+            },
+            ReserveData {
+                d_rate: SCALAR_12,
+                // 1.1: not `SCALAR_12` exactly, so the two floors actually
+                // bite instead of cancelling.
+                b_rate: 1_100_000_000_000,
+                ir_mod: SCALAR_7,
+                b_supply: 0,
+                d_supply: 0,
+                backstop_credit: 0,
+                last_time: 0,
+            },
+        )
+        .expect("a test reserve");
+
+        // `wanted` well past any headroom, so the search runs rather than
+        // the `fits(wanted)` early return.
+        let headroom = supply_headroom(&reserve, 20_000_000_000).expect("a headroom");
+        assert_eq!(headroom, 10_000_000_000);
+
+        let naive = reserve
+            .config
+            .supply_cap
+            .checked_sub(reserve.total_supply().expect("total supply"))
+            .expect("no overflow in a test");
+        assert!(
+            headroom > naive,
+            "supply_headroom ({headroom}) must find the stroop the naive \
+             subtraction ({naive}) leaves on the table"
+        );
+
+        // Tight, not merely conservative: verified from the reserve's own
+        // conversions, not from `supply_headroom` itself. `headroom` fits;
+        // one more stroop does not.
+        let minted = reserve.to_b_token_down(headroom).expect("mint");
+        let after = reserve
+            .data
+            .b_supply
+            .checked_add(minted)
+            .expect("no overflow in a test");
+        assert!(
+            reserve.to_asset_from_b_token(after).expect("total supply")
+                <= reserve.config.supply_cap,
+            "the returned headroom must not itself breach the cap"
+        );
+        let minted_one_more = reserve.to_b_token_down(headroom + 1).expect("mint");
+        let after_one_more = reserve
+            .data
+            .b_supply
+            .checked_add(minted_one_more)
+            .expect("no overflow in a test");
+        assert!(
+            reserve
+                .to_asset_from_b_token(after_one_more)
+                .expect("total supply")
+                > reserve.config.supply_cap,
+            "one more stroop than the returned headroom should already breach the cap"
+        );
+
+        // A cap already strictly breached before any new supply — the
+        // pool's own cap lowered under what is already parked there, say
+        // — answers zero rather than a negative: 100 already supplied
+        // against a cap of 50 leaves no room for even the first stroop.
+        let breached = Reserve::new(
+            "Y".to_string(),
+            ReserveConfig {
+                supply_cap: 50,
+                ..reserve.config.clone()
+            },
+            ReserveData {
+                b_supply: 100,
+                b_rate: SCALAR_12,
+                ..reserve.data.clone()
+            },
+        )
+        .expect("a test reserve");
+        assert!(
+            breached.total_supply().expect("total supply") > breached.config.supply_cap,
+            "the fixture must actually start over its cap"
+        );
+        assert_eq!(
+            supply_headroom(&breached, 1_000).expect("a headroom"),
+            0,
+            "already over the cap: no more room, not a negative one"
+        );
     }
 }
 
