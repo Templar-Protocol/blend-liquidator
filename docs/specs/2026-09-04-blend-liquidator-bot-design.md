@@ -127,8 +127,8 @@ extension point (section 11) so it can be added without restructuring.
   complete, so a fill from there on takes the whole lot for nothing; the
   fill is still a position takeover that must pass the health check
   regardless. `force_fill` does not create a cutoff or remove one — the
-  contract never had one — it only caps the ledger a fill aims for at 350,
-  fill regardless of how little the lot covers by then.
+  contract never had one — it only caps the ledger a fill aims for at
+  350, filling regardless of how little the lot covers by then.
 - **State is rebuildable.** Everything in the store can be reconstructed from
   the seed source, the RPC's retained events, and chain reads. Durable state
   is a convenience for restarts and an audit trail, not a correctness

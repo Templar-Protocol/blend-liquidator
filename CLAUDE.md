@@ -885,16 +885,21 @@ Status above for what remains.
 - `getLedgerEntries` omits absent keys rather than returning nulls, so a
   lookup must go by key, never by position, and "the RPC returned fewer
   entries than keys" is the normal shape of "some of these do not exist".
-  It also caps a request at 200 keys, and `Filler::tick`'s snapshot key
-  list — the filler's own account plus every live auction's borrower,
-  since a full fill's own health projection needs the borrower's
-  positions (`math::setoff::project_default`) — is roughly `2 × reserves +
-  live auctions + 1`. A pool with around 180 simultaneously fillable
-  auctions exceeds the limit, and the whole pool is skipped for that tick
-  rather than the list capped: capping it would silently drop a borrower,
-  and a missing borrower is exactly the optimistic projection the haircut
-  modelling exists to close. Chunking the snapshot into several
-  `getLedgerEntries` calls is the real fix and is not done.
+  `RpcClient::ledger_entries` (`src/chain/rpc.rs:376`) already chunks a
+  request into `ENTRY_BATCH`-sized (200-key) batches, so there is no
+  key-count ceiling and nothing skips a pool for holding too many
+  auctions. What a longer key list costs instead: every batch must report
+  the same `latestLedger`, or the read is refused whole as
+  `ChainError::LedgerMoved` (`src/chain/pool.rs:304-334`) and
+  `PoolReader::snapshot` retries up to `SNAPSHOT_ATTEMPTS` (3) times. This
+  is pre-existing and applies to any snapshot, not only a wide one — but
+  `Filler::tick`'s snapshot key list now spans the filler's own account
+  *and* every live auction's borrower (`math::setoff::project_default`
+  needs the borrower's positions to project a full fill's own haircut),
+  so it spans more batches on a pool with many open auctions and is
+  correspondingly more likely to straddle a ledger close and pay for a
+  retry. It still fails closed — a `LedgerMoved` that survives every
+  retry is returned to the caller, never averaged across two ledgers.
 - The `sqlx::query!` macros in `src/store.rs` are checked at compile time,
   so a build needs either a live database (`make db-up && sqlx migrate run`)
   or the committed offline metadata in `.sqlx/` (`SQLX_OFFLINE=true`, which
@@ -919,9 +924,13 @@ Status above for what remains.
   concurrency — so it will be rediscovered by the next person who runs
   the suite locally rather than through `make check`. Separately, the
   lib **test** target needs a live `DATABASE_URL` even for a run that
-  touches no database: three test-only queries in `src/store.rs` are
-  absent from the committed `.sqlx/` offline cache, so `SQLX_OFFLINE=true`
-  alone does not compile it.
+  touches no database: `make sqlx-prepare` prepares `--lib --bins`, never
+  `--tests`, so every `sqlx::query!`/`query_scalar!` reachable only from
+  `#[cfg(test)]` code is absent from the committed `.sqlx/` offline
+  cache. `SQLX_OFFLINE=true cargo test --lib --no-run` fails on 56 such
+  queries across five files (`src/filler.rs` 19, `src/executor.rs` 14,
+  `src/auctioneer.rs` 9, `src/store.rs` 8, `src/service.rs` 6) — not a
+  handful in `store.rs` alone.
 - A `users` row exists only while the account owes something — the tracker
   deletes it the moment its liabilities empty — so `count(*)` on `users` is
   the number of positions that could be liquidated, not the number of
