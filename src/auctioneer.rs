@@ -508,6 +508,14 @@ impl<'a> Auctioneer<'a> {
     /// them — one user's failure is never allowed to withhold every other
     /// user's decision.
     ///
+    /// `is_own_account` is checked here, before the batch's snapshot is
+    /// read, not only inside `decide_one`: a user this check catches never
+    /// contributes a `positions` key to the read, and a batch made up
+    /// entirely of such users — the pool's own address, most often — never
+    /// calls `PoolReader::snapshot` at all. `decide_one` keeps the same
+    /// check as its own first guard regardless, so the rule holds for any
+    /// future caller of it that does not pre-filter.
+    ///
     /// A store failure is fatal to the whole batch: it means the bot cannot
     /// trust what it read about who to check or what is already open, and
     /// nothing downstream of that is safe to act on. A chain or math failure
@@ -524,18 +532,36 @@ impl<'a> Auctioneer<'a> {
         if users.is_empty() {
             return Ok(Vec::new());
         }
-        let accounts: Vec<&str> = users.iter().map(|user| user.account.as_str()).collect();
+
+        let mut decisions: Vec<Option<(String, Decision)>> = Vec::with_capacity(users.len());
+        let mut pending = Vec::new();
+        for user in users {
+            if self.is_own_account(pool, &user.account) {
+                decisions.push(Some((
+                    user.account.clone(),
+                    Decision::Skip(SkipReason::OwnAccount),
+                )));
+            } else {
+                decisions.push(None);
+                pending.push(decisions.len() - 1);
+            }
+        }
+        if pending.is_empty() {
+            return Ok(decisions.into_iter().flatten().collect());
+        }
+
+        let accounts: Vec<&str> = pending.iter().map(|&i| users[i].account.as_str()).collect();
         let snapshot = PoolReader::new(self.rpc, pool).snapshot(&accounts).await?;
         let valued_at = snapshot.valued_at(tick.close_time);
         let reserves = snapshot.accrued_reserves(valued_at)?;
 
-        let mut decisions = Vec::with_capacity(users.len());
-        for user in users {
+        for i in pending {
+            let user = &users[i];
             match self
                 .decide_one(pool, &user.account, &snapshot, &reserves, valued_at)
                 .await
             {
-                Ok(decision) => decisions.push((user.account.clone(), decision)),
+                Ok(decision) => decisions[i] = Some((user.account.clone(), decision)),
                 Err(AuctioneerError::Store(error)) => return Err(AuctioneerError::Store(error)),
                 Err(error) => {
                     tracing::warn!(
@@ -547,7 +573,25 @@ impl<'a> Auctioneer<'a> {
                 }
             }
         }
-        Ok(decisions)
+        Ok(decisions.into_iter().flatten().collect())
+    }
+
+    /// Whether `account` needs no decision at all: the pool contract's own
+    /// address, or one this bot signs with.
+    ///
+    /// The pool contract is a `Positions` holder on the fork this bot
+    /// targets: a defaulting borrower's leftover collateral is confiscated
+    /// into the pool's own address as ordinary supply
+    /// (`pool/src/pool/bad_debt.rs:98-109`). It holds no liabilities, so
+    /// there is nothing to liquidate, and the contract refuses
+    /// `user == e.current_contract_address()` with 1211 in any case — but a
+    /// seed source that lists the pool would otherwise cost a chain read
+    /// and a decision every scan. Checked against `pool` rather than folded
+    /// into `own_addresses`: that set is bot-wide, built once per run from
+    /// the signing keys, while a pool address is meaningful only to the
+    /// pool being decided, and this bot follows several.
+    fn is_own_account(&self, pool: &str, account: &str) -> bool {
+        account == pool || self.config.own_addresses.contains(account)
     }
 
     /// One borrower's decision against an already-read `snapshot` and its
@@ -563,7 +607,10 @@ impl<'a> Auctioneer<'a> {
         reserves: &BTreeMap<u32, Reserve>,
         valued_at: u64,
     ) -> Result<Decision, AuctioneerError> {
-        if self.config.own_addresses.contains(account) {
+        // See `is_own_account`'s doc: `decide` already filters this case
+        // out before any chain read, but the guard stays here too, as the
+        // definitive per-account rule for any future caller that does not.
+        if self.is_own_account(pool, account) {
             return Ok(Decision::Skip(SkipReason::OwnAccount));
         }
         // The store, not the chain: the tracker maintains this table from
@@ -1790,6 +1837,27 @@ mod tests {
             vec![(USER_ONE.to_string(), Decision::Skip(SkipReason::OwnAccount))],
             "USER_ONE is healthy anyway, so a wrong check here would still \
              pass by accident unless it runs before the health factor is read"
+        );
+        Ok(())
+    }
+
+    /// The pool contract holds positions of its own on the fork —
+    /// confiscated collateral lands there as `supply` — so a seed source
+    /// that lists it would otherwise cost a chain read and a decision
+    /// every scan. The contract refuses to liquidate itself (1211).
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_pool_itself_is_never_a_borrower(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let auctioneer = Auctioneer::new(&client, &store, config(BTreeSet::new()), None);
+        let decisions = auctioneer
+            .decide(POOL, &[tracked_user(POOL)], harness::fixture_tick())
+            .await
+            .expect("decide");
+        assert_eq!(
+            decisions,
+            vec![(POOL.to_string(), Decision::Skip(SkipReason::OwnAccount))]
         );
         Ok(())
     }

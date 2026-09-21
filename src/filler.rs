@@ -747,7 +747,16 @@ impl<'a> Filler<'a> {
         if row.auction_type != AuctionType::UserLiquidation {
             return false;
         }
-        if self.config.own_addresses.contains(&row.account) {
+        // The pool contract is a `Positions` holder on the fork this bot
+        // targets: a defaulting borrower's leftover collateral is
+        // confiscated into the pool's own address as ordinary supply. It
+        // never holds liabilities, so there is never an auction against it
+        // in practice, but a row that somehow named it is worth nothing to
+        // chase. Compared against `pool.address` rather than folded into
+        // `own_addresses`: that set is bot-wide, built once per run from
+        // the signing keys, while a pool address is meaningful only to the
+        // pool this row belongs to, and this bot follows several.
+        if row.account == pool.address || self.config.own_addresses.contains(&row.account) {
             return false;
         }
         let bid: Vec<&str> = row.bid.keys().map(String::as_str).collect();
@@ -3604,6 +3613,49 @@ mod tests {
             skip_count(&metrics, SkipLabel::Unfunded)
                 + skip_count(&metrics, SkipLabel::ContractError),
             0
+        );
+        Ok(())
+    }
+
+    /// The pool contract holds positions of its own on the fork —
+    /// confiscated collateral lands there as `supply` — so a row that
+    /// somehow named the pool as the auctioned account costs no chain
+    /// read either, the same as the bot's own account.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_pool_itself_is_never_considered(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let pool_owns_it = auction(tick.sequence - 300);
+        store
+            .upsert_auction(&tracked(harness::POOL, &pool_owns_it))
+            .await
+            .expect("seed the pool's own row");
+        let rpc = ScriptedRpc::start().await;
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let pools = vec![pool_config()];
+        let metrics = metrics();
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            filler_config(),
+            Executor::new(&store, None, true),
+            Inventory::new(XLM.to_string(), 0),
+            notifier(),
+            Arc::clone(&metrics),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+
+        let summary = filler
+            .tick(&mut state, tick, true, None, &shutdown)
+            .await
+            .expect("tick");
+
+        assert_eq!(summary, TickSummary::default());
+        assert!(
+            rpc.received().await.is_empty(),
+            "the pool's own address costs no chain read, the same as the bot's own account"
         );
         Ok(())
     }
