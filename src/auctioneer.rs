@@ -51,7 +51,9 @@ use crate::store::{
 };
 
 /// `PoolError::InvalidLiqTooLarge`: the liquidation would leave the
-/// borrower's health factor at or above `1.15`, so the percent is too high.
+/// borrower's health factor above `1.15` — the contract's own comparison
+/// is strict, so it accepts exactly `1.15` — meaning the percent is too
+/// high.
 const INVALID_LIQ_TOO_LARGE: u32 = 1_213;
 
 /// `PoolError::InvalidLiqTooSmall`: the liquidation would leave the
@@ -1033,8 +1035,8 @@ impl<'a> Auctioneer<'a> {
     /// transaction unsigned: the walk may run in dry-run precisely because
     /// nothing in it signs, restores or sends.
     /// `InvalidLiqTooSmall` (1214, the post-liquidation health factor below
-    /// `1.03`) raises the percent by one; `InvalidLiqTooLarge` (1213, at or
-    /// above `1.15`) lowers it by one — `checked_add`/`checked_sub` and a
+    /// `1.03`) raises the percent by one; `InvalidLiqTooLarge` (1213, above
+    /// `1.15`) lowers it by one — `checked_add`/`checked_sub` and a
     /// [`FillPercent`] range check rather than raw arithmetic, so the walk
     /// can never wrap past `1..=100` and a percent that would leave that
     /// range ends the walk at once instead of retrying a value the contract
