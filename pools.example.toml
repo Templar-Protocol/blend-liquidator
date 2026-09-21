@@ -34,20 +34,35 @@ min_health_factor = 1.5
 # basis points.
 default_profit_bps = 1000
 
-# Fill this pool's auctions on the auction's schedule rather than on
-# profit's. An auction's lot ramps up over its first 200 ledgers and its bid
-# ramps down to nothing over the next 200; the filler normally waits for the
-# ledger at which the lot covers the bid plus the profit rules below, and
-# will not fill past the auction's 400th ledger at all. force_fill changes
-# both ends: the fill happens no later than 350 ledgers into the auction,
-# however little the lot covers by then, and an auction already past its
-# 400th ledger is filled rather than skipped.
+# Fill this pool's auctions at a fixed delay rather than waiting on
+# fill_objective below. An auction's lot ramps up over its first 200 ledgers
+# and its bid ramps down to nothing over the next 200; there is no cutoff
+# after that — the contract will still take a fill at ledger 500 or 5,000 —
+# so force_fill's only effect is a cap: the fill happens no later than 350
+# ledgers into the auction, however little the lot covers by then, whichever
+# ledger fill_objective would otherwise have picked.
 #
 # It does not waive the health check — a fill is a position takeover, and
 # min_health_factor above still binds every plan. For exercising a pool's
 # wiring end to end, not for production: the 350-ledger cap is the one
 # thing that will take a fill at whatever the lot covers by then.
 force_fill = false
+
+# Which ledger a fill aims at, before force_fill's cap (if any) is applied.
+# An auction's bid ramps down to nothing by its 400th ledger, and from there
+# the contract does not merely price it at zero: the bid is absent, so the
+# filler takes the whole lot and assumes no liability at all. There is no
+# cutoff after that ledger — the contract will still accept a fill at 500 or
+# 5,000 — only nothing further to gain by waiting past it.
+#
+# "free-fill" (the default) waits for that ledger: the most the auction can
+# pay, at the price of being the last to get it — anyone willing to pay a
+# real bid can fill first, so this is a bet that nothing else is watching
+# this pool. "earliest-profitable" instead fills at the first ledger the lot
+# covers the bid plus default_profit_bps (or the matching rule below): less
+# profit per fill, but the fill actually happens where competition for the
+# auction is real.
+fill_objective = "free-fill"
 
 # Assets the bot will pay as the auction's bid, or ["*"] for any reserve.
 # Every entry here must be a reserve of the pool.

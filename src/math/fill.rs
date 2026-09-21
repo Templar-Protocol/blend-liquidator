@@ -160,6 +160,29 @@ pub fn to_oracle_units(value: i128, oracle_scalar: i128) -> Result<i128, MathErr
     mul_floor(value, oracle_scalar, SCALAR_7)
 }
 
+/// Which ledger a fill aims at.
+///
+/// The auction's lot ramps to whole over its first 200 ledgers while the
+/// bid stays whole; from 200 the bid decays to nothing by 400. From 400 on
+/// the scaled bid is not merely zero but **absent** — the contract never
+/// stores a zero amount — so the filler takes the whole lot and assumes no
+/// liability at all, and there is no cutoff after which the fill stops
+/// being legal.
+///
+/// The two objectives are a bet on competition, not on arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FillObjective {
+    /// Wait for the ledger the bid is gone, taking the whole lot for
+    /// nothing. The most the auction can pay, and the last to get it:
+    /// anyone willing to pay a real bid can fill first.
+    #[default]
+    FreeFill,
+    /// Fill at the earliest ledger the lot covers the bid plus the pool's
+    /// margin. Less profit per fill, and the fill actually happens where
+    /// others are competing for it.
+    EarliestProfitable,
+}
+
 /// What the pool and the operator hold one fill to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FillTerms {
@@ -179,8 +202,13 @@ pub struct FillTerms {
     pub health_floor: i128,
     /// The margin [`fill_delay`] waits for, in basis points.
     pub profit_bps: u32,
-    /// Fill by [`FORCE_FILL_MAX_DELAY`], and past the auction's end at all.
+    /// Fill by [`FORCE_FILL_MAX_DELAY`] whatever the economics, capping
+    /// whichever ledger `objective` picks.
     pub force_fill: bool,
+    /// Which ledger to aim at before `force_fill`'s cap is applied. See
+    /// [`FillObjective`]; the config-file spelling lives in
+    /// `crate::config::PoolConfig::fill_objective`.
+    pub objective: FillObjective,
     /// How many rounds of supply → percent → delay the plan may take.
     ///
     /// Never zero: the rounds run `0..plan_iterations`, so a zero would
@@ -287,8 +315,6 @@ pub struct FillDraft {
 pub enum FillSkip {
     /// The lot is worth nothing at the oracle's prices.
     Unprofitable,
-    /// Past its 400th ledger, in a pool that is not `force_fill`.
-    PastAuctionEnd,
     /// The fill would take the filler past the pool's `max_positions`.
     TooManyPositions,
     /// More of the primary asset would have closed the shortfall, and the
@@ -318,13 +344,21 @@ const SUPPLY_ROUNDING_ALLOWANCE: i128 = 2;
 
 /// Plans one fill (spec §5, "Health-bounded plan").
 ///
-/// 1. Value the whole auction. A lot worth nothing is `Unprofitable`. An
-///    auction whose earliest ledger is more than 400 past its start is
-///    `PastAuctionEnd` unless the pool is `force_fill` (spec §1).
-/// 2. The first candidate is `start + fill_delay(...)`, moved to the
-///    earliest ledger if it has already passed, at `max_percent`. The
-///    latest a candidate may be is `start + 350` under `force_fill`, else
-///    `start + 400` — or the earliest ledger, when that is already later.
+/// 1. Value the whole auction. A lot worth nothing is `Unprofitable`.
+///    Otherwise the delay is `terms.objective`'s: `FreeFill` aims at
+///    `RAMP_END_BLOCKS` (400), where the bid has ramped away to nothing and
+///    the lot is whole — the contract has no fill cutoff, so there is
+///    nothing left to wait for past it; `EarliestProfitable` is
+///    `fill_delay(...)`, the earliest ledger the lot covers the bid plus
+///    the margin. `force_fill` then caps whichever the objective picked at
+///    `FORCE_FILL_MAX_DELAY` (350) — narrower than either, and the one
+///    thing it still does.
+/// 2. The first candidate is `start + delay`, moved to the earliest ledger
+///    if it has already passed, at `max_percent`. The latest a candidate
+///    may be is `start + 350` under `force_fill`, else `start + 400` — or
+///    the earliest ledger, when that is already later: `last` is a search
+///    bound, not a refusal, since nothing past 400 improves a fill either
+///    objective would take.
 /// 3. Each round (at most `plan_iterations`) projects the candidate
 ///    exactly: the fill's scaled lot and bid added to the filler's
 ///    positions; `Repay` of each bid asset the wallet holds, the scaled
@@ -346,13 +380,14 @@ const SUPPLY_ROUNDING_ALLOWANCE: i128 = 2;
 /// 5. Out of rounds or candidates: `Unfunded` if the wallet capped a
 ///    supply along the way, else `Health`.
 ///
-/// A plan that is not `force_fill` may land on exactly `start + 400`,
-/// where the bid modifier has already reached zero, and it is meant to:
-/// step 1's gate is `> 400` and it is asked at *planning* time, while the
-/// transaction is sent at the earliest ledger it could land in, so such a
-/// fill applies at 401 or later. Nothing is lost by that — from block 400
-/// on the bid is nothing and the lot is whole — and landing later than the
-/// candidate only improves the fill.
+/// A `FreeFill` candidate can land anywhere at or past `start + 400`: the
+/// transaction is sent at the earliest ledger it could land in, which is
+/// later than the candidate whenever this auction was first read well past
+/// its ramp. Nothing is lost by that — from block 400 on the bid is nothing
+/// and the lot is whole regardless of which ledger past it a fill actually
+/// lands on — and there is no ledger past which the fill stops being legal
+/// (spec §2.5; past 500 `delete_stale_auction` becomes callable, which the
+/// filler warns about separately rather than refusing here).
 ///
 /// Whatever a round or a search produces is still refused as
 /// `Unprofitable` when its own lot no longer covers its own bid: step 1
@@ -379,16 +414,25 @@ pub fn plan_fill(terms: &FillTerms, inputs: &FillInputs<'_>) -> Result<PlannedFi
     }
     let start = inputs.auction.block;
     let earliest = inputs.earliest_ledger.max(start);
-    // `earliest >= start` by the line above.
-    if earliest - start > RAMP_END_BLOCKS && !terms.force_fill {
-        return Ok(PlannedFill::Skip(FillSkip::PastAuctionEnd));
-    }
-    let delay = fill_delay(
-        whole.collateral_raw,
-        whole.liability_raw,
-        terms.profit_bps,
-        terms.force_fill,
-    )?;
+    let delay = match terms.objective {
+        // From `RAMP_END_BLOCKS` on the bid is absent and the lot is
+        // whole: the most the auction can pay, and nothing later improves
+        // it.
+        FillObjective::FreeFill => RAMP_END_BLOCKS,
+        FillObjective::EarliestProfitable => fill_delay(
+            whole.collateral_raw,
+            whole.liability_raw,
+            terms.profit_bps,
+            terms.force_fill,
+        )?,
+    };
+    // `force_fill` is the narrower window and keeps winning: it means fill
+    // by 350 whatever the economics, whichever ledger the objective picked.
+    let delay = if terms.force_fill {
+        delay.min(FORCE_FILL_MAX_DELAY)
+    } else {
+        delay
+    };
     let ledger = start
         .checked_add(delay)
         .ok_or(MathError::Overflow)?
@@ -1066,7 +1110,9 @@ mod plan_tests {
     }
 
     /// Floor 1.1, 10% margin, XLM as the primary asset, $100 of minimum
-    /// collateral.
+    /// collateral. `EarliestProfitable` so every test below that predates
+    /// the objective keeps its own ledger arithmetic; the objective's own
+    /// tests override it.
     fn terms() -> FillTerms {
         FillTerms {
             min_collateral: 1_000_000_000,
@@ -1076,6 +1122,7 @@ mod plan_tests {
             health_floor: 11_000_000,
             profit_bps: 1_000,
             force_fill: false,
+            objective: FillObjective::EarliestProfitable,
             plan_iterations: 5,
         }
     }
@@ -1449,40 +1496,91 @@ mod plan_tests {
         assert_eq!(planned, PlannedFill::Skip(FillSkip::TooManyPositions));
     }
 
-    /// Spec §1: past its 400th ledger an auction is filled only under
-    /// `force_fill` — and then at once, with the bid at zero.
+    /// The contract has no fill cutoff: `fill_auction` guards only the
+    /// auction type and `user == filler`, and `delete_stale_auction`
+    /// merely becomes callable at 500. An auction first seen well past 400
+    /// is the cheapest fill there is — the bid is absent — and refusing it
+    /// gives that away.
     #[test]
-    fn past_its_end_only_a_force_fill_pool_fills() {
+    fn an_auction_past_400_is_planned_not_refused() {
         let pool = pool();
-        let late = START + 401;
-        let planned = plan(
-            &terms(),
+        let terms = FillTerms {
+            objective: FillObjective::FreeFill,
+            ..terms()
+        };
+        let draft = draft(plan(
+            &terms,
             &pool,
             &well_collateralised(),
             &BTreeMap::new(),
             &auction(),
-            late,
+            START + 450,
             percent(100),
+        ));
+        assert_eq!(draft.fill_ledger, START + 450);
+        assert!(
+            draft.to_fill.bid.is_empty(),
+            "the bid has ramped away to nothing"
         );
-        assert_eq!(planned, PlannedFill::Skip(FillSkip::PastAuctionEnd));
-        let forced = FillTerms {
+    }
+
+    /// `FreeFill` aims at the first ledger the bid is gone, however early
+    /// the lot alone would already cover the bid plus the margin.
+    #[test]
+    fn free_fill_targets_block_400() {
+        let pool = pool();
+        let free = FillTerms {
+            objective: FillObjective::FreeFill,
+            ..terms()
+        };
+        let waited = draft(plan(
+            &free,
+            &pool,
+            &Positions::default(),
+            &BTreeMap::new(),
+            &auction(),
+            START + 1,
+            percent(100),
+        ));
+        assert_eq!(waited.fill_ledger, START + RAMP_END_BLOCKS);
+
+        let earliest_profitable = draft(plan(
+            &terms(),
+            &pool,
+            &Positions::default(),
+            &BTreeMap::new(),
+            &auction(),
+            START + 1,
+            percent(100),
+        ));
+        assert!(
+            earliest_profitable.fill_ledger < waited.fill_ledger,
+            "{} should be strictly earlier than {}",
+            earliest_profitable.fill_ledger,
+            waited.fill_ledger
+        );
+    }
+
+    /// `force_fill` is the narrower window and keeps winning over either
+    /// objective: it means fill by 350 whatever the economics.
+    #[test]
+    fn force_fill_still_caps_the_delay_at_350() {
+        let pool = pool();
+        let terms = FillTerms {
+            objective: FillObjective::FreeFill,
             force_fill: true,
             ..terms()
         };
         let draft = draft(plan(
-            &forced,
+            &terms,
             &pool,
             &well_collateralised(),
             &BTreeMap::new(),
             &auction(),
-            late,
+            START + 1,
             percent(100),
         ));
-        assert_eq!(draft.fill_ledger, late);
-        assert!(
-            draft.to_fill.bid.is_empty(),
-            "the bid has ramped to nothing"
-        );
+        assert_eq!(draft.fill_ledger, START + FORCE_FILL_MAX_DELAY);
     }
 
     /// $100 of lot against $1,000 of bid would wait 382 ledgers for its

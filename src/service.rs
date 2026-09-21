@@ -2904,6 +2904,7 @@ mod tests {
     use crate::config::{ChainConfig, RunMode, Secret};
     use crate::fixture::{mainnet_fixed_v2, text};
     use crate::harness;
+    use crate::math::fill::FillObjective;
     use crate::math::AuctionData;
     use crate::store::TrackedAuction;
     use std::collections::BTreeMap;
@@ -3123,6 +3124,13 @@ mod tests {
             min_health_factor: 15_000_000,
             default_profit_bps: 0,
             force_fill: false,
+            // Deliberately not the crate's own default (`FreeFill`): none
+            // of this fixture's callers are testing which ledger a fill
+            // aims at, and `FreeFill` would move every one of their fill
+            // ledgers out to `start + RAMP_END_BLOCKS`, which is a fact
+            // about the objective, not about whatever each test's name
+            // says it is checking.
+            fill_objective: FillObjective::EarliestProfitable,
             supported_bid: bid.iter().map(|asset| (*asset).to_string()).collect(),
             supported_lot: lot.iter().map(|asset| (*asset).to_string()).collect(),
             profits: Vec::new(),
@@ -6666,6 +6674,14 @@ mod tests {
             min_health_factor: 15_000_000,
             default_profit_bps: 1_000,
             force_fill: false,
+            // Deliberately not the crate's own default (`FreeFill`): the
+            // tests built on this fixture (startup delay, the published
+            // tick, unwind timing) are about the loop's wiring, not about
+            // which ledger a fill aims at, and their expected fill ledgers
+            // are `EarliestProfitable`'s. `FreeFill` would move every one
+            // of them out to `start + RAMP_END_BLOCKS` for no reason the
+            // test's own name explains.
+            fill_objective: FillObjective::EarliestProfitable,
             supported_bid: vec!["*".to_string()],
             supported_lot: vec!["*".to_string()],
             profits: Vec::new(),

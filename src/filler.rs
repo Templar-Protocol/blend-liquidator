@@ -99,6 +99,13 @@ use crate::store::{Store, StoreError, TrackedAuction};
 /// 12), and it lowers it from whatever the contract refused.
 const WHOLE_AUCTION: u32 = 100;
 
+/// The auction age, in ledgers past its start, at which
+/// `delete_stale_auction` stops refusing and becomes callable by anyone.
+/// Not a fill bound — the contract has none — but a plan aimed at or past
+/// it is racing a deletion, not just another filler, so it is worth a
+/// warning.
+const STALE_AUCTION_BLOCKS: u32 = 500;
+
 /// The longest an unwind pass that keeps making no progress is held off
 /// for, in ledgers. The backoff doubles from two, so this is reached on
 /// the sixth consecutive setback and never exceeded.
@@ -457,14 +464,11 @@ fn due(
 ///
 /// Exhaustive on purpose — a new [`FillSkip`] must be given a label here
 /// rather than silently joining whichever one a catch-all arm named.
-/// [`FillSkip::PastAuctionEnd`] is `Unprofitable` because that is what it
-/// is: the ramp is over, so there is nothing left to wait for and the lot
-/// is whatever it is. [`FillSkip::TooManyPositions`] is `Health` because
-/// what it refuses is the filler's own position, exactly as the floor
-/// does.
+/// [`FillSkip::TooManyPositions`] is `Health` because what it refuses is
+/// the filler's own position, exactly as the floor does.
 fn skip_label(reason: FillSkip) -> SkipLabel {
     match reason {
-        FillSkip::Unprofitable | FillSkip::PastAuctionEnd => SkipLabel::Unprofitable,
+        FillSkip::Unprofitable => SkipLabel::Unprofitable,
         FillSkip::TooManyPositions | FillSkip::Health => SkipLabel::Health,
         FillSkip::Unfunded => SkipLabel::Unfunded,
     }
@@ -947,6 +951,7 @@ impl<'a> Filler<'a> {
             health_floor: context.health_floor,
             profit_bps: context.pool.profit_bps(&bid, &lot),
             force_fill: context.pool.force_fill,
+            objective: context.pool.fill_objective,
             plan_iterations: self.config.plan_iterations,
         }
     }
@@ -1265,6 +1270,20 @@ impl<'a> Filler<'a> {
         queue: Option<&SubmissionQueue>,
         pass: &mut Pass<'_>,
     ) -> Result<Option<ExecOutcome>, FillerError> {
+        // From 500 on, `delete_stale_auction` stops refusing. It is
+        // permissionless and deletes nothing by itself, so this is not a
+        // refusal — but a plan aimed past it is racing anyone willing to
+        // spend a transaction removing the auction, not just another
+        // filler.
+        if draft.fill_ledger.saturating_sub(start_ledger) >= STALE_AUCTION_BLOCKS {
+            tracing::warn!(
+                pool = %row.pool,
+                account = %row.account,
+                fill_ledger = draft.fill_ledger,
+                start_ledger,
+                "this auction is old enough for anyone to delete; the fill races a deletion"
+            );
+        }
         let priority = match self.priority(context, draft) {
             Ok(priority) => priority,
             Err(error) => {
@@ -2023,7 +2042,7 @@ mod tests {
         self, contract_entry_xdr, entry, filler_signer, instance_entry_xdr, positions_entry_xdr,
         script_empty_wallet, script_snapshot_positions, simulation, tx_config, BLND, POOL_TWO,
     };
-    use crate::math::fill::FillAction;
+    use crate::math::fill::{FillAction, FillObjective};
     use crate::math::unwind::UnwindAction;
     use crate::notifier::{NotificationChannel, NotifyError, NOTIFY_IN_FLIGHT};
     use stellar_xdr::{
@@ -2083,18 +2102,13 @@ mod tests {
             .expect("the profit total is always rendered")
     }
 
-    /// Every [`FillSkip`] has its own label, and the two pairs that share
-    /// one share it on purpose: a fill past the ramp's end is the
-    /// unprofitable case with nothing left to wait for, and one that would
-    /// take the filler past `max_positions` is refused by the filler's own
-    /// position exactly as the health floor refuses it.
+    /// Every [`FillSkip`] has its own label, and the one pair that shares
+    /// one shares it on purpose: a fill that would take the filler past
+    /// `max_positions` is refused by the filler's own position exactly as
+    /// the health floor refuses it.
     #[test]
     fn every_planner_skip_has_a_label() {
         assert_eq!(skip_label(FillSkip::Unprofitable), SkipLabel::Unprofitable);
-        assert_eq!(
-            skip_label(FillSkip::PastAuctionEnd),
-            SkipLabel::Unprofitable
-        );
         assert_eq!(skip_label(FillSkip::TooManyPositions), SkipLabel::Health);
         assert_eq!(skip_label(FillSkip::Health), SkipLabel::Health);
         assert_eq!(skip_label(FillSkip::Unfunded), SkipLabel::Unfunded);
@@ -2183,11 +2197,16 @@ mod tests {
     async fn a_post_read_skip_is_keyed_by_the_chain_auction(db: sqlx::PgPool) -> sqlx::Result<()> {
         let store = Store::from_pool(db);
         let tick = harness::fixture_tick();
-        // Both past the ramp's 400th ledger in a pool that is not
-        // `force_fill`, so every plan of either is `PastAuctionEnd` — a
-        // planner skip, which is the first of the post-read sites.
-        let old = auction(tick.sequence - 600);
-        let new = auction(tick.sequence - 500);
+        // A lot worth nothing at the oracle's prices, so every plan of
+        // either is `Unprofitable` — a planner skip, which is the first of
+        // the post-read sites — independent of when each is read.
+        let worthless = |block: u32| AuctionData {
+            bid: BTreeMap::from([(USDC.to_string(), BID)]),
+            lot: BTreeMap::from([(XLM.to_string(), 1)]),
+            block,
+        };
+        let old = worthless(tick.sequence - 600);
+        let new = worthless(tick.sequence - 500);
         store
             .upsert_auction(&tracked(harness::USER_ONE, &old))
             .await
@@ -2221,7 +2240,7 @@ mod tests {
                 skipped: 1,
                 ..TickSummary::default()
             },
-            "the auction the chain holds is past its ramp, and the planner says so"
+            "the auction the chain holds has a worthless lot, and the planner says so"
         );
         assert_eq!(skip_count(&metrics, SkipLabel::Unprofitable), 1);
 
@@ -2490,6 +2509,7 @@ mod tests {
             min_health_factor: 15_000_000,
             default_profit_bps: 1_000,
             force_fill: false,
+            fill_objective: FillObjective::EarliestProfitable,
             supported_bid: vec!["*".to_string()],
             supported_lot: vec!["*".to_string()],
             profits: Vec::new(),

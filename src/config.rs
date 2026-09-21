@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 
+use crate::math::fill::FillObjective;
 use crate::LiquidatorError;
 
 /// Parse only the literal strings `true` and `false`.
@@ -231,6 +232,10 @@ pub struct PoolConfig {
     pub default_profit_bps: u32,
     /// Fill regardless of profit. For testing a pool, not for production.
     pub force_fill: bool,
+    /// Which ledger a fill aims at: the free-fill point at block 400, or
+    /// the earliest ledger the lot covers the bid plus the margin. See
+    /// `crate::math::fill::FillObjective`.
+    pub fill_objective: FillObjective,
     /// Bid assets the bot will pay, or `["*"]`.
     pub supported_bid: Vec<String>,
     /// Lot assets the bot will take, or `["*"]`.
@@ -249,6 +254,8 @@ struct RawPool {
     default_profit_bps: u32,
     #[serde(default)]
     force_fill: bool,
+    #[serde(default)]
+    fill_objective: Option<String>,
     supported_bid: Vec<String>,
     supported_lot: Vec<String>,
     #[serde(default)]
@@ -308,6 +315,19 @@ pub fn parse_pools(text: &str) -> Result<Vec<PoolConfig>, LiquidatorError> {
                 pool.address
             )));
         }
+        let fill_objective = match pool.fill_objective.as_deref() {
+            None | Some("free-fill") => FillObjective::FreeFill,
+            Some("earliest-profitable") => FillObjective::EarliestProfitable,
+            Some(other) => {
+                return Err(LiquidatorError::Config(format!(
+                    "pools file: pool {}: `{other}` is not a fill_objective: it is \
+                     `free-fill` (the default, which waits for the ledger the bid is gone) \
+                     or `earliest-profitable` (which fills as soon as the lot covers the bid \
+                     plus the pool's margin)",
+                    pool.address
+                )));
+            }
+        };
         pools.push(PoolConfig {
             address: pool.address,
             primary_asset: pool.primary_asset,
@@ -315,6 +335,7 @@ pub fn parse_pools(text: &str) -> Result<Vec<PoolConfig>, LiquidatorError> {
             min_health_factor: pool.min_health_factor.get(),
             default_profit_bps: pool.default_profit_bps,
             force_fill: pool.force_fill,
+            fill_objective,
             supported_bid: pool.supported_bid,
             supported_lot: pool.supported_lot,
             profits: pool.profits,
@@ -1737,6 +1758,30 @@ supported_lot = ["*"]
         assert_eq!(pool.supported_lot, ["*"]);
         assert_eq!(pool.profits.len(), 1);
         assert_eq!(pool.profits[0].profit_bps, 500);
+    }
+
+    #[test]
+    fn the_fill_objective_defaults_to_the_free_fill_and_rejects_nonsense() {
+        let pools = parse_pools(POOLS).expect("the example parses");
+        assert_eq!(pools[0].fill_objective, FillObjective::FreeFill);
+
+        let named = POOLS.replace(
+            "force_fill = false",
+            "force_fill = false\nfill_objective = \"earliest-profitable\"",
+        );
+        assert_eq!(
+            parse_pools(&named).expect("parses")[0].fill_objective,
+            FillObjective::EarliestProfitable
+        );
+
+        let bad = POOLS.replace(
+            "force_fill = false",
+            "force_fill = false\nfill_objective = \"whenever\"",
+        );
+        assert!(parse_pools(&bad)
+            .expect_err("nonsense is refused")
+            .to_string()
+            .contains("fill_objective"));
     }
 
     #[test]
