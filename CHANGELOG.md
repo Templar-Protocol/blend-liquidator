@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-21
+
+The first release: a Blend v2 liquidation bot targeting the ADR-0008
+security fork of the Blend contracts (`Templar-Protocol/blend-contracts-v2`)
+and also running against stock pools, dry-run by default. This being the
+first release, the `Changed` entries below record how behaviour settled
+during development rather than a difference from an earlier release.
+
 ### Added
 
 - The ADR-0008 fork reconciliation (`docs/specs/2026-09-20-adr-0008-fork-semantics.md`
@@ -650,6 +658,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Dependabot ignores it, since a bump of it alone only adds a second copy;
   the check fails unless `Cargo.lock` holds exactly one — two is the signal
   to bump it in the same PR as a `stellar-xdr` that moves its own.
+- The documentation set: `docs/configuration.md` (every setting, its
+  default and bound), `docs/deploy.md` (the operator's guide from
+  pulling the image to running it armed), `docs/deployment-contract.md`
+  (what the image guarantees and what a deployment must provide) and
+  `docs/architecture.md` (the one-sitting overview), plus
+  `the_configuration_documents_cover_exactly_the_real_settings`
+  (`src/config.rs`), a test that fails unless the reference and
+  `.env.example` name exactly the real settings.
+- SIGPIPE-safe `grep` pipelines in `scripts/check-repo-invariants.sh` and
+  `scripts/check-release.sh`: a `grep -q` consumer under `pipefail` could
+  read its upstream's `SIGPIPE` exit as a failed match even though the
+  pattern was found.
+- The Dockerfile's `HEALTHCHECK` comment, corrected: it predated `/livez`
+  and never explained why the check isn't wired to it.
 
 ### Changed
 
