@@ -140,8 +140,8 @@ contract's own logic:
 
 The source of truth for pool behaviour is
 `Templar-Protocol/blend-contracts-v2`, the ADR-0008/ADR-0011 security
-fork — not the `blend-capital/blend-contracts-v2` stock contract Phases 1
-through 7 were built against. Most of the fork is byte-identical to stock,
+fork — not the stock `blend-capital/blend-contracts-v2`. Most of the fork
+is byte-identical to stock,
 including all of this crate's arithmetic port. What differs, and what the
 bot does about each difference, is written down in
 `docs/specs/2026-09-20-adr-0008-fork-semantics.md`; in short:
