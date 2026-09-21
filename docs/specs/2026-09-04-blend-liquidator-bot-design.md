@@ -431,14 +431,21 @@ then to base value at oracle prices, both raw and effective. The profit margin
 
 ### Fill ledger
 
-The fill delay `d` is the smallest value in `0..=400` such that
+Which ledger a fill aims at is the pool's `fill_objective` (section 6). Under
+`free-fill`, the default, the delay is 400: from there the scaled bid is
+absent and the lot is whole, so the filler takes everything and assumes no
+liability. Under `earliest-profitable` it is the closed form below. Either
+way the result is capped at 350 under `force_fill`.
+
+For `earliest-profitable`, the fill delay `d` is the smallest value in
+`0..=400` such that
 `scaled_lot(d) ≥ scaled_bid(d) × (1 + p)`, where the scaling is the
 contract's. It is solved in closed form with ceiling division: on the lot ramp
 `d = ceil(200 × bid × (1 + p) / lot)` when the full lot covers the bid plus
 margin, otherwise on the bid ramp
 `d = 400 − floor(200 × lot / (bid × (1 + p)))`. Tests verify the closed form
-by evaluating the contract's scaling at `d` and `d − 1`. The result is capped
-at 350 under `force_fill`, and moved to the next ledger when it has already
+by evaluating the contract's scaling at `d` and `d − 1`. Under either
+objective the planned ledger is moved to the next one when it has already
 passed.
 
 ### Health-bounded plan
@@ -589,6 +596,7 @@ min_primary_collateral = "1000000000000"  # underlying units, decimal string
 min_health_factor = 1.5
 default_profit_bps = 1000
 force_fill = false
+fill_objective = "free-fill"      # or "earliest-profitable"; see Fill ledger
 supported_bid = ["C...", "C..."]  # or ["*"]
 supported_lot = ["*"]
 

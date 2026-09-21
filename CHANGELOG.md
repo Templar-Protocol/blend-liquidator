@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The ADR-0008 fork reconciliation (`docs/specs/2026-09-20-adr-0008-fork-semantics.md`
+  §4). The bot now targets `Templar-Protocol/blend-contracts-v2`, whose pools
+  destroy a defaulted borrower's debt by cutting the reserve's `b_rate`
+  rather than handing it to the backstop.
+- `math::setoff` (`src/math/setoff.rs`): the fork's default path, ported —
+  the borrower's own supply in the debt reserve sets off what it can, then
+  the rest is destroyed and every b-token holder in that reserve pays for it
+  through a `b_rate` cut rounded up and floored at zero.
+- Three fork events decoded (`src/chain/xdr/events.rs`): `debt_setoff`,
+  `collateral_orphaned` and `orphan_settled`.
+- `NotificationKind::StockWasmDetected`, raised at `Severity::High` whenever a
+  `bad_debt` event is seen. The fork declares that event with no call sites,
+  so one means the pool is running stock wasm. New series
+  `notifications_total{kind="stock_wasm_detected"}`.
+- A per-pool `fill_objective` key in the pools file: `free-fill` (the
+  default) or `earliest-profitable`. Any other value is a startup error that
+  names the two legal spellings.
+- `FillSkip::SupplyCapped` and a new series `skips_total{reason="supply_capped"}`,
+  for a fill whose own primary-asset supply the reserve's `supply_cap`
+  stopped rather than the wallet.
+
 - The sandbox integration tier (`scripts/sandbox/`,
   `tests/liquidation_sandbox.rs`, and the `sandbox*` make targets): a
   throwaway Stellar network from a digest-pinned `stellar/quickstart`
@@ -631,6 +652,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to bump it in the same PR as a `stellar-xdr` that moves its own.
 
 ### Changed
+
+- **Fills now wait for the free-fill point by default, which moves an
+  existing deployment's fills later on upgrade.** With no `fill_objective`
+  set, a pool now aims at `start + 400`, where the scaled bid has decayed to
+  nothing and the filler takes the whole lot without assuming any debt.
+  Previously it aimed at the earliest ledger the lot covered the bid plus the
+  pool's margin. Waiting pays more per fill and forfeits the auction to
+  anyone who fills earlier; set `fill_objective = "earliest-profitable"` to
+  keep the old timing. `force_fill` still caps the wait at 350 ledgers.
+- There is no longer a 400-ledger fill cutoff. `FillSkip::PastAuctionEnd` is
+  gone: the contract never refused a late fill, so an auction first seen past
+  its 400th ledger is now planned rather than skipped. From its 500th ledger
+  anyone may delete it, which the filler logs as a warning.
+- `plan_fill` projects the `b_rate` cut a full fill causes. On the fork a
+  100% fill runs the borrower's default path inside the filler's own
+  transaction, before the contract checks the filler's health, so the
+  filler's collateral in that reserve is worth less at check time than the
+  pre-fill snapshot said. A full fill is now valued against the post-default
+  reserves. The fill walk reads each auction's borrower to do this, which
+  widens an existing snapshot rather than adding a round trip.
+- A fill's primary-asset supply is sized under the reserve's `supply_cap` by
+  exact search, instead of rebuilding an over-cap supply the chain refuses
+  with error 1220 on every re-plan.
+- Bad debt is decided on raw collateral rather than c-factor-weighted
+  collateral, matching the contract's own gate. A borrower holding a
+  low-factor reserve no longer draws a `bad_debt` proposal the contract
+  refuses.
+- `new_auction_op` takes no auction-type parameter. Only a user-liquidation
+  auction is legal on the fork; every other type raises error 1200.
+- A pool's own contract address is never treated as a borrower, and is
+  filtered out before the auctioneer's batch snapshot is read. On the fork
+  confiscated collateral lands there as ordinary supply.
+- `TARGET_HF`'s refusal of exactly `1.15` is unchanged, but its message and
+  documentation now say that bound is this bot's own margin. The contract
+  itself accepts `1.15`.
 
 - `Notifier::notify` no longer waits for delivery: it takes the dedup
   entry synchronously and spawns the send behind `NOTIFY_IN_FLIGHT`'s

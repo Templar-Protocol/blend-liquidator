@@ -391,8 +391,9 @@ const SUPPLY_ROUNDING_ALLOWANCE: i128 = 2;
 ///    the search finds is the plan: it is drafted from the very projection
 ///    it was found with, never re-projected by a later round that
 ///    `plan_iterations` may not reach.
-/// 5. Out of rounds or candidates: `Unfunded` if the wallet capped a
-///    supply along the way, else `Health`.
+/// 5. Out of rounds or candidates: `SupplyCapped` if the reserve's own
+///    `supply_cap` capped a supply along the way, else `Unfunded` if the
+///    wallet did, else `Health`.
 ///
 /// A `FreeFill` candidate can land anywhere at or past `start + 400`: the
 /// transaction is sent at the earliest ledger it could land in, which is

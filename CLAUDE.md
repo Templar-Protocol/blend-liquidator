@@ -1025,7 +1025,7 @@ Status above for what remains.
   still decides *whether*. Past the 500th ledger `delete_stale_auction`
   becomes callable by anyone — permissionless, and it deletes nothing by
   itself — so a plan aimed past it is racing a deletion rather than only
-  another filler: `Filler::execute` (`STALE_AUCTION_BLOCKS` in
+  another filler: `Filler::execute_once` (`STALE_AUCTION_BLOCKS` in
   `src/filler.rs`) warns rather than refuses.
 - `WITHDRAW_ALL` is `i64::MAX`, and that is the safe spelling of "all",
   not a saturation. `WithdrawCollateral` burns `min(to_b_token_up(amount),

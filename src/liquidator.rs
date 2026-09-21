@@ -41,8 +41,8 @@
 //! (`docs/specs/2026-09-20-adr-0008-fork-semantics.md`): the fork's own
 //! events, bad-debt, fill-timing and supply-cap behaviour, ported into
 //! this crate's pure math (`math::setoff`, `math::fill`) rather than left
-//! for the contract to refuse. What is left is Phase 9's docs and first
-//! release, and a testnet soak.
+//! for the contract to refuse. What is left is Phase 9's docs, the
+//! deployment contract and the first release, and a testnet soak.
 //!
 //! The repository scaffolding around it — CI gates, lint
 //! posture, dev container, release preflight — is complete and enforced

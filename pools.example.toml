@@ -34,8 +34,8 @@ min_health_factor = 1.5
 # basis points.
 default_profit_bps = 1000
 
-# Fill this pool's auctions at a fixed delay rather than waiting on
-# fill_objective below. An auction's lot ramps up over its first 200 ledgers
+# Cap how long this pool's fills wait, rather than letting fill_objective
+# below decide alone. An auction's lot ramps up over its first 200 ledgers
 # and its bid ramps down to nothing over the next 200; there is no cutoff
 # after that — the contract will still take a fill at ledger 500 or 5,000 —
 # so force_fill's only effect is a cap: the fill happens no later than 350
