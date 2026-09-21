@@ -320,6 +320,11 @@ pub enum FillSkip {
     /// More of the primary asset would have closed the shortfall, and the
     /// wallet does not hold it.
     Unfunded,
+    /// More of the primary asset would have closed the shortfall and the
+    /// pool's `supply_cap` has no room for it. Distinct from
+    /// [`FillSkip::Unfunded`]: the wallet may be full, and sending more
+    /// capital fixes nothing.
+    SupplyCapped,
     /// Nothing within `plan_iterations` holds the filler's floor.
     Health,
 }
@@ -449,6 +454,7 @@ pub fn plan_fill(terms: &FillTerms, inputs: &FillInputs<'_>) -> Result<PlannedFi
     let percent = inputs.max_percent;
     let mut supply = 0_i128;
     let mut unfunded = false;
+    let mut capped = false;
 
     for _ in 0..terms.plan_iterations {
         let projection = project(terms, inputs, ledger, percent, supply)?;
@@ -462,8 +468,11 @@ pub fn plan_fill(terms: &FillTerms, inputs: &FillInputs<'_>) -> Result<PlannedFi
             let wanted = supply
                 .checked_add(supply_for(terms, inputs, &projection.data)?)
                 .ok_or(MathError::Overflow)?;
-            let next = wanted.min(projection.primary_available);
+            let (_, primary) = reserve_for(inputs, &terms.primary_asset)?;
+            let room = supply_headroom(primary, wanted)?;
+            let next = wanted.min(projection.primary_available).min(room);
             unfunded |= wanted > projection.primary_available;
+            capped |= wanted > room;
             if next > supply {
                 supply = next;
                 continue;
@@ -481,7 +490,11 @@ pub fn plan_fill(terms: &FillTerms, inputs: &FillInputs<'_>) -> Result<PlannedFi
         }
         break;
     }
-    Ok(PlannedFill::Skip(if unfunded {
+    // The cap takes precedence over the wallet: a full pool is the
+    // operator's cheaper problem to diagnose than an underfunded wallet.
+    Ok(PlannedFill::Skip(if capped {
+        FillSkip::SupplyCapped
+    } else if unfunded {
         FillSkip::Unfunded
     } else {
         FillSkip::Health
@@ -793,6 +806,46 @@ fn supply_for(
     )?
     .checked_add(SUPPLY_ROUNDING_ALLOWANCE)
     .ok_or(MathError::Overflow)
+}
+
+/// The largest underlying amount of `asset` that can be supplied without
+/// the contract's `ExceededSupplyCap` (1220).
+///
+/// The contract checks `total_supply() > supply_cap` **after** minting
+/// `to_b_token_down(amount)` b-tokens, so the bound is not
+/// `supply_cap − total_supply()`: the mint rounds down and `total_supply`
+/// rounds down again, and assuming the two cancel overstates the room by up
+/// to a stroop in the direction that earns the refusal. Search the exact
+/// bound instead — the largest amount whose projected `total_supply` still
+/// fits — and let a cap already breached answer zero rather than a
+/// negative.
+fn supply_headroom(reserve: &Reserve, wanted: i128) -> Result<i128, MathError> {
+    if wanted <= 0 {
+        return Ok(0);
+    }
+    let fits = |amount: i128| -> Result<bool, MathError> {
+        let minted = reserve.to_b_token_down(amount)?;
+        let after = reserve
+            .data
+            .b_supply
+            .checked_add(minted)
+            .ok_or(MathError::Overflow)?;
+        Ok(reserve.to_asset_from_b_token(after)? <= reserve.config.supply_cap)
+    };
+    if fits(wanted)? {
+        return Ok(wanted);
+    }
+    // Binary search the largest amount that fits, in `0..wanted`.
+    let (mut low, mut high) = (0_i128, wanted);
+    while low < high {
+        let mid = low + (high - low + 1) / 2;
+        if fits(mid)? {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    Ok(low)
 }
 
 /// The largest percent below `below` whose exact projection at `ledger`
@@ -1686,6 +1739,108 @@ mod plan_tests {
             percent(100),
         );
         assert_eq!(planned, PlannedFill::Skip(FillSkip::Unfunded));
+    }
+
+    /// The pool's supply cap binds the escalation. A reserve at its cap
+    /// cannot absorb another stroop, so a plan that needs more of the
+    /// primary asset to hold its health floor is not merely unfunded —
+    /// the wallet may be full — it is capped, and saying so is the
+    /// difference between "send more capital" and "this pool is full".
+    #[test]
+    fn a_supply_that_would_breach_the_cap_is_capped_not_unfunded() {
+        let mut pool = pool();
+        {
+            let xlm = pool.reserves.get_mut(&0).expect("the XLM reserve");
+            // `total_supply()` is 0 here (default `b_supply`), so the cap
+            // is already exactly met: no stroop of supply fits.
+            xlm.config.supply_cap = xlm.total_supply().expect("total supply");
+        }
+        let under_water = Positions {
+            collateral: BTreeMap::from([(0, 1_000_000_000_000)]),
+            liabilities: BTreeMap::from([(1, 100_000_000_000)]),
+            ..Positions::default()
+        };
+        // Plenty in the wallet: the cap, not the wallet, must be what
+        // refuses this plan.
+        let wallet = BTreeMap::from([(XLM.to_string(), 1_000_000_000_000_000)]);
+        let planned = plan(
+            &terms(),
+            &pool,
+            &under_water,
+            &wallet,
+            &auction(),
+            START + 1,
+            percent(100),
+        );
+        assert_eq!(planned, PlannedFill::Skip(FillSkip::SupplyCapped));
+    }
+
+    /// Headroom short of the shortfall is still used: the plan supplies
+    /// what fits and only gives up if that is not enough. The wallet here
+    /// is unlimited — as in
+    /// [`the_primary_asset_is_supplied_to_close_a_shortfall`], whose
+    /// 44,385,964,922 first-round shortfall this reuses — so the reserve's
+    /// own `supply_cap` is the only thing that can bind, at the same
+    /// 10,000,000,000 [`a_wallet_short_of_the_primary_lowers_the_percent`]
+    /// reaches through the wallet instead, landing on the same percent 22.
+    #[test]
+    fn a_partial_headroom_is_supplied_up_to_the_cap() {
+        let mut pool = pool();
+        {
+            let xlm = pool.reserves.get_mut(&0).expect("the XLM reserve");
+            // An existing 5,000,000,000 of supply plus 10,000,000,000 of
+            // headroom: `supply_cap` is not `0`, so a plan that reads it
+            // as `cap − total_supply()` at the wrong moment is not what
+            // proves this test — the reserve's own conversions below are.
+            xlm.data.b_supply = 5_000_000_000;
+            xlm.config.supply_cap = 15_000_000_000;
+        }
+        let wallet = BTreeMap::from([(XLM.to_string(), 1_000_000_000_000)]);
+        let draft = draft(plan(
+            &terms(),
+            &pool,
+            &Positions::default(),
+            &wallet,
+            &auction(),
+            START + 1,
+            percent(100),
+        ));
+        assert_eq!(draft.fill_ledger, START + 110);
+        assert_eq!(draft.percent, percent(22));
+        let [FillAction::SupplyCollateral { asset, amount }] = draft.actions.as_slice() else {
+            panic!("expected one supply, got {:?}", draft.actions);
+        };
+        assert_eq!(asset.as_str(), XLM);
+        assert_eq!(*amount, 10_000_000_000);
+
+        // Independently verify the bound the escalation respected, from
+        // the reserve's own `to_b_token_down`/`to_asset_from_b_token`
+        // rather than from `supply_headroom` itself: the drafted amount
+        // leaves `total_supply()` at or under the cap, and one more
+        // stroop would not.
+        let xlm = pool.reserves.get(&0).expect("the XLM reserve");
+        let minted = xlm.to_b_token_down(*amount).expect("mint");
+        let after = xlm
+            .data
+            .b_supply
+            .checked_add(minted)
+            .expect("no overflow in a test");
+        assert!(
+            xlm.to_asset_from_b_token(after).expect("total supply") <= xlm.config.supply_cap,
+            "the drafted amount must not breach the cap"
+        );
+        let minted_one_more = xlm.to_b_token_down(*amount + 1).expect("mint");
+        let after_one_more = xlm
+            .data
+            .b_supply
+            .checked_add(minted_one_more)
+            .expect("no overflow in a test");
+        assert!(
+            xlm.to_asset_from_b_token(after_one_more)
+                .expect("total supply")
+                > xlm.config.supply_cap,
+            "one more stroop should already breach the cap"
+        );
     }
 
     /// A candidate a search proves is the plan, not one held over for a

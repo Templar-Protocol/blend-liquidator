@@ -471,6 +471,7 @@ fn skip_label(reason: FillSkip) -> SkipLabel {
         FillSkip::Unprofitable => SkipLabel::Unprofitable,
         FillSkip::TooManyPositions | FillSkip::Health => SkipLabel::Health,
         FillSkip::Unfunded => SkipLabel::Unfunded,
+        FillSkip::SupplyCapped => SkipLabel::SupplyCapped,
     }
 }
 
@@ -2112,6 +2113,7 @@ mod tests {
         assert_eq!(skip_label(FillSkip::TooManyPositions), SkipLabel::Health);
         assert_eq!(skip_label(FillSkip::Health), SkipLabel::Health);
         assert_eq!(skip_label(FillSkip::Unfunded), SkipLabel::Unfunded);
+        assert_eq!(skip_label(FillSkip::SupplyCapped), SkipLabel::SupplyCapped);
     }
 
     /// A skip is one per auction *per reason*. The filler re-makes every
