@@ -36,10 +36,13 @@
 //! Prometheus metrics (`metrics`), and the `/healthz`/`/livez`/`/metrics`
 //! server (`http`). Phase 7 landed the sandbox integration tier that runs
 //! all of it armed against a throwaway Stellar network
-//! (`scripts/sandbox/`, `tests/liquidation_sandbox.rs`). What is left is
-//! Phase 8, the ADR-0008 fork reconciliation
-//! (`docs/specs/2026-09-20-adr-0008-fork-semantics.md`), then Phase 9's
-//! docs and first release, and a testnet soak.
+//! (`scripts/sandbox/`, `tests/liquidation_sandbox.rs`). Phase 8 landed
+//! the ADR-0008 fork reconciliation
+//! (`docs/specs/2026-09-20-adr-0008-fork-semantics.md`): the fork's own
+//! events, bad-debt, fill-timing and supply-cap behaviour, ported into
+//! this crate's pure math (`math::setoff`, `math::fill`) rather than left
+//! for the contract to refuse. What is left is Phase 9's docs and first
+//! release, and a testnet soak.
 //!
 //! The repository scaffolding around it — CI gates, lint
 //! posture, dev container, release preflight — is complete and enforced

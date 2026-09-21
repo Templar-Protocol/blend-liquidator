@@ -2003,7 +2003,7 @@ supported_lot = ["*"]
         for refused in ["0", "0.9", "1.0299999", "1.15", "1.2", "2"] {
             assert!(
                 parse_target(refused).is_err(),
-                "TARGET_HF={refused} is outside the band the contract accepts"
+                "TARGET_HF={refused} is outside the band this bot plans within"
             );
         }
         for accepted in ["1.03", "1.06", "1.1499999"] {

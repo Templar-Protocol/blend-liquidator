@@ -335,8 +335,11 @@ both are addresses.
 
 ## 4. What the bot must change
 
-Each item names the decision, not just the defect. These are the scope of the
-implementation phase; none of them is done.
+Each item names the decision, not just the defect. These were the scope of
+the implementation phase, and A through J landed on
+`phase-8/fork-reconciliation` (Phase 8). §5, §6 and §7 below are untouched by
+that work: nothing in Phase 8 implemented `gulp`, retargeted the sandbox at
+the fork, or answered an open question.
 
 **A. Decode the three new events** in `chain::xdr::events`, with
 `affected_accounts` answering the borrower for `collateral_orphaned` and no one
@@ -416,6 +419,18 @@ auction stays open. The acceptance criterion is therefore about the *plan*:
 headroom and size the supply under it, or decline the escalation and say so
 with its own `FillSkip`. A 1220 reaching the executor at all should be the
 unexpected case.
+
+The headroom is not `supply_cap − total_supply()`. That naive subtraction
+cannot breach the cap at any rate — `to_b_token_down` and
+`to_asset_from_b_token` both round down, so
+`floor(a·S/r)·r/S ≤ a`, and therefore `total_supply_after(a) ≤
+total_supply_before + a`; at `a = cap − total_supply_before` that bound is
+`≤ cap` for every rate. What it does instead is **understate** the room, by
+up to a stroop, because the mint rounds down and `total_supply` rounds down
+again on top of it. So the exact search this item asks for is not what keeps
+the cap from being breached — nothing here can breach it — it is what
+recovers that last stroop a planner using the naive formula would decline for
+no reason, and skip a fill that needed exactly it.
 
 **H. Add the pool's own contract address to the bot's own-address set.** It is
 a `Positions` holder now. It cannot be liquidated (1211, stock) and its row is
