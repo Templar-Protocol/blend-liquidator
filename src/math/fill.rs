@@ -1770,7 +1770,7 @@ mod plan_tests {
     }
 
     /// `force_fill` is the narrower window and keeps winning over either
-    /// objective: it means fill by 350 whatever the economics.
+    /// objective: it caps the target at 350 whatever the economics.
     #[test]
     fn force_fill_still_caps_the_delay_at_350() {
         let pool = pool();

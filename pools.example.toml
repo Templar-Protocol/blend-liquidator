@@ -38,9 +38,11 @@ default_profit_bps = 1000
 # below decide alone. An auction's lot ramps up over its first 200 ledgers
 # and its bid ramps down to nothing over the next 200; there is no cutoff
 # after that — the contract will still take a fill at ledger 500 or 5,000 —
-# so force_fill's only effect is a cap: the fill happens no later than 350
-# ledgers into the auction, however little the lot covers by then, whichever
-# ledger fill_objective would otherwise have picked.
+# so force_fill's only effect is a cap on the target: the filler aims no
+# later than 350 ledgers into the auction, however little the lot covers by
+# then, whichever ledger fill_objective would otherwise have picked. It is
+# not a deadline: an auction the filler first sees after ledger 350 is
+# filled at the first ledger it can still act in.
 #
 # It does not waive the health check — a fill is a position takeover, and
 # min_health_factor above still binds every plan. For exercising a pool's

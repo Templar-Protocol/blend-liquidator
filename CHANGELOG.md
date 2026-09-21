@@ -660,7 +660,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Previously it aimed at the earliest ledger the lot covered the bid plus the
   pool's margin. Waiting pays more per fill and forfeits the auction to
   anyone who fills earlier; set `fill_objective = "earliest-profitable"` to
-  keep the old timing. `force_fill` still caps the wait at 350 ledgers.
+  keep the old timing. `force_fill` still caps the target at 350 ledgers
+  into the auction; it is not a deadline, so an auction first seen later
+  fills at the first ledger the bot can act in.
 - There is no longer a 400-ledger fill cutoff. `FillSkip::PastAuctionEnd` is
   gone: the contract never refused a late fill, so an auction first seen past
   its 400th ledger is now planned rather than skipped. From its 500th ledger
