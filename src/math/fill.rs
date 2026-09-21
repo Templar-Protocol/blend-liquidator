@@ -812,13 +812,15 @@ fn supply_for(
 /// the contract's `ExceededSupplyCap` (1220).
 ///
 /// The contract checks `total_supply() > supply_cap` **after** minting
-/// `to_b_token_down(amount)` b-tokens, so the bound is not
-/// `supply_cap − total_supply()`: the mint rounds down and `total_supply`
-/// rounds down again, and assuming the two cancel overstates the room by up
-/// to a stroop in the direction that earns the refusal. Search the exact
-/// bound instead — the largest amount whose projected `total_supply` still
-/// fits — and let a cap already breached answer zero rather than a
-/// negative.
+/// `to_b_token_down(amount)` b-tokens, so the bound is not `supply_cap −
+/// total_supply()` — not because that formula could breach the cap; the
+/// mint rounding down and `total_supply` rounding down again make it safe
+/// for any rate. It understates the room instead, by up to a stroop: a
+/// planner that used it would decline a supply the contract would have
+/// accepted, and skip a fill for no reason over the last stroop. Search
+/// the exact bound instead — the largest amount whose projected
+/// `total_supply` still fits — and let a cap already breached answer zero
+/// rather than a negative.
 fn supply_headroom(reserve: &Reserve, wanted: i128) -> Result<i128, MathError> {
     if wanted <= 0 {
         return Ok(0);
