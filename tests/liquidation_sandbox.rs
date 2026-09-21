@@ -95,7 +95,7 @@ const CREATION_TIMEOUT: Duration = Duration::from_secs(90);
 /// with the pool's 100 bps margin the fill landed at block 178. Both sides
 /// scale with the percent, so the break-even block is near-invariant across
 /// the band the percent walk lands in. Nothing shortens it: `force_fill`
-/// caps the wait at 350 ledgers, which is later, not sooner, and this is
+/// caps the target at 350 ledgers, which is later, not sooner, and this is
 /// the earliest-profitable break-even specifically — `pools_toml` below
 /// pins `fill_objective` to `earliest-profitable` for exactly that reason,
 /// since the crate's own default, `free-fill`, aims at `start + 400`

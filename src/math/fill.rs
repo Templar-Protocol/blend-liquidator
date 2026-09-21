@@ -441,8 +441,9 @@ pub fn plan_fill(terms: &FillTerms, inputs: &FillInputs<'_>) -> Result<PlannedFi
             terms.force_fill,
         )?,
     };
-    // `force_fill` is the narrower window and keeps winning: it means fill
-    // by 350 whatever the economics, whichever ledger the objective picked.
+    // `force_fill` is the narrower window and keeps winning: it caps the
+    // target at 350 whatever the economics, whichever ledger the objective
+    // picked.
     let delay = if terms.force_fill {
         delay.min(FORCE_FILL_MAX_DELAY)
     } else {
