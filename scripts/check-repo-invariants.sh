@@ -94,7 +94,11 @@ fi
 for file in .devcontainer/post-create.sh .github/workflows/sandbox.yml; do
 	if [ ! -f "${file}" ]; then
 		bad "${file} is missing — it is one of the two places that install the stellar CLI, and both must take the version from scripts/sandbox/versions.env"
-	elif ! grep -vE '^[[:space:]]*#' "${file}" | grep -qF 'versions.env'; then
+	# No `-q` on the consumer: `grep -q` exits at its first match while the
+	# producer is still writing, the producer takes SIGPIPE, and under
+	# `pipefail` a match then reads as a failure. Discarding the output lets
+	# the consumer drain its input, so the producer cannot be cut off.
+	elif ! grep -vE '^[[:space:]]*#' "${file}" | grep -F 'versions.env' >/dev/null; then
 		bad "${file} does not read scripts/sandbox/versions.env — the stellar CLI version (${cli_version}) lives in that one file, and ${file} must source or grep it rather than pin its own"
 	elif grep -qE 'stellar-cli-[0-9]' "${file}"; then
 		bad "${file} names a stellar CLI release literally (stellar-cli-…) — take the URL and its checksum from scripts/sandbox/versions.env instead, which is the only place the version belongs"
@@ -127,7 +131,7 @@ fi
 post_create=.devcontainer/post-create.sh
 if [ ! -f "${post_create}" ]; then
 	bad "${post_create} is missing — it is one of the two places that install sqlx-cli, and it must take the version from scripts/sandbox/versions.env"
-elif ! grep -vE '^[[:space:]]*#' "${post_create}" | grep -qF 'SQLX_CLI_VERSION'; then
+elif ! grep -vE '^[[:space:]]*#' "${post_create}" | grep -F 'SQLX_CLI_VERSION' >/dev/null; then
 	bad "${post_create} does not read SQLX_CLI_VERSION from scripts/sandbox/versions.env — it must grep or source it rather than pin its own (on a line that is not a comment)"
 elif grep -qE 'sqlx-cli[[:space:]]+--version[[:space:]]+[0-9]' "${post_create}"; then
 	bad "${post_create} names an sqlx-cli version literally — read SQLX_CLI_VERSION from scripts/sandbox/versions.env instead"

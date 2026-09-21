@@ -75,7 +75,9 @@ fi
 # and of any prose line quoting the header, either of which would pass while
 # the release shipped with no level-2 section. So: literal match on the
 # version, then an anchored regex on the constant prefix.
-if grep -F "## [${version}]" CHANGELOG.md | grep -q '^## \['; then
+# No `-q` on the consumer here either — see the comment on the same
+# `grep | grep` shape in scripts/check-repo-invariants.sh.
+if grep -F "## [${version}]" CHANGELOG.md | grep '^## \[' >/dev/null; then
 	note "CHANGELOG.md has a section for ${version}"
 else
 	bad "CHANGELOG.md has no '## [${version}]' section — add one before tagging"
