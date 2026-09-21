@@ -17,8 +17,11 @@ you do either.
 
 The image is published to `ghcr.io/templar-protocol/blend-liquidator`
 only on a `v*` tag push (`.github/workflows/release.yml`), tagged with
-the version the tag names. This repository is private, so the package is
-private too: pulling it needs a token with the `read:packages` scope.
+the version the tag names — its leading `v` stripped, so the git tag
+`v0.1.0` publishes as image tag `0.1.0`, never `v0.1.0`
+(`docs/deployment-contract.md`, "What this repository guarantees"). This
+repository is private, so the package is private too: pulling it needs a
+token with the `read:packages` scope.
 
 ```bash
 echo "$GHCR_TOKEN" | docker login ghcr.io -u <github-username> --password-stdin
@@ -125,8 +128,12 @@ is durable and reviewable, not just a log line that scrolled past.
 
 Arming means the bot signs and sends. Do this only once a dry run's
 decisions look right and `check-config` passes against the real
-configuration — `docs/deployment-contract.md` states that ordering as
-what this repository guarantees, not a suggestion.
+configuration. `docs/deployment-contract.md` makes that ordering a
+requirement of the deployment, not a guarantee the image enforces on its
+own: nothing in `src/` stops `DRY_RUN=false` from being set before
+`check-config` has ever run against that configuration — this is the
+operator's own line to hold, and evidence to have in hand before crossing
+it.
 
 **Two things, together, and nothing else opts in:**
 
@@ -143,19 +150,28 @@ the one submission queue that key needs — the ordinary deployment. Set
 it only when you want the two roles on separate keys, and note the two
 keys are refused if they are the same value.
 
-**Fund the filler account before arming:**
+**Fund the filler account's wallet before arming:** at least
+`XLM_FEE_RESERVE` (default 50 XLM) of native XLM, held back from
+everything else the filler spends. `check-config` and the run's own
+startup validation both check this wallet balance, and it is a startup
+*error* once armed (a warning in dry-run).
 
-- At least `XLM_FEE_RESERVE` (default 50 XLM) of native XLM, held back
-  from everything else the filler spends — `check-config` and the run's
-  own startup validation both check this, and it is a startup *error*
-  once armed (a warning in dry-run).
-- At least each configured pool's `min_primary_collateral`, in that
-  pool's primary asset. This is only checked once armed (a dry run plans
-  against whatever the wallet holds and skips the read), and even then
-  it is always a warning, never a startup failure — it caps how much the
-  filler can take rather than stopping it from taking anything — but an
-  armed filler under it is arming without the working capital the
-  configuration says it should have.
+**`min_primary_collateral` is a separate check, on a different quantity,
+and funding the wallet does not satisfy it.** Once armed, `check-config`
+and startup also warn — never an error, either way — when each
+configured pool's primary asset, *already supplied to that pool as
+collateral*, is below the pool's own `min_primary_collateral`. This reads
+the filler's on-chain position (b-tokens converted to underlying), not
+its wallet balance, so sending the wallet more of the primary asset does
+nothing to clear this warning by itself. The bot never tops the position
+up to reach the floor on its own: a fill's own supply step sizes itself
+to whatever that fill's post-fill health floor needs, not to
+`min_primary_collateral`, and the unwind pass only ever trims the
+primary asset supplied to a pool *down* to `min_primary_collateral` —
+never up. So an operator who wants a standing buffer supplies it to the
+pool directly, outside the bot, and sets `min_primary_collateral` to
+exactly what they mean the bot to keep supplied there: anything supplied
+above that floor is trimmed back to the wallet on the run's first tick.
 
 **`STARTUP_DELAY_LEDGERS`** is the window in which the bot plans and
 records but does not submit. The auctioneer and the filler each hold
