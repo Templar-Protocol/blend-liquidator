@@ -47,13 +47,22 @@ pub fn submit_op(
     )
 }
 
-/// `new_auction(auction_type, user, bid, lot, percent)`. `percent` is a
-/// `FillPercent`, so the contract's 1 to 100 range is already validated by
-/// construction — never checked again here, and never sent out of range for
-/// the contract to reject.
+/// `new_auction(0, user, bid, lot, percent)` — a user liquidation, and
+/// nothing else.
+///
+/// The auction type is not a parameter because only one value is legal:
+/// the fork's `create_auction` panics `BadRequest` (1200) for any type
+/// other than `UserLiquidation`
+/// (`pool/src/auctions/auction.rs:82-97`), and the bot never wanted a
+/// bad-debt or interest auction in any case — bad debt goes through
+/// [`bad_debt_op`], which is a different contract function. A parameter
+/// that may hold only one value is a refusal waiting for a caller.
+///
+/// `percent` is a `FillPercent`, so the contract's 1 to 100 range is
+/// already validated by construction — never checked again here, and
+/// never sent out of range for the contract to reject.
 pub fn new_auction_op(
     pool: &str,
-    auction_type: AuctionType,
     user: &str,
     bid: &[&str],
     lot: &[&str],
@@ -70,7 +79,7 @@ pub fn new_auction_op(
         pool,
         "new_auction",
         vec![
-            ScVal::U32(auction_type.code()),
+            ScVal::U32(AuctionType::UserLiquidation.code()),
             address(user)?,
             addresses(bid)?,
             addresses(lot)?,
@@ -477,15 +486,7 @@ mod tests {
     #[test]
     fn new_auction_op_and_bad_debt_op_match_the_contract_signatures() {
         let percent = FillPercent::try_from(50).expect("50 is in range");
-        let op = new_auction_op(
-            POOL,
-            AuctionType::UserLiquidation,
-            USER,
-            &[USDC],
-            &[],
-            percent,
-        )
-        .unwrap();
+        let op = new_auction_op(POOL, USER, &[USDC], &[], percent).unwrap();
         let (function, args) = invoke(&op);
         assert_eq!(function, "new_auction");
         assert_eq!(args[0], ScVal::U32(0));
@@ -495,15 +496,7 @@ mod tests {
         assert_eq!(args[4], ScVal::U32(50));
         let (function, args) = invoke(&bad_debt_op(POOL, USER).unwrap());
         assert_eq!((function.as_str(), args.len()), ("bad_debt", 1));
-        assert!(new_auction_op(
-            POOL,
-            AuctionType::UserLiquidation,
-            USER,
-            &["not-an-address"],
-            &[],
-            percent
-        )
-        .is_err());
+        assert!(new_auction_op(POOL, USER, &["not-an-address"], &[], percent).is_err());
     }
 
     fn entry(key: &stellar_xdr::LedgerKey, xdr: &str) -> Value {

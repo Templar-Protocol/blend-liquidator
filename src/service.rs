@@ -119,7 +119,7 @@ use crate::auctioneer::{
 };
 use crate::chain::pool::{PoolReader, PoolSnapshot};
 use crate::chain::rpc::RpcClient;
-use crate::chain::xdr::PoolStatus;
+use crate::chain::xdr::{PoolEvent, PoolStatus};
 use crate::chain::{ChainError, Network, Signer, Submitter, TxConfig, TxOutcome};
 use crate::config::{
     HttpConfig, PoolConfig, SeedConfig, ServiceConfig, Signers, SigningKeys, TelegramConfig,
@@ -854,6 +854,26 @@ async fn handle_message(
         } => match tracker.apply(&pool, ledger, &event).await {
             Ok(accounts) => {
                 instruments.metrics.events_processed(&pool, 1);
+                // The fork's `bad_debt` event has zero call sites, so the
+                // contract this bot is written against can never emit it:
+                // seeing one means the pool is running stock wasm, and
+                // every assumption this bot makes about default handling
+                // is void. An alarm, never a decision input — the tracker
+                // applies the event exactly as it would any other and the
+                // tick proceeds.
+                if let PoolEvent::BadDebt { user, asset, .. } = &event {
+                    instruments.notifier.notify(Notification {
+                        kind: NotificationKind::StockWasmDetected,
+                        severity: Severity::High,
+                        pool: pool.clone(),
+                        account: Some(user.clone()),
+                        message: format!(
+                            "a bad_debt event named {asset}: this pool is not running the \
+                             ADR-0008 fork, whose bad_debt event has no call sites — the \
+                             bot's default-handling assumptions do not hold here"
+                        ),
+                    });
+                }
                 state.pending.entry(pool).or_default().extend(accounts);
             }
             Err(error) => {
@@ -2884,6 +2904,7 @@ mod tests {
     use crate::config::{ChainConfig, RunMode, Secret};
     use crate::fixture::{mainnet_fixed_v2, text};
     use crate::harness;
+    use crate::math::fill::FillObjective;
     use crate::math::AuctionData;
     use crate::store::TrackedAuction;
     use std::collections::BTreeMap;
@@ -3103,6 +3124,13 @@ mod tests {
             min_health_factor: 15_000_000,
             default_profit_bps: 0,
             force_fill: false,
+            // Deliberately not the crate's own default (`FreeFill`): none
+            // of this fixture's callers are testing which ledger a fill
+            // aims at, and `FreeFill` would move every one of their fill
+            // ledgers out to `start + RAMP_END_BLOCKS`, which is a fact
+            // about the objective, not about whatever each test's name
+            // says it is checking.
+            fill_objective: FillObjective::EarliestProfitable,
             supported_bid: bid.iter().map(|asset| (*asset).to_string()).collect(),
             supported_lot: lot.iter().map(|asset| (*asset).to_string()).collect(),
             profits: Vec::new(),
@@ -3966,6 +3994,59 @@ mod tests {
              successes"
         );
         let _ = std::fs::remove_file(&file);
+        Ok(())
+    }
+
+    /// A `bad_debt` event cannot be emitted by the fork — the event is
+    /// declared with zero call sites — so one means the pool is running
+    /// stock wasm and every assumption the bot makes about default
+    /// handling is void. It is an alarm, never something to act on.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_bad_debt_event_alarms_that_stock_wasm_is_deployed(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let tracker = Tracker::new(&client, &store);
+        let (_flag, shutdown) = watch::channel(false);
+        let (tick_tx, _tick_rx) = tick_watch();
+        let mut state = LoopState::default();
+        let (instruments, recording) = recording_instruments();
+
+        let event = PoolEvent::BadDebt {
+            user: harness::USER_ONE.to_string(),
+            asset: USDC.to_string(),
+            d_tokens: 4_242,
+        };
+        handle_message(
+            &tracker,
+            &[],
+            quiet_cadence(),
+            &mut state,
+            &shutdown,
+            &instruments,
+            &tick_tx,
+            PollerMessage::Event {
+                pool: harness::POOL.to_string(),
+                ledger: 10,
+                event: event.clone(),
+            },
+        )
+        .await
+        .expect("the event is applied");
+
+        assert!(instruments.notifier.drain(DRAIN_BUDGET).await);
+        let sent = recording.sent();
+        assert_eq!(sent.len(), 1, "exactly one alarm: {sent:?}");
+        assert_eq!(sent[0].kind, NotificationKind::StockWasmDetected);
+        assert_eq!(
+            sent[0].severity,
+            Severity::High,
+            "the wrong contract is deployed; this wakes someone"
+        );
+        assert_eq!(sent[0].pool, harness::POOL);
+        assert_eq!(sent[0].account.as_deref(), Some(harness::USER_ONE));
         Ok(())
     }
 
@@ -6593,6 +6674,14 @@ mod tests {
             min_health_factor: 15_000_000,
             default_profit_bps: 1_000,
             force_fill: false,
+            // Deliberately not the crate's own default (`FreeFill`): the
+            // tests built on this fixture (startup delay, the published
+            // tick, unwind timing) are about the loop's wiring, not about
+            // which ledger a fill aims at, and their expected fill ledgers
+            // are `EarliestProfitable`'s. `FreeFill` would move every one
+            // of them out to `start + RAMP_END_BLOCKS` for no reason the
+            // test's own name explains.
+            fill_objective: FillObjective::EarliestProfitable,
             supported_bid: vec!["*".to_string()],
             supported_lot: vec!["*".to_string()],
             profits: Vec::new(),

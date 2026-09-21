@@ -95,8 +95,11 @@ const CREATION_TIMEOUT: Duration = Duration::from_secs(90);
 /// with the pool's 100 bps margin the fill landed at block 178. Both sides
 /// scale with the percent, so the break-even block is near-invariant across
 /// the band the percent walk lands in. Nothing shortens it: `force_fill`
-/// caps the wait at 350 ledgers, which is later, not sooner. 190 is 178
-/// with room for a re-plan.
+/// caps the target at 350 ledgers, which is later, not sooner, and this is
+/// the earliest-profitable break-even specifically — `pools_toml` below
+/// pins `fill_objective` to `earliest-profitable` for exactly that reason,
+/// since the crate's own default, `free-fill`, aims at `start + 400`
+/// instead, well outside this budget. 190 is 178 with room for a re-plan.
 const FILL_LEDGERS: u32 = 190;
 
 /// What [`FILL_LEDGERS`] worth of measured close time is padded by, for the
@@ -504,6 +507,10 @@ fn pools_toml(pool: &str, xlm: &str, usdc: &str) -> String {
          min_primary_collateral = \"{MIN_PRIMARY_COLLATERAL}\"\n\
          min_health_factor = 1.5\n\
          default_profit_bps = 100\n\
+         # earliest-profitable, not the crate's free-fill default: FILL_LEDGERS\n\
+         # is measured against the lot ramp's break-even ledger, and free-fill\n\
+         # would move the fill out to start + 400, past that measured budget.\n\
+         fill_objective = \"earliest-profitable\"\n\
          supported_bid = [\"{usdc}\"]\n\
          supported_lot = [\"*\"]\n"
     )

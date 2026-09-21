@@ -217,15 +217,18 @@ by itself — somebody has to call it. So 500 is where waiting stops being a rac
 against another filler and starts being a race against anyone willing to spend
 a transaction deleting the auction.
 
-The bot today reaches the *start* of the free region and no further.
-`plan_fill`'s gate is `earliest - start > RAMP_END_BLOCKS`
-(`src/math/fill.rs:365`), strictly greater, so it can plan at exactly 400 and
-answers `PastAuctionEnd` from 401 on unless the pool sets `force_fill`. An
-auction this bot first sees at `block_dif` 450 is therefore refused outright,
-although filling it would cost nothing. Separately, `fill_delay` searches for
-the *earliest* ledger at which the lot covers the bid plus the margin, which is
-the right objective against stock and the wrong one here: it pays a real bid to
-win a race the bot could instead win for free a few minutes later.
+Before §4-F landed, the bot reached only the *start* of the free region and no
+further. `plan_fill`'s gate was `earliest - start > RAMP_END_BLOCKS`
+(`src/math/fill.rs:365`), strictly greater, so it could plan at exactly 400 but
+answered `PastAuctionEnd` from 401 on unless the pool set `force_fill`. An
+auction the bot first saw at `block_dif` 450 was therefore refused outright,
+although filling it would have cost nothing. Separately, `fill_delay` searched
+for the *earliest* ledger at which the lot covers the bid plus the margin,
+which is the right objective against stock and was the wrong one here: it paid
+a real bid to win a race the bot could instead win for free a few minutes
+later. §4-F removed the cutoff (`PastAuctionEnd` is no longer answered past
+400) and made the objective the per-pool `FillObjective` choice described
+there.
 
 It is a race, though, and that is the whole trade-off. Waiting to 400
 maximises the take and forfeits it entirely to anyone who fills at 250. The bot
@@ -300,8 +303,11 @@ in five specifics. Recording them so they are not re-introduced:
    is the closed interval `[1.03, 1.15]`. Read as an open interval,
    "(1.03, 1.15)" names the accepted set's *interior* and silently drops its
    two endpoints, which is the one place the distinction changes an answer.
-   The crate's constants are the right numbers; §4-J is where the crate still
-   reads the endpoints the old way.
+   The crate's constants are the right numbers; §4-J, landed, is where the
+   crate stopped reading the endpoints the old way — `TARGET_HF`'s refusal
+   message and doc comments now say plainly that `[1.03, 1.15)` is the bot's
+   own margin inside the contract's closed `[1.03, 1.15]`, not the
+   contract's own bound.
 4. **`bad_debt` is declared but never emitted** on the fork — zero call sites
    (`pool/src/events.rs:157-160`). The briefing's rule "if this pool emits
    stock's `bad_debt`, the wrong wasm is deployed" is therefore sound, and
@@ -335,8 +341,11 @@ both are addresses.
 
 ## 4. What the bot must change
 
-Each item names the decision, not just the defect. These are the scope of the
-implementation phase; none of them is done.
+Each item names the decision, not just the defect. These were the scope of
+the implementation phase, and A through J landed on
+`phase-8/fork-reconciliation` (Phase 8). §5, §6 and §7 below are untouched by
+that work: nothing in Phase 8 implemented `gulp`, retargeted the sandbox at
+the fork, or answered an open question.
 
 **A. Decode the three new events** in `chain::xdr::events`, with
 `affected_accounts` answering the borrower for `collateral_orphaned` and no one
@@ -416,6 +425,18 @@ auction stays open. The acceptance criterion is therefore about the *plan*:
 headroom and size the supply under it, or decline the escalation and say so
 with its own `FillSkip`. A 1220 reaching the executor at all should be the
 unexpected case.
+
+The headroom is not `supply_cap − total_supply()`. That naive subtraction
+cannot breach the cap at any rate — `to_b_token_down` and
+`to_asset_from_b_token` both round down, so
+`floor(a·S/r)·r/S ≤ a`, and therefore `total_supply_after(a) ≤
+total_supply_before + a`; at `a = cap − total_supply_before` that bound is
+`≤ cap` for every rate. What it does instead is **understate** the room, by
+up to a stroop, because the mint rounds down and `total_supply` rounds down
+again on top of it. So the exact search this item asks for is not what keeps
+the cap from being breached — nothing here can breach it — it is what
+recovers that last stroop a planner using the naive formula would decline for
+no reason, and skip a fill that needed exactly it.
 
 **H. Add the pool's own contract address to the bot's own-address set.** It is
 a `Positions` holder now. It cannot be liquidated (1211, stock) and its row is

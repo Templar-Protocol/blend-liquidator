@@ -51,7 +51,9 @@ use crate::store::{
 };
 
 /// `PoolError::InvalidLiqTooLarge`: the liquidation would leave the
-/// borrower's health factor at or above `1.15`, so the percent is too high.
+/// borrower's health factor above `1.15` — the contract's own comparison
+/// is strict, so it accepts exactly `1.15` — meaning the percent is too
+/// high.
 const INVALID_LIQ_TOO_LARGE: u32 = 1_213;
 
 /// `PoolError::InvalidLiqTooSmall`: the liquidation would leave the
@@ -508,6 +510,14 @@ impl<'a> Auctioneer<'a> {
     /// them — one user's failure is never allowed to withhold every other
     /// user's decision.
     ///
+    /// `is_own_account` is checked here, before the batch's snapshot is
+    /// read, not only inside `decide_one`: a user this check catches never
+    /// contributes a `positions` key to the read, and a batch made up
+    /// entirely of such users — the pool's own address, most often — never
+    /// calls `PoolReader::snapshot` at all. `decide_one` keeps the same
+    /// check as its own first guard regardless, so the rule holds for any
+    /// future caller of it that does not pre-filter.
+    ///
     /// A store failure is fatal to the whole batch: it means the bot cannot
     /// trust what it read about who to check or what is already open, and
     /// nothing downstream of that is safe to act on. A chain or math failure
@@ -524,18 +534,36 @@ impl<'a> Auctioneer<'a> {
         if users.is_empty() {
             return Ok(Vec::new());
         }
-        let accounts: Vec<&str> = users.iter().map(|user| user.account.as_str()).collect();
+
+        let mut decisions: Vec<Option<(String, Decision)>> = Vec::with_capacity(users.len());
+        let mut pending = Vec::new();
+        for user in users {
+            if self.is_own_account(pool, &user.account) {
+                decisions.push(Some((
+                    user.account.clone(),
+                    Decision::Skip(SkipReason::OwnAccount),
+                )));
+            } else {
+                decisions.push(None);
+                pending.push(decisions.len() - 1);
+            }
+        }
+        if pending.is_empty() {
+            return Ok(decisions.into_iter().flatten().collect());
+        }
+
+        let accounts: Vec<&str> = pending.iter().map(|&i| users[i].account.as_str()).collect();
         let snapshot = PoolReader::new(self.rpc, pool).snapshot(&accounts).await?;
         let valued_at = snapshot.valued_at(tick.close_time);
         let reserves = snapshot.accrued_reserves(valued_at)?;
 
-        let mut decisions = Vec::with_capacity(users.len());
-        for user in users {
+        for i in pending {
+            let user = &users[i];
             match self
                 .decide_one(pool, &user.account, &snapshot, &reserves, valued_at)
                 .await
             {
-                Ok(decision) => decisions.push((user.account.clone(), decision)),
+                Ok(decision) => decisions[i] = Some((user.account.clone(), decision)),
                 Err(AuctioneerError::Store(error)) => return Err(AuctioneerError::Store(error)),
                 Err(error) => {
                     tracing::warn!(
@@ -547,7 +575,25 @@ impl<'a> Auctioneer<'a> {
                 }
             }
         }
-        Ok(decisions)
+        Ok(decisions.into_iter().flatten().collect())
+    }
+
+    /// Whether `account` needs no decision at all: the pool contract's own
+    /// address, or one this bot signs with.
+    ///
+    /// The pool contract is a `Positions` holder on the fork this bot
+    /// targets: a defaulting borrower's leftover collateral is confiscated
+    /// into the pool's own address as ordinary supply
+    /// (`pool/src/pool/bad_debt.rs:98-109`). It holds no liabilities, so
+    /// there is nothing to liquidate, and the contract refuses
+    /// `user == e.current_contract_address()` with 1211 in any case — but a
+    /// seed source that lists the pool would otherwise cost a chain read
+    /// and a decision every scan. Checked against `pool` rather than folded
+    /// into `own_addresses`: that set is bot-wide, built once per run from
+    /// the signing keys, while a pool address is meaningful only to the
+    /// pool being decided, and this bot follows several.
+    fn is_own_account(&self, pool: &str, account: &str) -> bool {
+        account == pool || self.config.own_addresses.contains(account)
     }
 
     /// One borrower's decision against an already-read `snapshot` and its
@@ -563,7 +609,10 @@ impl<'a> Auctioneer<'a> {
         reserves: &BTreeMap<u32, Reserve>,
         valued_at: u64,
     ) -> Result<Decision, AuctioneerError> {
-        if self.config.own_addresses.contains(account) {
+        // See `is_own_account`'s doc: `decide` already filters this case
+        // out before any chain read, but the guard stays here too, as the
+        // definitive per-account rule for any future caller that does not.
+        if self.is_own_account(pool, account) {
             return Ok(Decision::Skip(SkipReason::OwnAccount));
         }
         // The store, not the chain: the tracker maintains this table from
@@ -580,7 +629,15 @@ impl<'a> Auctioneer<'a> {
         let Some(data) = snapshot.position_data(account, valued_at)? else {
             return Ok(Decision::Skip(SkipReason::NoLiabilities));
         };
-        if data.liability_base > 0 && data.collateral_base == 0 {
+        // The contract's own gate, read the same way it reads it:
+        // `check_and_handle_user_bad_debt` returns early unless the
+        // borrower has liabilities *and* `collateral_raw == 0`
+        // (`pool/src/pool/bad_debt.rs:56-58`). `collateral_base` is
+        // c-factor weighted, so a borrower holding a zero-factor reserve
+        // has `collateral_base == 0` with collateral still there, and
+        // proposing `bad_debt` for it costs a simulation and a flag for
+        // an answer that is always 1200.
+        if data.liability_base > 0 && data.collateral_raw == 0 {
             return Ok(Decision::BadDebt);
         }
         // `health_factor` is `None` only when there are no liabilities. A
@@ -978,8 +1035,8 @@ impl<'a> Auctioneer<'a> {
     /// transaction unsigned: the walk may run in dry-run precisely because
     /// nothing in it signs, restores or sends.
     /// `InvalidLiqTooSmall` (1214, the post-liquidation health factor below
-    /// `1.03`) raises the percent by one; `InvalidLiqTooLarge` (1213, at or
-    /// above `1.15`) lowers it by one — `checked_add`/`checked_sub` and a
+    /// `1.03`) raises the percent by one; `InvalidLiqTooLarge` (1213, above
+    /// `1.15`) lowers it by one — `checked_add`/`checked_sub` and a
     /// [`FillPercent`] range check rather than raw arithmetic, so the walk
     /// can never wrap past `1..=100` and a percent that would leave that
     /// range ends the walk at once instead of retrying a value the contract
@@ -1015,16 +1072,9 @@ impl<'a> Auctioneer<'a> {
         let bid: Vec<&str> = plan.bid.iter().map(String::as_str).collect();
         let lot: Vec<&str> = plan.lot.iter().map(String::as_str).collect();
         let build = |percent: FillPercent| {
-            new_auction_op(
-                pool,
-                AuctionType::UserLiquidation,
-                account,
-                &bid,
-                &lot,
-                percent,
-            )
-            .map_err(ChainError::from)
-            .map_err(AuctioneerError::from)
+            new_auction_op(pool, account, &bid, &lot, percent)
+                .map_err(ChainError::from)
+                .map_err(AuctioneerError::from)
         };
 
         let Some(submitter) = self.submitter.as_ref() else {
@@ -1638,6 +1688,92 @@ mod tests {
         Ok(())
     }
 
+    /// None of the fixture's three reserves has `c_factor == 0` — they are
+    /// `7_500_000` (index 0, XLM), `9_500_000` (index 1, USDC) and
+    /// `9_500_000` (index 2) — so this exercises the fallback the task
+    /// brief allows: a position sized so the weighted value floors to zero
+    /// while the raw value does not, on real fixture numbers rather than an
+    /// edited fixture.
+    ///
+    /// `to_effective_asset_from_b_token` applies the collateral factor
+    /// *before* the oracle price: one b-token converts to 1 unit of
+    /// underlying on every reserve here (`b_rate` is ~1.0), and
+    /// `floor(1 * c_factor / 1e7)` is 0 on all three (0.75 and 0.95 both
+    /// floor away at that size) — so `collateral_base`'s contribution from
+    /// a single b-token is 0 everywhere, regardless of price. What decides
+    /// whether `collateral_raw` (no factor, priced directly) survives
+    /// instead is `floor(price * 1 / reserve.scalar)`, which needs a price
+    /// at or above the reserve's own scalar (`10^decimals`, `1e7` here) to
+    /// floor to anything but 0 too. Reserve 0 prices at 1_778_617 (~$0.18)
+    /// and reserve 1 at 9_999_165 (~$1.00 less a rounding hair) — both
+    /// still floor their raw contribution to 0, no divergence at all.
+    /// `DUST_C_FACTOR_INDEX` (reserve 2) prices at 11_613_052 (~$1.16):
+    /// `floor(11_613_052 * 1 / 10_000_000) == 1`. One b-token of it is
+    /// therefore collateral worth 1 raw unit to the contract's gate and 0
+    /// to the health factor — the same case a zero `c_factor` would have
+    /// made trivially, had the fixture held one.
+    const DUST_C_FACTOR_INDEX: u32 = 2;
+
+    /// The contract gates its default path on `collateral_raw`, not on
+    /// the c-factor-weighted `collateral_base`
+    /// (`pool/src/pool/bad_debt.rs:56-58` returns early unless the
+    /// borrower has liabilities *and* `collateral_raw == 0`). A borrower
+    /// holding a dust amount of `DUST_C_FACTOR_INDEX` therefore has
+    /// `collateral_base == 0` (the weighted value floors away) and
+    /// `collateral_raw > 0` (the raw, priced value does not): deciding on
+    /// the weighted value proposes a `bad_debt` the contract answers 1200,
+    /// costing a simulation and a flag every scan.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn collateral_the_factor_zeroes_is_still_collateral(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let account = synthetic_account(3);
+        // One b-token: the smallest position this pool can hold, and the
+        // size worked out above to float `collateral_raw` above zero while
+        // `collateral_base` stays at it.
+        let collateral = &[(DUST_C_FACTOR_INDEX, 1)];
+        let liabilities = &[(1, 10_000_000_000)];
+
+        // Once to read the position data directly and prove the premise,
+        // once more for `decide` — each round of `script_snapshot_with_positions`
+        // answers exactly one `PoolReader::snapshot` call.
+        script_snapshot_with_positions(&rpc, &account, collateral, liabilities);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let snapshot = PoolReader::new(&client, POOL)
+            .snapshot(&[&account])
+            .await
+            .expect("snapshot");
+        let tick = harness::fixture_tick();
+        let valued_at = snapshot.valued_at(tick.close_time);
+        let data = snapshot
+            .position_data(&account, valued_at)
+            .expect("position data")
+            .expect("account holds positions");
+        assert_eq!(
+            data.collateral_base, 0,
+            "the c-factor-weighted value floors away at this size"
+        );
+        assert!(
+            data.collateral_raw > 0,
+            "the raw value must survive for this to be the case the fix targets"
+        );
+
+        script_snapshot_with_positions(&rpc, &account, collateral, liabilities);
+        let auctioneer = Auctioneer::new(&client, &store, config(BTreeSet::new()), None);
+        let decisions = auctioneer
+            .decide(POOL, &[tracked_user(&account)], tick)
+            .await
+            .expect("decide");
+        assert_ne!(
+            decisions[0].1,
+            Decision::BadDebt,
+            "raw collateral remains, so the contract would refuse bad_debt with 1200"
+        );
+        Ok(())
+    }
+
     /// A borrower with an auction already open is skipped: the contract
     /// would answer `AuctionInProgress`, and a simulation spent finding
     /// that out is a round trip for nothing.
@@ -1703,6 +1839,27 @@ mod tests {
             vec![(USER_ONE.to_string(), Decision::Skip(SkipReason::OwnAccount))],
             "USER_ONE is healthy anyway, so a wrong check here would still \
              pass by accident unless it runs before the health factor is read"
+        );
+        Ok(())
+    }
+
+    /// The pool contract holds positions of its own on the fork —
+    /// confiscated collateral lands there as `supply` — so a seed source
+    /// that lists it would otherwise cost a chain read and a decision
+    /// every scan. The contract refuses to liquidate itself (1211).
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_pool_itself_is_never_a_borrower(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let auctioneer = Auctioneer::new(&client, &store, config(BTreeSet::new()), None);
+        let decisions = auctioneer
+            .decide(POOL, &[tracked_user(POOL)], harness::fixture_tick())
+            .await
+            .expect("decide");
+        assert_eq!(
+            decisions,
+            vec![(POOL.to_string(), Decision::Skip(SkipReason::OwnAccount))]
         );
         Ok(())
     }

@@ -63,7 +63,7 @@ impl Attempt {
 }
 
 /// Why the filler skipped an auction without taking it. A closed set,
-/// rendered the same way [`Attempt`] is: all five `skips_total` series
+/// rendered the same way [`Attempt`] is: all six `skips_total` series
 /// every time, zero included. The auctioneer's own `SkipReason` is not
 /// counted here — [`Metrics::skip`] has no auctioneer call site.
 ///
@@ -71,7 +71,7 @@ impl Attempt {
 /// the filler re-makes every one of these decisions on every tick an
 /// auction stays open, so it remembers what it has already counted (see
 /// `FillerState::counted_skips`) and one auction the planner refuses
-/// forever cannot bury the other four. A different reason for the same
+/// forever cannot bury the other five. A different reason for the same
 /// auction counts again; the same reason does not until the auction
 /// closes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -81,6 +81,9 @@ pub enum SkipLabel {
     UnsupportedAssets,
     /// The filler's wallet does not hold enough of what the fill needs.
     Unfunded,
+    /// More of the primary asset would have closed the shortfall and the
+    /// pool's `supply_cap` has no room for it.
+    SupplyCapped,
     /// No plan closes the position at a profit worth taking.
     Unprofitable,
     /// Acting would leave the bot's own position below its health floor.
@@ -93,9 +96,10 @@ pub enum SkipLabel {
 impl SkipLabel {
     /// Every variant, in declaration order — the order [`Metrics::render`]
     /// emits `skips_total` series in.
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::UnsupportedAssets,
         Self::Unfunded,
+        Self::SupplyCapped,
         Self::Unprofitable,
         Self::Health,
         Self::ContractError,
@@ -107,6 +111,7 @@ impl SkipLabel {
         match self {
             Self::UnsupportedAssets => "unsupported_assets",
             Self::Unfunded => "unfunded",
+            Self::SupplyCapped => "supply_capped",
             Self::Unprofitable => "unprofitable",
             Self::Health => "health",
             Self::ContractError => "contract_error",
@@ -191,7 +196,7 @@ struct Inner {
     pools: BTreeMap<String, PoolRecord>,
     creations: [u64; 3],
     fills: [u64; 3],
-    skips: [u64; 5],
+    skips: [u64; 6],
     /// Saturating running total of the positive estimates, in the pool
     /// oracle's units. Display-only: see [`Metrics::profit`].
     profit_total: i128,
@@ -211,7 +216,7 @@ impl Inner {
             pools: BTreeMap::new(),
             creations: [0; 3],
             fills: [0; 3],
-            skips: [0; 5],
+            skips: [0; 6],
             profit_total: 0,
             loss_total: 0,
             reserved_inventory: BTreeMap::new(),

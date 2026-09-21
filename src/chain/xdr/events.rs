@@ -6,6 +6,15 @@
 //! contract upgrade may add more, neither of which may stall the poller. A
 //! *modelled* event with an unexpected shape is an error, because that means
 //! a shape this bot depends on has changed.
+//!
+//! `DefaultedDebt`, `DebtSetoff` and `OrphanSettled` name no account
+//! (`PoolEvent::affected_accounts` answers none for them): a `b_rate` cut
+//! that lowers every borrower's position in that reserve flags nobody for
+//! a targeted re-read, and a `bad_debt(user)` call whose set-off clears the
+//! debt entirely from the borrower's own supply emits only `DebtSetoff` —
+//! no user-bearing event at all — so that borrower's row goes stale until
+//! the next full scan reaches it. A known bound of event-driven tracking,
+//! not a defect this module can close on its own.
 
 use stellar_xdr::ScVal;
 
@@ -87,14 +96,42 @@ pub enum PoolEvent {
         auction_type: AuctionType,
         user: String,
     },
-    /// A user's debt moved to the backstop.
+    /// A user's debt moved to the backstop — stock semantics only. The
+    /// fork declares this event with zero call sites, so a pool built
+    /// from ADR-0008 can never emit it: seeing one means the pool is
+    /// running stock wasm and every fork assumption this bot makes is
+    /// void (`NotificationKind::StockWasmDetected`).
     BadDebt {
         user: String,
         asset: String,
         d_tokens: i128,
     },
-    /// The backstop defaulted debt; suppliers took the loss.
+    /// Debt destroyed and the reserve's `b_rate` cut so suppliers absorb
+    /// the loss. Verbatim from stock, but the fork emits it on two paths:
+    /// the backstop's, and the user path `check_and_handle_user_bad_debt`
+    /// runs inside a full liquidation fill — the event a modelled full
+    /// fill's projected haircut (`math::setoff`) causes.
     DefaultedDebt { asset: String, d_tokens: i128 },
+    /// The fork's set-off: before declaring a default it repays what it
+    /// can from the borrower's own supply in the debt reserve. Names no
+    /// account — the event carries only the asset.
+    DebtSetoff {
+        asset: String,
+        b_tokens_burned: i128,
+        d_tokens_repaid: i128,
+    },
+    /// A defaulted borrower's remaining collateral, moved into the pool
+    /// contract's own `supply`. Emitted only when a residual default
+    /// actually occurred: a set-off that clears the debt leaves the
+    /// collateral with the borrower and emits nothing.
+    CollateralOrphaned {
+        user: String,
+        asset: String,
+        b_tokens: i128,
+    },
+    /// Orphaned collateral retired from pool custody by `gulp`, which is
+    /// refused while the reserve carries any debt.
+    OrphanSettled { asset: String, b_tokens: i128 },
     /// A reserve was added or reconfigured.
     SetReserve { asset: String, index: u32 },
     /// The pool's status changed, which gates what requests it accepts.
@@ -114,17 +151,21 @@ impl PoolEvent {
             | Self::Borrow { from, .. }
             | Self::Repay { from, .. }
             | Self::FlashLoan { from, .. } => vec![from],
-            // Bad debt (below) moves the liability to the backstop, so the
-            // backstop's own positions change too — but the event carries
-            // no backstop address, so a consumer that wants to refresh it
+            // `BadDebt` is stock-only (see its own doc): a fork pool never
+            // emits it. On stock it moves the liability to the backstop,
+            // whose own positions change too, but the event carries no
+            // backstop address, so a consumer that wants to refresh it
             // adds `PoolInstance::backstop` itself.
             Self::NewAuction { user, .. }
             | Self::DeleteAuction { user, .. }
+            | Self::CollateralOrphaned { user, .. }
             | Self::BadDebt { user, .. } => vec![user],
             Self::FillAuction { user, filler, .. } => vec![user, filler],
-            Self::DefaultedDebt { .. } | Self::SetReserve { .. } | Self::SetStatus { .. } => {
-                Vec::new()
-            }
+            Self::DefaultedDebt { .. }
+            | Self::DebtSetoff { .. }
+            | Self::OrphanSettled { .. }
+            | Self::SetReserve { .. }
+            | Self::SetStatus { .. } => Vec::new(),
         }
     }
 }
@@ -332,8 +373,9 @@ fn decode_auction_event(
     Ok(Some(event))
 }
 
-/// The rest: `bad_debt`, `defaulted_debt`, `set_reserve` and `set_status`,
-/// which share no common shape.
+/// The rest: `bad_debt`, `defaulted_debt`, the fork's `debt_setoff`,
+/// `collateral_orphaned` and `orphan_settled`, `set_reserve` and
+/// `set_status`, which share no common shape.
 fn decode_admin_event(
     name: &str,
     topics: &[ScVal],
@@ -353,6 +395,30 @@ fn decode_admin_event(
             PoolEvent::DefaultedDebt {
                 asset: as_address(topic(topics, 1)?)?,
                 d_tokens: as_i128(value)?,
+            }
+        }
+        "debt_setoff" => {
+            require_topics(topics, 2, "debt_setoff with 2 topics")?;
+            let items = data(value, 2)?;
+            PoolEvent::DebtSetoff {
+                asset: as_address(topic(topics, 1)?)?,
+                b_tokens_burned: as_i128(&items[0])?,
+                d_tokens_repaid: as_i128(&items[1])?,
+            }
+        }
+        "collateral_orphaned" => {
+            require_topics(topics, 3, "collateral_orphaned with 3 topics")?;
+            PoolEvent::CollateralOrphaned {
+                user: as_address(topic(topics, 1)?)?,
+                asset: as_address(topic(topics, 2)?)?,
+                b_tokens: as_i128(value)?,
+            }
+        }
+        "orphan_settled" => {
+            require_topics(topics, 2, "orphan_settled with 2 topics")?;
+            PoolEvent::OrphanSettled {
+                asset: as_address(topic(topics, 1)?)?,
+                b_tokens: as_i128(value)?,
             }
         }
         "set_reserve" => {
@@ -603,6 +669,109 @@ mod tests {
                 d_tokens: 9_999
             })
         );
+    }
+
+    #[test]
+    fn decodes_a_constructed_debt_setoff() {
+        // Fork `PoolEvents::debt_setoff`: 2 topics, data `(b_tokens_burned,
+        // d_tokens_repaid)`.
+        let topics = vec![
+            symbol("debt_setoff").expect("symbol"),
+            address(USDC).expect("address"),
+        ];
+        let value =
+            crate::chain::xdr::encode::vec(vec![i128_val(1_200), i128_val(950)]).expect("data");
+        assert_eq!(
+            decode_pool_event(&topics, &value).expect("decodes"),
+            Some(PoolEvent::DebtSetoff {
+                asset: USDC.to_string(),
+                b_tokens_burned: 1_200,
+                d_tokens_repaid: 950,
+            })
+        );
+    }
+
+    #[test]
+    fn decodes_a_constructed_orphan_settled() {
+        // Fork `PoolEvents::orphan_settled`: 2 topics, scalar data.
+        let topics = vec![
+            symbol("orphan_settled").expect("symbol"),
+            address(XLM).expect("address"),
+        ];
+        assert_eq!(
+            decode_pool_event(&topics, &i128_val(77)).expect("decodes"),
+            Some(PoolEvent::OrphanSettled {
+                asset: XLM.to_string(),
+                b_tokens: 77,
+            })
+        );
+    }
+
+    /// `collateral_orphaned` is the one fork event with three topics, and
+    /// the borrower sits in topic 1 with the asset in topic 2 — the
+    /// opposite order from `bad_debt`'s reading being wrong in a way no
+    /// type catches, since both are addresses.
+    #[test]
+    fn collateral_orphaned_takes_the_user_from_topic_one() {
+        let topics = vec![
+            symbol("collateral_orphaned").expect("symbol"),
+            address(USER).expect("address"),
+            address(XLM).expect("address"),
+        ];
+        assert_eq!(
+            decode_pool_event(&topics, &i128_val(4_321)).expect("decodes"),
+            Some(PoolEvent::CollateralOrphaned {
+                user: USER.to_string(),
+                asset: XLM.to_string(),
+                b_tokens: 4_321,
+            })
+        );
+    }
+
+    /// A modelled event with the wrong shape is an error, never `None`:
+    /// `None` means "an event this bot does not model", and reading a
+    /// changed shape as that would hide the change.
+    #[test]
+    fn a_fork_event_with_the_wrong_shape_is_an_error() {
+        let two_topics = vec![
+            symbol("collateral_orphaned").expect("symbol"),
+            address(XLM).expect("address"),
+        ];
+        assert!(decode_pool_event(&two_topics, &i128_val(1)).is_err());
+
+        let setoff = vec![
+            symbol("debt_setoff").expect("symbol"),
+            address(USDC).expect("address"),
+        ];
+        assert!(decode_pool_event(&setoff, &i128_val(1)).is_err());
+    }
+
+    /// Only `collateral_orphaned` names an account; the other two are
+    /// reserve-wide and name nobody, like `defaulted_debt`.
+    #[test]
+    fn only_collateral_orphaned_names_an_account() {
+        assert_eq!(
+            PoolEvent::CollateralOrphaned {
+                user: USER.to_string(),
+                asset: XLM.to_string(),
+                b_tokens: 1,
+            }
+            .affected_accounts(),
+            vec![USER]
+        );
+        assert!(PoolEvent::DebtSetoff {
+            asset: USDC.to_string(),
+            b_tokens_burned: 1,
+            d_tokens_repaid: 1,
+        }
+        .affected_accounts()
+        .is_empty());
+        assert!(PoolEvent::OrphanSettled {
+            asset: XLM.to_string(),
+            b_tokens: 1,
+        }
+        .affected_accounts()
+        .is_empty());
     }
 
     #[test]

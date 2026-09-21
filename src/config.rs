@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 
+use crate::math::fill::FillObjective;
 use crate::LiquidatorError;
 
 /// Parse only the literal strings `true` and `false`.
@@ -144,14 +145,21 @@ impl<'de> serde::Deserialize<'de> for Decimal7 {
 }
 
 /// The bottom of the pool contract's post-liquidation band, 7 decimals:
-/// below `1.03` it answers `InvalidLiqTooSmall` (1214).
+/// **below** `1.03` it answers `InvalidLiqTooSmall` (1214). The
+/// comparison is strict (`is_hf_under` is `<`), so exactly `1.03` is
+/// accepted and this bound is inclusive.
 const TARGET_HF_MIN: i128 = 10_300_000;
 
-/// The top of that band, 7 decimals, exclusive: at or above `1.15` the
-/// contract answers `InvalidLiqTooLarge` (1213).
+/// One notch inside the top of that band, 7 decimals, and **this bot's
+/// own margin rather than the contract's rule**. The contract refuses
+/// only *above* `1.15` (`is_hf_over` is `>`, so exactly `1.15` is
+/// accepted), but a target of exactly `1.15` aims every liquidation at
+/// the ceiling with nothing left for the drift between planning and
+/// fill — one ledger of interest on the borrower's debt puts the
+/// outcome over, and the contract answers `InvalidLiqTooLarge` (1213).
 const TARGET_HF_MAX: i128 = 11_500_000;
 
-/// `TARGET_HF`, refused outside the band the contract itself accepts.
+/// `TARGET_HF`, refused outside the band this bot plans within.
 ///
 /// The knob names the health factor a liquidation aims to leave the
 /// borrower at, and the plan's percent is computed straight from it:
@@ -163,21 +171,27 @@ const TARGET_HF_MAX: i128 = 11_500_000;
 /// `PLAN_ITERATIONS` simulations per borrower before skipping it, one warn
 /// line each.
 ///
-/// The bounds are the contract's own and nothing narrower: it refuses a
-/// post-liquidation health factor below `1.03` (`InvalidLiqTooSmall`) and
-/// at or above `1.15` (`InvalidLiqTooLarge`), so `[1.03, 1.15)` is exactly
-/// the set of values that name an outcome the contract can accept. Picking
-/// a tighter range here would be this bot's opinion rather than the
-/// contract's rule, and the ±1 percent walk is what absorbs the margin at
-/// either edge. Refused at parse rather than clamped, for the same reason
-/// `PLAN_ITERATIONS` and `PRICE_DELTA_BPS` are: a knob value that makes the
-/// bot look busy and do nothing is a startup error, not a default.
+/// The lower bound is the contract's own: below `1.03` it answers
+/// `InvalidLiqTooSmall`. The upper bound is not — the contract's own
+/// check is strict (`is_hf_over` uses `>`), so it accepts exactly `1.15`
+/// — but aiming a liquidation at the ceiling leaves no room for the
+/// drift between planning and fill that `TARGET_HF`'s default of `1.06`
+/// exists to absorb: one ledger of interest on the borrower's debt after
+/// planning and the outcome lands over `1.15`, answered
+/// `InvalidLiqTooLarge`. So `[1.03, 1.15)` is this bot's own band, one
+/// notch narrower at the top than what the contract would accept, and
+/// the ±1 percent walk is what absorbs whatever drift is left within it.
+/// Refused at parse rather than clamped, for the same reason
+/// `PLAN_ITERATIONS` and `PRICE_DELTA_BPS` are: a knob value that makes
+/// the bot look busy and do nothing is a startup error, not a default.
 fn target_health_factor(text: &str) -> Result<Decimal7, String> {
     let value: Decimal7 = text.parse()?;
     if value.get() < TARGET_HF_MIN || value.get() >= TARGET_HF_MAX {
         return Err(format!(
-            "`{text}` is outside the band the pool contract accepts: TARGET_HF must be at \
-             least 1.03 and below 1.15, or every liquidation this bot plans is refused"
+            "`{text}` is outside the band this bot plans within: TARGET_HF must be at least \
+             1.03 and below 1.15. The contract itself accepts exactly 1.15 — its own check is \
+             strict — but aiming there leaves no room for the drift between planning and fill, \
+             so the upper bound is this bot's margin and the lower one is the contract's"
         ));
     }
     Ok(value)
@@ -231,6 +245,10 @@ pub struct PoolConfig {
     pub default_profit_bps: u32,
     /// Fill regardless of profit. For testing a pool, not for production.
     pub force_fill: bool,
+    /// Which ledger a fill aims at: the free-fill point at block 400, or
+    /// the earliest ledger the lot covers the bid plus the margin. See
+    /// `crate::math::fill::FillObjective`.
+    pub fill_objective: FillObjective,
     /// Bid assets the bot will pay, or `["*"]`.
     pub supported_bid: Vec<String>,
     /// Lot assets the bot will take, or `["*"]`.
@@ -249,6 +267,8 @@ struct RawPool {
     default_profit_bps: u32,
     #[serde(default)]
     force_fill: bool,
+    #[serde(default)]
+    fill_objective: Option<String>,
     supported_bid: Vec<String>,
     supported_lot: Vec<String>,
     #[serde(default)]
@@ -308,6 +328,19 @@ pub fn parse_pools(text: &str) -> Result<Vec<PoolConfig>, LiquidatorError> {
                 pool.address
             )));
         }
+        let fill_objective = match pool.fill_objective.as_deref() {
+            None | Some("free-fill") => FillObjective::FreeFill,
+            Some("earliest-profitable") => FillObjective::EarliestProfitable,
+            Some(other) => {
+                return Err(LiquidatorError::Config(format!(
+                    "pools file: pool {}: `{other}` is not a fill_objective: it is \
+                     `free-fill` (the default, which waits for the ledger the bid is gone) \
+                     or `earliest-profitable` (which fills as soon as the lot covers the bid \
+                     plus the pool's margin)",
+                    pool.address
+                )));
+            }
+        };
         pools.push(PoolConfig {
             address: pool.address,
             primary_asset: pool.primary_asset,
@@ -315,6 +348,7 @@ pub fn parse_pools(text: &str) -> Result<Vec<PoolConfig>, LiquidatorError> {
             min_health_factor: pool.min_health_factor.get(),
             default_profit_bps: pool.default_profit_bps,
             force_fill: pool.force_fill,
+            fill_objective,
             supported_bid: pool.supported_bid,
             supported_lot: pool.supported_lot,
             profits: pool.profits,
@@ -709,18 +743,20 @@ pub struct Args {
 
     /// The health factor a liquidation aims to leave the borrower at.
     ///
-    /// The contract refuses a post-liquidation health factor at or above
-    /// `1.15` (`InvalidLiqTooLarge`) or below `1.03` (`InvalidLiqTooSmall`),
-    /// so this sits between them with room for the auction to be filled a
-    /// ledger or two later than planned — and anything outside that band is
-    /// refused at parse rather than clamped: `TARGET_HF=0` would make the
-    /// planned excess non-positive for every borrower, so every
-    /// liquidatable one is recorded as "no plan" for ever, silently, and a
-    /// value above the band burns `PLAN_ITERATIONS` simulations per
-    /// borrower before skipping it. The bounds are the contract's own and
-    /// nothing narrower — a tighter range would be this bot's opinion
-    /// rather than the contract's rule — and the ±1 percent walk is what
-    /// absorbs the margin at either edge.
+    /// The contract refuses a post-liquidation health factor above `1.15`
+    /// (`InvalidLiqTooLarge`) or below `1.03` (`InvalidLiqTooSmall`), both
+    /// comparisons strict, so it would accept exactly `1.15` — but aiming
+    /// there leaves no room for the drift between planning and fill, so
+    /// this bot refuses one notch inside that ceiling instead, with room
+    /// for the auction to be filled a ledger or two later than planned.
+    /// Anything outside `[1.03, 1.15)` is refused at parse rather than
+    /// clamped: `TARGET_HF=0` would make the planned excess non-positive
+    /// for every borrower, so every liquidatable one is recorded as "no
+    /// plan" for ever, silently, and a value above the band burns
+    /// `PLAN_ITERATIONS` simulations per borrower before skipping it. The
+    /// lower bound is the contract's own rule; the upper one is this bot's
+    /// margin, and the ±1 percent walk is what absorbs whatever drift is
+    /// left within it.
     #[arg(
         long,
         env = "TARGET_HF",
@@ -1740,6 +1776,30 @@ supported_lot = ["*"]
     }
 
     #[test]
+    fn the_fill_objective_defaults_to_the_free_fill_and_rejects_nonsense() {
+        let pools = parse_pools(POOLS).expect("the example parses");
+        assert_eq!(pools[0].fill_objective, FillObjective::FreeFill);
+
+        let named = POOLS.replace(
+            "force_fill = false",
+            "force_fill = false\nfill_objective = \"earliest-profitable\"",
+        );
+        assert_eq!(
+            parse_pools(&named).expect("parses")[0].fill_objective,
+            FillObjective::EarliestProfitable
+        );
+
+        let bad = POOLS.replace(
+            "force_fill = false",
+            "force_fill = false\nfill_objective = \"whenever\"",
+        );
+        assert!(parse_pools(&bad)
+            .expect_err("nonsense is refused")
+            .to_string()
+            .contains("fill_objective"));
+    }
+
+    #[test]
     fn a_pools_file_that_is_wrong_is_a_config_error_naming_the_problem() {
         for (bad, expected) in [
             ("", "at least one pool"),
@@ -1943,7 +2003,7 @@ supported_lot = ["*"]
         for refused in ["0", "0.9", "1.0299999", "1.15", "1.2", "2"] {
             assert!(
                 parse_target(refused).is_err(),
-                "TARGET_HF={refused} is outside the band the contract accepts"
+                "TARGET_HF={refused} is outside the band this bot plans within"
             );
         }
         for accepted in ["1.03", "1.06", "1.1499999"] {
@@ -1952,6 +2012,26 @@ supported_lot = ["*"]
                 "TARGET_HF={accepted} names an outcome the contract accepts"
             );
         }
+    }
+
+    /// The contract's own comparisons are strict — `is_hf_over(1_1500000)`
+    /// uses `>` and `is_hf_under(1_0300000)` uses `<` — so exactly 1.15
+    /// is accepted by the contract and refused here on purpose. The
+    /// refusal must say that it is the bot's own margin, not the
+    /// contract's rule.
+    #[test]
+    fn the_target_band_is_the_bots_own_margin_and_says_so() {
+        let error = target_health_factor("1.15").expect_err("refused");
+        assert!(
+            !error.contains("the band the pool contract accepts"),
+            "the contract accepts 1.15; the refusal must not claim otherwise: {error}"
+        );
+        assert!(
+            error.contains("drift"),
+            "the refusal must say why the bot is narrower: {error}"
+        );
+        // Exactly 1.03 is accepted by both.
+        assert!(target_health_factor("1.03").is_ok());
     }
 
     /// A liquidation threshold above the scan threshold names borrowers

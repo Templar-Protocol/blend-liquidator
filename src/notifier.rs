@@ -90,6 +90,13 @@ pub enum NotificationKind {
     RpcFailing,
     EventGap,
     UnfundedFill,
+    /// A `bad_debt` event was seen on chain. The ADR-0008 fork declares
+    /// that event with zero call sites, so it cannot be emitted by the
+    /// contract this bot is written against: one means the pool is
+    /// running stock wasm, and every assumption about default handling —
+    /// the supplier haircut, orphan custody, the fill's own health
+    /// projection — is void. An alarm, never something to act on.
+    StockWasmDetected,
 }
 
 impl NotificationKind {
@@ -108,6 +115,7 @@ impl NotificationKind {
             Self::RpcFailing => "rpc_failing",
             Self::EventGap => "event_gap",
             Self::UnfundedFill => "unfunded_fill",
+            Self::StockWasmDetected => "stock_wasm_detected",
         }
     }
 }

@@ -99,6 +99,13 @@ use crate::store::{Store, StoreError, TrackedAuction};
 /// 12), and it lowers it from whatever the contract refused.
 const WHOLE_AUCTION: u32 = 100;
 
+/// The auction age, in ledgers past its start, at which
+/// `delete_stale_auction` stops refusing and becomes callable by anyone.
+/// Not a fill bound — the contract has none — but a plan aimed at or past
+/// it is racing a deletion, not just another filler, so it is worth a
+/// warning.
+const STALE_AUCTION_BLOCKS: u32 = 500;
+
 /// The longest an unwind pass that keeps making no progress is held off
 /// for, in ledgers. The backoff doubles from two, so this is reached on
 /// the sixth consecutive setback and never exceeded.
@@ -457,16 +464,14 @@ fn due(
 ///
 /// Exhaustive on purpose — a new [`FillSkip`] must be given a label here
 /// rather than silently joining whichever one a catch-all arm named.
-/// [`FillSkip::PastAuctionEnd`] is `Unprofitable` because that is what it
-/// is: the ramp is over, so there is nothing left to wait for and the lot
-/// is whatever it is. [`FillSkip::TooManyPositions`] is `Health` because
-/// what it refuses is the filler's own position, exactly as the floor
-/// does.
+/// [`FillSkip::TooManyPositions`] is `Health` because what it refuses is
+/// the filler's own position, exactly as the floor does.
 fn skip_label(reason: FillSkip) -> SkipLabel {
     match reason {
-        FillSkip::Unprofitable | FillSkip::PastAuctionEnd => SkipLabel::Unprofitable,
+        FillSkip::Unprofitable => SkipLabel::Unprofitable,
         FillSkip::TooManyPositions | FillSkip::Health => SkipLabel::Health,
         FillSkip::Unfunded => SkipLabel::Unfunded,
+        FillSkip::SupplyCapped => SkipLabel::SupplyCapped,
     }
 }
 
@@ -633,7 +638,17 @@ impl<'a> Filler<'a> {
         if live.is_empty() || *shutdown.borrow() {
             return Ok(());
         }
-        let accounts: Vec<&str> = self.executor.filler().into_iter().collect();
+        // The filler's own account, and every live auction's borrower: a
+        // full fill runs the contract's default path over the borrower
+        // inside the filler's own transaction, and `plan_fill` projects
+        // what that does to the reserves it then values the filler
+        // against. `PoolReader::snapshot` answers for every account it is
+        // handed, so this widens the `getLedgerEntries` it was already
+        // making rather than adding a round trip.
+        let mut accounts: Vec<&str> = self.executor.filler().into_iter().collect();
+        accounts.extend(live.iter().map(|(row, _)| row.account.as_str()));
+        accounts.sort_unstable();
+        accounts.dedup();
         let snapshot = match reader.snapshot(&accounts).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -695,7 +710,7 @@ impl<'a> Filler<'a> {
     /// of them is a decision it re-makes on every tick the auction stays
     /// open: counting per attempt would make each reason's rate a
     /// function of how long an auction lived rather than of how often the
-    /// bot declined one, and the five reasons would stop being comparable
+    /// bot declined one, and the six reasons would stop being comparable
     /// with each other. See `FillerState::counted_skips` for what the
     /// key is and when it is forgotten.
     ///
@@ -732,7 +747,16 @@ impl<'a> Filler<'a> {
         if row.auction_type != AuctionType::UserLiquidation {
             return false;
         }
-        if self.config.own_addresses.contains(&row.account) {
+        // The pool contract is a `Positions` holder on the fork this bot
+        // targets: a defaulting borrower's leftover collateral is
+        // confiscated into the pool's own address as ordinary supply. It
+        // never holds liabilities, so there is never an auction against it
+        // in practice, but a row that somehow named it is worth nothing to
+        // chase. Compared against `pool.address` rather than folded into
+        // `own_addresses`: that set is bot-wide, built once per run from
+        // the signing keys, while a pool address is meaningful only to the
+        // pool this row belongs to, and this bot follows several.
+        if row.account == pool.address || self.config.own_addresses.contains(&row.account) {
             return false;
         }
         let bid: Vec<&str> = row.bid.keys().map(String::as_str).collect();
@@ -937,6 +961,7 @@ impl<'a> Filler<'a> {
             health_floor: context.health_floor,
             profit_bps: context.pool.profit_bps(&bid, &lot),
             force_fill: context.pool.force_fill,
+            objective: context.pool.fill_objective,
             plan_iterations: self.config.plan_iterations,
         }
     }
@@ -947,15 +972,23 @@ impl<'a> Filler<'a> {
     fn plan(
         &self,
         context: &PoolPass<'_>,
+        account: &str,
         auction: &AuctionData,
         max_percent: FillPercent,
     ) -> Result<PlannedFill, MathError> {
         let wallet = self.inventory.available();
+        // A borrower the snapshot holds no entry for has no position to
+        // default, so an empty one is the truthful reading rather than a
+        // refusal: the snapshot was asked for this account, and "no
+        // entry" is how the ledger spells a position that holds nothing.
+        let empty = Positions::default();
+        let borrower = context.snapshot.positions.get(account).unwrap_or(&empty);
         let inputs = FillInputs {
             reserves: &context.reserves,
             asset_index: &context.snapshot.asset_index,
             prices: &context.snapshot.prices,
             filler: &context.filler,
+            borrower,
             wallet: &wallet,
             auction,
             earliest_ledger: context.earliest_ledger,
@@ -1013,7 +1046,7 @@ impl<'a> Filler<'a> {
         max_percent: FillPercent,
         pass: &mut Pass<'_>,
     ) -> Result<Option<FillDraft>, FillerError> {
-        match self.plan(context, auction, max_percent) {
+        match self.plan(context, &row.account, auction, max_percent) {
             Ok(PlannedFill::Fill(draft)) => Ok(Some(draft)),
             Ok(PlannedFill::Skip(reason)) => {
                 tracing::debug!(
@@ -1247,13 +1280,27 @@ impl<'a> Filler<'a> {
         queue: Option<&SubmissionQueue>,
         pass: &mut Pass<'_>,
     ) -> Result<Option<ExecOutcome>, FillerError> {
+        // From 500 on, `delete_stale_auction` stops refusing. It is
+        // permissionless and deletes nothing by itself, so this is not a
+        // refusal — but a plan aimed past it is racing anyone willing to
+        // spend a transaction removing the auction, not just another
+        // filler.
+        if draft.fill_ledger.saturating_sub(start_ledger) >= STALE_AUCTION_BLOCKS {
+            tracing::warn!(
+                pool = %row.pool,
+                account = %row.account,
+                fill_ledger = draft.fill_ledger,
+                start_ledger,
+                "this auction is old enough for anyone to delete; the fill races a deletion"
+            );
+        }
         let priority = match self.priority(context, draft) {
             Ok(priority) => priority,
             Err(error) => {
                 tracing::warn!(pool = %row.pool, account = %row.account, %error, "this fill's fee tier does not compute");
                 // Nothing chain-specific refused this fill — it never
                 // reached the chain — but `ContractError` is the label for
-                // exactly this: a refusal none of the other four reasons
+                // exactly this: a refusal none of the other five reasons
                 // classifies more specifically.
                 self.count_skip(pass, row, start_ledger, SkipLabel::ContractError);
                 pass.summary.skipped += 1;
@@ -2005,7 +2052,7 @@ mod tests {
         self, contract_entry_xdr, entry, filler_signer, instance_entry_xdr, positions_entry_xdr,
         script_empty_wallet, script_snapshot_positions, simulation, tx_config, BLND, POOL_TWO,
     };
-    use crate::math::fill::FillAction;
+    use crate::math::fill::{FillAction, FillObjective};
     use crate::math::unwind::UnwindAction;
     use crate::notifier::{NotificationChannel, NotifyError, NOTIFY_IN_FLIGHT};
     use stellar_xdr::{
@@ -2065,27 +2112,23 @@ mod tests {
             .expect("the profit total is always rendered")
     }
 
-    /// Every [`FillSkip`] has its own label, and the two pairs that share
-    /// one share it on purpose: a fill past the ramp's end is the
-    /// unprofitable case with nothing left to wait for, and one that would
-    /// take the filler past `max_positions` is refused by the filler's own
-    /// position exactly as the health floor refuses it.
+    /// Every [`FillSkip`] has its own label, and the one pair that shares
+    /// one shares it on purpose: a fill that would take the filler past
+    /// `max_positions` is refused by the filler's own position exactly as
+    /// the health floor refuses it.
     #[test]
     fn every_planner_skip_has_a_label() {
         assert_eq!(skip_label(FillSkip::Unprofitable), SkipLabel::Unprofitable);
-        assert_eq!(
-            skip_label(FillSkip::PastAuctionEnd),
-            SkipLabel::Unprofitable
-        );
         assert_eq!(skip_label(FillSkip::TooManyPositions), SkipLabel::Health);
         assert_eq!(skip_label(FillSkip::Health), SkipLabel::Health);
         assert_eq!(skip_label(FillSkip::Unfunded), SkipLabel::Unfunded);
+        assert_eq!(skip_label(FillSkip::SupplyCapped), SkipLabel::SupplyCapped);
     }
 
     /// A skip is one per auction *per reason*. The filler re-makes every
     /// skip decision on every tick an auction stays open, so a reason
     /// counted per attempt would count per ledger instead and one auction
-    /// the planner refuses forever would bury the other four. A
+    /// the planner refuses forever would bury the other five. A
     /// *different* reason for the same auction is a different decision and
     /// counts again, and the auction leaving the pool's open rows is what
     /// ends the count.
@@ -2165,11 +2208,16 @@ mod tests {
     async fn a_post_read_skip_is_keyed_by_the_chain_auction(db: sqlx::PgPool) -> sqlx::Result<()> {
         let store = Store::from_pool(db);
         let tick = harness::fixture_tick();
-        // Both past the ramp's 400th ledger in a pool that is not
-        // `force_fill`, so every plan of either is `PastAuctionEnd` — a
-        // planner skip, which is the first of the post-read sites.
-        let old = auction(tick.sequence - 600);
-        let new = auction(tick.sequence - 500);
+        // A lot worth nothing at the oracle's prices, so every plan of
+        // either is `Unprofitable` — a planner skip, which is the first of
+        // the post-read sites — independent of when each is read.
+        let worthless = |block: u32| AuctionData {
+            bid: BTreeMap::from([(USDC.to_string(), BID)]),
+            lot: BTreeMap::from([(XLM.to_string(), 1)]),
+            block,
+        };
+        let old = worthless(tick.sequence - 600);
+        let new = worthless(tick.sequence - 500);
         store
             .upsert_auction(&tracked(harness::USER_ONE, &old))
             .await
@@ -2203,7 +2251,7 @@ mod tests {
                 skipped: 1,
                 ..TickSummary::default()
             },
-            "the auction the chain holds is past its ramp, and the planner says so"
+            "the auction the chain holds has a worthless lot, and the planner says so"
         );
         assert_eq!(skip_count(&metrics, SkipLabel::Unprofitable), 1);
 
@@ -2472,6 +2520,7 @@ mod tests {
             min_health_factor: 15_000_000,
             default_profit_bps: 1_000,
             force_fill: false,
+            fill_objective: FillObjective::EarliestProfitable,
             supported_bid: vec!["*".to_string()],
             supported_lot: vec!["*".to_string()],
             profits: Vec::new(),
@@ -3564,6 +3613,49 @@ mod tests {
             skip_count(&metrics, SkipLabel::Unfunded)
                 + skip_count(&metrics, SkipLabel::ContractError),
             0
+        );
+        Ok(())
+    }
+
+    /// The pool contract holds positions of its own on the fork —
+    /// confiscated collateral lands there as `supply` — so a row that
+    /// somehow named the pool as the auctioned account costs no chain
+    /// read either, the same as the bot's own account.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_pool_itself_is_never_considered(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let tick = harness::fixture_tick();
+        let pool_owns_it = auction(tick.sequence - 300);
+        store
+            .upsert_auction(&tracked(harness::POOL, &pool_owns_it))
+            .await
+            .expect("seed the pool's own row");
+        let rpc = ScriptedRpc::start().await;
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let pools = vec![pool_config()];
+        let metrics = metrics();
+        let filler = Filler::new(
+            &client,
+            &store,
+            &pools,
+            filler_config(),
+            Executor::new(&store, None, true),
+            Inventory::new(XLM.to_string(), 0),
+            notifier(),
+            Arc::clone(&metrics),
+        );
+        let (_flag, shutdown) = watch::channel(false);
+        let mut state = FillerState::default();
+
+        let summary = filler
+            .tick(&mut state, tick, true, None, &shutdown)
+            .await
+            .expect("tick");
+
+        assert_eq!(summary, TickSummary::default());
+        assert!(
+            rpc.received().await.is_empty(),
+            "the pool's own address costs no chain read, the same as the bot's own account"
         );
         Ok(())
     }

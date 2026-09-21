@@ -8,16 +8,19 @@
 //! and pays; *effective* values, after collateral and liability factors,
 //! are what the contract's health check reads.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use ethnum::I256;
 
 use super::auction::{
-    bid_modifier, lot_modifier, scale_auction, AuctionData, RAMP_BLOCKS, RAMP_END_BLOCKS,
+    bid_modifier, lot_modifier, scale_auction, AuctionData, ScaledAuction, RAMP_BLOCKS,
+    RAMP_END_BLOCKS,
 };
 use super::fixed::{div_ceil, mul_ceil, mul_floor, MathError, SCALAR_7};
 use super::position::{calculate_position_data, OraclePrices, PositionData, Positions};
 use super::reserve::Reserve;
+use super::setoff::project_default;
 use crate::chain::xdr::encode::FillPercent;
 
 /// The latest delay, in ledgers from an auction's start, a `force_fill`
@@ -157,6 +160,29 @@ pub fn to_oracle_units(value: i128, oracle_scalar: i128) -> Result<i128, MathErr
     mul_floor(value, oracle_scalar, SCALAR_7)
 }
 
+/// Which ledger a fill aims at.
+///
+/// The auction's lot ramps to whole over its first 200 ledgers while the
+/// bid stays whole; from 200 the bid decays to nothing by 400. From 400 on
+/// the scaled bid is not merely zero but **absent** — the contract never
+/// stores a zero amount — so the filler takes the whole lot and assumes no
+/// liability at all, and there is no cutoff after which the fill stops
+/// being legal.
+///
+/// The two objectives are a bet on competition, not on arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FillObjective {
+    /// Wait for the ledger the bid is gone, taking the whole lot for
+    /// nothing. The most the auction can pay, and the last to get it:
+    /// anyone willing to pay a real bid can fill first.
+    #[default]
+    FreeFill,
+    /// Fill at the earliest ledger the lot covers the bid plus the pool's
+    /// margin. Less profit per fill, and the fill actually happens where
+    /// others are competing for it.
+    EarliestProfitable,
+}
+
 /// What the pool and the operator hold one fill to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FillTerms {
@@ -176,8 +202,13 @@ pub struct FillTerms {
     pub health_floor: i128,
     /// The margin [`fill_delay`] waits for, in basis points.
     pub profit_bps: u32,
-    /// Fill by [`FORCE_FILL_MAX_DELAY`], and past the auction's end at all.
+    /// Fill by [`FORCE_FILL_MAX_DELAY`] whatever the economics, capping
+    /// whichever ledger `objective` picks.
     pub force_fill: bool,
+    /// Which ledger to aim at before `force_fill`'s cap is applied. See
+    /// [`FillObjective`]; the config-file spelling lives in
+    /// `crate::config::PoolConfig::fill_objective`.
+    pub objective: FillObjective,
     /// How many rounds of supply → percent → delay the plan may take.
     ///
     /// Never zero: the rounds run `0..plan_iterations`, so a zero would
@@ -199,6 +230,21 @@ pub struct FillInputs<'a> {
     pub prices: &'a OraclePrices,
     /// The filler's own positions in this pool before the fill.
     pub filler: &'a Positions,
+    /// The borrower's positions in this pool before the fill, at the same
+    /// ledger as every other field.
+    ///
+    /// A **full** fill runs the contract's default path over the borrower
+    /// inside the filler's own transaction, and that path can cut a
+    /// reserve's `b_rate` before `validate_submit` checks the filler's
+    /// health. Without the borrower there is no way to project it, and the
+    /// projection is an upper bound rather than an equality — a miss the
+    /// contract answers with `InvalidHf` (1205). See
+    /// [`crate::math::setoff`].
+    ///
+    /// An account the pool holds no position for is an empty `Positions`,
+    /// never an absent field: a borrower with nothing has nothing to
+    /// default.
+    pub borrower: &'a Positions,
     /// What the filler's wallet may spend, per asset: its balance less the
     /// fee reserve and every live reservation.
     pub wallet: &'a BTreeMap<String, i128>,
@@ -253,7 +299,16 @@ pub struct FillDraft {
     pub lot_value: i128,
     /// `to_fill.bid`'s raw value, oracle units.
     pub bid_value: i128,
-    /// `lot_value − bid_value`.
+    /// `lot_value − bid_value`, both valued against `inputs.reserves` as
+    /// read — **before** any `b_rate` cut a full fill's own default path
+    /// would cause (`math::setoff::project_default`; only
+    /// `Projection::data`, and so `projected_health`, is valued against
+    /// the cut reserves). It therefore excludes the filler's own share of
+    /// that cut, which `HIGH_FEE_PROFIT_THRESHOLD` and
+    /// `estimated_profit_total` both inherit unaccounted for — an
+    /// omission that is systematically largest under the `free-fill`
+    /// objective, whose whole point is the ledger the residual debt
+    /// defaults.
     pub est_profit: i128,
     /// The wallet amounts `actions` spend, per asset: what a live plan
     /// reserves.
@@ -269,13 +324,16 @@ pub struct FillDraft {
 pub enum FillSkip {
     /// The lot is worth nothing at the oracle's prices.
     Unprofitable,
-    /// Past its 400th ledger, in a pool that is not `force_fill`.
-    PastAuctionEnd,
     /// The fill would take the filler past the pool's `max_positions`.
     TooManyPositions,
     /// More of the primary asset would have closed the shortfall, and the
     /// wallet does not hold it.
     Unfunded,
+    /// More of the primary asset would have closed the shortfall and the
+    /// pool's `supply_cap` has no room for it. Distinct from
+    /// [`FillSkip::Unfunded`]: the wallet may be full, and sending more
+    /// capital fixes nothing.
+    SupplyCapped,
     /// Nothing within `plan_iterations` holds the filler's floor.
     Health,
 }
@@ -300,13 +358,21 @@ const SUPPLY_ROUNDING_ALLOWANCE: i128 = 2;
 
 /// Plans one fill (spec §5, "Health-bounded plan").
 ///
-/// 1. Value the whole auction. A lot worth nothing is `Unprofitable`. An
-///    auction whose earliest ledger is more than 400 past its start is
-///    `PastAuctionEnd` unless the pool is `force_fill` (spec §1).
-/// 2. The first candidate is `start + fill_delay(...)`, moved to the
-///    earliest ledger if it has already passed, at `max_percent`. The
-///    latest a candidate may be is `start + 350` under `force_fill`, else
-///    `start + 400` — or the earliest ledger, when that is already later.
+/// 1. Value the whole auction. A lot worth nothing is `Unprofitable`.
+///    Otherwise the delay is `terms.objective`'s: `FreeFill` aims at
+///    `RAMP_END_BLOCKS` (400), where the bid has ramped away to nothing and
+///    the lot is whole — the contract has no fill cutoff, so there is
+///    nothing left to wait for past it; `EarliestProfitable` is
+///    `fill_delay(...)`, the earliest ledger the lot covers the bid plus
+///    the margin. `force_fill` then caps whichever the objective picked at
+///    `FORCE_FILL_MAX_DELAY` (350) — narrower than either, and the one
+///    thing it still does.
+/// 2. The first candidate is `start + delay`, moved to the earliest ledger
+///    if it has already passed, at `max_percent`. The latest a candidate
+///    may be is `start + 350` under `force_fill`, else `start + 400` — or
+///    the earliest ledger, when that is already later: `last` is a search
+///    bound, not a refusal, since nothing past 400 improves a fill either
+///    objective would take.
 /// 3. Each round (at most `plan_iterations`) projects the candidate
 ///    exactly: the fill's scaled lot and bid added to the filler's
 ///    positions; `Repay` of each bid asset the wallet holds, the scaled
@@ -325,16 +391,18 @@ const SUPPLY_ROUNDING_ALLOWANCE: i128 = 2;
 ///    the search finds is the plan: it is drafted from the very projection
 ///    it was found with, never re-projected by a later round that
 ///    `plan_iterations` may not reach.
-/// 5. Out of rounds or candidates: `Unfunded` if the wallet capped a
-///    supply along the way, else `Health`.
+/// 5. Out of rounds or candidates: `SupplyCapped` if the reserve's own
+///    `supply_cap` capped a supply along the way, else `Unfunded` if the
+///    wallet did, else `Health`.
 ///
-/// A plan that is not `force_fill` may land on exactly `start + 400`,
-/// where the bid modifier has already reached zero, and it is meant to:
-/// step 1's gate is `> 400` and it is asked at *planning* time, while the
-/// transaction is sent at the earliest ledger it could land in, so such a
-/// fill applies at 401 or later. Nothing is lost by that — from block 400
-/// on the bid is nothing and the lot is whole — and landing later than the
-/// candidate only improves the fill.
+/// A `FreeFill` candidate can land anywhere at or past `start + 400`: the
+/// transaction is sent at the earliest ledger it could land in, which is
+/// later than the candidate whenever this auction was first read well past
+/// its ramp. Nothing is lost by that — from block 400 on the bid is nothing
+/// and the lot is whole regardless of which ledger past it a fill actually
+/// lands on — and there is no ledger past which the fill stops being legal
+/// (spec §2.5; past 500 `delete_stale_auction` becomes callable, which the
+/// filler warns about separately rather than refusing here).
 ///
 /// Whatever a round or a search produces is still refused as
 /// `Unprofitable` when its own lot no longer covers its own bid: step 1
@@ -361,16 +429,26 @@ pub fn plan_fill(terms: &FillTerms, inputs: &FillInputs<'_>) -> Result<PlannedFi
     }
     let start = inputs.auction.block;
     let earliest = inputs.earliest_ledger.max(start);
-    // `earliest >= start` by the line above.
-    if earliest - start > RAMP_END_BLOCKS && !terms.force_fill {
-        return Ok(PlannedFill::Skip(FillSkip::PastAuctionEnd));
-    }
-    let delay = fill_delay(
-        whole.collateral_raw,
-        whole.liability_raw,
-        terms.profit_bps,
-        terms.force_fill,
-    )?;
+    let delay = match terms.objective {
+        // From `RAMP_END_BLOCKS` on the bid is absent and the lot is
+        // whole: the most the auction can pay, and nothing later improves
+        // it.
+        FillObjective::FreeFill => RAMP_END_BLOCKS,
+        FillObjective::EarliestProfitable => fill_delay(
+            whole.collateral_raw,
+            whole.liability_raw,
+            terms.profit_bps,
+            terms.force_fill,
+        )?,
+    };
+    // `force_fill` is the narrower window and keeps winning: it caps the
+    // target at 350 whatever the economics, whichever ledger the objective
+    // picked.
+    let delay = if terms.force_fill {
+        delay.min(FORCE_FILL_MAX_DELAY)
+    } else {
+        delay
+    };
     let ledger = start
         .checked_add(delay)
         .ok_or(MathError::Overflow)?
@@ -387,6 +465,7 @@ pub fn plan_fill(terms: &FillTerms, inputs: &FillInputs<'_>) -> Result<PlannedFi
     let percent = inputs.max_percent;
     let mut supply = 0_i128;
     let mut unfunded = false;
+    let mut capped = false;
 
     for _ in 0..terms.plan_iterations {
         let projection = project(terms, inputs, ledger, percent, supply)?;
@@ -400,8 +479,17 @@ pub fn plan_fill(terms: &FillTerms, inputs: &FillInputs<'_>) -> Result<PlannedFi
             let wanted = supply
                 .checked_add(supply_for(terms, inputs, &projection.data)?)
                 .ok_or(MathError::Overflow)?;
-            let next = wanted.min(projection.primary_available);
+            let (_, primary) = reserve_for(inputs, &terms.primary_asset)?;
+            let room = supply_headroom(primary, wanted)?;
+            let next = wanted.min(projection.primary_available).min(room);
             unfunded |= wanted > projection.primary_available;
+            // Gated on `room` actually being the tighter bound: when the
+            // wallet is shorter than the cap (`primary_available < room <
+            // wanted`), the wallet is what limited `next` below, and
+            // reporting `SupplyCapped` there would tell the operator their
+            // pool is full while suppressing the `UnfundedFill` notice
+            // their empty wallet needed.
+            capped |= wanted > room && room < projection.primary_available;
             if next > supply {
                 supply = next;
                 continue;
@@ -419,7 +507,11 @@ pub fn plan_fill(terms: &FillTerms, inputs: &FillInputs<'_>) -> Result<PlannedFi
         }
         break;
     }
-    Ok(PlannedFill::Skip(if unfunded {
+    // The cap takes precedence over the wallet: a full pool is the
+    // operator's cheaper problem to diagnose than an underfunded wallet.
+    Ok(PlannedFill::Skip(if capped {
+        FillSkip::SupplyCapped
+    } else if unfunded {
         FillSkip::Unfunded
     } else {
         FillSkip::Health
@@ -480,6 +572,66 @@ pub(crate) fn add_to<K: Ord>(
     Ok(())
 }
 
+/// Subtracts `amount` from `index`'s entry, checked, removing the entry
+/// once nothing is left of it — what the contract's `rm_positions` does
+/// once a balance reaches zero.
+///
+/// The removal is not tidiness: [`project_default`]'s gate reads
+/// `collateral_raw == 0`, and a zero entry left in the map would also have
+/// to be priced by `calculate_position_data`, so an emptied key and an
+/// absent one must be the same position.
+///
+/// An amount larger than the entry holds is a transfer the contract itself
+/// refuses (`BalanceError`), so no fill this could mis-model is one the
+/// chain would accept; leaving nothing behind is the reading that expects
+/// the default path to run, which is the side that cannot cost the filler
+/// a refused fill.
+fn remove_from(map: &mut BTreeMap<u32, i128>, index: u32, amount: i128) -> Result<(), MathError> {
+    let Some(held) = map.get(&index).copied() else {
+        return Ok(());
+    };
+    let left = held.checked_sub(amount).ok_or(MathError::Overflow)?;
+    if left > 0 {
+        map.insert(index, left);
+    } else {
+        map.remove(&index);
+    }
+    Ok(())
+}
+
+/// The pool's reserves as a **full** fill of `to_fill` would leave them:
+/// the borrower's collateral and liabilities reduced by what the fill takes
+/// over, then the contract's default path run over what is left
+/// ([`project_default`]).
+///
+/// The borrower's `supply` travels in as the snapshot read it. A fill moves
+/// only collateral and liabilities, and the plain supply is exactly what
+/// the default path's set-off step spends before anything is destroyed.
+///
+/// # Errors
+///
+/// Whatever [`project_default`] raises, propagated rather than read as "no
+/// default": collateral the oracle cannot price leaves the haircut
+/// unknowable, and assuming it does not apply is the optimistic direction
+/// this whole projection exists to close — the contract refuses such a fill
+/// anyway. `InvalidInput` or `MissingReserve` for an auction asset this
+/// pool does not list, from [`reserve_for`].
+fn defaulted_reserves(
+    inputs: &FillInputs<'_>,
+    to_fill: &AuctionData,
+) -> Result<BTreeMap<u32, Reserve>, MathError> {
+    let mut borrower = inputs.borrower.clone();
+    for (asset, b_tokens) in &to_fill.lot {
+        let (index, _) = reserve_for(inputs, asset)?;
+        remove_from(&mut borrower.collateral, index, *b_tokens)?;
+    }
+    for (asset, d_tokens) in &to_fill.bid {
+        let (index, _) = reserve_for(inputs, asset)?;
+        remove_from(&mut borrower.liabilities, index, *d_tokens)?;
+    }
+    Ok(project_default(inputs.reserves, inputs.prices, &borrower)?.reserves)
+}
+
 /// Projects a fill of `percent` at `ledger` exactly, with the requests
 /// after it in the order the executor sends them:
 ///
@@ -499,6 +651,17 @@ pub(crate) fn add_to<K: Ord>(
 /// `spend` records is first debited from a copy of the wallet that no
 /// debit takes below zero, so a projection never spends more of an asset
 /// than the wallet holds.
+///
+/// A **full** fill — one the scaling leaves no remainder of, which is the
+/// fill the contract deletes the auction on — is valued against
+/// [`defaulted_reserves`] rather than the snapshot's own: the contract runs
+/// the borrower's default path inside this same transaction, before it
+/// checks the filler's health. Only that last valuation moves. Every
+/// conversion above it stays on the reserves as read, because the contract
+/// performs those conversions first — and where one of them does not
+/// (`to_b_token_down` of the supply, which a cut `b_rate` would mint *more*
+/// b-tokens for), the reserves as read are the smaller answer, which is the
+/// side of the projection that cannot cost the filler a refused fill.
 fn project(
     terms: &FillTerms,
     inputs: &FillInputs<'_>,
@@ -506,7 +669,8 @@ fn project(
     percent: FillPercent,
     supply: i128,
 ) -> Result<Projection, MathError> {
-    let to_fill = scale_auction(inputs.auction, ledger, percent.get())?.to_fill;
+    let ScaledAuction { to_fill, remaining } =
+        scale_auction(inputs.auction, ledger, percent.get())?;
     let mut positions = inputs.filler.clone();
     for (asset, b_tokens) in &to_fill.lot {
         let (index, _) = reserve_for(inputs, asset)?;
@@ -582,7 +746,15 @@ fn project(
         }
     }
 
-    let data = calculate_position_data(inputs.reserves, inputs.prices, &positions)?;
+    // `remaining` is `None` for exactly the fills the contract deletes the
+    // auction on, and those are the ones that run the borrower's default
+    // path. A partial fill runs none of it and is valued as read.
+    let reserves = if remaining.is_none() {
+        Cow::Owned(defaulted_reserves(inputs, &to_fill)?)
+    } else {
+        Cow::Borrowed(inputs.reserves)
+    };
+    let data = calculate_position_data(&reserves, inputs.prices, &positions)?;
     Ok(Projection {
         to_fill,
         positions,
@@ -651,6 +823,51 @@ fn supply_for(
     )?
     .checked_add(SUPPLY_ROUNDING_ALLOWANCE)
     .ok_or(MathError::Overflow)
+}
+
+/// The largest underlying amount of `asset` that can be supplied without
+/// the contract's `ExceededSupplyCap` (1220).
+///
+/// The contract checks `total_supply() > supply_cap` **after** minting
+/// `to_b_token_down(amount)` b-tokens, so the bound is not `supply_cap −
+/// total_supply()` — not because that formula could breach the cap; the
+/// mint rounding down and `total_supply` rounding down again make it safe
+/// for any rate. It understates the room instead, by up to a stroop: a
+/// planner that used it would decline a supply the contract would have
+/// accepted, and skip a fill for no reason over the last stroop. Search
+/// the exact bound instead — the largest amount whose projected
+/// `total_supply` still fits — and let a cap already breached answer zero
+/// rather than a negative.
+fn supply_headroom(reserve: &Reserve, wanted: i128) -> Result<i128, MathError> {
+    if wanted <= 0 {
+        return Ok(0);
+    }
+    let fits = |amount: i128| -> Result<bool, MathError> {
+        let minted = reserve.to_b_token_down(amount)?;
+        let after = reserve
+            .data
+            .b_supply
+            .checked_add(minted)
+            .ok_or(MathError::Overflow)?;
+        Ok(reserve.to_asset_from_b_token(after)? <= reserve.config.supply_cap)
+    };
+    if fits(wanted)? {
+        return Ok(wanted);
+    }
+    // Binary search the largest amount that fits, in `0..wanted`.
+    let (mut low, mut high) = (0_i128, wanted);
+    while low < high {
+        // Round-up midpoint without `high - low + 1`: `low + (high - low)`
+        // is `high`, already a valid `i128`, and this sums to no more than
+        // that, so it cannot overflow even at `wanted == i128::MAX`.
+        let mid = low + (high - low) / 2 + ((high - low) & 1);
+        if fits(mid)? {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    Ok(low)
 }
 
 /// The largest percent below `below` whose exact projection at `ledger`
@@ -770,6 +987,7 @@ fn draft(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::{ReserveConfig, ReserveData, SCALAR_12};
 
     /// The closed form is the smallest delay that meets the margin: it
     /// meets it, and the ledger before does not. `meets_margin` is
@@ -892,6 +1110,139 @@ mod tests {
         );
         assert_eq!(to_oracle_units(100_000_000, 1_000_000).unwrap(), 10_000_000);
     }
+
+    /// A reserve at a non-unit `b_rate`, built by hand with no pool,
+    /// auction or filler position anywhere near it: [`supply_headroom`] is
+    /// private but not behind anything else, and calling it directly is
+    /// what actually pins its search against `to_b_token_down` and
+    /// `to_asset_from_b_token`, worked out longhand, rather than against
+    /// itself.
+    ///
+    /// The naive `supply_cap − total_supply()` this function's own doc
+    /// comment warns against does *not* breach the cap when followed —
+    /// minting rounds down and converting back rounds down again, so
+    /// `to_asset_from_b_token(to_b_token_down(a)) ≤ a` for every `a`, and
+    /// supplying exactly the naive estimate can only under-fill, never
+    /// over-fill. What it gets wrong is leaving real headroom unused: at
+    /// `b_rate = 1.1`, minting 10,000,000,000 underlying rounds down to
+    /// ⌊10,000,000,000 × 10 / 11⌋ = ⌊100,000,000,000 / 11⌋ = 9,090,909,090
+    /// b-tokens, which converts back to ⌊9,090,909,090 × 11 / 10⌋ =
+    /// ⌊99,999,999,990 / 10⌋ = 9,999,999,999 — one stroop short of
+    /// 10,000,000,000. So with a fresh reserve (`total_supply() = 0`) and
+    /// `supply_cap = 9,999,999,999`, the naive estimate is exactly
+    /// `9,999,999,999 − 0 = 9,999,999,999`: one stroop less than what the
+    /// reserve can actually still take. A regression that reverted
+    /// [`supply_headroom`] to that subtraction would return 9,999,999,999
+    /// here and fail this test's first assertion.
+    ///
+    /// One more stroop (10,000,000,001) mints ⌊100,000,000,010 / 11⌋ =
+    /// 9,090,909,091, which converts back to ⌊100,000,000,001 / 10⌋ =
+    /// 10,000,000,000 — over the cap — so 10,000,000,000 is not merely
+    /// safe, it is the most this reserve allows.
+    #[test]
+    fn supply_headroom_is_exact_not_naive_subtraction() {
+        let reserve = Reserve::new(
+            "X".to_string(),
+            ReserveConfig {
+                index: 0,
+                decimals: 7,
+                c_factor: 7_500_000,
+                l_factor: 7_500_000,
+                util: 0,
+                max_util: 9_500_000,
+                r_base: 0,
+                r_one: 0,
+                r_two: 0,
+                r_three: 0,
+                reactivity: 0,
+                supply_cap: 9_999_999_999,
+                enabled: true,
+            },
+            ReserveData {
+                d_rate: SCALAR_12,
+                // 1.1: not `SCALAR_12` exactly, so the two floors actually
+                // bite instead of cancelling.
+                b_rate: 1_100_000_000_000,
+                ir_mod: SCALAR_7,
+                b_supply: 0,
+                d_supply: 0,
+                backstop_credit: 0,
+                last_time: 0,
+            },
+        )
+        .expect("a test reserve");
+
+        // `wanted` well past any headroom, so the search runs rather than
+        // the `fits(wanted)` early return.
+        let headroom = supply_headroom(&reserve, 20_000_000_000).expect("a headroom");
+        assert_eq!(headroom, 10_000_000_000);
+
+        let naive = reserve
+            .config
+            .supply_cap
+            .checked_sub(reserve.total_supply().expect("total supply"))
+            .expect("no overflow in a test");
+        assert!(
+            headroom > naive,
+            "supply_headroom ({headroom}) must find the stroop the naive \
+             subtraction ({naive}) leaves on the table"
+        );
+
+        // Tight, not merely conservative: verified from the reserve's own
+        // conversions, not from `supply_headroom` itself. `headroom` fits;
+        // one more stroop does not.
+        let minted = reserve.to_b_token_down(headroom).expect("mint");
+        let after = reserve
+            .data
+            .b_supply
+            .checked_add(minted)
+            .expect("no overflow in a test");
+        assert!(
+            reserve.to_asset_from_b_token(after).expect("total supply")
+                <= reserve.config.supply_cap,
+            "the returned headroom must not itself breach the cap"
+        );
+        let minted_one_more = reserve.to_b_token_down(headroom + 1).expect("mint");
+        let after_one_more = reserve
+            .data
+            .b_supply
+            .checked_add(minted_one_more)
+            .expect("no overflow in a test");
+        assert!(
+            reserve
+                .to_asset_from_b_token(after_one_more)
+                .expect("total supply")
+                > reserve.config.supply_cap,
+            "one more stroop than the returned headroom should already breach the cap"
+        );
+
+        // A cap already strictly breached before any new supply — the
+        // pool's own cap lowered under what is already parked there, say
+        // — answers zero rather than a negative: 100 already supplied
+        // against a cap of 50 leaves no room for even the first stroop.
+        let breached = Reserve::new(
+            "Y".to_string(),
+            ReserveConfig {
+                supply_cap: 50,
+                ..reserve.config.clone()
+            },
+            ReserveData {
+                b_supply: 100,
+                b_rate: SCALAR_12,
+                ..reserve.data.clone()
+            },
+        )
+        .expect("a test reserve");
+        assert!(
+            breached.total_supply().expect("total supply") > breached.config.supply_cap,
+            "the fixture must actually start over its cap"
+        );
+        assert_eq!(
+            supply_headroom(&breached, 1_000).expect("a headroom"),
+            0,
+            "already over the cap: no more room, not a negative one"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -968,7 +1319,9 @@ mod plan_tests {
     }
 
     /// Floor 1.1, 10% margin, XLM as the primary asset, $100 of minimum
-    /// collateral.
+    /// collateral. `EarliestProfitable` so every test below that predates
+    /// the objective keeps its own ledger arithmetic; the objective's own
+    /// tests override it.
     fn terms() -> FillTerms {
         FillTerms {
             min_collateral: 1_000_000_000,
@@ -978,6 +1331,7 @@ mod plan_tests {
             health_floor: 11_000_000,
             profit_bps: 1_000,
             force_fill: false,
+            objective: FillObjective::EarliestProfitable,
             plan_iterations: 5,
         }
     }
@@ -998,10 +1352,38 @@ mod plan_tests {
         FillPercent::try_from(value).expect("1..=100")
     }
 
+    /// A plan against a borrower that holds nothing: the default path
+    /// needs liabilities to reach, so every case below that is not about
+    /// the haircut is projected against the reserves as read.
     fn plan(
         terms: &FillTerms,
         pool: &Pool,
         filler: &Positions,
+        wallet: &BTreeMap<String, i128>,
+        auction: &AuctionData,
+        earliest_ledger: u32,
+        max_percent: FillPercent,
+    ) -> PlannedFill {
+        plan_against(
+            terms,
+            pool,
+            filler,
+            &Positions::default(),
+            wallet,
+            auction,
+            earliest_ledger,
+            max_percent,
+        )
+    }
+
+    /// The same, against a named borrower — what a full fill's default
+    /// path is projected over.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_against(
+        terms: &FillTerms,
+        pool: &Pool,
+        filler: &Positions,
+        borrower: &Positions,
         wallet: &BTreeMap<String, i128>,
         auction: &AuctionData,
         earliest_ledger: u32,
@@ -1014,6 +1396,7 @@ mod plan_tests {
                 asset_index: &pool.asset_index,
                 prices: &pool.prices,
                 filler,
+                borrower,
                 wallet,
                 auction,
                 earliest_ledger,
@@ -1035,6 +1418,30 @@ mod plan_tests {
     fn well_collateralised() -> Positions {
         Positions {
             collateral: BTreeMap::from([(1, 100_000_000_000)]),
+            ..Positions::default()
+        }
+    }
+
+    /// The same pool with a real supply behind USDC: 100,000 USDC of
+    /// b-tokens at a rate of 1.0, of which [`well_collateralised`] holds a
+    /// tenth. `b_rate` only moves for a reserve that has b-tokens to
+    /// charge a default to, and the haircut is the destroyed debt divided
+    /// by exactly this `b_supply`.
+    fn pool_with_usdc_supply() -> Pool {
+        let mut pool = pool();
+        let usdc = pool.reserves.get_mut(&1).expect("the USDC reserve");
+        usdc.data.b_supply = 1_000_000_000_000;
+        usdc.data.d_supply = 10_000_000_000;
+        pool
+    }
+
+    /// A borrower whose whole position is this auction: `collateral` is
+    /// the share of the lot a fill of `percent` hands over, and the debt
+    /// is the whole 1,000 USDC the auction bids for.
+    fn borrower(collateral: i128) -> Positions {
+        Positions {
+            collateral: BTreeMap::from([(0, collateral)]),
+            liabilities: BTreeMap::from([(1, 10_000_000_000)]),
             ..Positions::default()
         }
     }
@@ -1298,40 +1705,91 @@ mod plan_tests {
         assert_eq!(planned, PlannedFill::Skip(FillSkip::TooManyPositions));
     }
 
-    /// Spec §1: past its 400th ledger an auction is filled only under
-    /// `force_fill` — and then at once, with the bid at zero.
+    /// The contract has no fill cutoff: `fill_auction` guards only the
+    /// auction type and `user == filler`, and `delete_stale_auction`
+    /// merely becomes callable at 500. An auction first seen well past 400
+    /// is the cheapest fill there is — the bid is absent — and refusing it
+    /// gives that away.
     #[test]
-    fn past_its_end_only_a_force_fill_pool_fills() {
+    fn an_auction_past_400_is_planned_not_refused() {
         let pool = pool();
-        let late = START + 401;
-        let planned = plan(
-            &terms(),
+        let terms = FillTerms {
+            objective: FillObjective::FreeFill,
+            ..terms()
+        };
+        let draft = draft(plan(
+            &terms,
             &pool,
             &well_collateralised(),
             &BTreeMap::new(),
             &auction(),
-            late,
+            START + 450,
             percent(100),
+        ));
+        assert_eq!(draft.fill_ledger, START + 450);
+        assert!(
+            draft.to_fill.bid.is_empty(),
+            "the bid has ramped away to nothing"
         );
-        assert_eq!(planned, PlannedFill::Skip(FillSkip::PastAuctionEnd));
-        let forced = FillTerms {
+    }
+
+    /// `FreeFill` aims at the first ledger the bid is gone, however early
+    /// the lot alone would already cover the bid plus the margin.
+    #[test]
+    fn free_fill_targets_block_400() {
+        let pool = pool();
+        let free = FillTerms {
+            objective: FillObjective::FreeFill,
+            ..terms()
+        };
+        let waited = draft(plan(
+            &free,
+            &pool,
+            &Positions::default(),
+            &BTreeMap::new(),
+            &auction(),
+            START + 1,
+            percent(100),
+        ));
+        assert_eq!(waited.fill_ledger, START + RAMP_END_BLOCKS);
+
+        let earliest_profitable = draft(plan(
+            &terms(),
+            &pool,
+            &Positions::default(),
+            &BTreeMap::new(),
+            &auction(),
+            START + 1,
+            percent(100),
+        ));
+        assert!(
+            earliest_profitable.fill_ledger < waited.fill_ledger,
+            "{} should be strictly earlier than {}",
+            earliest_profitable.fill_ledger,
+            waited.fill_ledger
+        );
+    }
+
+    /// `force_fill` is the narrower window and keeps winning over either
+    /// objective: it caps the target at 350 whatever the economics.
+    #[test]
+    fn force_fill_still_caps_the_delay_at_350() {
+        let pool = pool();
+        let terms = FillTerms {
+            objective: FillObjective::FreeFill,
             force_fill: true,
             ..terms()
         };
         let draft = draft(plan(
-            &forced,
+            &terms,
             &pool,
             &well_collateralised(),
             &BTreeMap::new(),
             &auction(),
-            late,
+            START + 1,
             percent(100),
         ));
-        assert_eq!(draft.fill_ledger, late);
-        assert!(
-            draft.to_fill.bid.is_empty(),
-            "the bid has ramped to nothing"
-        );
+        assert_eq!(draft.fill_ledger, START + FORCE_FILL_MAX_DELAY);
     }
 
     /// $100 of lot against $1,000 of bid would wait 382 ledgers for its
@@ -1437,6 +1895,146 @@ mod plan_tests {
             percent(100),
         );
         assert_eq!(planned, PlannedFill::Skip(FillSkip::Unfunded));
+    }
+
+    /// The pool's supply cap binds the escalation. A reserve at its cap
+    /// cannot absorb another stroop, so a plan that needs more of the
+    /// primary asset to hold its health floor is not merely unfunded —
+    /// the wallet may be full — it is capped, and saying so is the
+    /// difference between "send more capital" and "this pool is full".
+    #[test]
+    fn a_supply_that_would_breach_the_cap_is_capped_not_unfunded() {
+        let mut pool = pool();
+        {
+            let xlm = pool.reserves.get_mut(&0).expect("the XLM reserve");
+            // `total_supply()` is 0 here (default `b_supply`), so the cap
+            // is already exactly met: no stroop of supply fits.
+            xlm.config.supply_cap = xlm.total_supply().expect("total supply");
+        }
+        let under_water = Positions {
+            collateral: BTreeMap::from([(0, 1_000_000_000_000)]),
+            liabilities: BTreeMap::from([(1, 100_000_000_000)]),
+            ..Positions::default()
+        };
+        // Plenty in the wallet: the cap, not the wallet, must be what
+        // refuses this plan.
+        let wallet = BTreeMap::from([(XLM.to_string(), 1_000_000_000_000_000)]);
+        let planned = plan(
+            &terms(),
+            &pool,
+            &under_water,
+            &wallet,
+            &auction(),
+            START + 1,
+            percent(100),
+        );
+        assert_eq!(planned, PlannedFill::Skip(FillSkip::SupplyCapped));
+    }
+
+    /// The wallet, not the cap, is what actually bound this escalation:
+    /// the cap leaves room for 5,000,000,000, well above the wallet's
+    /// 1,000,000,000, so the wallet is exhausted first every round and the
+    /// cap is never what `next` settled on. Reporting `SupplyCapped` here
+    /// (as `wanted > room` alone would, since both are dwarfed by the
+    /// ~588,000,000,000 the position needs) would tell the operator their
+    /// pool is full while it is their wallet that is empty, and would
+    /// suppress the `UnfundedFill` notification the operator needed. This
+    /// is what distinguishes the fix from
+    /// [`a_supply_that_would_breach_the_cap_is_capped_not_unfunded`], where
+    /// the cap is the tighter bound instead.
+    #[test]
+    fn a_shortfall_the_wallet_binds_first_is_unfunded_not_capped() {
+        let mut pool = pool();
+        {
+            let xlm = pool.reserves.get_mut(&0).expect("the XLM reserve");
+            // Room for 5,000,000,000 — above the 1,000,000,000 wallet
+            // below, and far short of the shortfall this position needs.
+            xlm.config.supply_cap = 5_000_000_000;
+        }
+        let under_water = Positions {
+            collateral: BTreeMap::from([(0, 1_000_000_000_000)]),
+            liabilities: BTreeMap::from([(1, 100_000_000_000)]),
+            ..Positions::default()
+        };
+        let wallet = BTreeMap::from([(XLM.to_string(), 1_000_000_000)]);
+        let planned = plan(
+            &terms(),
+            &pool,
+            &under_water,
+            &wallet,
+            &auction(),
+            START + 1,
+            percent(100),
+        );
+        assert_eq!(planned, PlannedFill::Skip(FillSkip::Unfunded));
+    }
+
+    /// Headroom short of the shortfall is still used: the plan supplies
+    /// what fits and only gives up if that is not enough. The wallet here
+    /// is unlimited — as in
+    /// [`the_primary_asset_is_supplied_to_close_a_shortfall`], whose
+    /// 44,385,964,922 first-round shortfall this reuses — so the reserve's
+    /// own `supply_cap` is the only thing that can bind, at the same
+    /// 10,000,000,000 [`a_wallet_short_of_the_primary_lowers_the_percent`]
+    /// reaches through the wallet instead, landing on the same percent 22.
+    #[test]
+    fn a_partial_headroom_is_supplied_up_to_the_cap() {
+        let mut pool = pool();
+        {
+            let xlm = pool.reserves.get_mut(&0).expect("the XLM reserve");
+            // An existing 5,000,000,000 of supply plus 10,000,000,000 of
+            // headroom: `supply_cap` is not `0`, so a plan that reads it
+            // as `cap − total_supply()` at the wrong moment is not what
+            // proves this test — the reserve's own conversions below are.
+            xlm.data.b_supply = 5_000_000_000;
+            xlm.config.supply_cap = 15_000_000_000;
+        }
+        let wallet = BTreeMap::from([(XLM.to_string(), 1_000_000_000_000)]);
+        let draft = draft(plan(
+            &terms(),
+            &pool,
+            &Positions::default(),
+            &wallet,
+            &auction(),
+            START + 1,
+            percent(100),
+        ));
+        assert_eq!(draft.fill_ledger, START + 110);
+        assert_eq!(draft.percent, percent(22));
+        let [FillAction::SupplyCollateral { asset, amount }] = draft.actions.as_slice() else {
+            panic!("expected one supply, got {:?}", draft.actions);
+        };
+        assert_eq!(asset.as_str(), XLM);
+        assert_eq!(*amount, 10_000_000_000);
+
+        // Independently verify the bound the escalation respected, from
+        // the reserve's own `to_b_token_down`/`to_asset_from_b_token`
+        // rather than from `supply_headroom` itself: the drafted amount
+        // leaves `total_supply()` at or under the cap, and one more
+        // stroop would not.
+        let xlm = pool.reserves.get(&0).expect("the XLM reserve");
+        let minted = xlm.to_b_token_down(*amount).expect("mint");
+        let after = xlm
+            .data
+            .b_supply
+            .checked_add(minted)
+            .expect("no overflow in a test");
+        assert!(
+            xlm.to_asset_from_b_token(after).expect("total supply") <= xlm.config.supply_cap,
+            "the drafted amount must not breach the cap"
+        );
+        let minted_one_more = xlm.to_b_token_down(*amount + 1).expect("mint");
+        let after_one_more = xlm
+            .data
+            .b_supply
+            .checked_add(minted_one_more)
+            .expect("no overflow in a test");
+        assert!(
+            xlm.to_asset_from_b_token(after_one_more)
+                .expect("total supply")
+                > xlm.config.supply_cap,
+            "one more stroop should already breach the cap"
+        );
     }
 
     /// A candidate a search proves is the plan, not one held over for a
@@ -1639,5 +2237,149 @@ mod plan_tests {
                 }
             }
         }
+    }
+
+    /// A 100% fill runs the borrower's default path inside the filler's
+    /// own transaction, cutting the reserve's `b_rate` before
+    /// `validate_submit` checks health. A projection against the pre-fill
+    /// reserves is therefore an upper bound, and planning from it earns
+    /// `InvalidHf` (1205) from the contract — which the fork's own test
+    /// suite asserts happens
+    /// (`test-suites/tests/test_pool_default_orphan_scenarios.rs:760-765`).
+    #[test]
+    fn a_full_fill_that_defaults_the_borrower_projects_the_haircut() {
+        let pool = pool_with_usdc_supply();
+        let terms = FillTerms {
+            profit_bps: 20_000,
+            ..terms()
+        };
+        // At 267 ledgers in, the lot modifier is whole and the bid
+        // modifier is 0.665: the fill takes all 20,000 XLM of the lot and
+        // 665 of the 1,000 USDC of debt, and nothing of the auction is
+        // left, so the contract deletes it and runs the default path.
+        //
+        // (a) The borrower's whole position is this auction. The fill
+        // leaves them no collateral and 335 USDC still owed, which the
+        // default path destroys: 3_350_000_000 over a `b_supply` of
+        // 1_000_000_000_000 cuts `b_rate` by
+        // ceil(3_350_000_000 x 1e12 / 1e12) = 3_350_000_000, from 1.0 to
+        // 0.99665.
+        let defaulting = borrower(200_000_000_000);
+        // (b) The same borrower with 100 XLM of collateral left over.
+        // `collateral_raw` is then not zero, the contract's gate stays
+        // shut, and no rate moves.
+        let solvent = borrower(201_000_000_000);
+
+        let plan_at = |positions: &Positions| {
+            draft(plan_against(
+                &terms,
+                &pool,
+                &well_collateralised(),
+                positions,
+                &BTreeMap::new(),
+                &auction(),
+                START + 1,
+                percent(100),
+            ))
+        };
+        let with = plan_at(&defaulting);
+        let without = plan_at(&solvent);
+
+        // Same auction, same filler, same reserves: the fill itself is
+        // identical, and the only difference is whether what it leaves
+        // behind is valued through the haircut.
+        assert_eq!(with.fill_ledger, START + 267);
+        assert_eq!(with.percent, percent(100));
+        assert_eq!(
+            (
+                with.fill_ledger,
+                with.percent,
+                &with.to_fill,
+                with.est_profit
+            ),
+            (
+                without.fill_ledger,
+                without.percent,
+                &without.to_fill,
+                without.est_profit
+            )
+        );
+        assert!(
+            with.actions.is_empty() && without.actions.is_empty(),
+            "the wallet is empty, so neither plan sends anything after the fill"
+        );
+
+        // Without the haircut: the filler's 10,000 USDC of collateral is
+        // $9,500 effective beside the lot's $1,500, over $700 of
+        // effective liability (665 / 0.95, exactly) — 110e9 / 7e9.
+        assert_eq!(without.projected_health, Some(157_142_857));
+        // With it: the same 1e11 b-tokens are worth 9,966.5 USDC, so
+        // $9,468.175 effective and 109_681_750_000 of collateral against
+        // the same 7e9 — the liability side is `d_rate`, which no default
+        // moves.
+        assert_eq!(with.projected_health, Some(156_688_214));
+        assert!(
+            with.projected_health < without.projected_health,
+            "the haircut can only lower the projection: {:?} against {:?}",
+            with.projected_health,
+            without.projected_health
+        );
+
+        // The control really is the un-haircut projection, not merely a
+        // different one: a borrower with nothing to default plans the
+        // same as a borrower the gate turns away.
+        assert_eq!(
+            without,
+            draft(plan(
+                &terms,
+                &pool,
+                &well_collateralised(),
+                &BTreeMap::new(),
+                &auction(),
+                START + 1,
+                percent(100),
+            ))
+        );
+    }
+
+    /// A partial fill is not a full fill: the auction stays on the ledger,
+    /// the contract runs no default path, and no haircut applies.
+    #[test]
+    fn a_partial_fill_projects_no_haircut() {
+        let pool = pool_with_usdc_supply();
+        let terms = FillTerms {
+            profit_bps: 20_000,
+            ..terms()
+        };
+        // Collateral of exactly what a 50% fill hands over, so the
+        // borrower is left owing 667.5 USDC (10e9 − ⌈5e9 × 0.665⌉) against
+        // nothing at all: the gate a full fill opens would open here too,
+        // and only the remainder the scaling leaves keeps the default path
+        // from running. A projection that read the gate without reading
+        // the remainder would haircut this one.
+        let defaulting = borrower(100_000_000_000);
+        let partial = draft(plan_against(
+            &terms,
+            &pool,
+            &well_collateralised(),
+            &defaulting,
+            &BTreeMap::new(),
+            &auction(),
+            START + 1,
+            percent(50),
+        ));
+        let unmodelled = draft(plan(
+            &terms,
+            &pool,
+            &well_collateralised(),
+            &BTreeMap::new(),
+            &auction(),
+            START + 1,
+            percent(50),
+        ));
+
+        assert_eq!(partial.percent, percent(50));
+        assert_eq!(partial.fill_ledger, START + 267);
+        assert_eq!(partial, unmodelled);
     }
 }

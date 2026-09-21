@@ -122,10 +122,13 @@ extension point (section 11) so it can be added without restructuring.
 - **The bot never fills its own auctions and never creates an auction for an
   address it controls.** Both are contract errors anyway; refusing locally
   saves a simulation.
-- **An auction past ledger 400 is filled only under `force_fill`.** From that
-  point the bid is zero and the lot is complete; there is nothing left to wait
-  for, but the fill is still a position takeover that must pass the health
-  check.
+- **There is no ledger past which an auction stops being fillable.** From
+  its 400th ledger the bid is not merely zero but absent, and the lot is
+  complete, so a fill from there on takes the whole lot for nothing; the
+  fill is still a position takeover that must pass the health check
+  regardless. `force_fill` does not create a cutoff or remove one — the
+  contract never had one — it only caps the ledger a fill aims for at
+  350, filling regardless of how little the lot covers by then.
 - **State is rebuildable.** Everything in the store can be reconstructed from
   the seed source, the RPC's retained events, and chain reads. Durable state
   is a convenience for restarts and an audit trail, not a correctness
@@ -428,14 +431,21 @@ then to base value at oracle prices, both raw and effective. The profit margin
 
 ### Fill ledger
 
-The fill delay `d` is the smallest value in `0..=400` such that
+Which ledger a fill aims at is the pool's `fill_objective` (section 6). Under
+`free-fill`, the default, the delay is 400: from there the scaled bid is
+absent and the lot is whole, so the filler takes everything and assumes no
+liability. Under `earliest-profitable` it is the closed form below. Either
+way the result is capped at 350 under `force_fill`.
+
+For `earliest-profitable`, the fill delay `d` is the smallest value in
+`0..=400` such that
 `scaled_lot(d) ≥ scaled_bid(d) × (1 + p)`, where the scaling is the
 contract's. It is solved in closed form with ceiling division: on the lot ramp
 `d = ceil(200 × bid × (1 + p) / lot)` when the full lot covers the bid plus
 margin, otherwise on the bid ramp
 `d = 400 − floor(200 × lot / (bid × (1 + p)))`. Tests verify the closed form
-by evaluating the contract's scaling at `d` and `d − 1`. The result is capped
-at 350 under `force_fill`, and moved to the next ledger when it has already
+by evaluating the contract's scaling at `d` and `d − 1`. Under either
+objective the planned ledger is moved to the next one when it has already
 passed.
 
 ### Health-bounded plan
@@ -586,6 +596,7 @@ min_primary_collateral = "1000000000000"  # underlying units, decimal string
 min_health_factor = 1.5
 default_profit_bps = 1000
 force_fill = false
+fill_objective = "free-fill"      # or "earliest-profitable"; see Fill ledger
 supported_bid = ["C...", "C..."]  # or ["*"]
 supported_lot = ["*"]
 

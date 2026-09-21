@@ -19,7 +19,7 @@ publication, release, deployment, activation, or handling funds", and it
 publishes no release, which is why the sandbox tier below still pins stock
 wasm.
 
-**Status: Phase 7 complete.** Phase 1 landed the pure fixed-point math
+**Status: Phase 8 complete.** Phase 1 landed the pure fixed-point math
 (`math`) and the ScVal/ledger-entry codecs (`chain::xdr`); Phase 2 landed
 the chain layer (`chain::rpc`, `chain::pool`, `chain::signer`, `chain::tx`);
 Phase 3 landed the Postgres store, a per-pool ledger poller and a tracker
@@ -74,14 +74,32 @@ price move from liquidation, and the real binary run against it **armed**
 — the only place in this repository anything signs and sends a
 transaction — asserting on chain and in the store that it created the
 auction, filled it, unwound the position it took, and counted all three.
-What remains is **Phase 8, the ADR-0008 fork reconciliation** — the work
-`docs/specs/2026-09-20-adr-0008-fork-semantics.md` §4 lists, which sequences
-ahead of the documentation set because the documentation would otherwise
-describe stock semantics and need rewriting at once — then Phase 9 (the docs
-set, the deployment contract and the first release tag) and the testnet soak
-the design spec's §9 ends with. Everything Phases 1 through 7 built still
-stands: the fork leaves this crate's whole arithmetic port byte-identical.
-The repository scaffolding is complete and enforced.
+Phase 8 reconciled the bot with the ADR-0008 fork
+(`docs/specs/2026-09-20-adr-0008-fork-semantics.md` §4, A through J,
+landed on `phase-8/fork-reconciliation`): it decodes the fork's three new
+events — `debt_setoff`, `collateral_orphaned`, `orphan_settled`
+(`chain::xdr::events`) — and raises `NotificationKind::StockWasmDetected`
+the moment a `bad_debt` event is seen, since the fork's own contract can
+never emit one; decides bad debt on raw collateral rather than
+c-factor-weighted, and only ever builds a user-liquidation auction, since
+the fork panics on any other type (`new_auction_op` now takes no
+auction-type parameter); ports the fork's set-off and default path as
+`math::setoff`, and `plan_fill` projects the `b_rate` haircut a full fill
+can cause on the reserves it values the filler's own health against,
+rather than trusting the pre-fill snapshot; makes which ledger a fill
+aims at a per-pool choice (`PoolConfig::fill_objective`,
+`math::fill::FillObjective`: `FreeFill` at the ramp's end by default, or
+`EarliestProfitable`), with no invented 400-ledger cutoff — the contract
+never had one; sizes a fill's own supply under the reserve's `supply_cap`
+by exact search rather than skipping only once the chain refuses it
+(`FillSkip`/`SkipLabel::SupplyCapped`); and never treats the pool's own
+contract address — a `Positions` holder on the fork, since confiscated
+collateral lands there as ordinary supply — as a borrower to liquidate.
+What remains is Phase 9: the docs set, the deployment contract, the first
+release tag, and the testnet soak the design spec's §9 ends with.
+Everything Phases 1 through 7 built still stands: the fork's differences
+are additions to this crate's arithmetic port, not corrections to it. The
+repository scaffolding is complete and enforced.
 
 **This bot is NOT non-custodial.** It is designed to hold a signing key and
 submit transactions itself — that is the point of a liquidation bot. Treat
@@ -145,7 +163,11 @@ make help                           # Docker Compose lifecycle
   fill one), and the two keys being the *same* key (leave
   `AUCTIONEER_SECRET_KEY` unset to share one). `SigningKeys::into_signers`
   answers which key signs which role, and `Signers::shared` tells by
-  pointer whether both roles hold the one `Arc`.
+  pointer whether both roles hold the one `Arc`. `parse_pools` reads one
+  more per-pool knob than the fields above: `fill_objective`
+  (`free-fill`, the default, or `earliest-profitable`, anything else a
+  named error) into `PoolConfig::fill_objective`, `math::fill`'s
+  `FillObjective`.
 - `src/main.rs` — binary entry point: tracing setup, argument parsing, exit.
 - `src/math/` — the pure port of the pool contract's arithmetic: `fixed`
   (checked rounding), `reserve` (accrual and token conversions), `position`
@@ -153,17 +175,40 @@ make help                           # Docker Compose lifecycle
   `liquidation` (which auction to create — `plan_liquidation` selects the
   bid and lot assets and the percent that closes a borrower's excess down
   to `TARGET_HF`, walking in more assets when the selection cannot),
-  `fill` (which auction to *take* — `fill_delay` answers, in closed form
-  proved against the contract's own modifiers by `meets_margin`, the fewest
-  ledgers after an auction's start at which its lot covers its bid plus the
-  pool's profit margin; `health_floor` is `min_health_factor ×
+  `fill` (which auction to *take* — `FillObjective`
+  (`config::PoolConfig::fill_objective`) picks which ledger a plan aims
+  at: `FreeFill`, the default, aims at `RAMP_END_BLOCKS` (400), where the
+  bid has ramped away to nothing and the lot is whole; `EarliestProfitable`
+  aims at `fill_delay`'s answer instead — in closed form, proved against
+  the contract's own modifiers by `meets_margin`, the fewest ledgers after
+  an auction's start at which its lot covers its bid plus the pool's
+  profit margin. There is no fill cutoff past 400 either way; `force_fill`
+  means one thing only, capping whichever ledger the objective picked at
+  `FORCE_FILL_MAX_DELAY` (350). `health_floor` is `min_health_factor ×
   HF_SAFETY_MULTIPLIER`, rounded up; `plan_fill` builds the request list —
   the fill, a repay of each bid asset the wallet holds, a withdrawal of
   each zero-collateral-factor lot asset, a supply of the primary asset —
-  by projecting the filler's own post-fill position exactly, and escalates
-  supply → lower percent → later ledger when the projection is short,
-  searching candidates exactly rather than estimating one a later round
-  would only have to correct), `unwind` (which of the filler's own debts
+  by projecting the filler's own post-fill position exactly: a **full**
+  fill (the scaling leaves no remainder) is valued against the reserves
+  `setoff::project_default` leaves behind rather than the pre-fill
+  snapshot's own, since the contract runs the borrower's own default path
+  — and any `b_rate` haircut it causes — inside that same transaction
+  before it checks the filler's health; every other conversion stays on
+  the reserves as read. `supply_headroom` bounds the escalation's own
+  supply at the reserve's `supply_cap` by exact search — `cap −
+  total_supply()` cannot breach the cap at any rate, but understates the
+  room by up to a stroop — and `plan_fill` escalates supply → lower
+  percent → later ledger when the projection is short, searching
+  candidates exactly rather than estimating one a later round would only
+  have to correct, answering `FillSkip::SupplyCapped` when the cap rather
+  than the wallet is what stopped it), `setoff` (the fork's default path,
+  ported: `project_default` answers what the contract's
+  `check_and_handle_user_bad_debt` does to the pool's reserves — the
+  borrower's own supply in the debt reserve sets off what it can first,
+  then whatever debt remains is destroyed and every b-token holder in
+  that reserve is charged for it through a `b_rate` cut, floored at zero
+  — so `fill` can project a full fill's own haircut rather than trust the
+  pre-fill snapshot), `unwind` (which of the filler's own debts
   to repay from its wallet and which of its collateral to withdraw once a
   fill has left it holding a position — `plan_unwind`'s three steps: repay
   each liability the wallet holds, then with none left withdraw every
@@ -180,7 +225,9 @@ make help                           # Docker Compose lifecycle
   Nothing here does I/O and nothing panics.
 - `src/chain/xdr/` — ScVal codecs for the pool: `encode` (values, operations,
   simulation envelopes), `keys` (ledger keys, durability included), `decode`
-  (entries and view-call returns), `events` (pool events).
+  (entries and view-call returns), `events` (pool events, including the
+  fork's `debt_setoff`, `collateral_orphaned` and `orphan_settled`
+  alongside the stock `bad_debt` and `defaulted_debt`).
 - `src/chain/rpc.rs` — the Soroban JSON-RPC client: the eight methods the
   bot uses, their wire shapes, base64 XDR decoded at the boundary. Every
   result carries the ledger it was taken at.
@@ -320,7 +367,11 @@ make help                           # Docker Compose lifecycle
   leave before the process does. `pub mod telegram` is `TelegramChannel`,
   the second `NotificationChannel`. `NotificationKind` already lists every
   kind spec §7 names, so the semaphore, `drain()` and the Telegram channel
-  add no new variant. Must be used from inside a tokio runtime:
+  add no new variant; Phase 8 added the one this crate's own fork
+  reconciliation needed, `StockWasmDetected` — raised, `Severity::High`,
+  the moment `src/service.rs`'s event handler sees a `bad_debt` event,
+  since the fork's contract can never emit one and one on chain means the
+  wrong wasm is deployed. Must be used from inside a tokio runtime:
   `notify` spawns.
 - `src/notifier/telegram.rs` — `TelegramChannel`: `sendMessage` for
   delivery, `getMe` (`verify`) to prove the configured credentials work
@@ -343,6 +394,11 @@ make help                           # Docker Compose lifecycle
   are closed enums (`Attempt`, `SkipLabel`, `DeliveryLabel`) rendered with
   every member present, zero included, so a dashboard never has to guess
   whether a missing series means zero or means the bot has not run yet.
+  `SkipLabel` grew a sixth member in Phase 8, `SupplyCapped` — a new
+  `skips_total` series — for a fill whose own primary-asset supply the
+  reserve's `supply_cap` capped rather than the wallet; a new member here
+  always means a new series, which is why `ALL`'s own length moves with
+  the variant list rather than being derived from it.
   Money is rendered as an integer in the pool oracle's own units —
   `estimated_profit_total` and `estimated_loss_total` — never scaled by
   an assumed number of decimals, and a landed fill's negative estimate
@@ -470,7 +526,7 @@ make help                           # Docker Compose lifecycle
   stays open for, which is what `FillerState::counted_skips` and
   `Filler::count_skip` are for: the filler re-makes every one of those
   decisions every tick, so one auction the planner refuses forever would
-  otherwise bury the other four reasons. A skip decided *after* the chain
+  otherwise bury the other five reasons. A skip decided *after* the chain
   read is keyed by the **entry's** `block`, never the row's: the chain can
   hold a new auction for an account before the tracker has opened it, and
   a key on the older row is pruned the moment the tracker catches up —
@@ -829,6 +885,21 @@ Status above for what remains.
 - `getLedgerEntries` omits absent keys rather than returning nulls, so a
   lookup must go by key, never by position, and "the RPC returned fewer
   entries than keys" is the normal shape of "some of these do not exist".
+  `RpcClient::ledger_entries` (`src/chain/rpc.rs:376`) already chunks a
+  request into `ENTRY_BATCH`-sized (200-key) batches, so there is no
+  key-count ceiling and nothing skips a pool for holding too many
+  auctions. What a longer key list costs instead: every batch must report
+  the same `latestLedger`, or the read is refused whole as
+  `ChainError::LedgerMoved` (`src/chain/pool.rs:304-334`) and
+  `PoolReader::snapshot` retries up to `SNAPSHOT_ATTEMPTS` (3) times. This
+  is pre-existing and applies to any snapshot, not only a wide one — but
+  `Filler::tick`'s snapshot key list now spans the filler's own account
+  *and* every live auction's borrower (`math::setoff::project_default`
+  needs the borrower's positions to project a full fill's own haircut),
+  so it spans more batches on a pool with many open auctions and is
+  correspondingly more likely to straddle a ledger close and pay for a
+  retry. It still fails closed — a `LedgerMoved` that survives every
+  retry is returned to the caller, never averaged across two ledgers.
 - The `sqlx::query!` macros in `src/store.rs` are checked at compile time,
   so a build needs either a live database (`make db-up && sqlx migrate run`)
   or the committed offline metadata in `.sqlx/` (`SQLX_OFFLINE=true`, which
@@ -841,6 +912,25 @@ Status above for what remains.
   a rounding bug waiting to happen.
 - Store tests need a live Postgres and are not skipped without one:
   `#[sqlx::test]` creates a database per test. `make db-up` first.
+- **The local test suite needs capped concurrency.** At the default
+  `cargo test` thread count this container's Postgres refuses connections
+  (`PoolTimedOut`, `UnexpectedEof`) — every `#[sqlx::test]` opens a
+  database of its own — and a timing-sensitive queue test fails with
+  `Elapsed`. Three separate runs produced three different sets of
+  spurious failures, all of them resource exhaustion rather than a real
+  regression. `cargo test --lib --bins -- --test-threads=2` is green and
+  takes about 25 seconds where the default thread count took 213 and
+  failed. CI does not hit this — it runs on a clean machine at default
+  concurrency — so it will be rediscovered by the next person who runs
+  the suite locally rather than through `make check`. Separately, the
+  lib **test** target needs a live `DATABASE_URL` even for a run that
+  touches no database: `make sqlx-prepare` prepares `--lib --bins`, never
+  `--tests`, so every `sqlx::query!`/`query_scalar!` reachable only from
+  `#[cfg(test)]` code is absent from the committed `.sqlx/` offline
+  cache. `SQLX_OFFLINE=true cargo test --lib --no-run` fails on 56 such
+  queries across five files (`src/filler.rs` 19, `src/executor.rs` 14,
+  `src/auctioneer.rs` 9, `src/store.rs` 8, `src/service.rs` 6) — not a
+  handful in `store.rs` alone.
 - A `users` row exists only while the account owes something — the tracker
   deletes it the moment its liabilities empty — so `count(*)` on `users` is
   the number of positions that could be liquidated, not the number of
@@ -876,15 +966,16 @@ Status above for what remains.
   **above** `1_1500000` is `InvalidLiqTooLarge` (error code `1213`), and
   below `1_0300000` is `InvalidLiqTooSmall` (`1214`, raised only for a
   partial liquidation). Both comparisons are strict (`is_hf_over` is `>`,
-  `is_hf_under` is `<`), so the accepted window is the *closed* interval and
-  a health factor of exactly `1_1500000` or exactly `1_0300000` is legal —
-  the adjustment loop must not treat either endpoint as a rejection. **The
-  crate still reads it the old way and enforces that**: `TARGET_HF`'s parser
-  refuses `1.15` at startup and its doc comments say "at or above", which
-  §4-J of the fork spec is the item for. The constants are right; the band
-  around them is not yet.
-  `TARGET_HF`'s default of `1.06` sits between them with room for a ledger or
-  two of drift before the auction is filled.
+  `is_hf_under` is `<`), so the contract's own accepted window is the
+  *closed* interval `[1.03, 1.15]`, and the adjustment loop reads it that
+  way — raising the percent on `1214`, lowering it on `1213`, treating
+  neither endpoint as a rejection. `TARGET_HF` itself is narrower at the
+  top on purpose, refusing exactly `1.15`: aiming a liquidation at the
+  contract's own ceiling leaves no room for the drift between planning and
+  fill, and `target_health_factor` in `src/config.rs` says plainly that the
+  upper bound is this bot's own margin, never the contract's rule. `TARGET_HF`'s
+  default of `1.06` sits inside both bands with room for a ledger or two of
+  drift before the auction is filled.
 - `PoolSnapshot::position_data` accrues a **clone** of `self.reserves`
   before valuing a position, so `snapshot.reserves` itself is never
   accrued and stays exactly as read. Anything that values positions
@@ -913,32 +1004,29 @@ Status above for what remains.
   write the filler makes to that table, and it writes `fill_ledger` and
   `percent` and nothing else. What a plan is made *against* is the chain's
   auction entry, re-read every time, never the row.
-- An auction's 400th ledger is the end of its ramp: from there the bid
-  modifier is zero and the lot is complete, so there is nothing left to
-  wait for — but a fill is still a position takeover that must pass the
-  health check. `plan_fill`'s gate is `earliest - start > RAMP_END_BLOCKS`
-  (`src/math/fill.rs`), **strictly greater**, so it plans at exactly 400
-  and answers `PastAuctionEnd` from 401 on unless the pool sets
-  `force_fill`. The bot therefore reaches the start of the free region and
-  no further: an auction it first sees at `block_dif` 450 is refused
-  outright, although filling it would cost nothing. **On the fork that
-  refusal gives away the best fill there is** and is scheduled to change:
-  at `block_dif >= 400` the scaled bid is not merely zero, it is *absent*,
-  because a zero amount is never stored, so the filler takes the whole lot
-  and assumes no liability at all. There is no fill cutoff anywhere:
-  `fill_auction` guards only the auction type and `user == filler`, so a
-  fill at 400, 500 or 1000 is equally valid for as long as the entry
-  exists. What 500 changes is that `delete_stale_auction`
-  stops refusing — it is permissionless but deletes nothing by itself, so
-  past 500 waiting races a deletion rather than another filler. See
-  §2.5 and §4-F of `docs/specs/2026-09-20-adr-0008-fork-semantics.md`, which
-  narrow `force_fill` to its delay cap alone.
-  As it stands, `force_fill` means two things at once: fill past the 400th
-  ledger at all, *and* cap both the profit delay and the health escalation
-  at 350 ledgers (`FORCE_FILL_MAX_DELAY`), so the fill happens no later than
-  that however little the lot then covers. What it does not mean is "fill
-  regardless of profit": the margin still decides *when*, and the health
-  floor still decides *whether*.
+- An auction's 400th ledger is the end of its ramp: from there the bid is
+  not merely zero, it is **absent** — the contract never stores a zero
+  amount — so a fill from there on takes the whole lot and assumes no
+  liability at all. There is no fill cutoff anywhere: `fill_auction`
+  guards only the auction type and `user == filler`, so a fill at 400, 500
+  or 5,000 is equally valid for as long as the entry exists, and
+  `plan_fill` has no refusal for it — `FillSkip::PastAuctionEnd` does not
+  exist. Which ledger a fill aims at *before* 400 is
+  `PoolConfig::fill_objective` (`math::fill::FillObjective`): `FreeFill`,
+  the default, aims at `RAMP_END_BLOCKS` (400) itself, the most the
+  auction can pay and the last ledger to get it; `EarliestProfitable` aims
+  at `fill_delay`'s answer instead, the earliest ledger the lot covers the
+  bid plus the pool's margin, trading profit for actually landing where
+  competition for the auction is real. `force_fill` means one thing only
+  now — there is no "fill past the end" left to mean, since there is no
+  end — capping whichever ledger the objective picked at
+  `FORCE_FILL_MAX_DELAY` (350) however little the lot covers by then; the
+  margin still decides *when* apart from that cap, and the health floor
+  still decides *whether*. Past the 500th ledger `delete_stale_auction`
+  becomes callable by anyone — permissionless, and it deletes nothing by
+  itself — so a plan aimed past it is racing a deletion rather than only
+  another filler: `Filler::execute_once` (`STALE_AUCTION_BLOCKS` in
+  `src/filler.rs`) warns rather than refuses.
 - `WITHDRAW_ALL` is `i64::MAX`, and that is the safe spelling of "all",
   not a saturation. `WithdrawCollateral` burns `min(to_b_token_up(amount),
   position)` and recomputes `tokens_out` from the cap, so any amount above
@@ -1191,18 +1279,21 @@ Verified against `Templar-Protocol/blend-contracts-v2` PR #3 at head
 reasoning and the work each one implies, is
 `docs/specs/2026-09-20-adr-0008-fork-semantics.md`; these are the traps.
 
-- **A 100% fill can cut the filler's own health factor, and the snapshot
-  cannot see it coming.** On the fork a full fill runs
-  `check_and_handle_user_bad_debt`, which destroys the borrower's residual
-  debt by *reducing the reserve's `b_rate`* — in the filler's own
-  transaction, before `validate_submit` checks health. Every holder of
-  collateral in that reserve, the filler included, is worth less at check
-  time than the plan projected. So `plan_fill`'s "project the post-fill
-  position exactly" is an **upper bound** on the fork, not an equality, and
-  the miss surfaces as `1205 InvalidHf`. Today's half-percent re-plan
-  survives it only by accident — a half fill is not a full fill, so the
-  default never runs. This is the single most important difference; nothing
-  else on this list can lose money.
+- **A 100% fill can cut the filler's own health factor, and the plan now
+  accounts for it.** On the fork a full fill runs
+  `check_and_handle_user_bad_debt` over the borrower before
+  `validate_submit` checks the filler's own health, and that path can
+  destroy debt by *reducing the reserve's `b_rate`* — inside the filler's
+  own transaction. `plan_fill` values a **full** fill (one the scaling
+  leaves no remainder of) against the reserves
+  `math::setoff::project_default` leaves behind rather than the pre-fill
+  snapshot's own; every other conversion still runs on the reserves as
+  read, since the contract performs those first. The projection is still
+  an **upper bound**, not an equality — `FillInputs::borrower`'s doc has
+  the reasoning — so a miss can still surface as `1205 InvalidHf`, and the
+  half-percent re-plan is still the backstop for it. This is the single
+  most important difference on this list; nothing else here can lose
+  money, and it is no longer flying blind into it.
 - **Only three events are new**: `debt_setoff`, `collateral_orphaned` and
   `orphan_settled`. `defaulted_debt` is **stock**, and this crate already
   decodes it correctly — do not "add" it. The topic shapes differ and the
@@ -1211,8 +1302,12 @@ reasoning and the work each one implies, is
   user at all, so a decoder that assumes "asset is always topic 1" mis-reads
   it silently, both being addresses.
 - **A `bad_debt` event on a fork pool means stock wasm is deployed.** The
-  event is still declared and has zero call sites, so it can never be
-  emitted. Treat one as a deployment alarm, never as something to act on.
+  event is still declared and has zero call sites, so a fork pool can
+  never emit one. `handle_message` (`src/service.rs`) raises
+  `NotificationKind::StockWasmDetected` at `Severity::High` the moment one
+  is seen, naming the pool, the account and the asset — a deployment
+  alarm, never something to act on: the tracker still applies the event
+  exactly as any other and the tick proceeds.
 - **The bad-debt *auction* is dead; the `bad_debt` *call* is not.** Creating
   or filling any auction type other than `UserLiquidation` raises `1200`, so
   `AuctionType::BadDebt` and `Interest` can never be built. But
@@ -1234,23 +1329,31 @@ reasoning and the work each one implies, is
   `Repay`, `SupplyCollateral` or the fill itself, and `WithdrawCollateral`
   already forced the check on stock. Worth knowing so an unwind's 1205 is not
   misdiagnosed as this.
-- **`1220 ExceededSupplyCap` is reachable and the planner cannot see it.**
-  ADR-0008 seals each reserve's stress-priced supply cap at $25k and a pool's
-  sum at $50k. The executor is already right about it — `refusal` maps
-  everything but 1205 and 1224 to `Refused`, which counts
-  `SkipLabel::ContractError` and leaves the auction for the next tick, and
-  **does not re-plan**; only `Replan` does that, and only by lowering the
-  percent. The gap is in `plan_fill`, which has no notion of a cap, so
-  `Filler::due`'s `REPLAN_LEDGERS` cadence rebuilds the same over-cap supply
-  and earns the same 1220 for as long as the auction is open. Do not fix this
-  by adding a re-plan to `Refused`: that arm carries every unhandled code.
+- **`1220 ExceededSupplyCap` is now sized against by the planner.**
+  ADR-0008 seals each reserve's stress-priced supply cap at $25k and a
+  pool's sum at $50k. `plan_fill`'s supply-escalation step bounds itself
+  at `supply_headroom`'s answer — the exact largest amount the reserve's
+  own `supply_cap` still has room for, found by binary search rather than
+  `cap − total_supply()` (which cannot breach the cap at any rate, but
+  understates the room by up to a stroop) — and answers
+  `FillSkip::SupplyCapped`/`SkipLabel::SupplyCapped` when the cap, not the
+  wallet, is what stopped it. The executor's own handling was already
+  right and stays untouched: `refusal` maps every code but 1205 and 1224
+  to `Refused`, which counts `SkipLabel::ContractError` and leaves the
+  auction for the next tick without re-planning — a `1220` reaching the
+  executor at all is now the unexpected case, not the routine one.
 - **`flash_loan`, `update_pool` and `set_emissions_config` all panic `1200`**,
   as do six backstop emissions exports (ADR-0011), with their ABIs preserved.
   The bot calls none of them; `flash_loan` matters only as a closed door.
 - **The pool contract's own address is a `Positions` holder now** — confiscated
   collateral lands there as `supply`, never collateral or liabilities. It
-  cannot be liquidated (`1211`, stock) and its row is deleted for having no
-  liabilities, so it costs a chain read rather than causing a bug.
+  cannot be liquidated (`1211`, stock), and both the auctioneer and the
+  filler now treat it the same as one of the bot's own signing accounts:
+  `Auctioneer::decide` filters it out (`is_own_account`) before the
+  batch's snapshot is even read, and the filler's row filter drops it
+  before any chain read of the auction entry — so a seed source, or an
+  auction row, that names the pool costs nothing rather than a wasted
+  read.
 - **`gulp` is repurposed and effectively unreachable**: permissionless, always
   returns zero, and raises `1200` while the reserve has any outstanding debt —
   which is always, for a reserve anybody borrows from. Orphaned collateral is
