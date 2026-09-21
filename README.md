@@ -6,45 +6,33 @@
 A liquidation bot for [Blend Protocol](https://blend.capital) lending pools on
 [Stellar](https://stellar.org).
 
-> **Status: Phase 8 complete.** The bot validates its configuration, seeds its
-> tracked-user set from the [Blend analytics API](https://api.blend.templarfi.org)
-> or a static file, and follows every configured pool — applying pool events
-> and refreshing borrowers' health factors from chain into a Postgres store.
-> Once a tick it decides which tracked borrowers are liquidatable
-> or owe bad debt, builds the auction the contract should accept, lets the
-> contract judge the percent through simulation, and records every
-> creation it decides to make — and, only with a signing key configured
-> and `DRY_RUN=false`,
-> creates it on chain. It also fills: once a tick it plans a fill for
-> every open liquidation auction whose assets its pool configuration
-> supports, works out the ledger at which the auction's lot first covers
-> its bid plus the pool's profit margin, keeps its own position at or above
-> `min_health_factor × HF_SAFETY_MULTIPLIER` while taking one over, records
-> every fill it executes — and, only with `DRY_RUN=false` *and*
-> `FILLER_SECRET_KEY`, submits it on chain. It unwinds: after a
-> fill lands, and once at startup, it repays the debt it holds from its
-> wallet and withdraws collateral to the wallet — everything but the
-> primary asset, and the primary down to `min_primary_collateral` — while
-> keeping its health factor at or above the pool's `min_health_factor`
-> (see Safety below). And it now reports itself: dependency-free
-> Prometheus metrics at `/metrics`, `/healthz`/`/livez` for a deployment's
-> readiness and liveness probes, and Telegram notifications alongside the
-> log — all optional, and none of it load-bearing for trading (see Running
-> it below). And it is proved end to end: a nightly sandbox run deploys
-> Blend v2 on a throwaway Stellar network in Docker, crashes a price, and
-> runs this binary against it armed until it has created the auction,
-> filled it and unwound the position it took (see Testing below). Phase 8
-> reconciled the bot with the ADR-0008 fork of the Blend contracts that is
-> now its source of truth
-> (`docs/specs/2026-09-20-adr-0008-fork-semantics.md`): decoding the
-> fork's new events, alarming on evidence of the wrong contract, and
-> matching the fork's bad-debt, fill-timing and supply-cap behaviour
-> exactly, in the pure math this bot plans from. What remains is Phase 9
-> — the docs set, the deployment contract and the first release tag — and
-> a testnet soak. What *is* complete is the scaffolding
-> around all of it — CI gates, lint posture, dev container, release
-> preflight — so nothing lands into a repository that does not already
-> fail loudly.
+> **Status: 0.1.0.** The bot follows every configured Blend v2 pool,
+> creates the liquidation auction a tracked borrower's position calls
+> for, fills auctions — its own and anyone else's — that its pool
+> configuration supports, and unwinds the position a fill leaves it
+> holding back to its own wallet. It targets the ADR-0008 security fork
+> of the Blend contracts (`Templar-Protocol/blend-contracts-v2`) and
+> also runs against stock pools. Dry-run is the default: nothing is
+> created or filled on chain until `DRY_RUN=false` is set explicitly.
+> Armed, it is custodial — it holds a signing key and submits
+> transactions itself, which is the point of a liquidation bot (see
+> Safety below). `docs/architecture.md` is the one-sitting tour of how
+> the pieces fit together and where the arithmetic and contract facts
+> behind a decision live.
+
+## Documentation
+
+- [`docs/architecture.md`](docs/architecture.md) — the one-sitting overview:
+  what the bot does, how its tasks fit together, and where the arithmetic
+  and contract facts behind a decision live.
+- [`docs/configuration.md`](docs/configuration.md) — every setting: its
+  default, the bound its parser enforces, and what a startup error naming
+  it means.
+- [`docs/deploy.md`](docs/deploy.md) — the operator's guide, from pulling
+  the image to running it armed.
+- [`docs/deployment-contract.md`](docs/deployment-contract.md) — what this
+  repository guarantees about the image and the binary, and what a
+  deployment must provide around it.
 
 ## Safety
 
@@ -108,9 +96,10 @@ cp .env.example .env
 docker compose up
 ```
 
-The published image is `ghcr.io/templar-protocol/blend-liquidator:0.1.0`. This
-repository is private, so the package is too — pulling it needs a token with
-`read:packages`.
+The published image is `ghcr.io/templar-protocol/blend-liquidator:0.1.0`.
+Whether the package is public is a GitHub package setting, not something
+this repository controls; while it is private, pulling it needs a token
+with `read:packages`.
 
 ## Running it
 
@@ -260,7 +249,7 @@ wrong, which is what the pull-request gate is for.
 | `src/main.rs` | Binary entry point |
 | `scripts/` | Repo-invariant and release preflight checks, review tooling, the sandbox tier |
 | `tests/` | Fixtures, and the sandbox tier's end-to-end test |
-| `docs/` | Design specs |
+| `docs/` | Guides and reference (see Documentation above) and design specs |
 
 ## Licence
 

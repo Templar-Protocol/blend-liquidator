@@ -19,7 +19,7 @@ publication, release, deployment, activation, or handling funds", and it
 publishes no release, which is why the sandbox tier below still pins stock
 wasm.
 
-**Status: Phase 8 complete.** Phase 1 landed the pure fixed-point math
+**Status: Phase 9 complete.** Phase 1 landed the pure fixed-point math
 (`math`) and the ScVal/ledger-entry codecs (`chain::xdr`); Phase 2 landed
 the chain layer (`chain::rpc`, `chain::pool`, `chain::signer`, `chain::tx`);
 Phase 3 landed the Postgres store, a per-pool ledger poller and a tracker
@@ -95,8 +95,14 @@ by exact search rather than skipping only once the chain refuses it
 (`FillSkip`/`SkipLabel::SupplyCapped`); and never treats the pool's own
 contract address — a `Positions` holder on the fork, since confiscated
 collateral lands there as ordinary supply — as a borrower to liquidate.
-What remains is Phase 9: the docs set, the deployment contract, the first
-release tag, and the testnet soak the design spec's §9 ends with.
+Phase 9 landed the documentation set — `docs/configuration.md`,
+`docs/deploy.md`, `docs/deployment-contract.md` and `docs/architecture.md`
+— the deployment contract, and a `check-release.sh`-green `0.1.0`
+changelog section. The `v0.1.0` tag itself is the maintainer's to push:
+pushing it is what publishes the GHCR image and cuts the GitHub Release,
+not anything landed on this branch. What remains is the testnet soak the
+design spec's §9 ends with, which needs a decision on which contracts to
+soak against first, since the fork is not deployed anywhere yet.
 Everything Phases 1 through 7 built still stands: the fork's differences
 are additions to this crate's arithmetic port, not corrections to it. The
 repository scaffolding is complete and enforced.
@@ -167,7 +173,11 @@ make help                           # Docker Compose lifecycle
   more per-pool knob than the fields above: `fill_objective`
   (`free-fill`, the default, or `earliest-profitable`, anything else a
   named error) into `PoolConfig::fill_objective`, `math::fill`'s
-  `FillObjective`.
+  `FillObjective`. A test in this file,
+  `the_configuration_documents_cover_exactly_the_real_settings`, fails
+  unless every setting named here also appears in `docs/configuration.md`
+  and `.env.example`; a new variable read directly through
+  `std::env::var` must be added to that test's hard-coded list by hand.
 - `src/main.rs` — binary entry point: tracing setup, argument parsing, exit.
 - `src/math/` — the pure port of the pool contract's arithmetic: `fixed`
   (checked rounding), `reserve` (accrual and token conversions), `position`
@@ -1381,6 +1391,11 @@ reasoning and the work each one implies, is
   sandbox tier (`sandbox/`).
 - `tests/` — the fixtures the math is pinned against, and
   `liquidation_sandbox.rs`, the tier's one `#[ignore]`d end-to-end test.
+- `docs/` — `configuration.md` (every setting, its default and bound),
+  `deploy.md` (the operator's guide from pulling the image to running it
+  armed), `deployment-contract.md` (what the image guarantees and what a
+  deployment must provide) and `architecture.md` (the one-sitting
+  overview). Committed.
 - `docs/specs/` — the design specs, the durable half of the documentation
   and the authority every plan argues from. Committed.
 - `docs/plans/` — per-phase implementation plans. Working documents that go
