@@ -2715,4 +2715,68 @@ supported_lot = ["*"]
         );
         assert!(rendered.contains("Secret(<redacted>)"));
     }
+
+    /// The configuration reference, `.env.example` and the real `clap`
+    /// definition name the same variables, and the example pools file is
+    /// one `parse_pools` accepts. Documentation that has drifted from the
+    /// code is worse than none, and nothing else would notice: every one
+    /// of these files can go stale without a single other test failing.
+    #[test]
+    fn the_configuration_documents_cover_exactly_the_real_settings() {
+        use clap::CommandFactory;
+        let root = env!("CARGO_MANIFEST_DIR");
+        let read_file = |path: &str| {
+            std::fs::read_to_string(format!("{root}/{path}"))
+                .unwrap_or_else(|error| panic!("{path}: {error}"))
+        };
+        let reference = read_file("docs/configuration.md");
+        let template = read_file(".env.example");
+
+        // Read straight from the environment, never through clap, so
+        // `Args::command()` cannot see them. A new one must be added here.
+        let direct = [
+            "RPC_API_KEY",
+            "DATABASE_URL",
+            "TELEGRAM_BOT_TOKEN",
+            "FILLER_SECRET_KEY",
+            "AUCTIONEER_SECRET_KEY",
+            "RUST_LOG",
+        ];
+        let mut real: std::collections::BTreeSet<String> = Args::command()
+            .get_arguments()
+            .filter_map(|arg| arg.get_env())
+            .map(|env| env.to_string_lossy().into_owned())
+            .collect();
+        real.extend(direct.iter().map(|name| (*name).to_string()));
+
+        for name in &real {
+            assert!(
+                reference.contains(&format!("`{name}`")),
+                "docs/configuration.md never names `{name}`"
+            );
+            assert!(
+                template.contains(&format!("{name}=")),
+                ".env.example never names {name}"
+            );
+        }
+
+        // The reverse: every variable `.env.example` names is real.
+        let named = template.lines().filter_map(|line| {
+            let line = line.trim_start_matches(['#', ' ']);
+            let (name, _) = line.split_once('=')?;
+            (!name.is_empty() && name.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
+                .then_some(name)
+        });
+        for name in named {
+            assert!(
+                real.contains(name),
+                ".env.example names {name}, which nothing reads"
+            );
+        }
+
+        // The annotated example is a file the bot accepts; with
+        // `deny_unknown_fields` on every table, that also proves each of
+        // its keys is real.
+        parse_pools(&read_file("pools.example.toml")).expect("pools.example.toml parses");
+    }
 }
