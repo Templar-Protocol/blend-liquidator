@@ -710,7 +710,7 @@ impl<'a> Filler<'a> {
     /// of them is a decision it re-makes on every tick the auction stays
     /// open: counting per attempt would make each reason's rate a
     /// function of how long an auction lived rather than of how often the
-    /// bot declined one, and the five reasons would stop being comparable
+    /// bot declined one, and the six reasons would stop being comparable
     /// with each other. See `FillerState::counted_skips` for what the
     /// key is and when it is forgotten.
     ///
@@ -1300,7 +1300,7 @@ impl<'a> Filler<'a> {
                 tracing::warn!(pool = %row.pool, account = %row.account, %error, "this fill's fee tier does not compute");
                 // Nothing chain-specific refused this fill — it never
                 // reached the chain — but `ContractError` is the label for
-                // exactly this: a refusal none of the other four reasons
+                // exactly this: a refusal none of the other five reasons
                 // classifies more specifically.
                 self.count_skip(pass, row, start_ledger, SkipLabel::ContractError);
                 pass.summary.skipped += 1;
@@ -2128,7 +2128,7 @@ mod tests {
     /// A skip is one per auction *per reason*. The filler re-makes every
     /// skip decision on every tick an auction stays open, so a reason
     /// counted per attempt would count per ledger instead and one auction
-    /// the planner refuses forever would bury the other four. A
+    /// the planner refuses forever would bury the other five. A
     /// *different* reason for the same auction is a different decision and
     /// counts again, and the auction leaving the pool's open rows is what
     /// ends the count.

@@ -299,7 +299,16 @@ pub struct FillDraft {
     pub lot_value: i128,
     /// `to_fill.bid`'s raw value, oracle units.
     pub bid_value: i128,
-    /// `lot_value − bid_value`.
+    /// `lot_value − bid_value`, both valued against `inputs.reserves` as
+    /// read — **before** any `b_rate` cut a full fill's own default path
+    /// would cause (`math::setoff::project_default`; only
+    /// `Projection::data`, and so `projected_health`, is valued against
+    /// the cut reserves). It therefore excludes the filler's own share of
+    /// that cut, which `HIGH_FEE_PROFIT_THRESHOLD` and
+    /// `estimated_profit_total` both inherit unaccounted for — an
+    /// omission that is systematically largest under the `free-fill`
+    /// objective, whose whole point is the ledger the residual debt
+    /// defaults.
     pub est_profit: i128,
     /// The wallet amounts `actions` spend, per asset: what a live plan
     /// reserves.
@@ -472,7 +481,13 @@ pub fn plan_fill(terms: &FillTerms, inputs: &FillInputs<'_>) -> Result<PlannedFi
             let room = supply_headroom(primary, wanted)?;
             let next = wanted.min(projection.primary_available).min(room);
             unfunded |= wanted > projection.primary_available;
-            capped |= wanted > room;
+            // Gated on `room` actually being the tighter bound: when the
+            // wallet is shorter than the cap (`primary_available < room <
+            // wanted`), the wallet is what limited `next` below, and
+            // reporting `SupplyCapped` there would tell the operator their
+            // pool is full while suppressing the `UnfundedFill` notice
+            // their empty wallet needed.
+            capped |= wanted > room && room < projection.primary_available;
             if next > supply {
                 supply = next;
                 continue;
@@ -840,7 +855,10 @@ fn supply_headroom(reserve: &Reserve, wanted: i128) -> Result<i128, MathError> {
     // Binary search the largest amount that fits, in `0..wanted`.
     let (mut low, mut high) = (0_i128, wanted);
     while low < high {
-        let mid = low + (high - low + 1) / 2;
+        // Round-up midpoint without `high - low + 1`: `low + (high - low)`
+        // is `high`, already a valid `i128`, and this sums to no more than
+        // that, so it cannot overflow even at `wanted == i128::MAX`.
+        let mid = low + (high - low) / 2 + ((high - low) & 1);
         if fits(mid)? {
             low = mid;
         } else {
@@ -1911,6 +1929,44 @@ mod plan_tests {
         assert_eq!(planned, PlannedFill::Skip(FillSkip::SupplyCapped));
     }
 
+    /// The wallet, not the cap, is what actually bound this escalation:
+    /// the cap leaves room for 5,000,000,000, well above the wallet's
+    /// 1,000,000,000, so the wallet is exhausted first every round and the
+    /// cap is never what `next` settled on. Reporting `SupplyCapped` here
+    /// (as `wanted > room` alone would, since both are dwarfed by the
+    /// ~588,000,000,000 the position needs) would tell the operator their
+    /// pool is full while it is their wallet that is empty, and would
+    /// suppress the `UnfundedFill` notification the operator needed. This
+    /// is what distinguishes the fix from
+    /// [`a_supply_that_would_breach_the_cap_is_capped_not_unfunded`], where
+    /// the cap is the tighter bound instead.
+    #[test]
+    fn a_shortfall_the_wallet_binds_first_is_unfunded_not_capped() {
+        let mut pool = pool();
+        {
+            let xlm = pool.reserves.get_mut(&0).expect("the XLM reserve");
+            // Room for 5,000,000,000 — above the 1,000,000,000 wallet
+            // below, and far short of the shortfall this position needs.
+            xlm.config.supply_cap = 5_000_000_000;
+        }
+        let under_water = Positions {
+            collateral: BTreeMap::from([(0, 1_000_000_000_000)]),
+            liabilities: BTreeMap::from([(1, 100_000_000_000)]),
+            ..Positions::default()
+        };
+        let wallet = BTreeMap::from([(XLM.to_string(), 1_000_000_000)]);
+        let planned = plan(
+            &terms(),
+            &pool,
+            &under_water,
+            &wallet,
+            &auction(),
+            START + 1,
+            percent(100),
+        );
+        assert_eq!(planned, PlannedFill::Skip(FillSkip::Unfunded));
+    }
+
     /// Headroom short of the shortfall is still used: the plan supplies
     /// what fits and only gives up if that is not enough. The wallet here
     /// is unlimited — as in
@@ -2294,11 +2350,11 @@ mod plan_tests {
             ..terms()
         };
         // Collateral of exactly what a 50% fill hands over, so the
-        // borrower is left owing 668.75 USDC against nothing at all: the
-        // gate a full fill opens would open here too, and only the
-        // remainder the scaling leaves keeps the default path from
-        // running. A projection that read the gate without reading the
-        // remainder would haircut this one.
+        // borrower is left owing 667.5 USDC (10e9 − ⌈5e9 × 0.665⌉) against
+        // nothing at all: the gate a full fill opens would open here too,
+        // and only the remainder the scaling leaves keeps the default path
+        // from running. A projection that read the gate without reading
+        // the remainder would haircut this one.
         let defaulting = borrower(100_000_000_000);
         let partial = draft(plan_against(
             &terms,

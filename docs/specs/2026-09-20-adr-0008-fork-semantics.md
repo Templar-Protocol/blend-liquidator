@@ -217,15 +217,18 @@ by itself — somebody has to call it. So 500 is where waiting stops being a rac
 against another filler and starts being a race against anyone willing to spend
 a transaction deleting the auction.
 
-The bot today reaches the *start* of the free region and no further.
-`plan_fill`'s gate is `earliest - start > RAMP_END_BLOCKS`
-(`src/math/fill.rs:365`), strictly greater, so it can plan at exactly 400 and
-answers `PastAuctionEnd` from 401 on unless the pool sets `force_fill`. An
-auction this bot first sees at `block_dif` 450 is therefore refused outright,
-although filling it would cost nothing. Separately, `fill_delay` searches for
-the *earliest* ledger at which the lot covers the bid plus the margin, which is
-the right objective against stock and the wrong one here: it pays a real bid to
-win a race the bot could instead win for free a few minutes later.
+Before §4-F landed, the bot reached only the *start* of the free region and no
+further. `plan_fill`'s gate was `earliest - start > RAMP_END_BLOCKS`
+(`src/math/fill.rs:365`), strictly greater, so it could plan at exactly 400 but
+answered `PastAuctionEnd` from 401 on unless the pool set `force_fill`. An
+auction the bot first saw at `block_dif` 450 was therefore refused outright,
+although filling it would have cost nothing. Separately, `fill_delay` searched
+for the *earliest* ledger at which the lot covers the bid plus the margin,
+which is the right objective against stock and was the wrong one here: it paid
+a real bid to win a race the bot could instead win for free a few minutes
+later. §4-F removed the cutoff (`PastAuctionEnd` is no longer answered past
+400) and made the objective the per-pool `FillObjective` choice described
+there.
 
 It is a race, though, and that is the whole trade-off. Waiting to 400
 maximises the take and forfeits it entirely to anyone who fills at 250. The bot
@@ -300,8 +303,11 @@ in five specifics. Recording them so they are not re-introduced:
    is the closed interval `[1.03, 1.15]`. Read as an open interval,
    "(1.03, 1.15)" names the accepted set's *interior* and silently drops its
    two endpoints, which is the one place the distinction changes an answer.
-   The crate's constants are the right numbers; §4-J is where the crate still
-   reads the endpoints the old way.
+   The crate's constants are the right numbers; §4-J, landed, is where the
+   crate stopped reading the endpoints the old way — `TARGET_HF`'s refusal
+   message and doc comments now say plainly that `[1.03, 1.15)` is the bot's
+   own margin inside the contract's closed `[1.03, 1.15]`, not the
+   contract's own bound.
 4. **`bad_debt` is declared but never emitted** on the fork — zero call sites
    (`pool/src/events.rs:157-160`). The briefing's rule "if this pool emits
    stock's `bad_debt`, the wrong wasm is deployed" is therefore sound, and

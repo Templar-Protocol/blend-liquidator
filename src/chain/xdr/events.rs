@@ -6,6 +6,15 @@
 //! contract upgrade may add more, neither of which may stall the poller. A
 //! *modelled* event with an unexpected shape is an error, because that means
 //! a shape this bot depends on has changed.
+//!
+//! `DefaultedDebt`, `DebtSetoff` and `OrphanSettled` name no account
+//! (`PoolEvent::affected_accounts` answers none for them): a `b_rate` cut
+//! that lowers every borrower's position in that reserve flags nobody for
+//! a targeted re-read, and a `bad_debt(user)` call whose set-off clears the
+//! debt entirely from the borrower's own supply emits only `DebtSetoff` —
+//! no user-bearing event at all — so that borrower's row goes stale until
+//! the next full scan reaches it. A known bound of event-driven tracking,
+//! not a defect this module can close on its own.
 
 use stellar_xdr::ScVal;
 
@@ -87,13 +96,21 @@ pub enum PoolEvent {
         auction_type: AuctionType,
         user: String,
     },
-    /// A user's debt moved to the backstop.
+    /// A user's debt moved to the backstop — stock semantics only. The
+    /// fork declares this event with zero call sites, so a pool built
+    /// from ADR-0008 can never emit it: seeing one means the pool is
+    /// running stock wasm and every fork assumption this bot makes is
+    /// void (`NotificationKind::StockWasmDetected`).
     BadDebt {
         user: String,
         asset: String,
         d_tokens: i128,
     },
-    /// The backstop defaulted debt; suppliers took the loss.
+    /// Debt destroyed and the reserve's `b_rate` cut so suppliers absorb
+    /// the loss. Verbatim from stock, but the fork emits it on two paths:
+    /// the backstop's, and the user path `check_and_handle_user_bad_debt`
+    /// runs inside a full liquidation fill — the event a modelled full
+    /// fill's projected haircut (`math::setoff`) causes.
     DefaultedDebt { asset: String, d_tokens: i128 },
     /// The fork's set-off: before declaring a default it repays what it
     /// can from the borrower's own supply in the debt reserve. Names no
@@ -134,9 +151,10 @@ impl PoolEvent {
             | Self::Borrow { from, .. }
             | Self::Repay { from, .. }
             | Self::FlashLoan { from, .. } => vec![from],
-            // Bad debt (below) moves the liability to the backstop, so the
-            // backstop's own positions change too — but the event carries
-            // no backstop address, so a consumer that wants to refresh it
+            // `BadDebt` is stock-only (see its own doc): a fork pool never
+            // emits it. On stock it moves the liability to the backstop,
+            // whose own positions change too, but the event carries no
+            // backstop address, so a consumer that wants to refresh it
             // adds `PoolInstance::backstop` itself.
             Self::NewAuction { user, .. }
             | Self::DeleteAuction { user, .. }

@@ -526,7 +526,7 @@ make help                           # Docker Compose lifecycle
   stays open for, which is what `FillerState::counted_skips` and
   `Filler::count_skip` are for: the filler re-makes every one of those
   decisions every tick, so one auction the planner refuses forever would
-  otherwise bury the other four reasons. A skip decided *after* the chain
+  otherwise bury the other five reasons. A skip decided *after* the chain
   read is keyed by the **entry's** `block`, never the row's: the chain can
   hold a new auction for an account before the tracker has opened it, and
   a key on the older row is pruned the moment the tracker catches up —

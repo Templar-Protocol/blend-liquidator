@@ -71,7 +71,7 @@ impl Attempt {
 /// the filler re-makes every one of these decisions on every tick an
 /// auction stays open, so it remembers what it has already counted (see
 /// `FillerState::counted_skips`) and one auction the planner refuses
-/// forever cannot bury the other four. A different reason for the same
+/// forever cannot bury the other five. A different reason for the same
 /// auction counts again; the same reason does not until the auction
 /// closes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
