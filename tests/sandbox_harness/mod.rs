@@ -120,6 +120,21 @@ const CLOSE_RATE_TIMEOUT: Duration = Duration::from_secs(30);
 /// primary asset down to its floor, measured from the fill row appearing.
 const UNWIND_TIMEOUT: Duration = Duration::from_mins(2);
 
+/// How long the filler's position has to show at least one liability once
+/// the fill's transaction hash is on the audit row. The position update is
+/// part of the same transaction, so — like the fill row itself — this is
+/// slack for a chain read to catch up, not a real wait.
+const LIABILITY_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// How long `unwind_repay`'s first bot has to reach an unwind pass that is
+/// idle with debt still outstanding. `plan_unwind`'s step-3 withdrawal is
+/// sized by exact projection in one call, so an empty wallet converges in a
+/// handful of landed passes rather than many, but each landed pass is still
+/// a real chain submission — a repay or a withdrawal, prepared, signed and
+/// sent — so this stays in the same range as [`UNWIND_TIMEOUT`]'s own
+/// budget rather than the near-instant [`LIABILITY_TIMEOUT`] above.
+const LEFTOVERS_TIMEOUT: Duration = Duration::from_mins(3);
+
 /// How long the bot has to drain and exit after `SIGTERM`.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -1344,6 +1359,82 @@ pub(crate) async fn wait_for_unwind(
     }
 }
 
+/// Waits until the filler holds at least one liability in `pool`, and
+/// answers how many.
+///
+/// `unwind_repay`'s counterpart to [`wait_for_unwind`]'s opposite
+/// condition: its first run's fill leaves the bid asset unrepaid because
+/// the wallet holds none of it, and this is the proof that debt actually
+/// landed on the filler's own position before the scenario goes looking
+/// for the `UnwindLeftovers` alert that follows.
+pub(crate) async fn wait_for_liability(
+    bot: &mut Bot,
+    rpc: &RpcClient,
+    pool: &str,
+    filler: &str,
+    xlm: &str,
+) -> usize {
+    let mut wait = Wait::new(
+        "the filler's position to hold at least one liability",
+        LIABILITY_TIMEOUT,
+    );
+    loop {
+        let seen = match filler_position(rpc, pool, filler, xlm).await {
+            Ok(position) => {
+                if position.liabilities >= 1 {
+                    println!("the filler holds {position} at {:.1} s", bot.elapsed());
+                    return position.liabilities;
+                }
+                position.to_string()
+            }
+            Err(error) => error,
+        };
+        if !wait.tick(bot).await {
+            let message = format!(
+                "{} (last read: {seen}; expected at least one liability)",
+                wait.timed_out()
+            );
+            fail(bot, &message);
+        }
+    }
+}
+
+/// The metric series [`NotificationKind::UnwindLeftovers`] renders as, at
+/// the `LogChannel` delivery every unconfigured or failed-send channel
+/// falls back to — this sandbox tier configures no Telegram credentials,
+/// so `queued` here means exactly what `src/notifier.rs` says it means:
+/// the notifier accepted the entry and spawned its delivery, not that any
+/// particular channel confirmed it.
+///
+/// [`NotificationKind::UnwindLeftovers`]: blend_liquidator::notifier::NotificationKind::UnwindLeftovers
+const UNWIND_LEFTOVERS_METRIC: &str =
+    "blend_liquidator_notifications_total{kind=\"unwind_leftovers\",delivery=\"queued\"}";
+
+/// Waits until [`UNWIND_LEFTOVERS_METRIC`] reaches exactly `1` on
+/// `/metrics` — the one signal in this scenario that nothing on chain or
+/// in the store proves ahead of the notifier's own counter: a
+/// notification leaves no audit row of its own, so `/metrics` is the only
+/// place this evidence exists at all.
+pub(crate) async fn wait_for_unwind_leftovers(bot: &mut Bot, http: &reqwest::Client) -> i64 {
+    let mut wait = Wait::new(
+        "the UnwindLeftovers notification to be queued once",
+        LEFTOVERS_TIMEOUT,
+    );
+    loop {
+        let metrics = read_metrics(bot, http).await;
+        if let Some(value) = series(&metrics, UNWIND_LEFTOVERS_METRIC) {
+            if value == 1 {
+                println!("{UNWIND_LEFTOVERS_METRIC} is 1 at {:.1} s", bot.elapsed());
+                return value;
+            }
+        }
+        if !wait.tick(bot).await {
+            let message = wait.timed_out();
+            fail(bot, &message);
+        }
+    }
+}
+
 /// `/metrics`, once, before a bot is asked to stop.
 pub(crate) async fn read_metrics(bot: &Bot, http: &reqwest::Client) -> String {
     let url = format!("http://127.0.0.1:{HTTP_PORT}/metrics");
@@ -1386,17 +1477,34 @@ pub(crate) fn assert_counter(bot: &Bot, metrics: &str, name: &str, expected: i64
     }
 }
 
-/// The three series the `liquidation` scenario is judged by: exactly one
-/// creation and one fill that landed, and at least one completed unwind
-/// pass.
+/// Asserts a counter is at least `minimum`, and answers what it held.
 ///
-/// Exactly one of each, not "at least": a second creation for the same
-/// borrower would mean the first was lost, and a second fill would mean the
-/// first took only part of the auction. Either is worth failing on.
-pub(crate) fn assert_metrics(bot: &Bot, metrics: &str) {
-    // Every counter the run actually moved, printed before anything is
-    // asserted: a failure below is far easier to read next to the rest of
-    // what the bot counted, and this is the excerpt a CI artefact keeps.
+/// [`assert_counter`]'s counterpart for a series this tier only ever bounds
+/// from below — `unwind_repay`'s own `unwind_passes_total`, which a
+/// backed-off pass can move more than once before the pool goes idle.
+pub(crate) fn assert_counter_at_least(bot: &Bot, metrics: &str, name: &str, minimum: i64) -> i64 {
+    match series(metrics, name) {
+        Some(value) if value >= minimum => value,
+        Some(value) => {
+            let message = format!("{name} is {value}, expected at least {minimum}");
+            fail(bot, &message);
+        }
+        None => {
+            let message = format!("/metrics has no {name} series");
+            fail(bot, &message);
+        }
+    }
+}
+
+/// Prints every counter series `/metrics` reports as nonzero.
+///
+/// Factored out of [`assert_metrics`] so a scenario that means to print
+/// `/metrics` without that function's own three hard assertions —
+/// `unwind_repay`'s first run, whose fill lands but deliberately leaves
+/// debt behind rather than the one landed fill and nothing else
+/// [`assert_metrics`] expects — can still show the same excerpt a passing
+/// run's report keeps.
+pub(crate) fn print_nonzero_counters(metrics: &str) {
     println!("/metrics, the counters this run moved:");
     for line in metrics.lines() {
         let Some(series) = line.strip_prefix("blend_liquidator_") else {
@@ -1410,6 +1518,20 @@ pub(crate) fn assert_metrics(bot: &Bot, metrics: &str) {
             _ => {}
         }
     }
+}
+
+/// The three series the `liquidation` scenario is judged by: exactly one
+/// creation and one fill that landed, and at least one completed unwind
+/// pass.
+///
+/// Exactly one of each, not "at least": a second creation for the same
+/// borrower would mean the first was lost, and a second fill would mean the
+/// first took only part of the auction. Either is worth failing on.
+pub(crate) fn assert_metrics(bot: &Bot, metrics: &str) {
+    // Every counter the run actually moved, printed before anything is
+    // asserted: a failure below is far easier to read next to the rest of
+    // what the bot counted, and this is the excerpt a CI artefact keeps.
+    print_nonzero_counters(metrics);
     assert_counter(
         bot,
         metrics,
@@ -1620,11 +1742,6 @@ pub(crate) fn crash(bot: &Bot, root: &Path) {
 /// stroops to the sandbox filler — the `unwind_repay` scenario's way of
 /// funding a wallet its own deploy left empty, once whatever it means to
 /// prove with the debt still outstanding has already happened.
-///
-/// Unused until that scenario's own test exists (a later task): this
-/// module is shared plumbing for all five scenarios, landed ahead of the
-/// tests that call each other piece of it.
-#[allow(dead_code)]
 pub(crate) fn mint(bot: &Bot, root: &Path, amount: i128) {
     let script = root.join("scripts/sandbox/mint.sh");
     match Command::new(&script)
@@ -1647,5 +1764,25 @@ pub(crate) fn mint(bot: &Bot, root: &Path, amount: i128) {
             fail(bot, &message);
         }
         Err(error) => fail(bot, &format!("could not run {}: {error}", script.display())),
+    }
+}
+
+/// Every line of the bot's log containing `needle`, for a scenario's own
+/// report — never for an assertion.
+///
+/// `unwind_repay` uses this to pull the fill's own request out of the log
+/// (`"fill planned"`, `"fill recorded"`) and the leftover notification's
+/// own line, rather than re-deriving either from a chain or store read the
+/// assertions above have already made. A read failure is one line saying
+/// so rather than a panic: this is reporting, and a report that could not
+/// be built is not this run's own failure.
+pub(crate) fn log_lines_containing(bot: &Bot, needle: &str) -> Vec<String> {
+    match std::fs::read_to_string(&bot.log) {
+        Ok(text) => text
+            .lines()
+            .filter(|line| line.contains(needle))
+            .map(str::to_string)
+            .collect(),
+        Err(error) => vec![format!("(could not read {}: {error})", bot.log.display())],
     }
 }
