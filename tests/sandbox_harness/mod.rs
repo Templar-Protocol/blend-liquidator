@@ -44,7 +44,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use blend_liquidator::chain::xdr::AuctionType;
 use blend_liquidator::chain::{PoolReader, RpcClient};
 use blend_liquidator::math::AuctionData;
-use blend_liquidator::store::Store;
+use blend_liquidator::store::{Store, TrackedAuction};
 use sqlx::postgres::PgPool;
 
 /// The only network this tier will talk to. `scripts/sandbox/versions.env`
@@ -200,6 +200,18 @@ impl Bot {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+
+    /// Whether this struct still holds a child handle. `kill`'s own
+    /// `Option::take` clears it unconditionally, and `kill` blocks on
+    /// `Child::wait` before returning — which does not answer until the
+    /// process has actually exited — so by the time `kill` returns this is
+    /// always `false`; the `restart_adopt` scenario still checks it
+    /// explicitly, as its own proof that the first bot it spawns cannot
+    /// still be running by the time the second one starts against the same
+    /// auction.
+    pub(crate) fn is_running(&self) -> bool {
+        self.child.is_some()
     }
 
     /// Seconds since the bot was spawned, for the run's timeline.
@@ -986,6 +998,84 @@ pub(crate) async fn wait_for_tx_hash(
             let message = wait.timed_out();
             fail(bot, &message);
         }
+    }
+}
+
+/// Waits for `pool`'s store to hold an `auctions` row for `account`, and
+/// answers it.
+///
+/// `restart_adopt`'s own wait: adoption is a read-then-upsert of the
+/// chain's own entry (`Auctioneer::adopt`/`Store::upsert_auction`), not a
+/// submission, so there is no transaction hash to wait for the way
+/// [`wait_for_tx_hash`] does — the row itself, appearing in a database that
+/// started with none, is the evidence.
+pub(crate) async fn wait_for_adopted_auction(
+    bot: &mut Bot,
+    store: &Store,
+    what: &'static str,
+    budget: Duration,
+    pool: &str,
+    account: &str,
+) -> TrackedAuction {
+    let mut wait = Wait::new(what, budget);
+    loop {
+        match store
+            .auction(pool, account, AuctionType::UserLiquidation)
+            .await
+        {
+            Ok(Some(auction)) => {
+                println!(
+                    "{what} at {:.1} s (start ledger {}, bid {:?}, lot {:?})",
+                    bot.elapsed(),
+                    auction.start_ledger,
+                    auction.bid,
+                    auction.lot
+                );
+                return auction;
+            }
+            Ok(None) => {}
+            Err(error) => fail(
+                bot,
+                &format!("could not read the store's auction row: {error}"),
+            ),
+        }
+        if !wait.tick(bot).await {
+            let message = wait.timed_out();
+            fail(bot, &message);
+        }
+    }
+}
+
+/// Asserts `statement` (one of the `*_TX_HASH` queries above) finds no row
+/// for `(pool, account)` at all.
+///
+/// Stronger than the `*_VIOLATING_DRY_RUN` counts above, which only rule
+/// out an armed or hashed row alongside others that carry neither:
+/// `restart_adopt` needs no row whatsoever, because `Auctioneer::act`
+/// answers `ActOutcome::Refused` — see `refuse_percent` in
+/// `src/auctioneer.rs` — before `record_creation` is ever called, so a
+/// refusal that adopts an auction never writes a `creations` row for the
+/// attempt at all.
+pub(crate) async fn assert_no_tx_hash_row(
+    bot: &Bot,
+    store: &Store,
+    statement: &'static str,
+    what: &'static str,
+    pool: &str,
+    account: &str,
+) {
+    match sqlx::query_scalar::<_, String>(statement)
+        .bind(pool)
+        .bind(account)
+        .fetch_optional(store.pool())
+        .await
+    {
+        Ok(None) => println!("asserted: no {what} row carries a transaction hash"),
+        Ok(Some(hash)) => fail(
+            bot,
+            &format!("a {what} row carries a transaction hash ({hash}) — none should exist"),
+        ),
+        Err(error) => fail(bot, &format!("could not check {what} rows: {error}")),
     }
 }
 

@@ -20,6 +20,12 @@
 //!   fill leaves debt behind for the unwind's repay branch — the one thing
 //!   `liquidation`'s own run never exercises (see below) — to repay once
 //!   the wallet is funded and a second bot restarts.
+//! - [`restart_adopt`]: a bot is `SIGKILL`ed right after creating a
+//!   borrower's liquidation auction, and a second instance, on a database
+//!   that never recorded it, finds the auction still open on chain, adopts
+//!   it (`AuctionInProgress`, 1212) rather than trying to create a second
+//!   one, and fills it — proving `Auctioneer::adopt`, otherwise
+//!   unreachable from this tier's own continuous runs.
 //!
 //! `mod sandbox_harness` (`tests/sandbox_harness/mod.rs`) is the machinery
 //! every scenario in this tier shares: the standalone-network gate, the
@@ -69,14 +75,15 @@ use sqlx::postgres::PgPool;
 
 use sandbox_harness::{
     assert_all_dry_run, assert_auction_unchanged, assert_counter, assert_counter_at_least,
-    assert_metrics, assert_no_auction, crash, create_run_database, create_run_database_unmigrated,
-    drop_run_database, fail, fail_check, fill_budget, log_lines_containing, mint,
-    note_run_database, pools_toml, print_nonzero_counters, read_metrics, repo_root,
-    require_standalone_rpc, required, run_check_config, sandbox_env, spawn_bot, terminate,
-    wait_for_auction, wait_for_dry_run_row, wait_for_ledgers_past, wait_for_liability,
-    wait_for_ready, wait_for_tx_hash, wait_for_unwind, wait_for_unwind_leftovers, with_database,
-    Bot, BotConfig, CREATIONS_VIOLATING_DRY_RUN, CREATION_TIMEOUT, CREATION_TX_HASH,
-    DRY_RUN_CREATION_ROW, DRY_RUN_FILL_ROW, FILLS_VIOLATING_DRY_RUN, FILL_TX_HASH,
+    assert_metrics, assert_no_auction, assert_no_tx_hash_row, crash, create_run_database,
+    create_run_database_unmigrated, drop_run_database, fail, fail_check, fill_budget,
+    log_lines_containing, mint, note_run_database, pools_toml, print_nonzero_counters,
+    read_metrics, repo_root, require_standalone_rpc, required, run_check_config, sandbox_env,
+    spawn_bot, terminate, wait_for_adopted_auction, wait_for_auction, wait_for_dry_run_row,
+    wait_for_ledgers_past, wait_for_liability, wait_for_ready, wait_for_tx_hash, wait_for_unwind,
+    wait_for_unwind_leftovers, with_database, Bot, BotConfig, CREATIONS_VIOLATING_DRY_RUN,
+    CREATION_TIMEOUT, CREATION_TX_HASH, DRY_RUN_CREATION_ROW, DRY_RUN_FILL_ROW,
+    FILLS_VIOLATING_DRY_RUN, FILL_TX_HASH,
 };
 
 /// The whole tier's original scenario: an armed bot creates the auction,
@@ -1262,4 +1269,334 @@ async fn unwind_repay() {
     // nobody will read is a database worth not keeping.
     store.pool().close().await;
     drop_run_database(&root, &maintenance_url, &database).await;
+}
+
+/// What both of [`restart_adopt`]'s bots share: the pool's identity, the
+/// chain and HTTP handles, and the one seed file both bots read the
+/// borrower from. Unlike [`UnwindRepayCtx`], there is no single shared
+/// `Store` here — each bot gets its own database, and each phase function
+/// below owns that database's own connection's lifecycle, closing it
+/// before it returns.
+struct RestartAdoptCtx<'a> {
+    root: &'a Path,
+    env: &'a BTreeMap<String, String>,
+    rpc: &'a RpcClient,
+    http: &'a reqwest::Client,
+    pool: &'a str,
+    xlm: &'a str,
+    usdc: &'a str,
+    borrower: &'a str,
+    filler: &'a str,
+    seed_path: &'a Path,
+}
+
+/// Bot #1 of [`restart_adopt`]: an armed creator whose filler cannot fill
+/// its own auction — `supported_bid = [xlm]`, while the auction's bid is
+/// USDC, the same trick [`armed_creation_phase_b`] uses — creates the
+/// borrower's liquidation auction and is killed with `SIGKILL`, never
+/// `SIGTERM`, before it does anything else with it. The kill is the whole
+/// point: nothing about a graceful exit runs, and bot #2's database never
+/// hears from this bot at all, so whatever bot #2 later does with this
+/// auction has to be the adoption path, not a resumed session on the same
+/// database. Answers the auction entry it created, read from chain.
+async fn restart_adopt_bot_one(ctx: &RestartAdoptCtx<'_>, database_url: &str) -> AuctionData {
+    let store = match Store::connect(database_url, 2).await {
+        Ok(store) => store,
+        Err(error) => panic!("bot #1: could not connect to its database: {error}"),
+    };
+
+    let unfillable_pools = pools_toml(ctx.pool, ctx.xlm, &[ctx.xlm]);
+    let mut bot = spawn_bot(
+        ctx.root,
+        ctx.env,
+        BotConfig {
+            dry_run: false,
+            filler_secret: Some(required(ctx.env, "SANDBOX_FILLER_SECRET_KEY")),
+            pools: unfillable_pools,
+            database_url: database_url.to_string(),
+            log_name: "bot-restart-1.log",
+            extra_env: vec![("SEED_FILE", ctx.seed_path.display().to_string())],
+        },
+    );
+
+    wait_for_ready(&mut bot, ctx.http).await;
+
+    println!("bot #1: crashing XLM's price at {:.1} s", bot.elapsed());
+    crash(&bot, ctx.root);
+
+    let creation = wait_for_tx_hash(
+        &mut bot,
+        &store,
+        CREATION_TX_HASH,
+        "the auctioneer to create the borrower's liquidation auction",
+        CREATION_TIMEOUT,
+        ctx.pool,
+        ctx.borrower,
+    )
+    .await;
+
+    let (ledger, entry) = wait_for_auction(
+        &mut bot,
+        ctx.rpc,
+        ctx.pool,
+        ctx.borrower,
+        AuctionType::UserLiquidation,
+        "the auction entry to exist on chain",
+        AUCTION_ENTRY_TIMEOUT,
+    )
+    .await;
+    println!(
+        "bot #1: auction created (tx {creation}) at ledger {ledger}, start block {}, bid {:?}, \
+         lot {:?}",
+        entry.block, entry.bid, entry.lot
+    );
+
+    bot.kill();
+    assert!(
+        !bot.is_running(),
+        "bot #1's process is still recorded as running after kill()"
+    );
+    println!("bot #1: confirmed dead at {:.1} s", bot.elapsed());
+
+    // Closed before this function returns: bot #2 is not spawned yet, but
+    // this connection has nothing left to do, and the caller's database is
+    // this bot's own to release.
+    store.pool().close().await;
+    entry
+}
+
+/// Bot #2 of [`restart_adopt`]: an armed bot with the standard, fillable
+/// pools config, on a fresh database that has never recorded bot #1's
+/// auction at all. Its own `new_auction` simulation is refused with
+/// `AuctionInProgress` (1212) — the contract already holds one for this
+/// borrower — which is exactly the path `Auctioneer::adopt` exists for
+/// (`src/auctioneer.rs`): it re-reads the chain's own entry and writes the
+/// store's `auctions` row from it, and `refuse_percent` returns `None`
+/// without ever recording a `creations` row for the attempt at all — see
+/// `assert_no_tx_hash_row`'s own doc. The filler then walks that adopted
+/// row like any other and fills it.
+async fn restart_adopt_bot_two(ctx: &RestartAdoptCtx<'_>, database_url: &str) {
+    let store = match Store::connect(database_url, 4).await {
+        Ok(store) => store,
+        Err(error) => panic!("bot #2: could not connect to its database: {error}"),
+    };
+
+    let standard_pools = pools_toml(ctx.pool, ctx.xlm, &[ctx.usdc]);
+    let mut bot = spawn_bot(
+        ctx.root,
+        ctx.env,
+        BotConfig {
+            dry_run: false,
+            filler_secret: Some(required(ctx.env, "SANDBOX_FILLER_SECRET_KEY")),
+            pools: standard_pools,
+            database_url: database_url.to_string(),
+            log_name: "bot-restart-2.log",
+            extra_env: vec![("SEED_FILE", ctx.seed_path.display().to_string())],
+        },
+    );
+
+    wait_for_ready(&mut bot, ctx.http).await;
+
+    let adopted = wait_for_adopted_auction(
+        &mut bot,
+        &store,
+        "the auctioneer to adopt the auction bot #1 left open",
+        CREATION_TIMEOUT,
+        ctx.pool,
+        ctx.borrower,
+    )
+    .await;
+    println!(
+        "bot #2: adopted the auction at {:.1} s (start ledger {}, bid {:?}, lot {:?})",
+        bot.elapsed(),
+        adopted.start_ledger,
+        adopted.bid,
+        adopted.lot
+    );
+
+    // The line `refuse_percent` (`src/auctioneer.rs`) logs unconditionally
+    // for every refused simulation, filtered here to the one refusal this
+    // scenario means to prove: `contract_error` 1212, `AuctionInProgress`,
+    // is what sends this borrower down the adoption path rather than a
+    // percent-adjustment retry. For the report only — the assertions below
+    // and the adopted row waited for above are what this test actually
+    // stands or falls on.
+    let adoption_lines: Vec<String> =
+        log_lines_containing(&bot, "liquidation refused by simulation; skipping")
+            .into_iter()
+            .filter(|line| line.contains("1212"))
+            .collect();
+    if adoption_lines.is_empty() {
+        fail(
+            &bot,
+            "bot #2's log names no refusal with contract_error 1212 — the adoption path this \
+             scenario means to prove was never taken",
+        );
+    }
+    for line in &adoption_lines {
+        println!("bot #2, the adoption path: {line}");
+    }
+
+    let budget = fill_budget(&mut bot, ctx.rpc).await;
+    let fill = wait_for_tx_hash(
+        &mut bot,
+        &store,
+        FILL_TX_HASH,
+        "the filler to take the adopted auction",
+        budget,
+        ctx.pool,
+        ctx.borrower,
+    )
+    .await;
+    let collateral = wait_for_unwind(&mut bot, ctx.rpc, ctx.pool, ctx.filler, ctx.xlm).await;
+
+    assert_no_tx_hash_row(
+        &bot,
+        &store,
+        CREATION_TX_HASH,
+        "creations",
+        ctx.pool,
+        ctx.borrower,
+    )
+    .await;
+
+    let metrics = read_metrics(&bot, ctx.http).await;
+    print_nonzero_counters(&metrics);
+    assert_counter(
+        &bot,
+        &metrics,
+        "blend_liquidator_creations_total{result=\"succeeded\"}",
+        0,
+    );
+    assert_counter(
+        &bot,
+        &metrics,
+        "blend_liquidator_fills_total{result=\"succeeded\"}",
+        1,
+    );
+
+    terminate(&mut bot).await;
+    println!(
+        "bot #2 done in {:.1} s: fill {fill}, {collateral} stroops of XLM collateral left",
+        bot.elapsed()
+    );
+
+    store.pool().close().await;
+}
+
+/// The `restart_adopt` scenario: a bot `SIGKILL`ed right after creating a
+/// borrower's liquidation auction, and a second, fresh instance — on a
+/// database that has never heard of that auction — finds it on chain,
+/// adopts it, and fills it. What no other scenario in this tier proves:
+/// every other bot here creates and fills its own auction inside one
+/// continuous run, so `Auctioneer::adopt` (the `AuctionInProgress`/1212
+/// path in `src/auctioneer.rs`) is otherwise unreachable from this tier at
+/// all.
+///
+/// Two bots, two databases — [`restart_adopt_bot_one`] and
+/// [`restart_adopt_bot_two`], sharing one [`RestartAdoptCtx`] — the same
+/// shape [`unwind_repay`]'s own two runs use, except that a restart needs a
+/// fresh database for its second bot rather than the one database
+/// `unwind_repay`'s two runs share.
+///
+/// Ignored on purpose — it needs `scripts/sandbox/up.sh` and
+/// `SANDBOX_SCENARIO=restart_adopt scripts/sandbox/deploy.sh` to have run,
+/// and a Postgres at `DATABASE_URL`.
+#[tokio::test]
+#[ignore = "needs the local sandbox network: scripts/sandbox/up.sh && scripts/sandbox/deploy.sh"]
+async fn restart_adopt() {
+    let root = repo_root();
+    let env = sandbox_env(&root.join("target/sandbox/sandbox.env"), "restart_adopt");
+
+    let passphrase = required(&env, "SANDBOX_PASSPHRASE").to_string();
+    let pool = required(&env, "SANDBOX_POOL").to_string();
+    let xlm = required(&env, "SANDBOX_XLM").to_string();
+    let usdc = required(&env, "SANDBOX_USDC").to_string();
+    let borrower = required(&env, "SANDBOX_BORROWER").to_string();
+    let filler = required(&env, "SANDBOX_FILLER").to_string();
+    let rpc_url = required(&env, "SANDBOX_RPC_URL").to_string();
+
+    // Ordered with the two refusals `sandbox_env` just made, and for the
+    // same reason every other scenario keeps it first: nothing below this
+    // line may run against an endpoint whose own answer has not been
+    // checked — and this scenario, of all of them, is the one that arms
+    // two bots on two different databases with the real filler key.
+    require_standalone_rpc(&rpc_url).await;
+
+    let Ok(maintenance_url) = std::env::var("DATABASE_URL") else {
+        panic!("DATABASE_URL is not set — the store tests need it too; see `make db-up`")
+    };
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or_default();
+    let database_one = format!("sandbox_{stamp}_1");
+    let database_two = format!("sandbox_{stamp}_2");
+    println!("creating bot #1's database {database_one}");
+    let database_url_one = create_run_database(&root, &maintenance_url, &database_one).await;
+    // Noted once each database exists, so a failure from here on says both
+    // are kept; the success path at the bottom drops them and neither is
+    // read again.
+    note_run_database(&database_one);
+    println!("creating bot #2's database {database_two}, fresh — it must never see bot #1's own");
+    let database_url_two = create_run_database(&root, &maintenance_url, &database_two).await;
+    note_run_database(&database_two);
+
+    let sandbox_dir = root.join("target/sandbox");
+    let seed_path = sandbox_dir.join("seed-restart-adopt.toml");
+    let seed = format!("[accounts]\n\"{pool}\" = [\"{borrower}\"]\n");
+    if let Err(error) = std::fs::write(&seed_path, seed) {
+        panic!("could not write {}: {error}", seed_path.display());
+    }
+
+    let http = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => panic!("could not build an HTTP client: {error}"),
+    };
+    let chain = ChainConfig {
+        network_passphrase: passphrase,
+        rpc_url,
+        rpc_api_key: None,
+        base_fee: 5_000,
+        high_fee: 10_000,
+        tx_poll_ledgers: 30,
+    };
+    let rpc = match RpcClient::from_config(&chain) {
+        Ok(rpc) => rpc,
+        Err(error) => panic!("could not build an RPC client: {error}"),
+    };
+
+    let ctx = RestartAdoptCtx {
+        root: root.as_path(),
+        env: &env,
+        rpc: &rpc,
+        http: &http,
+        pool: &pool,
+        xlm: &xlm,
+        usdc: &usdc,
+        borrower: &borrower,
+        filler: &filler,
+        seed_path: seed_path.as_path(),
+    };
+
+    println!("--- bot #1: an armed creator that cannot fill ---");
+    let entry = restart_adopt_bot_one(&ctx, &database_url_one).await;
+    println!(
+        "bot #1 created bid {:?} lot {:?} at start block {}",
+        entry.bid, entry.lot, entry.block
+    );
+
+    println!("--- bot #2: adopts the auction on a fresh database ---");
+    restart_adopt_bot_two(&ctx, &database_url_two).await;
+
+    println!("restart_adopt passed for {borrower}");
+
+    // Last, and only here: both bots either passed or panicked, so reaching
+    // this line is what "the run succeeded" means, and databases nobody
+    // will read are databases worth not keeping.
+    drop_run_database(&root, &maintenance_url, &database_one).await;
+    drop_run_database(&root, &maintenance_url, &database_two).await;
 }
