@@ -52,7 +52,11 @@
 //! that has stopped answering costs a bounded number of tasks and drops
 //! what does not fit.
 //!
-//! # Every exit of `run` that returns drains
+//! # Every exit of `run` once its tasks run drains
+//!
+//! `run`'s earlier `?`s — validation and the seed pass — return before
+//! `finish_run`, with nothing to drain: nothing before the task set
+//! notifies.
 //!
 //! What a shutdown owes the sends still in flight is
 //! [`crate::notifier::Notifier::drain`], and `finish_run` is where both
@@ -2678,10 +2682,12 @@ impl Service {
     /// tick the tracker publishes after it acknowledges, one watchdog,
     /// one HTTP server when a port is set, and — only when armed — one
     /// submission-queue worker per distinct signing key — until a
-    /// shutdown signal arrives and every task has returned. Whenever it
-    /// returns, it leaves through `finish_run`, which drains the notifier;
-    /// the second shutdown signal's `exit(130)` and a release build's
-    /// panic abort end the process without returning.
+    /// shutdown signal arrives and every task has returned. Once its
+    /// tasks are running, every return goes through `finish_run`, which
+    /// drains the notifier; an earlier `?` returns with nothing in flight,
+    /// since nothing before the tasks notifies. The second shutdown
+    /// signal's `exit(130)` and a release build's panic abort end the
+    /// process without returning.
     ///
     /// `keys` holds both of `AUCTIONEER_SECRET_KEY` and
     /// `FILLER_SECRET_KEY`, either or both of which may be absent — neither

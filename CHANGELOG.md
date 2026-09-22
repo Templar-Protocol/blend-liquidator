@@ -171,8 +171,10 @@ during development rather than a difference from an earlier release.
   seed pass and every other task after it — sharing one `Metrics` and one
   `Notifier` built before the seed pass (`build_notifier`: the Telegram
   channel when both credentials are configured, `LogChannel` otherwise);
-  every exit but the second shutdown signal and a task panic drains the
-  notifier (`finish_run`) before returning. A release build, the image's,
+  once the tasks are running, every exit but the second shutdown signal
+  and a task panic drains the notifier (`finish_run`) before returning;
+  nothing before them notifies, so an earlier startup failure has nothing
+  in flight. A release build, the image's,
   sets `panic = "abort"`, so a panic there aborts the process on the spot;
   a debug build unwinds out of `drain_tasks` past `finish_run`. Either way
   notifications still in flight are lost with it. `Service::check_config`

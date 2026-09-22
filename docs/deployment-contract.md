@@ -67,23 +67,29 @@ default and bound beyond what is stated below.
   exiting with a code — `SIGABRT` (`134`) ordinarily; as a container's
   PID 1, where the kernel discards a self-sent `SIGABRT`, glibc's
   `abort()` ends in a fault signal instead, whose number depends on the
-  architecture: `SIGTRAP` (`133`), measured on arm64; the published image
-  is amd64, where glibc's fallback is expected to raise `SIGSEGV` (`139`),
-  unmeasured. Treat any death by signal as a crash.
+  architecture: `SIGTRAP` (`133`) on arm64, where it was measured; the
+  published image is amd64, and its signal there has not been measured.
+  Treat any death by signal as a crash.
 - **Two exits skip draining notifications still in flight**: `130` and a
   panic's abort.
 - **Logs go to stdout**, one line per event; `LOG_FORMAT=json` renders
   each as one JSON object per line instead of text. A command-line parse
   error and a panic's message go to stderr as plain text, whatever
   `LOG_FORMAT` says.
-- **Two overlapping instances cannot both act on one liquidation.**
-  Stellar accepts one transaction per account sequence number: of two
-  submissions built from the same signing account, one lands and the
-  other fails with a bad sequence and is never resent. The loser clears
-  its own state and re-decides from a fresh chain read on its next
-  pass — the filler drops the stale plan outright, the auctioneer
-  re-flags the borrower for its next tick — the same thing either would
-  do a tick later regardless.
+- **Two overlapping instances sharing signing keys cannot both act on
+  one liquidation** — the rolling-deploy case, where both revisions run
+  the same configuration. Stellar accepts one transaction per account
+  sequence number: of two submissions built from the same signing
+  account, one lands and the other fails with a bad sequence and is never
+  resent. The loser clears its own state and re-decides from a fresh
+  chain read on its next pass — the filler drops the stale plan outright,
+  the auctioneer re-flags the borrower for its next tick — the same thing
+  either would do a tick later regardless. Instances on *distinct* keys
+  submit through separate queues, so nothing orders them: auction
+  creation is still single, because the pool refuses a second auction for
+  a borrower who already has one (`AuctionInProgress`, `1212`) and the
+  auctioneer adopts the open auction when it meets that refusal, but a
+  fill is not — a partial fill leaves a remainder another filler may take.
 
 ## What a deployment must provide
 

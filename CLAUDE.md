@@ -585,9 +585,11 @@ make help                           # Docker Compose lifecycle
   (`build_notifier`: the Telegram channel when both credentials are
   configured, `LogChannel` otherwise) are built once, before the seed pass,
   and carried together as one `Instruments` to every loop that needs both.
-  However `run` ends, it leaves through `finish_run`, which drains the
-  notifier (`Notifier::drain(DRAIN_BUDGET)`) on both the `Ok` and the `Err`
-  path — the two exits that skip it are the second `SIGINT`/`SIGTERM`
+  Once its tasks are running, however `run` ends it leaves through
+  `finish_run`, which drains the notifier (`Notifier::drain(DRAIN_BUDGET)`)
+  on both the `Ok` and the `Err` path; an earlier `?` (validation, the
+  seed pass) has nothing in flight, since nothing before the tasks
+  notifies. The two exits that skip it are the second `SIGINT`/`SIGTERM`
   (`spawn_shutdown_listener`'s `exit(130)`, deliberately: a second signal
   means now) and a task panic. A release build — the image's — sets
   `panic = "abort"` (`Cargo.toml`'s `[profile.release]`), so there a

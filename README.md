@@ -98,8 +98,10 @@ cp .env.example .env
 docker compose up
 ```
 
-The published image is `ghcr.io/templar-protocol/blend-liquidator:0.1.0`.
-Whether the package is public is a GitHub package setting, not something
+This README tracks `ghcr.io/templar-protocol/blend-liquidator:0.1.0`. Each
+image is published by pushing its `v<version>` tag (`v0.1.0` for this one),
+so a version is pullable only once its tag has been pushed and the release
+workflow has run. Whether the package is public is a GitHub package setting, not something
 this repository controls; while it is private, pulling it needs a token
 with `read:packages`.
 
