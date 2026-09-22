@@ -3,19 +3,29 @@
 //! `scripts/sandbox/deploy.sh` populates. `make sandbox-test` always names
 //! this one binary (`--test liquidation_sandbox`) and picks the scenario
 //! with `--exact $(SANDBOX_SCENARIO)`, which is why a new scenario is a new
-//! function here rather than a new test target.
+//! function here rather than a new test target. Its name is written in four
+//! other places too — `deploy.sh`'s accepted list, the Makefile's
+//! `SANDBOX_SCENARIOS`, the harness's `SCENARIOS` and the nightly matrix —
+//! and `scripts/check-repo-invariants.sh` fails unless those four and this
+//! file's `#[ignore]`d fns name the same set. `make sandbox-test` lists
+//! first and refuses unless `--exact $(SANDBOX_SCENARIO)` names exactly one
+//! test fn, then runs it with `--include-ignored`, so a mistyped name or a
+//! fn that lost its `#[ignore]` cannot pass having run nothing.
 //!
 //! - [`liquidation`]: the standard end-to-end run — an armed bot creates a
 //!   borrower's liquidation auction after a price crash, fills it, and
 //!   unwinds the position it took.
 //! - [`check_config`]: `RUN_MODE=check-config` against the same deploy,
-//!   proving its six cases' exit codes and messages and that none of them
-//!   sends a transaction or migrates the database.
+//!   proving its eight cases' exit codes and messages — two of them with a
+//!   wrong `NETWORK_PASSPHRASE`, pinning what a keyed and a keyless
+//!   configuration each do with one — and that none of them sends a
+//!   transaction or migrates the database.
 //! - [`dry_run`]: the tier's most important safety test. A dry-run bot
-//!   holding the real filler key never signs or sends anything — not to
-//!   create a borrower's auction, and not to fill one an armed run of the
-//!   same bot created for it — proven on the filler's own sequence number
-//!   as well as on the audit tables and the chain.
+//!   holding the real filler key never sends a transaction — not to create
+//!   a borrower's auction, and not to fill one an armed run of the same bot
+//!   created for it — proven by the filler's own sequence number, the chain
+//!   (no auction created, none filled) and the audit rows (none armed, none
+//!   carrying a hash).
 //! - [`unwind_repay`]: deployed with the filler holding no USDC, so its
 //!   fill leaves debt behind for the unwind's repay branch — the one thing
 //!   `liquidation`'s own run never exercises (see below) — to repay once
@@ -29,7 +39,7 @@
 //!
 //! `mod sandbox_harness` (`tests/sandbox_harness/mod.rs`) is the machinery
 //! every scenario in this tier shares: the standalone-network gate, the
-//! spawned bot, the per-run database and every named wait. Its own module
+//! spawned bot, the per-run databases and every named wait. Its own module
 //! doc carries the safety reasoning — the three refusals that keep an armed
 //! bot off any network but this sandbox's own, and the "nothing panics
 //! through `unwrap`/`expect`" rule every failure below honours through
@@ -42,7 +52,7 @@
 //!
 //! ```text
 //! scripts/sandbox/up.sh && SANDBOX_SCENARIO=liquidation scripts/sandbox/deploy.sh
-//! cargo test --test liquidation_sandbox -- --ignored --exact --nocapture liquidation
+//! make sandbox-test SANDBOX_SCENARIO=liquidation
 //! ```
 //!
 //! One thing `liquidation`'s assertions do not prove, so that nobody reads
@@ -59,6 +69,22 @@
 //! idle with debt still owed — raising `UnwindLeftovers` — and its second
 //! bot, once `mint.sh` has funded the wallet, repays that debt on its very
 //! first tick and withdraws the rest down to the primary floor.
+//!
+//! And what [`dry_run`]'s do not. Its three kinds of evidence — a sequence
+//! number that does not move, an auction entry that never appears or never
+//! changes, and audit rows never armed and never carrying a hash — rule out
+//! a transaction from the key reaching a ledger and a submission through
+//! the bot's own queue. They cannot see a signature made and discarded
+//! locally, or an envelope the RPC refused before any ledger included it.
+//! And the one historical way a dry run sent something — simulating
+//! through `Submitter::prepare`, which signs unconditionally and sends a
+//! `RestoreFootprint` of its own when a simulation reports an archived
+//! footprint — is unreachable here: a network minutes old has archived
+//! nothing, so that path would pass this scenario unexercised. The unit tests
+//! `a_dry_run_never_restores_an_archived_footprint` (`src/auctioneer.rs`)
+//! and `a_dry_run_that_needs_a_restore_is_refused` (`src/executor.rs`) are
+//! what cover it, each against a scripted RPC that answers with an
+//! archived footprint.
 
 mod sandbox_harness;
 
@@ -75,20 +101,20 @@ use sqlx::postgres::PgPool;
 
 use sandbox_harness::{
     assert_all_dry_run, assert_auction_unchanged, assert_counter, assert_counter_at_least,
-    assert_metrics, assert_no_auction, assert_no_tx_hash_row, crash, create_run_database,
+    assert_metrics, assert_no_auction, assert_no_rows, crash, create_run_database,
     create_run_database_unmigrated, drop_run_database, fail, fail_check, fill_budget,
     log_lines_containing, mint, note_run_database, pools_toml, print_nonzero_counters,
     read_metrics, repo_root, require_standalone_rpc, required, run_check_config, sandbox_env,
     spawn_bot, terminate, wait_for_adopted_auction, wait_for_auction, wait_for_dry_run_row,
     wait_for_ledgers_past, wait_for_liability, wait_for_ready, wait_for_tx_hash, wait_for_unwind,
-    wait_for_unwind_leftovers, with_database, Bot, BotConfig, CREATIONS_VIOLATING_DRY_RUN,
-    CREATION_TIMEOUT, CREATION_TX_HASH, DRY_RUN_CREATION_ROW, DRY_RUN_FILL_ROW,
-    FILLS_VIOLATING_DRY_RUN, FILL_TX_HASH,
+    wait_for_unwind_leftovers, with_database, Bot, BotConfig, CREATIONS_FOR_ACCOUNT,
+    CREATIONS_VIOLATING_DRY_RUN, CREATION_TIMEOUT, CREATION_TX_HASH, DRY_RUN_CREATION_ROW,
+    DRY_RUN_FILL_ROW, FILLS_VIOLATING_DRY_RUN, FILL_TX_HASH, UNWIND_LEFTOVERS_METRIC,
 };
 
-/// The whole tier's original scenario: an armed bot creates the auction,
-/// fills it and unwinds the position it took, against a network that exists
-/// only for this run.
+/// The tier's standard scenario: an armed bot creates the auction, fills it
+/// and unwinds the position it took, against a network that exists only for
+/// this run.
 ///
 /// Ignored on purpose — it needs `scripts/sandbox/up.sh` and
 /// `scripts/sandbox/deploy.sh` to have run, and a Postgres at `DATABASE_URL`.
@@ -108,7 +134,8 @@ async fn liquidation() {
 
     // Ordered with the two refusals `sandbox_env` just made, and for the
     // same reason: nothing below this line may run against an endpoint
-    // whose own answer has not been checked.
+    // whose own answer has not been checked. `spawn_bot` asks again
+    // immediately before it spawns.
     require_standalone_rpc(&rpc_url).await;
 
     let Ok(maintenance_url) = std::env::var("DATABASE_URL") else {
@@ -147,7 +174,8 @@ async fn liquidation() {
             log_name: "bot.log",
             extra_env: vec![("SEED_FILE", seed_path.display().to_string())],
         },
-    );
+    )
+    .await;
 
     let http = match reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -229,10 +257,10 @@ async fn liquidation() {
 /// stdout/stderr contains `expected_text`, then prints both for the
 /// report.
 ///
-/// `expected_text` is always a stable substring, never a whole line — the
-/// same rule the module doc above draws from `src/service.rs` and
-/// `src/config.rs`'s exact wording, which is where every one of this
-/// scenario's six cases gets the text it matches.
+/// `expected_text` is always a stable substring, never a whole line: the
+/// exact wording in `src/service.rs`, `src/config.rs` and the error types'
+/// own `Display` is where every one of this scenario's cases gets the text
+/// it matches.
 fn expect_case(
     name: &str,
     status: std::process::ExitStatus,
@@ -259,10 +287,9 @@ fn expect_case(
 
 /// One `check_config` case: [`sandbox_harness::run_check_config`]'s own
 /// arguments, and the exit code and output substring [`expect_case`]
-/// checks the run against. [`check_config_cases`] builds the table of six,
-/// so [`check_config`] itself is one loop over them rather than six
-/// repetitions of the same four lines; the comment on each case in that
-/// table carries the reasoning this struct has no field for.
+/// checks the run against. [`check_config_cases`] builds the table, so
+/// [`check_config`] itself is one loop over it; the comment on each case in
+/// that table carries the reasoning this struct has no field for.
 struct CheckConfigCase<'a> {
     label: &'static str,
     pools: &'a str,
@@ -270,15 +297,25 @@ struct CheckConfigCase<'a> {
     filler_secret: Option<&'a str>,
     extra_env: Vec<(&'static str, String)>,
     database_url: &'a str,
+    /// `None` for every case but the two that pin what a wrong
+    /// `NETWORK_PASSPHRASE` does; see
+    /// [`sandbox_harness::run_check_config`] for why only a `check-config`
+    /// run may ever be handed one.
+    passphrase_override: Option<&'static str>,
     expected_code: i32,
     expected_text: &'static str,
 }
 
-/// The six cases [`check_config`] runs, in the one order the brief lists
-/// them: wiring, not logic — kept out of that function itself so its own
-/// length stays under clippy's line count without an `#[allow]`. The
-/// comment on each case carries the reasoning `src/service.rs` and
-/// `src/config.rs` give for that exact code and text.
+/// A network passphrase that is not the sandbox's: the public testnet's.
+/// `check-config` is handed it against the sandbox's own RPC in cases (g)
+/// and (h), and nothing else ever is.
+const WRONG_PASSPHRASE: &str = "Test SDF Network ; September 2015";
+
+/// The eight cases [`check_config`] runs, (a) through (h) — wiring, not
+/// logic, kept out of that function so it reads as the chain and database
+/// checks around one loop. The comment on each case carries the reasoning
+/// `src/service.rs`, `src/config.rs` and `src/main.rs` give for that exact
+/// code and text.
 fn check_config_cases<'a>(
     default_pools: &'a str,
     blnd_pools: &'a str,
@@ -300,6 +337,7 @@ fn check_config_cases<'a>(
             filler_secret: Some(filler_secret),
             extra_env: vec![],
             database_url,
+            passphrase_override: None,
             expected_code: 0,
             expected_text: "short of min_primary_collateral",
         },
@@ -313,6 +351,7 @@ fn check_config_cases<'a>(
             filler_secret: Some(filler_secret),
             extra_env: vec![("XLM_FEE_RESERVE", "1000000".to_string())],
             database_url,
+            passphrase_override: None,
             expected_code: 0,
             expected_text: "XLM_FEE_RESERVE asks for",
         },
@@ -326,6 +365,7 @@ fn check_config_cases<'a>(
             filler_secret: Some(filler_secret),
             extra_env: vec![("XLM_FEE_RESERVE", "1000000".to_string())],
             database_url,
+            passphrase_override: None,
             expected_code: 2,
             expected_text: "XLM_FEE_RESERVE asks for",
         },
@@ -339,6 +379,7 @@ fn check_config_cases<'a>(
             filler_secret: None,
             extra_env: vec![],
             database_url,
+            passphrase_override: None,
             expected_code: 2,
             expected_text: "DRY_RUN=false needs FILLER_SECRET_KEY",
         },
@@ -351,6 +392,7 @@ fn check_config_cases<'a>(
             filler_secret: None,
             extra_env: vec![],
             database_url,
+            passphrase_override: None,
             expected_code: 2,
             expected_text: "is not a reserve",
         },
@@ -362,8 +404,42 @@ fn check_config_cases<'a>(
             filler_secret: None,
             extra_env: vec![],
             database_url: absent_url,
+            passphrase_override: None,
             expected_code: 2,
             expected_text: "connecting to the database failed",
+        },
+        // (g) the real key and a wrong passphrase, in dry run so nothing is
+        // armed: `check-config` never compares NETWORK_PASSPHRASE with the
+        // RPC's own `getNetwork`, but `SigningContext::from_config` derives
+        // the native asset's contract id from it, so `validate_filler`'s
+        // native-balance read simulates a call on a contract this network
+        // does not hold. That read propagates with `?` in either mode, and
+        // `src/main.rs` exits 2 for any `check-config` error — with a chain
+        // error that never names the passphrase.
+        CheckConfigCase {
+            label: "g",
+            pools: default_pools,
+            dry_run: true,
+            filler_secret: Some(filler_secret),
+            extra_env: vec![],
+            database_url,
+            passphrase_override: Some(WRONG_PASSPHRASE),
+            expected_code: 2,
+            expected_text: "chain: simulation failed",
+        },
+        // (h) the same wrong passphrase with no key: `validate_filler` has
+        // no account to read and only warns, and nothing else
+        // `check-config` reads depends on the passphrase, so it passes.
+        CheckConfigCase {
+            label: "h",
+            pools: default_pools,
+            dry_run: true,
+            filler_secret: None,
+            extra_env: vec![],
+            database_url,
+            passphrase_override: Some(WRONG_PASSPHRASE),
+            expected_code: 0,
+            expected_text: "no FILLER_SECRET_KEY",
         },
     ]
 }
@@ -371,10 +447,12 @@ fn check_config_cases<'a>(
 /// The `check_config` scenario: `RUN_MODE=check-config` against the
 /// standard deploy, proving the deploy-smoke-test contract spec §10
 /// promises — the right exit code and the right warning or error text for
-/// each of six cases — and that none of them sends a transaction or
-/// migrates the database it is pointed at.
+/// each of eight cases — and that none of them sends a transaction or
+/// migrates the database it is pointed at. Cases (g) and (h) pin what a
+/// wrong `NETWORK_PASSPHRASE` does, since nothing checks it against the
+/// network: a configuration with a key fails, one without passes.
 ///
-/// Six short-lived binary runs rather than one long-running [`Bot`]:
+/// Eight short-lived binary runs rather than one long-running [`Bot`]:
 /// `check-config` validates and exits on its own, so
 /// [`sandbox_harness::run_check_config`] is its own spawn-and-wait-for-exit
 /// rather than [`spawn_bot`]'s spawn-and-wait-for-`/healthz`, and every
@@ -383,21 +461,21 @@ fn check_config_cases<'a>(
 /// `fail` to tail.
 ///
 /// The database this run creates is deliberately **not** migrated
-/// ([`create_run_database_unmigrated`]): the whole point of cases (a)
-/// through (e) is that `check-config` leaves it exactly that way, which a
-/// migrated fixture could never prove. Case (f) points at a sixth name on
-/// the same server that this test never creates at all, for the one case
-/// that needs a `DATABASE_URL` naming nothing.
+/// ([`create_run_database_unmigrated`]): the point of every case but (f) is
+/// that `check-config` leaves it exactly that way, which a migrated fixture
+/// could never prove. Case (f) points at a second name on the same server,
+/// `sandbox_<stamp>_absent`, that this test never creates at all, for the
+/// one case that needs a `DATABASE_URL` naming nothing.
 ///
 /// Ignored on purpose — it needs `scripts/sandbox/up.sh` and
 /// `SANDBOX_SCENARIO=check_config scripts/sandbox/deploy.sh` to have run,
 /// and a Postgres at `DATABASE_URL`.
-// The six cases themselves are `check_config_cases`' table now, not six
-// repetitions here — but what is left is still over the limit: the chain
+// The cases live in `check_config_cases`' table; what is here is the chain
 // and database wiring around them (two databases, an RPC client, a
 // sequence number read before and after, a migration check), each its own
-// handful of lines of its own reason to fail closed. Wiring, not logic —
-// the same reason `Service::run` carries the same allow.
+// handful of lines of its own reason to fail closed, and together over
+// clippy's line count. Wiring, not logic — the same reason `Service::run`
+// carries the same allow.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
 #[ignore = "needs the local sandbox network: scripts/sandbox/up.sh && scripts/sandbox/deploy.sh"]
@@ -417,6 +495,7 @@ async fn check_config() {
     // Ordered with the two refusals `sandbox_env` just made, and for the
     // same reason `liquidation` keeps it first: nothing below this line
     // may run against an endpoint whose own answer has not been checked.
+    // `run_check_config` asks again immediately before each case's spawn.
     require_standalone_rpc(&rpc_url).await;
 
     let Ok(maintenance_url) = std::env::var("DATABASE_URL") else {
@@ -450,9 +529,9 @@ async fn check_config() {
         Err(error) => fail_check("", &format!("could not build an RPC client: {error}")),
     };
 
-    // Read before the first case and again after the last: every one of
-    // the six below is `check-config`, which reads and pings but never
-    // signs or sends, so nothing between these two reads may move it.
+    // Read before the first case and again after the last: every case
+    // below is `check-config`, which reads and pings but never signs or
+    // sends, so nothing between these two reads may move it.
     let sequence_before = match rpc.account(&filler).await {
         Ok(account) => account.sequence,
         Err(error) => fail_check(
@@ -486,7 +565,9 @@ async fn check_config() {
             case.dry_run,
             case.filler_secret,
             &case.extra_env,
-        );
+            case.passphrase_override,
+        )
+        .await;
         expect_case(
             case.label,
             status,
@@ -497,7 +578,8 @@ async fn check_config() {
     }
 
     println!(
-        "all six cases ran in {:.1} s",
+        "all {} cases ran in {:.1} s",
+        cases.len(),
         started.elapsed().as_secs_f64()
     );
 
@@ -556,12 +638,23 @@ async fn check_config() {
 const AUCTION_ENTRY_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// How long the chain has to close the handful of ledgers `dry_run`'s
-/// phases A and C each wait out. A fixed budget, not a measured one, like
-/// [`sandbox_harness::CREATION_TIMEOUT`]: unlike the fill wait, these
-/// waits do not depend on the auction's own ramp, only on the sandbox
-/// closing ledgers at all, which [`fill_budget`] has already proven it
-/// does by the time phase C reaches its own wait.
+/// phases A and C each wait out (10 and 20), and `unwind_repay`'s first run
+/// waits out before it re-reads its alert (5). A fixed budget, not a
+/// measured one, like [`sandbox_harness::CREATION_TIMEOUT`]: these waits do
+/// not depend on the auction's own ramp, only on the sandbox closing
+/// ledgers at all, and phase A's comes before any close rate has been
+/// measured. Three minutes is 20 ledgers at up to 9 s each — over three
+/// times the slowest close [`fill_budget`] accepts (its ten-minute cap
+/// over `FILL_LEDGERS` plus slack allows about 2.8 s a ledger), so a
+/// sandbox slow enough to time out here would fail every fill wait anyway,
+/// and a timeout names the ledger wait it happened in rather than blaming
+/// the bot.
 const LEDGER_ADVANCE_TIMEOUT: Duration = Duration::from_mins(3);
+
+/// How many ledgers `unwind_repay`'s first run lets pass after its
+/// `UnwindLeftovers` alert first appears before it reads the series again
+/// and requires it still to be exactly one.
+const LEFTOVERS_RECHECK_LEDGERS: u32 = 5;
 
 /// What [`unwind_repay`] mints the filler between its two runs, in USDC
 /// stroops (7 decimals): 1,000 USDC, far more than the auction's own bid,
@@ -604,7 +697,7 @@ async fn read_sequence(rpc: &RpcClient, filler: &str, phase: &str) -> i64 {
 
 /// Asserts the filler's sequence number still matches `before`, once
 /// `bot` has drained and exited — the proof that whatever `phase` decided,
-/// it never signed or sent a transaction with the real key it held.
+/// no transaction from the real key it held reached a ledger.
 async fn assert_sequence_unchanged(
     bot: &Bot,
     rpc: &RpcClient,
@@ -625,7 +718,7 @@ async fn assert_sequence_unchanged(
             bot,
             &format!(
                 "{phase}: the filler's sequence number moved from {before} to {after} — a \
-                 dry-run bot signed and sent something"
+                 transaction from the key a dry-run bot held reached a ledger"
             ),
         );
     }
@@ -647,11 +740,15 @@ fn assert_no_tx_hash(bot: &Bot, tx_hash: Option<String>, ledger: i64, table: &st
 }
 
 /// Phase A of [`dry_run`]: a dry-run bot holding the real filler key must
-/// decide and record a liquidation without ever signing or sending
-/// anything. The filler's own sequence number is the proof a `creations`
-/// row with no `tx_hash` cannot fake on its own — a row is only ever
-/// written, never submitted, but the sequence number is chain state this
-/// test does not control at all.
+/// decide and record a liquidation without ever sending a transaction. The
+/// filler's own sequence number is the proof a `creations` row with no
+/// `tx_hash` cannot fake on its own — a row is only ever written, never
+/// submitted, but the sequence number is chain state this test does not
+/// control at all.
+///
+/// The on-chain window is counted from the later of the crash and the
+/// ledger the dry-run row was decided at, so a decision that comes late
+/// still gets its full ten ledgers for a leaked submission to show.
 async fn dry_run_phase_a(ctx: &DryRunCtx<'_>) {
     let sequence_before = read_sequence(ctx.rpc, ctx.filler, "phase A").await;
     println!("phase A: the filler's sequence number before spawning: {sequence_before}");
@@ -667,7 +764,8 @@ async fn dry_run_phase_a(ctx: &DryRunCtx<'_>) {
             log_name: "bot-dry-run-a.log",
             extra_env: vec![("SEED_FILE", ctx.seed_path.display().to_string())],
         },
-    );
+    )
+    .await;
 
     wait_for_ready(&mut bot, ctx.http).await;
 
@@ -711,12 +809,27 @@ async fn dry_run_phase_a(ctx: &DryRunCtx<'_>) {
     )
     .await;
 
+    // `creations.ledger` is the tick the decision was made at, a bigint in
+    // the schema; a value that is no ledger number at all is a store this
+    // test cannot reason about, not something to clamp.
+    let decided_at = match u32::try_from(decided_at_ledger) {
+        Ok(ledger) => ledger,
+        Err(error) => fail(
+            &bot,
+            &format!("the dry-run creations row names ledger {decided_at_ledger}: {error}"),
+        ),
+    };
+    let window_start = baseline_ledger.max(decided_at);
+    println!(
+        "phase A: crashed at ledger {baseline_ledger}, decided at {decided_at}; watching from \
+         {window_start}"
+    );
     wait_for_ledgers_past(
         &mut bot,
         ctx.rpc,
-        baseline_ledger,
+        window_start,
         10,
-        "the chain to advance 10 ledgers past the crash",
+        "the chain to advance 10 ledgers past the crash and the dry-run decision",
         LEDGER_ADVANCE_TIMEOUT,
     )
     .await;
@@ -763,7 +876,8 @@ async fn armed_creation_phase_b(ctx: &DryRunCtx<'_>) -> AuctionData {
             log_name: "bot-creator-b.log",
             extra_env: vec![("SEED_FILE", ctx.seed_path.display().to_string())],
         },
-    );
+    )
+    .await;
 
     wait_for_ready(&mut bot, ctx.http).await;
 
@@ -843,7 +957,8 @@ async fn dry_run_phase_c(ctx: &DryRunCtx<'_>, expected_entry: &AuctionData) {
             log_name: "bot-dry-run-c.log",
             extra_env: vec![("SEED_FILE", ctx.seed_path.display().to_string())],
         },
-    );
+    )
+    .await;
 
     wait_for_ready(&mut bot, ctx.http).await;
 
@@ -914,8 +1029,12 @@ async fn dry_run_phase_c(ctx: &DryRunCtx<'_>, expected_entry: &AuctionData) {
 /// database — a dry-run bot holding the real filler key (phase A), an
 /// armed creator whose filler cannot fill what it creates (phase B), and a
 /// second dry-run bot facing that live auction (phase C) — proving that
-/// `DRY_RUN=true` never signs or sends anything, whether the decision is
-/// to create an auction or to fill one, however real the key it holds.
+/// `DRY_RUN=true` never sends a transaction, whether the decision is to
+/// create an auction or to fill one, however real the key it holds: the
+/// key's sequence number does not move, the chain shows no auction created
+/// or filled, and no audit row is armed or carries a hash. See the module
+/// doc for what that evidence cannot observe, and the unit tests that
+/// cover the one path it cannot reach.
 ///
 /// Three phases, each its own bot, log and set of assertions: one function
 /// per phase, with the sequence-number and no-tx-hash checks they share
@@ -940,7 +1059,8 @@ async fn dry_run() {
     // line may run against an endpoint whose own answer has not been
     // checked — and this scenario, of all of them, is the one where that
     // matters most, since every phase hands the real filler key to a
-    // spawned bot.
+    // spawned bot. `spawn_bot` asks again immediately before each phase's
+    // spawn.
     require_standalone_rpc(&rpc_url).await;
 
     let Ok(maintenance_url) = std::env::var("DATABASE_URL") else {
@@ -1066,7 +1186,8 @@ async fn unwind_repay_run_one(ctx: &UnwindRepayCtx<'_>) -> Bot {
             log_name: "bot-unwind-1.log",
             extra_env: vec![("SEED_FILE", ctx.seed_path.display().to_string())],
         },
-    );
+    )
+    .await;
 
     wait_for_ready(&mut bot, ctx.http).await;
 
@@ -1123,8 +1244,25 @@ async fn unwind_repay_run_one(ctx: &UnwindRepayCtx<'_>) -> Bot {
         println!("run 1, the alert: {line}");
     }
 
+    // Once, not merely at least once: some ledgers after the alert first
+    // appears the series must still read exactly 1, so no second alert for
+    // the same leftovers has been queued in between.
+    let alerted_at = match ctx.rpc.latest_ledger().await {
+        Ok(ledger) => ledger.sequence,
+        Err(error) => fail(&bot, &format!("could not read the latest ledger: {error}")),
+    };
+    wait_for_ledgers_past(
+        &mut bot,
+        ctx.rpc,
+        alerted_at,
+        LEFTOVERS_RECHECK_LEDGERS,
+        "the chain to advance past the UnwindLeftovers alert",
+        LEDGER_ADVANCE_TIMEOUT,
+    )
+    .await;
     let metrics = read_metrics(&bot, ctx.http).await;
     print_nonzero_counters(&metrics);
+    assert_counter(&bot, &metrics, UNWIND_LEFTOVERS_METRIC, 1);
 
     terminate(&mut bot).await;
     println!("run 1 done in {:.1} s", bot.elapsed());
@@ -1150,7 +1288,8 @@ async fn unwind_repay_run_two(ctx: &UnwindRepayCtx<'_>) {
             log_name: "bot-unwind-2.log",
             extra_env: vec![("SEED_FILE", ctx.seed_path.display().to_string())],
         },
-    );
+    )
+    .await;
 
     wait_for_ready(&mut bot, ctx.http).await;
 
@@ -1186,10 +1325,10 @@ async fn unwind_repay_run_two(ctx: &UnwindRepayCtx<'_>) {
     );
 }
 
-/// The scenario's own precondition, load-bearing per this task's brief: a
-/// deploy that minted the filler any USDC at all would let its fill repay
-/// the bid the same way `liquidation`'s own does, leaving nothing for this
-/// run to prove. Pre-spawn, so a failure here `panic!`s directly — there
+/// The scenario's own precondition, and a load-bearing one: a deploy that
+/// minted the filler any USDC at all would let its fill repay the bid the
+/// same way `liquidation`'s own does, leaving nothing for this run to
+/// prove. Pre-spawn, so a failure here `panic!`s directly — there
 /// is no bot yet for [`fail`] to tail.
 async fn assert_filler_holds_no_usdc(rpc: &RpcClient, pool: &str, usdc: &str, filler: &str) {
     let balance = match PoolReader::new(rpc, pool).balance(usdc, filler).await {
@@ -1268,7 +1407,8 @@ async fn unwind_repay() {
     // same reason every other scenario keeps it first: nothing below this
     // line may run against an endpoint whose own answer has not been
     // checked — and this scenario, of all of them, is the one that arms
-    // two bots with the real filler key rather than one.
+    // two bots with the real filler key rather than one. `spawn_bot` asks
+    // again immediately before each of them.
     require_standalone_rpc(&rpc_url).await;
 
     let Ok(maintenance_url) = std::env::var("DATABASE_URL") else {
@@ -1426,7 +1566,8 @@ async fn restart_adopt_bot_one(ctx: &RestartAdoptCtx<'_>, database_url: &str) ->
             log_name: "bot-restart-1.log",
             extra_env: vec![("SEED_FILE", ctx.seed_path.display().to_string())],
         },
-    );
+    )
+    .await;
 
     wait_for_ready(&mut bot, ctx.http).await;
 
@@ -1460,12 +1601,10 @@ async fn restart_adopt_bot_one(ctx: &RestartAdoptCtx<'_>, database_url: &str) ->
         entry.block, entry.bid, entry.lot
     );
 
-    bot.kill();
-    assert!(
-        !bot.is_running(),
-        "bot #1's process is still recorded as running after kill()"
-    );
-    println!("bot #1: confirmed dead at {:.1} s", bot.elapsed());
+    // `kill` waits for the process to exit before it returns, so bot #1 is
+    // gone before bot #2 is spawned against the same auction.
+    bot.kill("to simulate a crash, with its auction left open on chain");
+    println!("bot #1: exited at {:.1} s", bot.elapsed());
 
     // Closed before this function returns: bot #2 is not spawned yet, but
     // this connection has nothing left to do, and the caller's database is
@@ -1482,8 +1621,8 @@ async fn restart_adopt_bot_one(ctx: &RestartAdoptCtx<'_>, database_url: &str) ->
 /// (`src/auctioneer.rs`): it re-reads the chain's own entry and writes the
 /// store's `auctions` row from it, and `refuse_percent` returns `None`
 /// without ever recording a `creations` row for the attempt at all — see
-/// `assert_no_tx_hash_row`'s own doc. The filler then walks that adopted
-/// row like any other and fills it.
+/// [`sandbox_harness::assert_no_rows`]' own doc. The filler then walks that
+/// adopted row like any other and fills it.
 async fn restart_adopt_bot_two(ctx: &RestartAdoptCtx<'_>, database_url: &str) {
     let store = match Store::connect(database_url, 4).await {
         Ok(store) => store,
@@ -1502,7 +1641,8 @@ async fn restart_adopt_bot_two(ctx: &RestartAdoptCtx<'_>, database_url: &str) {
             log_name: "bot-restart-2.log",
             extra_env: vec![("SEED_FILE", ctx.seed_path.display().to_string())],
         },
-    );
+    )
+    .await;
 
     wait_for_ready(&mut bot, ctx.http).await;
 
@@ -1524,22 +1664,24 @@ async fn restart_adopt_bot_two(ctx: &RestartAdoptCtx<'_>, database_url: &str) {
     );
 
     // The line `refuse_percent` (`src/auctioneer.rs`) logs unconditionally
-    // for every refused simulation, filtered here to the one refusal this
+    // for every refused simulation, filtered to the one refusal this
     // scenario means to prove: `contract_error` 1212, `AuctionInProgress`,
     // is what sends this borrower down the adoption path rather than a
-    // percent-adjustment retry. For the report only — the assertions below
-    // and the adopted row waited for above are what this test actually
-    // stands or falls on.
+    // percent-adjustment retry. An assertion, alongside the adopted row
+    // waited for above: that row proves an adoption happened, and this line
+    // proves it happened for the reason this scenario names. The JSON
+    // field, not a bare `1212`, which a timestamp's fractional seconds can
+    // hold too.
     let adoption_lines: Vec<String> =
         log_lines_containing(&bot, "liquidation refused by simulation; skipping")
             .into_iter()
-            .filter(|line| line.contains("1212"))
+            .filter(|line| line.contains("\"contract_error\":1212"))
             .collect();
     if adoption_lines.is_empty() {
         fail(
             &bot,
-            "bot #2's log names no refusal with contract_error 1212 — the adoption path this \
-             scenario means to prove was never taken",
+            "bot #2's log names no refusal with \"contract_error\":1212 — the adoption path \
+             this scenario means to prove was never taken",
         );
     }
     for line in &adoption_lines {
@@ -1559,10 +1701,10 @@ async fn restart_adopt_bot_two(ctx: &RestartAdoptCtx<'_>, database_url: &str) {
     .await;
     let collateral = wait_for_unwind(&mut bot, ctx.rpc, ctx.pool, ctx.filler, ctx.xlm).await;
 
-    assert_no_tx_hash_row(
+    assert_no_rows(
         &bot,
         &store,
-        CREATION_TX_HASH,
+        CREATIONS_FOR_ACCOUNT,
         "creations",
         ctx.pool,
         ctx.borrower,
@@ -1630,6 +1772,7 @@ async fn restart_adopt() {
     // line may run against an endpoint whose own answer has not been
     // checked — and this scenario, of all of them, is the one that arms
     // two bots on two different databases with the real filler key.
+    // `spawn_bot` asks again immediately before each of them.
     require_standalone_rpc(&rpc_url).await;
 
     let Ok(maintenance_url) = std::env::var("DATABASE_URL") else {

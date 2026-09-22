@@ -221,13 +221,19 @@ SANDBOX_SCENARIO=liquidation make sandbox   # just one
 make sandbox-down                           # tear it down by hand (SANDBOX_KEEP=1 left it up)
 ```
 
+`make sandbox` stops at the first scenario that fails, leaving its
+database and logs to inspect. `SANDBOX_KEEP=1` leaves the network up
+too, and so takes exactly one scenario (`SANDBOX_SCENARIO=x`).
+
 It needs Docker, the `stellar` CLI (the dev container installs it; it is
 pinned and checksum-verified from `scripts/sandbox/versions.env`), and a
-Postgres at `DATABASE_URL` — each scenario creates and migrates its own
-database per run. Everything it deploys comes from wasm pinned by SHA-256,
-and every script refuses to proceed unless the RPC's own `getNetwork`
-answers the standalone network's passphrase, so none of it can be pointed
-at a public network. The keys it generates are funded by friendbot — with
+Postgres at `DATABASE_URL` — each scenario creates its own databases per
+run (`restart_adopt` one per bot) and migrates them, except
+`check_config`, which leaves its one database unmigrated because it
+asserts that `check-config` never migrates it. Everything it deploys
+comes from wasm pinned by SHA-256, and every script refuses to proceed
+unless the RPC's own `getNetwork` answers the standalone network's
+passphrase, so none of it can be pointed at a public network. The keys it generates are funded by friendbot — with
 a retry while `deploy.sh` waits, since the network's own health gate can
 go green before friendbot behind it is ready to fund an account — and
 belong to a network that is gone the moment it is torn down; the bot's
@@ -242,10 +248,12 @@ runner. `liquidation`'s deploy leaves a borrower at a health factor of
 the bot then creates the borrower's liquidation auction, fills it and
 unwinds the position it took, asserted through the audit tables' own
 transaction hashes, the filler's on-chain position and `/metrics`. The
-other four prove `check-config`'s exit codes and warnings without ever
-sending a transaction or migrating the database; that a dry-run bot
-holding a real signing key never signs, whether deciding to create an
-auction or to fill one; that the unwind's repay branch clears debt a
+other four prove `check-config`'s exit codes and warnings, a wrong
+`NETWORK_PASSPHRASE`'s included, without ever sending a transaction or
+migrating the database; that a dry-run bot holding a real signing key
+never sends a transaction, whether deciding to create an auction or to
+fill one — shown by the key's sequence number, the chain and the audit
+rows; that the unwind's repay branch clears debt a
 fill's own repay could not cover, once the wallet is funded and a second
 bot restarts; and that a bot `SIGKILL`ed right after creating an auction
 is followed by a fresh instance that adopts and fills that same auction

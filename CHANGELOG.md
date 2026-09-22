@@ -20,7 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   network — `unwind_repay`'s way of funding a wallet its own deploy left
   empty. `.github/workflows/sandbox.yml`'s nightly run now matrices over
   all five scenarios, one job per scenario on its own runner,
-  `fail-fast: false`.
+  `fail-fast: false`. `make sandbox-test` refuses a `SANDBOX_SCENARIO`
+  that does not name exactly one test fn, rather than passing having run
+  none, and `scripts/check-repo-invariants.sh` fails unless the five
+  places that name the scenarios agree.
 
 ### Fixed
 
@@ -29,9 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Horizon for an account to exist. `up.sh`'s own health gate proves the
   RPC is answering and closing ledgers, not that friendbot behind it is
   ready to fund an account, and `stellar keys generate --fund` exits `0`
-  whether or not its own funding request landed — so the only previous
-  symptom of that race was a 30s Horizon-polling timeout reported under
-  the wrong step's name.
+  whether or not its own funding request landed — so that race used to
+  fail a deploy at step 1 after 30s with "friendbot did not fund …", on a
+  network with nothing wrong with it but timing.
 
 ## [0.1.0] - 2026-09-22
 

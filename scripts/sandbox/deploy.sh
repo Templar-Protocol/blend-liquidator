@@ -25,15 +25,13 @@
 # CLI network: the environment can redirect a `--network`, and this script
 # generates keys, funds them and signs with them.
 #
-# SANDBOX_SCENARIO picks which of this tier's five scenarios (liquidation,
-# check_config, dry_run, unwind_repay, restart_adopt — the one list every
-# later script and test takes as given) this deploy is for, defaulting to
-# liquidation. It changes exactly one thing below: unwind_repay skips
-# minting the filler's USDC in step 2, so a fill's bid arrives with
-# nothing to cover it. It is written into sandbox.env in step 10, which is
-# what lets a scenario's own test (tests/sandbox_harness/mod.rs's
-# sandbox_env) refuse a deploy meant for a different one before it creates
-# a database or spawns anything.
+# SANDBOX_SCENARIO picks which of this tier's scenarios (sandbox_scenarios,
+# below) this deploy is for, defaulting to liquidation. It changes exactly
+# one thing below: unwind_repay skips minting the filler's USDC in step 2,
+# so a fill's bid arrives with nothing to cover it. It is written into
+# sandbox.env in step 10, which is what lets a scenario's own test
+# (tests/sandbox_harness/mod.rs's sandbox_env) refuse a deploy meant for a
+# different one before it creates a database or spawns anything.
 #
 # ## Argument names and shapes
 #
@@ -55,17 +53,30 @@ source "${script_dir}/lib.sh"
 : "${SANDBOX_PORT:=8000}"
 : "${SANDBOX_SCENARIO:=liquidation}"
 
-# The one place this list is written: every other script and test takes it
-# as given, either by comparing against sandbox.env's own SANDBOX_SCENARIO
-# (mint.sh, crash.sh's siblings) or, on the Rust side, as its own `const`
-# array (tests/sandbox_harness/mod.rs). Refused here, before
-# require_standalone_network, for the same reason the env-file check below
-# is: it touches no network, and an operator who mistyped it deserves that
-# answer immediately rather than after a network has been verified.
-case "${SANDBOX_SCENARIO}" in
-liquidation | check_config | dry_run | unwind_repay | restart_adopt) ;;
-*) die "deploy: SANDBOX_SCENARIO must be one of liquidation, check_config, dry_run, unwind_repay, restart_adopt — got '${SANDBOX_SCENARIO}'" ;;
-esac
+# The scenarios this deploy accepts. The same five names are written in
+# four more places — the Makefile's SANDBOX_SCENARIOS default, SCENARIOS in
+# tests/sandbox_harness/mod.rs, the matrix in .github/workflows/sandbox.yml
+# and the #[ignore]d test fns in tests/liquidation_sandbox.rs — and
+# scripts/check-repo-invariants.sh fails unless all five name the same set.
+# No other script reads SANDBOX_SCENARIO: the Rust side's sandbox_env is
+# what compares a test against the SANDBOX_SCENARIO this writes into
+# sandbox.env.
+#
+# Compared by exact string equality, one name at a time, because the value
+# is written into sandbox.env, which crash.sh and mint.sh later source.
+# Refused here, before require_standalone_network, for the same reason the
+# env-file check below is: it touches no network, and an operator who
+# mistyped it deserves that answer immediately rather than after a network
+# has been verified.
+sandbox_scenarios=(liquidation check_config dry_run unwind_repay restart_adopt)
+scenario_known=false
+for scenario in "${sandbox_scenarios[@]}"; do
+	if [ "${scenario}" = "${SANDBOX_SCENARIO}" ]; then
+		scenario_known=true
+	fi
+done
+"${scenario_known}" \
+	|| die "deploy: SANDBOX_SCENARIO must be one of ${sandbox_scenarios[*]} — got '${SANDBOX_SCENARIO}'"
 
 sandbox_root="$(sandbox_dir)"
 wasm_dir="${sandbox_root}/wasm"
@@ -187,8 +198,10 @@ generate_key() {
 # account, so `generate_key`'s own `--fund` request can land in the gap
 # between the two and be dropped with nothing to retry it. Re-requesting
 # here, every few seconds while this function waits, is what closes that
-# race — friendbot answers 400 once an account already exists, which is
-# harmless and why the request's result is ignored.
+# race. Each pass asks Horizon first and friendbot only when Horizon holds
+# no account yet, so an account `--fund` already funded costs no request
+# at all; a request that races a funding in flight is answered 400 once
+# the account exists, which is harmless and why its result is ignored.
 #
 # Horizon's /accounts/<G> is still the proof, because friendbot is the same
 # service on the same port: if Horizon cannot answer, nothing funded
@@ -200,16 +213,16 @@ require_funded() {
 	deadline=$(($(date +%s) + 90))
 	while :; do
 		now=$(date +%s)
-		if [ "${now}" -ge "$((last_request + 5))" ]; then
-			curl -fsS --max-time 10 "http://localhost:${SANDBOX_PORT}/friendbot?addr=${address}" >/dev/null 2>&1 || true
-			last_request=${now}
-		fi
 		body=$(curl -fsS --max-time 5 "http://localhost:${SANDBOX_PORT}/accounts/${address}" 2>/dev/null) || body=""
 		if [ "$(printf '%s' "${body}" | jq -r '.id // empty' 2>/dev/null)" = "${address}" ]; then
 			log "${name} is funded"
 			return 0
 		fi
 		[ "${now}" -lt "${deadline}" ] || break
+		if [ "${now}" -ge "$((last_request + 5))" ]; then
+			curl -fsS --max-time 10 "http://localhost:${SANDBOX_PORT}/friendbot?addr=${address}" >/dev/null 2>&1 || true
+			last_request=${now}
+		fi
 		sleep 1
 	done
 	die "step 1 keys: friendbot did not fund ${name} (${address}) — http://localhost:${SANDBOX_PORT}/accounts/${address} holds no such account after 90s"

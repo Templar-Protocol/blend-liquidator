@@ -26,12 +26,17 @@ on:
 
 # This group serialises whole *workflow runs*, not the matrix jobs within
 # one: GitHub schedules every job in the matrix below on its own runner, so
-# five scenarios run at once without contending for anything. What the group
-# prevents is two runs of this workflow overlapping — each job still binds
-# host port 8000 and the container name `blend-sandbox` on its own runner,
-# and up.sh refuses to start when a container by that name already exists,
-# which a second concurrent run of the whole workflow would hit. Queued
-# rather than cancelled: a cancelled run never reaches its teardown.
+# five scenarios run at once without contending for anything. On hosted
+# runners a second run's jobs get fresh VMs exactly as these do, so two
+# overlapping runs would not collide either; what the group buys there is
+# one night's run finishing before the next starts, and no doubled runner
+# minutes from a manual dispatch landing on top of the schedule. A real
+# collision needs self-hosted runners sharing one machine: each job binds
+# host port 8000 and the container name `blend-sandbox`, and up.sh refuses
+# to start while a container by that name exists, so two jobs there would
+# fail each other — and the group would keep two runs apart, but not the
+# matrix jobs inside one. Queued rather than cancelled: a cancelled run
+# never reaches its teardown.
 concurrency:
   group: sandbox
   cancel-in-progress: false
@@ -43,9 +48,9 @@ env:
   CARGO_TERM_COLOR: always
   # The crate's `sqlx::query!` macros are checked at compile time, and the
   # Postgres service below is a bare database with no migrations applied —
-  # the test creates and migrates one of its own per run. So the build must
-  # use the committed .sqlx metadata; checking against the live database
-  # would fail on every query.
+  # each scenario creates databases of its own per run, and migrates every
+  # one but check_config's. So the build must use the committed .sqlx
+  # metadata; checking against the live database would fail on every query.
   SQLX_OFFLINE: "true"
 
 jobs:
@@ -54,10 +59,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
-      # One matrix job per scenario, none cancelling the others: a scenario
-      # failing (dry_run finding a bot that signed when it should not, say)
-      # is exactly the case where the other four's results are still worth
-      # having, not a reason to lose them.
+      # One matrix job per scenario, each on its own runner, none cancelling
+      # the others: every scenario deploys its own network and asserts only
+      # on that, so each result stands on its own, and one failing (dry_run
+      # finding a transaction from a key a dry-run bot held, say) says
+      # nothing about the other four. `make sandbox` locally stops at the
+      # first failure instead, for a developer who wants that failure's
+      # state left to inspect.
       fail-fast: false
       matrix:
         scenario: [liquidation, check_config, dry_run, unwind_repay, restart_adopt]
@@ -192,11 +200,16 @@ jobs:
         run: make sandbox-test SANDBOX_SCENARIO="${SANDBOX_SCENARIO}"
 
       # Logs only, and *by extension*: target/sandbox/ also holds sandbox.env
-      # — the signing key — and the fetched wasm. `*.log` is bot.log and
-      # sandbox.log, neither of which can hold a secret (the bot's `Signer`
-      # renders as its address; lib.sh's log() is never handed an argument).
-      # Uploaded artifacts are not masked, so this path is the guarantee, not
-      # the ::add-mask:: above.
+      # — the signing key — and the fetched wasm. `*.log` is sandbox.log,
+      # deploy.sh's transcript, and the scenario's bot*.log files, one per
+      # bot it spawned (bot.log, bot-dry-run-a.log, bot-unwind-1.log and so
+      # on), each that bot's own stdout and stderr. None can hold a secret:
+      # the bot's `Signer` renders as its address, the key reaches it only
+      # through its environment, and lib.sh's log() is never handed an
+      # argument. check_config's runs write no file at all: their output is
+      # captured in memory and reaches only the test's own output, which the
+      # mask covers. Uploaded artifacts are not masked, so this path is the
+      # guarantee, not the ::add-mask:: above.
       - name: Upload the sandbox logs
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

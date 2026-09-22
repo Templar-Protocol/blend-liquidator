@@ -656,23 +656,37 @@ make help                           # Docker Compose lifecycle
   with `DRY_RUN=false` and a signing key. `tests/sandbox_harness/mod.rs`
   is the machinery every scenario shares — the standalone-network gate,
   the spawned bot, the per-run database(s) and every named wait — and
-  holds `SCENARIOS`, the same five names `deploy.sh`'s own
-  `SANDBOX_SCENARIO` case is written against;
-  `tests/liquidation_sandbox.rs` is one `#[tokio::test]` per scenario, and
-  `make sandbox-test SANDBOX_SCENARIO=x` runs one, `--exact`, against
-  this one binary. `liquidation` is the standard run: an armed bot
+  holds `SCENARIOS`, one of five places the scenario names are written:
+  `deploy.sh`'s accepted list, the Makefile's `SANDBOX_SCENARIOS`, the
+  nightly matrix and `tests/liquidation_sandbox.rs`'s `#[ignore]`d test
+  fns are the others, and `scripts/check-repo-invariants.sh` fails unless
+  all five name the same set. `tests/liquidation_sandbox.rs` is one
+  `#[tokio::test]` per scenario, and `make sandbox-test SANDBOX_SCENARIO=x`
+  runs one against this one binary: it runs `--list` first and refuses
+  unless `--exact x` names exactly one test fn — libtest exits `0` having
+  run nothing for a name that matches none — then runs it with
+  `--include-ignored`, which a fn that lost its `#[ignore]` cannot slip
+  past either. `liquidation` is the standard run: an armed bot
   creates a borrower's liquidation auction after `crash.sh` moves the
   oracle's price, fills it, and unwinds the position it took, proved
   through the `creations`/`fills` audit rows' transaction hashes, the
   filler's on-chain position and `/metrics`. `check_config` runs
-  `RUN_MODE=check-config`'s six table-driven exit-code and warning cases
-  against a live network, proving none of them sends a transaction or
-  migrates the database. `dry_run` is the tier's most important safety
-  test: across three phases — deciding to create an auction, an armed
-  creator whose filler cannot fill what it creates, and deciding to fill
-  that live auction — a dry-run bot holding the real filler key never
-  signs or sends anything, proved on the filler's own sequence number as
-  well as the audit tables and the chain. `unwind_repay` is deployed with
+  `RUN_MODE=check-config`'s eight table-driven exit-code and warning cases
+  against a live network — (g) and (h) pinning what a wrong
+  `NETWORK_PASSPHRASE` does (see the gotcha below) — proving none of them
+  sends a transaction or migrates the database. `dry_run` is the tier's
+  most important safety test: across three phases — deciding to create an
+  auction, an armed creator whose filler cannot fill what it creates, and
+  deciding to fill that live auction — a dry-run bot holding the real
+  filler key never sends a transaction, proved by the key's sequence
+  number, the chain and the audit rows. That evidence is what a
+  transaction leaves behind, not what the process does locally, and the
+  one historical way a dry run sent something — `Submitter::prepare`
+  signing and sending a `RestoreFootprint` for an archived footprint — is
+  unreachable on a network minutes old; the unit tests
+  `a_dry_run_never_restores_an_archived_footprint` (`src/auctioneer.rs`)
+  and `a_dry_run_that_needs_a_restore_is_refused` (`src/executor.rs`)
+  cover it, not this scenario. `unwind_repay` is deployed with
   the filler holding no USDC, so its fill leaves debt behind for the
   unwind's repay branch to clear once `scripts/sandbox/mint.sh` funds the
   wallet and a second bot restarts — the one branch `liquidation`'s own
@@ -684,18 +698,22 @@ make help                           # Docker Compose lifecycle
   tier that reaches `Auctioneer::adopt`. Every scenario is `#[ignore]`d,
   so `cargo test` never starts a container, and each refuses to run at
   all unless `target/sandbox/sandbox.env` exists, names the standalone
-  network and was deployed for that scenario. Nothing in either file
+  network and was deployed for that scenario. `spawn_bot` and
+  `run_check_config` ask the node for its network again immediately before
+  every spawn and hand the binary that URL and the passphrase it answered
+  with; only `run_check_config` can be given another passphrase, and a
+  long-running bot never is. Nothing in either file
   panics through `unwrap`/`expect`: every failure after a bot is spawned
   goes through `fail`, or — for `check_config`'s short-lived runs, which
   have no bot to tail — `fail_check`, either of which prints what it has
   before it panics.
 - `scripts/sandbox/` — the tier's scripts, all `set -euo pipefail`. Every
   one that drives the sandbox itself — `fetch-artifacts.sh`, `up.sh`,
-  `deploy.sh`, `crash.sh`, `down.sh` and `test-network-pinning.sh` —
-  sources `lib.sh`, and through it `versions.env`; `test-cargo-jobs.sh`
-  and `test-cargo-config.sh` source neither, because what they test is
-  `scripts/cargo-jobs*.sh`, which reaches no network and no pin. `lib.sh`
-  holds log/die, `sandbox_dir`, `sha256_check`/`fetch`, `wait_for_rpc`,
+  `deploy.sh`, `crash.sh`, `mint.sh`, `down.sh` and
+  `test-network-pinning.sh` — sources `lib.sh`, and through it
+  `versions.env`; `test-cargo-jobs.sh` and `test-cargo-config.sh` source
+  neither, because what they test is `scripts/cargo-jobs*.sh`, which
+  reaches no network and no pin. `lib.sh` holds log/die, `sandbox_dir`, `sha256_check`/`fetch`, `wait_for_rpc`,
   `require_standalone_network` and the `sandbox_network_args` flags it
   pins, the `invoke`/`invoke_view` wrappers that log a contract's *role*
   and never an argument, and `env_write`, which truncates and `chmod
@@ -757,19 +775,29 @@ make help                           # Docker Compose lifecycle
   list: that gate reads a skipped job as a failure, which is right for a
   workflow where nothing is conditional and wrong for one that has no
   pull-request run to skip. `strategy.matrix.scenario` runs all five
-  scenarios, `fail-fast: false`, each its own job on its own runner: the
-  deploy step passes `SANDBOX_SCENARIO: ${{ matrix.scenario }}`, the test
-  step runs `make sandbox-test SANDBOX_SCENARIO=${{ matrix.scenario }}`,
-  and the uploaded log artifact is named `sandbox-logs-${{
-  matrix.scenario }}` so five jobs' logs do not collide. The workflow-level
-  `concurrency` group of `sandbox`, with `cancel-in-progress: false`,
-  serialises whole *workflow runs* rather than the matrix jobs inside one
-  — those already run concurrently on separate runners, each binding host
-  port 8000 on its own machine — and queues rather than cancels because a
-  cancelled run never reaches its teardown. Every job masks the filler's
-  key (`::add-mask::`) immediately after its own deploy writes it and
-  before anything runs the bot, and uploads `target/sandbox/*.log` — a
-  path, not a mask, because uploaded artifacts are not masked.
+  scenarios, `fail-fast: false`, each its own job on its own runner,
+  because each result stands on its own (`make sandbox` locally stops at
+  the first failure instead, for a developer who wants that failure's
+  state). Both the deploy step and the test step take the scenario
+  through `env:` — `SANDBOX_SCENARIO: ${{ matrix.scenario }}` — and the
+  test step's script reads it as `"${SANDBOX_SCENARIO}"` (`make
+  sandbox-test SANDBOX_SCENARIO="${SANDBOX_SCENARIO}"`), never a `${{ }}`
+  spliced into the shell; the uploaded log artifact is named
+  `sandbox-logs-${{ matrix.scenario }}` so five jobs' logs do not collide.
+  The workflow-level `concurrency` group of `sandbox`, with
+  `cancel-in-progress: false`, serialises whole *workflow runs* rather
+  than the matrix jobs inside one. On hosted runners every job of every
+  run gets a fresh VM, so overlapping runs would not collide and the
+  group buys ordering and runner minutes; a real collision — two jobs on
+  one machine fighting over host port 8000 and the `blend-sandbox`
+  container name `up.sh` refuses on — needs self-hosted runners sharing a
+  machine, and even there the group keeps runs apart, not the matrix jobs
+  inside one. It queues rather than cancels because a cancelled run never
+  reaches its teardown. Every job masks the filler's key
+  (`::add-mask::`) immediately after its own deploy writes it and before
+  anything runs the bot, and uploads `target/sandbox/*.log` — `sandbox.log`
+  and the scenario's `bot*.log` files — a path, not a mask, because
+  uploaded artifacts are not masked.
 
 The module layout beyond this follows
 `docs/specs/2026-09-04-blend-liquidator-bot-design.md`; see
@@ -1209,12 +1237,15 @@ Status above for what remains.
 - **No sandbox script talks to a node it has not proved is the standalone
   network.** `require_standalone_network` — the RPC's own `getNetwork`
   answering `versions.env`'s `SANDBOX_PASSPHRASE`, `Standalone Network ;
-  February 2017` — is the first thing `up.sh`, `deploy.sh` and `crash.sh`
-  say to one, and `tests/liquidation_sandbox.rs` makes the same check on
-  the Rust side, against `sandbox.env`, before it creates a database or
-  spawns anything. The answer has to come from the node, never from
-  configuration: this is the one place the bot runs armed, and the only
-  thing that makes that safe is what network it is pointed at.
+  February 2017` — is the first thing `up.sh`, `deploy.sh`, `crash.sh`
+  and `mint.sh` say to one, and `tests/liquidation_sandbox.rs` makes the
+  same check on the Rust side, against `sandbox.env`, before it creates a
+  database — and again, through `spawn_bot` and `run_check_config`,
+  immediately before every binary it spawns, since a scenario's later
+  bots start minutes after its first check. The answer has to come from
+  the node, never from configuration: this is the one place the bot runs
+  armed, and the only thing that makes that safe is what network it is
+  pointed at.
 
   **And the URL it verified is the URL every `stellar` call is handed.**
   A named network is not: the CLI resolves an ad-hoc network from
@@ -1303,15 +1334,21 @@ Status above for what remains.
   cap. A constant written around "quickstart closes a ledger a second"
   becomes a flake the day it does not, and it fails as "the filler never
   filled" — a true statement about the wrong thing.
-- The sandbox test creates its own database per run, `sandbox_<unix
-  seconds>` on the `DATABASE_URL` server, and migrates it before the bot
-  starts — so a rerun never reads a previous run's rows, and a query error
-  in an assertion is a real failure rather than "the table may not exist
-  yet". A run that passes drops it. A run that **fails keeps it**, because
-  it is then the only durable record of what the bot decided, and every
-  failure says so. The name is appended to `target/sandbox/run-databases`
-  the moment the `CREATE` lands and the line removed when the run's own
-  drop succeeds, which is how `make sandbox-down` knows what to sweep:
+- Each sandbox scenario creates its own databases per run on the
+  `DATABASE_URL` server — `sandbox_<unix seconds>`, or `sandbox_<unix
+  seconds>_1` and `_2` for `restart_adopt`'s two bots, the suffixes
+  literals the test writes — and migrates them before any bot starts, so
+  a rerun never reads a previous run's rows, and a query error in an
+  assertion is a real failure rather than "the table may not exist yet".
+  `check_config` is the exception: its one database is created and **not**
+  migrated, because what it asserts is that `check-config` never migrates
+  it, and its case (f) points at a `sandbox_<unix seconds>_absent` that is
+  never created at all. A run that passes drops what it created. A run
+  that **fails keeps it**, because it is then the only durable record of
+  what the bot decided, and every failure says so. Each name is appended
+  to `target/sandbox/run-databases` the moment its `CREATE` lands and the
+  line removed when the run's own drop succeeds, which is how `make
+  sandbox-down` knows what to sweep:
   `sqlx database drop` drops only a name it is handed, nothing in sqlx-cli
   lists databases, and `psql` is in neither CI nor the dev container. That
   file is the one thing under `target/sandbox/` besides the wasm that
@@ -1328,18 +1365,26 @@ Status above for what remains.
   `check-repo-invariants.sh` fails unless that literal equals
   `SQLX_CLI_VERSION` — cross-file equality, the shape the three-way Rust
   pin already uses. Bump both together.
-- **`check-config` never checks `NETWORK_PASSPHRASE` against the network
-  it is pointed at.** `Service::check_config` validates the pools against
-  chain and pings the database, but the passphrase itself is taken as
-  given rather than compared against the RPC's own `getNetwork` — so a
-  wrong passphrase still passes the deploy smoke test spec §10 makes of
-  `check-config`. It fails closed later rather than silently: every armed
-  transaction is signed against the configured passphrase, and a network
-  whose own differs rejects that signature outright, so the first thing
-  an armed bot with the wrong one does is fail every submission loudly,
-  never trade quietly on the wrong chain. The sandbox's own `check_config`
-  scenario (`tests/liquidation_sandbox.rs`) documents this gap rather than
-  asserting either way; nothing here closes it.
+- **Nothing checks `NETWORK_PASSPHRASE` against the network it is pointed
+  at.** There is no `getNetwork` call anywhere in `src/`: the passphrase
+  is taken as given. What a wrong one does depends on whether a filler key
+  is configured. With none — a keyless dry-run configuration —
+  `check-config` passes (exit `0`), because nothing it reads depends on
+  the passphrase. With one, in either mode, it fails, but not by name:
+  `SigningContext::from_config` derives the native asset's contract id
+  from the passphrase, so `validate_filler`'s native-balance read
+  simulates a call on a contract the node does not hold, and that read
+  propagates with `?` as a `LiquidatorError::Chain` —
+  `chain: simulation failed: …`, never mentioning the passphrase.
+  `check-config` exits `2` on it, as it does on any error (`src/main.rs`);
+  `run` shares `validate_filler`, so any bot with a filler key — every
+  armed one, since `DRY_RUN=false` requires it — fails at startup instead,
+  exiting `1` because a chain error is not a `Config` one, before it seeds
+  a pool, starts a poller or submits anything. The sandbox's
+  `check_config` scenario pins both halves: case (g), the real key with
+  the testnet passphrase in dry run, exits `2` naming `chain: simulation
+  failed`; case (h), the same passphrase keyless, exits `0`. Nothing here
+  closes the gap.
 
 ## The fork's gotchas
 

@@ -14,10 +14,13 @@ ENV_FILE := .env
 DATABASE_URL ?= postgres://liquidator:liquidator@127.0.0.1:55432/liquidator
 export DATABASE_URL
 
-# The sandbox tier's five scenarios (scripts/sandbox/deploy.sh holds the
-# same list, for its own SANDBOX_SCENARIO refusal). SANDBOX_SCENARIO picks
-# the one `sandbox-deploy` and `sandbox-test` act on; SANDBOX_SCENARIOS is
-# what `sandbox` loops over when no single SANDBOX_SCENARIO is given.
+# The sandbox tier's five scenarios. The same five names are written in
+# scripts/sandbox/deploy.sh, tests/sandbox_harness/mod.rs's SCENARIOS,
+# .github/workflows/sandbox.yml's matrix and tests/liquidation_sandbox.rs's
+# #[ignore]d test fns, and scripts/check-repo-invariants.sh fails unless
+# all five name the same set. SANDBOX_SCENARIO picks the one
+# `sandbox-deploy` and `sandbox-test` act on; SANDBOX_SCENARIOS is what
+# `sandbox` loops over when no single SANDBOX_SCENARIO is given.
 SANDBOX_SCENARIO ?= liquidation
 SANDBOX_SCENARIOS ?= liquidation check_config dry_run unwind_repay restart_adopt
 
@@ -78,13 +81,33 @@ sandbox-fetch: ## Download and verify the pinned Blend v2 wasm artefacts
 sandbox-deploy: ## Deploy Blend v2 on the local network for SANDBOX_SCENARIO (default liquidation)
 	SANDBOX_SCENARIO=$(SANDBOX_SCENARIO) ./scripts/sandbox/deploy.sh
 
-sandbox-test: ## Run SANDBOX_SCENARIO's end-to-end test against the deployed sandbox (default liquidation, ~5 min)
-	cargo test --test liquidation_sandbox -- --ignored --exact --nocapture $(SANDBOX_SCENARIO)
+# `--list` first, and exactly one match required, because libtest exits 0
+# having run nothing: a name that matches no test fn reports `0 passed; N
+# filtered out`, and so would a matching fn that had lost its #[ignore]
+# under `--ignored`. `--include-ignored` runs the one match whether or not
+# it is still ignored — check-repo-invariants.sh is what holds every
+# scenario fn #[ignore]d — so the only way through this target is the named
+# scenario actually running. The list is captured before it is counted, and
+# counted by `grep -c`, which reads to the end of its input: no consumer
+# here exits early on a producer still writing. It needs no network, so a
+# mistyped SANDBOX_SCENARIO is refused before anything is asked of one.
+sandbox-test: ## Run SANDBOX_SCENARIO's end-to-end test against the deployed sandbox (default liquidation; refuses a name that is not exactly one test fn)
+	@scenario='$(SANDBOX_SCENARIO)'; \
+	listed=$$(cargo test --test liquidation_sandbox -- --include-ignored --exact --list "$$scenario") \
+		|| { status=$$?; echo "sandbox-test: could not list tests/liquidation_sandbox.rs's tests"; exit $$status; }; \
+	count=$$(printf '%s\n' "$$listed" | grep -c ': test$$' || true); \
+	if [ "$$count" != 1 ]; then \
+		found=$$(printf '%s\n' "$$listed" | sed -n 's/: test$$//p' | paste -sd' ' -); \
+		echo "sandbox-test: SANDBOX_SCENARIO='$$scenario' must name exactly one test fn in tests/liquidation_sandbox.rs, but --list found $$count: $${found:-none}"; \
+		exit 1; \
+	fi; \
+	cargo test --test liquidation_sandbox -- --include-ignored --exact --nocapture "$$scenario"
 
 # The database sweep is here rather than in down.sh because it is not the
-# network's: the test creates one `sandbox_<unix seconds>` database per
-# run and drops it again when the run passes, so what this reclaims is
-# what failed runs kept for inspection.
+# network's: each scenario creates its own databases per run —
+# `sandbox_<unix seconds>`, or `sandbox_<unix seconds>_1` and `_2` for
+# restart_adopt's two bots — and drops them again when the run passes, so
+# what this reclaims is what failed runs kept for inspection.
 #
 # target/sandbox/run-databases is the list, written by the test itself —
 # appended when it creates the database and the line removed when it
@@ -144,17 +167,21 @@ sandbox-down: ## Tear the sandbox down and drop the databases failed runs kept
 # deploy.sh re-verifies them itself regardless.
 #
 # SANDBOX_SCENARIOS is the list each of its own network, database and log
-# file is made for, defaulting to all five this tier has
-# (tests/sandbox_harness/mod.rs's own SCENARIOS holds the same list, for
-# the Rust side's refusal); SANDBOX_SCENARIO=x runs the one x instead. The
-# loop stops at the first scenario that fails and names it — a later
-# scenario's pass cannot make up for an earlier one's failure, so there is
-# nothing useful left to run.
+# file is made for, defaulting to all five this tier has; SANDBOX_SCENARIO=x
+# runs the one x instead. The loop stops at the first scenario that fails
+# and names it, because a developer running this by hand wants that
+# failure's state: its kept database and its logs, sandbox.log above all,
+# which the next scenario's deploy would rewrite. The nightly workflow
+# makes the opposite choice for its own reason — each matrix job runs one
+# scenario on its own runner, fail-fast: false, because there every
+# scenario's result stands on its own.
 #
-# SANDBOX_KEEP=1 skips that scenario's teardown, for inspecting the network
-# it ran against, and also stops the loop there: a container already up is
-# what the next `sandbox-up` refuses to start on, so a kept network is a
-# kept network only for the one scenario that made it.
+# SANDBOX_KEEP=1 skips the scenario's teardown, for inspecting the network
+# it ran against, and so needs exactly one scenario selected: a container
+# already up is what the next `sandbox-up` refuses to start on, so a kept
+# network can only ever be one scenario's. With more than one selected it
+# refuses before anything starts, naming SANDBOX_SCENARIO=x as the way to
+# pick one.
 #
 # The failure path runs down.sh rather than the sandbox-down target,
 # deliberately: the network goes, and the run's database stays, because it
@@ -172,9 +199,14 @@ sandbox-down: ## Tear the sandbox down and drop the databases failed runs kept
 # container still holding port 8000 and databases still on the server —
 # precisely what the next run refuses on, and reporting success would hide
 # it until then.
-sandbox: ## fetch, then up → deploy → test → down for each of SANDBOX_SCENARIOS (default all five; SANDBOX_SCENARIO=x runs just x; SANDBOX_KEEP=1 leaves a scenario's sandbox up)
-	@$(MAKE) sandbox-fetch || exit $$?; \
-	scenarios="$${SANDBOX_SCENARIO:-$(SANDBOX_SCENARIOS)}"; \
+sandbox: ## fetch, then up → deploy → test → down for each of SANDBOX_SCENARIOS (default all five; SANDBOX_SCENARIO=x runs just x; SANDBOX_KEEP=1, with one scenario selected, leaves its sandbox up)
+	@scenarios="$${SANDBOX_SCENARIO:-$(SANDBOX_SCENARIOS)}"; \
+	set -- $$scenarios; \
+	if [ -n "$${SANDBOX_KEEP:-}" ] && [ "$$#" -ne 1 ]; then \
+		echo "sandbox: SANDBOX_KEEP=1 keeps one scenario's network up, but $$# are selected ($$scenarios) — pick one with SANDBOX_SCENARIO=x"; \
+		exit 2; \
+	fi; \
+	$(MAKE) sandbox-fetch || exit $$?; \
 	for scenario in $$scenarios; do \
 		echo "=== sandbox: $$scenario ==="; \
 		$(MAKE) sandbox-up || exit $$?; \

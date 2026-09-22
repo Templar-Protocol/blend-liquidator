@@ -14,7 +14,12 @@
 //!   file is a claim; the node is the fact, and only the second of those
 //!   decides which network a signing key is handed to. Both refusals fire
 //!   before a database is created or anything is spawned, so a
-//!   misconfigured run can never point an armed bot at a real network.
+//!   misconfigured run can never point an armed bot at a real network;
+//! - [`spawn_bot`] and [`run_check_config`] ask the node again themselves,
+//!   immediately before each spawn, and hand the binary the URL they just
+//!   asked and the passphrase it answered with. A scenario's spawns can be
+//!   minutes after its first check, so no binary is ever started on the
+//!   strength of an answer older than one RPC call.
 //!
 //! **Nothing in this module may panic through `unwrap`/`expect`.** Every
 //! failure after a bot is spawned goes through [`fail`], which prints the
@@ -25,9 +30,13 @@
 //!
 //! A scenario creates its own database, or several — a restart spans two
 //! bot instances and needs a fresh one for each, which is why
-//! [`RUN_DATABASE`] holds a list rather than one name.
-//! [`create_run_database`] creates and migrates it, [`note_run_database`]
-//! tells [`fail`] to mention it if the run dies, and
+//! [`RUN_DATABASE`] holds a list rather than one name. Every name is
+//! `sandbox_` and the run's unix seconds, plus a literal suffix where a
+//! scenario needs more than one (`restart_adopt`'s `_1` and `_2`).
+//! [`create_run_database`] creates and migrates one;
+//! [`create_run_database_unmigrated`] creates one and leaves it bare, for
+//! `check_config`, which asserts that `check-config` never migrates it;
+//! [`note_run_database`] tells [`fail`] to mention it if the run dies, and
 //! [`record_run_database`]/[`forget_run_database`] keep
 //! `target/sandbox/run-databases` in sync so `make sandbox-down` can sweep
 //! whatever a failed run left behind. A run that passes drops every
@@ -54,12 +63,15 @@ use sqlx::postgres::PgPool;
 /// `sandbox.env` was produced.
 const STANDALONE_PASSPHRASE: &str = "Standalone Network ; February 2017";
 
-/// The tier's five scenarios, in the order `scripts/sandbox/deploy.sh`
-/// refuses anything outside of and the Makefile's `sandbox` target loops
-/// over. `deploy.sh` holds this same list for its own `SANDBOX_SCENARIO`
-/// refusal; the two are not derived from one another — a shell script and a
-/// Rust test share no build step that could — so a sixth scenario is added
-/// to both by hand.
+/// The tier's five scenarios, in the order the Makefile's `sandbox` target
+/// loops over them. The same five names are written in
+/// `scripts/sandbox/deploy.sh`'s accepted list, the Makefile's
+/// `SANDBOX_SCENARIOS`, `.github/workflows/sandbox.yml`'s matrix and the
+/// `#[ignore]`d test fns in `tests/liquidation_sandbox.rs`. None is derived
+/// from another — a shell script, a Makefile, a workflow and a Rust test
+/// share no build step that could — so a sixth scenario is added to all
+/// five by hand, and `scripts/check-repo-invariants.sh` fails unless they
+/// name the same set.
 pub(crate) const SCENARIOS: [&str; 5] = [
     "liquidation",
     "check_config",
@@ -195,33 +207,29 @@ pub(crate) struct Bot {
 
 impl Drop for Bot {
     fn drop(&mut self) {
-        self.kill();
+        // Only a panic, or a scenario that returned without `terminate`,
+        // leaves a child here: `terminate` and a deliberate `kill` both
+        // take it first.
+        self.kill("after a failure");
     }
 }
 
 impl Bot {
     /// Sends `SIGKILL`, waits for the child to exit, and takes it, so
-    /// nothing is left for `Drop` to do. `Drop` itself calls this; a
-    /// scenario that means to simulate a crash (a restart, adopting an
-    /// auction the killed bot never finished) may call it directly too.
-    pub(crate) fn kill(&mut self) {
+    /// nothing is left for `Drop` to do. `reason` finishes the line this
+    /// prints ("killing the bot (pid …) {reason}"), so a deliberate kill
+    /// does not read as a failure in the run's output. `Drop` itself calls
+    /// this; a scenario that means to simulate a crash (a restart, adopting
+    /// an auction the killed bot never finished) calls it directly.
+    ///
+    /// `Child::wait` does not answer until the process has exited, so when
+    /// this returns the process is gone — no separate check can add to that.
+    pub(crate) fn kill(&mut self, reason: &str) {
         if let Some(mut child) = self.child.take() {
-            println!("killing the bot (pid {}) after a failure", child.id());
+            println!("killing the bot (pid {}) {reason}", child.id());
             let _ = child.kill();
             let _ = child.wait();
         }
-    }
-
-    /// Whether this struct still holds a child handle. `kill`'s own
-    /// `Option::take` clears it unconditionally, and `kill` blocks on
-    /// `Child::wait` before returning — which does not answer until the
-    /// process has actually exited — so by the time `kill` returns this is
-    /// always `false`; the `restart_adopt` scenario still checks it
-    /// explicitly, as its own proof that the first bot it spawns cannot
-    /// still be running by the time the second one starts against the same
-    /// auction.
-    pub(crate) fn is_running(&self) -> bool {
-        self.child.is_some()
     }
 
     /// Seconds since the bot was spawned, for the run's timeline.
@@ -527,9 +535,10 @@ pub(crate) async fn create_run_database(root: &Path, maintenance_url: &str, name
     };
     // The one statement here that cannot take a bind parameter: Postgres
     // has no placeholder for an identifier. `AssertSqlSafe` is the audit
-    // sqlx asks for, and the audit is that `name` is the literal `sandbox_`
-    // followed by `SystemTime`'s seconds — digits the caller builds, never
-    // anything this process was given.
+    // sqlx asks for, and the audit is that every caller builds `name` as
+    // the literal `sandbox_`, `SystemTime`'s seconds, and at most one of
+    // the scenarios' own literal suffixes (`_1`, `_2`) — characters the
+    // test itself writes, never anything this process was given.
     let statement = format!("CREATE DATABASE \"{name}\"");
     if let Err(error) = sqlx::raw_sql(sqlx::AssertSqlSafe(statement))
         .execute(&maintenance)
@@ -567,10 +576,10 @@ pub(crate) async fn create_run_database(root: &Path, maintenance_url: &str, name
 /// itself never migrates — so its database must be left exactly as a plain
 /// `CREATE DATABASE` leaves it: no `_sqlx_migrations` table, nothing else
 /// either. Otherwise identical: the same identifier audit
-/// ([`AssertSqlSafe`](sqlx::AssertSqlSafe) on a name this process built, a
-/// digit string it was never handed), and [`record_run_database`] before
-/// anything past the `CREATE` could fail and leave an unrecorded database
-/// behind.
+/// ([`AssertSqlSafe`](sqlx::AssertSqlSafe) on a name this process built
+/// from `sandbox_` and its own clock's seconds, never one it was handed),
+/// and [`record_run_database`] before anything past the `CREATE` could fail
+/// and leave an unrecorded database behind.
 pub(crate) async fn create_run_database_unmigrated(
     root: &Path,
     maintenance_url: &str,
@@ -610,8 +619,9 @@ pub(crate) async fn drop_run_database(root: &Path, maintenance_url: &str, name: 
             return;
         }
     };
-    // Identifiers take no bind parameter; `name` is `sandbox_` and
-    // `SystemTime`'s seconds, the same audit `create_run_database` makes.
+    // Identifiers take no bind parameter; `name` is `sandbox_`,
+    // `SystemTime`'s seconds and at most a literal suffix, the same audit
+    // `create_run_database` makes.
     let statement = format!("DROP DATABASE \"{name}\"");
     match sqlx::raw_sql(sqlx::AssertSqlSafe(statement))
         .execute(&maintenance)
@@ -653,10 +663,11 @@ pub(crate) fn pools_toml(pool: &str, xlm: &str, bid: &[&str]) -> String {
 }
 
 /// What varies from one bot spawn to the next. What is common to every bot
-/// in this tier — the network's passphrase and RPC URL (read from
-/// `sandbox.env`), the HTTP port, the poll cadence — stays a [`spawn_bot`]
-/// default, since every scenario reads the first from the same file and
-/// wants the rest unchanged unless it says otherwise.
+/// in this tier — the network's RPC URL (read from `sandbox.env`) and
+/// passphrase (the one that URL has just answered with), the HTTP port, the
+/// poll cadence — stays a [`spawn_bot`] default: the first two are never a
+/// scenario's to choose, and every scenario wants the rest unchanged unless
+/// it says otherwise.
 pub(crate) struct BotConfig<'a> {
     pub(crate) dry_run: bool,
     pub(crate) filler_secret: Option<&'a str>,
@@ -671,8 +682,18 @@ pub(crate) struct BotConfig<'a> {
     pub(crate) extra_env: Vec<(&'a str, String)>,
 }
 
-/// Spawns the binary with `env_clear` and exactly the environment below,
-/// `config.extra_env` layered on top.
+/// Asks the node at `sandbox.env`'s `SANDBOX_RPC_URL` for its network
+/// ([`require_standalone_rpc`]), then spawns the binary with `env_clear` and
+/// exactly the environment below, `config.extra_env` layered on top.
+///
+/// The check is here, inside the spawn, rather than left to each scenario:
+/// a scenario spawns its second or third bot minutes after its first check,
+/// and no bot — armed or not — is started on an answer older than one RPC
+/// call. `RPC_URL` is the URL just asked and `NETWORK_PASSPHRASE` is
+/// [`STANDALONE_PASSPHRASE`], the answer it had to give, and neither can be
+/// overridden: `config.extra_env` is applied after them, but a long-running
+/// bot must never be given any other network, so an `extra_env` naming
+/// either is refused before anything is asked.
 ///
 /// `PATH` is the only variable carried over from this process, and the bot
 /// does not need even that: it is exec'd by absolute path, reaches the RPC
@@ -681,7 +702,11 @@ pub(crate) struct BotConfig<'a> {
 /// `PATH` is a puzzling thing to debug. `HOME` is deliberately *not*
 /// passed: nothing the bot reads lives there, and a test that handed it one
 /// would be hiding a dependency on the developer's machine.
-pub(crate) fn spawn_bot(root: &Path, env: &BTreeMap<String, String>, config: BotConfig<'_>) -> Bot {
+pub(crate) async fn spawn_bot(
+    root: &Path,
+    env: &BTreeMap<String, String>,
+    config: BotConfig<'_>,
+) -> Bot {
     // Destructured, not borrowed field-by-field: every field below is
     // consumed once, so taking `config` by value (a plain struct, not a
     // reference) has somewhere to go.
@@ -693,6 +718,10 @@ pub(crate) fn spawn_bot(root: &Path, env: &BTreeMap<String, String>, config: Bot
         log_name,
         extra_env,
     } = config;
+
+    refuse_network_overrides(&extra_env);
+    let rpc_url = required(env, "SANDBOX_RPC_URL");
+    require_standalone_rpc(rpc_url).await;
 
     let log_path = root.join("target/sandbox").join(log_name);
     let log = match std::fs::File::create(&log_path) {
@@ -708,10 +737,10 @@ pub(crate) fn spawn_bot(root: &Path, env: &BTreeMap<String, String>, config: Bot
     command
         .env_clear()
         .env("DATABASE_URL", database_url)
-        .env("NETWORK_PASSPHRASE", required(env, "SANDBOX_PASSPHRASE"))
-        .env("RPC_URL", required(env, "SANDBOX_RPC_URL"))
+        .env("NETWORK_PASSPHRASE", STANDALONE_PASSPHRASE)
+        .env("RPC_URL", rpc_url)
         // Set explicitly either way, rather than left to the default when
-        // true: a scenario that means to prove a dry run never signs must
+        // true: a scenario that means to prove a dry run never sends must
         // not depend on `DRY_RUN`'s own default staying `true`.
         .env("DRY_RUN", if dry_run { "true" } else { "false" })
         .env("POOLS_TOML", pools)
@@ -755,10 +784,28 @@ pub(crate) fn spawn_bot(root: &Path, env: &BTreeMap<String, String>, config: Bot
     }
 }
 
-/// Spawns the binary with `RUN_MODE=check-config`, waits up to
-/// [`CHECK_CONFIG_TIMEOUT`] for it to exit — killing it if that budget
-/// runs out — and answers its exit status and its combined stdout and
-/// stderr.
+/// Refuses an `extra_env` that names `RPC_URL` or `NETWORK_PASSPHRASE`.
+///
+/// Both are the network a spawned binary talks to, and both are set from
+/// the check [`spawn_bot`] and [`run_check_config`] have just made; an
+/// `extra_env` entry, applied after them, would replace what was verified
+/// with what was not. Pre-spawn, so this panics directly.
+fn refuse_network_overrides(extra_env: &[(&str, String)]) {
+    for (key, _) in extra_env {
+        assert!(
+            *key != "RPC_URL" && *key != "NETWORK_PASSPHRASE",
+            "extra_env sets {key}, which is the network a spawned binary talks to — it is always \
+             the one require_standalone_rpc has just verified, never a scenario's to override"
+        );
+    }
+}
+
+/// Asks the node at `sandbox.env`'s `SANDBOX_RPC_URL` for its network
+/// ([`require_standalone_rpc`]), exactly as [`spawn_bot`] does and for the
+/// same reason, then spawns the binary with `RUN_MODE=check-config`, waits
+/// up to [`CHECK_CONFIG_TIMEOUT`] for it to exit — killing it if that
+/// budget runs out — and answers its exit status and its combined stdout
+/// and stderr.
 ///
 /// There is no [`Bot`] here: `check-config` reads the chain, pings the
 /// database and exits — it serves no HTTP port and outlives no wait this
@@ -772,20 +819,38 @@ pub(crate) fn spawn_bot(root: &Path, env: &BTreeMap<String, String>, config: Bot
 /// and no `PORT` — a `check-config` run has nothing to serve. The signing
 /// key goes through [`Command::env`] only, never argv, the same rule
 /// [`spawn_bot`] keeps.
-pub(crate) fn run_check_config(
+///
+/// `passphrase_override` is the one thing this has that [`spawn_bot`] does
+/// not, and must never have: `None` hands the binary
+/// [`STANDALONE_PASSPHRASE`], the answer the node just gave, and `Some`
+/// hands it another passphrase in its place, for the cases that pin what
+/// `check-config` does with a wrong one. That is safe here and only here:
+/// `check-config` validates and exits on its own, signing nothing and
+/// sending nothing, and `RPC_URL` is still the URL just verified, which no
+/// argument can change. A long-running bot, armed or not, is only ever
+/// handed the verified passphrase.
+pub(crate) async fn run_check_config(
     env: &BTreeMap<String, String>,
     database_url: &str,
     pools: &str,
     dry_run: bool,
     filler_secret: Option<&str>,
     extra_env: &[(&str, String)],
+    passphrase_override: Option<&str>,
 ) -> (std::process::ExitStatus, String) {
+    refuse_network_overrides(extra_env);
+    let rpc_url = required(env, "SANDBOX_RPC_URL");
+    require_standalone_rpc(rpc_url).await;
+
     let mut command = Command::new(env!("CARGO_BIN_EXE_liquidator"));
     command
         .env_clear()
         .env("DATABASE_URL", database_url)
-        .env("NETWORK_PASSPHRASE", required(env, "SANDBOX_PASSPHRASE"))
-        .env("RPC_URL", required(env, "SANDBOX_RPC_URL"))
+        .env(
+            "NETWORK_PASSPHRASE",
+            passphrase_override.unwrap_or(STANDALONE_PASSPHRASE),
+        )
+        .env("RPC_URL", rpc_url)
         .env("DRY_RUN", if dry_run { "true" } else { "false" })
         .env("POOLS_TOML", pools)
         .env("SEED_URL", "")
@@ -842,7 +907,7 @@ pub(crate) fn run_check_config(
                 Err(error) => panic!("could not reap the killed check-config run: {error}"),
             };
         }
-        std::thread::sleep(POLL_INTERVAL);
+        tokio::time::sleep(POLL_INTERVAL).await;
     };
 
     let stdout_text = match stdout_reader.join() {
@@ -857,9 +922,9 @@ pub(crate) fn run_check_config(
     };
     let combined = format!("{stdout_text}{stderr_text}");
     if timed_out {
-        // A budget failure, not one of the six cases' own assertions, so
-        // it goes through `fail_check` here rather than handing the
-        // caller a status no case expects.
+        // A budget failure, not one of the cases' own assertions, so it
+        // goes through `fail_check` here rather than handing the caller a
+        // status no case expects.
         fail_check(
             &combined,
             &format!(
@@ -1056,17 +1121,21 @@ pub(crate) async fn wait_for_adopted_auction(
     }
 }
 
-/// Asserts `statement` (one of the `*_TX_HASH` queries above) finds no row
-/// for `(pool, account)` at all.
+/// Every `creations` row for one account, whatever its mode or hash.
+pub(crate) const CREATIONS_FOR_ACCOUNT: &str =
+    "SELECT count(*) FROM creations WHERE pool = $1 AND account = $2";
+
+/// Asserts `statement` (a `count(*)` over `(pool, account)`, such as
+/// [`CREATIONS_FOR_ACCOUNT`]) answers zero: no row for that account at all.
 ///
-/// Stronger than the `*_VIOLATING_DRY_RUN` counts above, which only rule
+/// Stronger than the `*_VIOLATING_DRY_RUN` counts below, which only rule
 /// out an armed or hashed row alongside others that carry neither:
-/// `restart_adopt` needs no row whatsoever, because `Auctioneer::act`
-/// answers `ActOutcome::Refused` — see `refuse_percent` in
-/// `src/auctioneer.rs` — before `record_creation` is ever called, so a
-/// refusal that adopts an auction never writes a `creations` row for the
-/// attempt at all.
-pub(crate) async fn assert_no_tx_hash_row(
+/// `restart_adopt` needs no `creations` row whatsoever, because
+/// `Auctioneer::act` answers `ActOutcome::Refused` — see `refuse_percent`
+/// in `src/auctioneer.rs` — before `record_creation` is ever called, so a
+/// refusal that adopts an auction never writes a row for the attempt at
+/// all, armed, dry-run, hashed or not.
+pub(crate) async fn assert_no_rows(
     bot: &Bot,
     store: &Store,
     statement: &'static str,
@@ -1074,18 +1143,18 @@ pub(crate) async fn assert_no_tx_hash_row(
     pool: &str,
     account: &str,
 ) {
-    match sqlx::query_scalar::<_, String>(statement)
+    match sqlx::query_scalar::<_, i64>(statement)
         .bind(pool)
         .bind(account)
-        .fetch_optional(store.pool())
+        .fetch_one(store.pool())
         .await
     {
-        Ok(None) => println!("asserted: no {what} row carries a transaction hash"),
-        Ok(Some(hash)) => fail(
+        Ok(0) => println!("asserted: no {what} row exists for {account}"),
+        Ok(count) => fail(
             bot,
-            &format!("a {what} row carries a transaction hash ({hash}) — none should exist"),
+            &format!("{count} {what} row(s) exist for {account} — none should"),
         ),
-        Err(error) => fail(bot, &format!("could not check {what} rows: {error}")),
+        Err(error) => fail(bot, &format!("could not count {what} rows: {error}")),
     }
 }
 
@@ -1507,43 +1576,71 @@ pub(crate) async fn wait_for_liability(
 /// particular channel confirmed it.
 ///
 /// [`NotificationKind::UnwindLeftovers`]: blend_liquidator::notifier::NotificationKind::UnwindLeftovers
-const UNWIND_LEFTOVERS_METRIC: &str =
+pub(crate) const UNWIND_LEFTOVERS_METRIC: &str =
     "blend_liquidator_notifications_total{kind=\"unwind_leftovers\",delivery=\"queued\"}";
 
-/// Waits until [`UNWIND_LEFTOVERS_METRIC`] reaches exactly `1` on
-/// `/metrics` — the one signal in this scenario that nothing on chain or
-/// in the store proves ahead of the notifier's own counter: a
+/// Waits until [`UNWIND_LEFTOVERS_METRIC`] is at least `1` on `/metrics`,
+/// and answers what it read — the one signal in this scenario that nothing
+/// on chain or in the store proves ahead of the notifier's own counter: a
 /// notification leaves no audit row of its own, so `/metrics` is the only
 /// place this evidence exists at all.
+///
+/// This is when the alert first arrives, not that it arrived only once:
+/// the caller re-reads the series some ledgers later and asserts it is
+/// exactly `1`. A `/metrics` read that fails inside the loop is one
+/// poll lost rather than the run's failure — the bot is serving its HTTP
+/// port from a busy process, and three minutes of polling must not stand
+/// or fall on one request — and the last such error is named if the wait
+/// times out.
 pub(crate) async fn wait_for_unwind_leftovers(bot: &mut Bot, http: &reqwest::Client) -> i64 {
     let mut wait = Wait::new(
-        "the UnwindLeftovers notification to be queued once",
+        "the UnwindLeftovers notification to be queued",
         LEFTOVERS_TIMEOUT,
     );
     loop {
-        let metrics = read_metrics(bot, http).await;
-        if let Some(value) = series(&metrics, UNWIND_LEFTOVERS_METRIC) {
-            if value == 1 {
-                println!("{UNWIND_LEFTOVERS_METRIC} is 1 at {:.1} s", bot.elapsed());
-                return value;
-            }
-        }
+        // What this poll saw, carried only as far as the timeout message
+        // below, the same shape `wait_for_unwind` keeps.
+        let seen = match try_read_metrics(http).await {
+            Ok(metrics) => match series(&metrics, UNWIND_LEFTOVERS_METRIC) {
+                Some(value) if value >= 1 => {
+                    println!(
+                        "{UNWIND_LEFTOVERS_METRIC} is {value} at {:.1} s",
+                        bot.elapsed()
+                    );
+                    return value;
+                }
+                Some(value) => format!("the series is {value}"),
+                None => "/metrics has no such series".to_string(),
+            },
+            Err(error) => error,
+        };
         if !wait.tick(bot).await {
-            let message = wait.timed_out();
+            let message = format!("{} (last read: {seen})", wait.timed_out());
             fail(bot, &message);
         }
     }
 }
 
-/// `/metrics`, once, before a bot is asked to stop.
-pub(crate) async fn read_metrics(bot: &Bot, http: &reqwest::Client) -> String {
+/// `/metrics`, once, or why it could not be read.
+async fn try_read_metrics(http: &reqwest::Client) -> Result<String, String> {
     let url = format!("http://127.0.0.1:{HTTP_PORT}/metrics");
-    match http.get(&url).send().await {
-        Ok(response) => match response.text().await {
-            Ok(body) => body,
-            Err(error) => fail(bot, &format!("could not read /metrics: {error}")),
-        },
-        Err(error) => fail(bot, &format!("could not reach /metrics: {error}")),
+    let response = http
+        .get(&url)
+        .send()
+        .await
+        .map_err(|error| format!("could not reach /metrics: {error}"))?;
+    response
+        .text()
+        .await
+        .map_err(|error| format!("could not read /metrics: {error}"))
+}
+
+/// `/metrics`, once, before a bot is asked to stop; a failed read fails the
+/// run.
+pub(crate) async fn read_metrics(bot: &Bot, http: &reqwest::Client) -> String {
+    match try_read_metrics(http).await {
+        Ok(body) => body,
+        Err(error) => fail(bot, &error),
     }
 }
 
@@ -1777,9 +1874,12 @@ pub(crate) fn sandbox_env(env_path: &Path, scenario: &str) -> BTreeMap<String, S
 /// endpoint itself has to be this sandbox's own.
 ///
 /// Every failure is a refusal, an unreachable RPC included: "could not ask"
-/// is not "it is the sandbox". Called before a run's database is created
-/// and long before anything is spawned, so a refusal here leaves nothing
-/// behind.
+/// is not "it is the sandbox". Every scenario calls this first, before its
+/// database is created, so a refusal there leaves nothing behind; and
+/// [`spawn_bot`] and [`run_check_config`] call it again immediately before
+/// every spawn, so a refusal there leaves no binary started — only the
+/// run's databases, which `target/sandbox/run-databases` already lists for
+/// `make sandbox-down`.
 pub(crate) async fn require_standalone_rpc(url: &str) {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -1867,15 +1967,18 @@ pub(crate) fn mint(bot: &Bot, root: &Path, amount: i128) {
     }
 }
 
-/// Every line of the bot's log containing `needle`, for a scenario's own
-/// report — never for an assertion.
+/// Every line of the bot's log containing `needle`.
 ///
-/// `unwind_repay` uses this to pull the fill's own request out of the log
-/// (`"fill planned"`, `"fill recorded"`) and the leftover notification's
-/// own line, rather than re-deriving either from a chain or store read the
-/// assertions above have already made. A read failure is one line saying
-/// so rather than a panic: this is reporting, and a report that could not
-/// be built is not this run's own failure.
+/// Mostly for a scenario's own report: `unwind_repay` uses this to pull the
+/// fill's own request out of the log (`"fill planned"`, `"fill recorded"`)
+/// and the leftover notification's own line, rather than re-deriving
+/// either from a chain or store read its assertions have already made.
+/// `restart_adopt` also asserts on it — a bot #2 log with no
+/// `"contract_error":1212` refusal fails the run. A read failure is one
+/// line saying so rather than a panic, which keeps a report from failing a
+/// run and still fails an assertion closed: that one line holds none of
+/// the log's own text, so a filter for anything the bot writes matches
+/// nothing in it, and the failure's own log tail names the read error.
 pub(crate) fn log_lines_containing(bot: &Bot, needle: &str) -> Vec<String> {
     match std::fs::read_to_string(&bot.log) {
         Ok(text) => text
