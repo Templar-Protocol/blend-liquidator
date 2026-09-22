@@ -60,14 +60,16 @@ withdraws its collateral to that wallet: everything but the primary
 asset, and the primary down to `min_primary_collateral`. It never trades
 one asset for another, so profit sits in the wallet as whatever assets the
 position happened to hold, not as a single settled currency; converting it
-is an operator decision this bot does not make for you. The startup pass
-also means the wallet's stated floor, `min_primary_collateral`, doubles as
-the most primary collateral you should expect the bot to leave supplied to
-a pool — anything above it is trimmed back to the wallet on the very first
-tick of a run. Where debt is left behind, the withdrawal stops half a
-percent *above* `min_health_factor` rather than on it, so a ledger of
-interest on that debt does not carry the position under the minimum you
-set with nothing scheduled to look again. It also stops at the pool's own
+is an operator decision this bot does not make for you.
+`min_primary_collateral` is primary collateral supplied to the pool — the
+filler's position there, not its wallet balance — and the startup pass
+makes it the most primary collateral you should expect the bot to leave
+supplied: once armed, and once `STARTUP_DELAY_LEDGERS` has passed, the
+run's first unwind pass trims anything above it back to the wallet. Where
+debt is left behind, the withdrawal stops half a percent *above*
+`min_health_factor` rather than on it, so a ledger of interest on that
+debt does not carry the position under the minimum you set with nothing
+scheduled to look again. It also stops at the pool's own
 `min_collateral` — the least collateral the contract lets a position with
 debt keep, $5 on the mainnet pools — which can be the binding one when
 the debt left behind is small. An unwind that keeps being refused is

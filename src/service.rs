@@ -2594,10 +2594,12 @@ async fn drain_tasks(
 ///
 /// Two exits skip this and leave whatever was in flight behind: the
 /// second `SIGINT`/`SIGTERM`, deliberately, per the paragraph above; and a
-/// task panic, which is not deliberate but has the same shape —
-/// `resume_on_panic` calls [`std::panic::resume_unwind`] from inside
-/// [`drain_tasks`], so the panic unwinds straight out of `Service::run`
-/// and never reaches this function at all.
+/// task panic, which is not deliberate but has the same shape. A release
+/// build — the image's — sets `panic = "abort"`, so there a panic ends the
+/// process where it happens, with no unwind and no graceful shutdown at
+/// all. A debug or test build unwinds instead: `resume_on_panic` calls
+/// [`std::panic::resume_unwind`] from inside [`drain_tasks`], so the panic
+/// unwinds straight out of `Service::run` and never reaches this function.
 async fn finish_run(
     result: Result<(), LiquidatorError>,
     notifier: &Notifier,

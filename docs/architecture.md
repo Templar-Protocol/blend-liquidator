@@ -96,7 +96,7 @@ signing key owns.
   it sends only once a tick's whole effect is in the store
   (`src/ledger.rs:584-614`). Committing on send instead would let a kill
   drop whatever was still queued while the store claimed those ledgers
-  done — and nothing re-reads a cursor that already exists, so the loss
+  done — and nothing re-reads the ledgers behind a cursor, so the loss
   would be silent.
 - **Nothing is sent for a key while an earlier transaction's outcome on it
   is unknown.** A Soroban transaction is built against its source
@@ -109,8 +109,8 @@ signing key owns.
   only the literal strings `true` or `false` (`strict_bool`,
   `src/config.rs:17`), wired to `Args::dry_run` with a default of `true`
   (`src/config.rs:602-619`); live trading requires setting it to exactly
-  `false`. Every other spelling is another way into live trading, and the
-  dangerous direction must be the loud one.
+  `false`. Accepting any other spelling would be another way into live
+  trading, and the dangerous direction must be the loud one.
 - **The maths agrees with the contract, and a fixture proves it.**
   `tests/fixtures/mainnet-fixed-v2.json` holds one mainnet ledger's
   entries and the contract's own attested answers at that ledger.
@@ -149,8 +149,8 @@ bot does about each difference, is written down in
 - the fork destroys a defaulted borrower's debt in place — set-off, then a
   `b_rate` cut on the reserve's own suppliers, then confiscation of any
   remaining collateral to the pool's own address as plain supply — where
-  stock instead moved the liabilities into the backstop's `Positions` and
-  left every reserve's `b_rate` untouched;
+  stock instead moves the liabilities into the backstop's `Positions`, and
+  cuts no `b_rate` inside the fill transaction;
 - because that destruction runs inside a 100% fill's own transaction,
   before the contract checks the filler's health, `math::fill::plan_fill`
   projects a full fill's own `b_rate` haircut through
@@ -165,8 +165,8 @@ bot does about each difference, is written down in
   event — which the fork's own contract can never emit — raises
   `NotificationKind::StockWasmDetected` as a deployment alarm, not a
   decision input;
-- the pool contract's own address is now a `Positions` holder, since
-  confiscated collateral lands there as ordinary supply, and both the
+- the pool contract's own address is, on the fork, a `Positions` holder,
+  since confiscated collateral lands there as ordinary supply, and both the
   auctioneer and the filler treat it as one of the bot's own accounts
   rather than a borrower.
 
@@ -176,10 +176,10 @@ release to pin. The bot still runs against stock Blend v2 pools as well,
 and two things follow from that:
 
 - `plan_fill`'s `b_rate`-haircut projection runs unconditionally, on stock
-  pools too. Stock's own default path moves debt to the backstop and cuts
-  no `b_rate` at all, so on a stock pool the projection overstates the
-  damage a full fill causes — pessimistic, and safe, rather than wrong in
-  the dangerous direction.
+  pools too. A full fill on a stock pool moves the borrower's remaining
+  debt to the backstop and cuts no `b_rate` inside the fill transaction,
+  so there the projection overstates the damage a full fill causes —
+  pessimistic, and safe, rather than wrong in the dangerous direction.
 - `NotificationKind::StockWasmDetected` fires on every `bad_debt` event
   regardless of which wasm is actually deployed, and a stock pool emits
   `bad_debt` in ordinary operation — so on a stock pool this alert is

@@ -814,13 +814,16 @@ pub struct Args {
     )]
     pub plan_iterations: u32,
 
-    /// A count of ledgers, measured from the first ledger the auctioneer
-    /// sees, before any submission is attempted.
+    /// A count of ledgers the chain must advance past the first tick a
+    /// task sees before that task submits anything; the auctioneer and the
+    /// filler each count their own.
     ///
     /// Zero by default, so a fresh deployment submits as soon as it is
-    /// ready. A nonzero value gives a poller that is catching up on a
-    /// backlog room to reach current chain state before the bot starts
-    /// acting on health factors it has not yet re-verified against it.
+    /// ready. Inside the delay both tasks still decide and plan, and send
+    /// nothing. Its use is a rolling deploy that runs two revisions at
+    /// once: set above the old revision's shutdown drain, converted to
+    /// ledgers, it keeps the new revision from submitting while the old
+    /// one still may.
     #[arg(long, env = "STARTUP_DELAY_LEDGERS", default_value_t = 0)]
     pub startup_delay_ledgers: u32,
 
@@ -2717,20 +2720,41 @@ supported_lot = ["*"]
     }
 
     /// The configuration reference, `.env.example` and the real `clap`
-    /// definition name the same variables, and the example pools file is
-    /// one `parse_pools` accepts. Documentation that has drifted from the
-    /// code is worse than none, and nothing else would notice: every one
-    /// of these files can go stale without a single other test failing.
+    /// definition name exactly the same variables, and the example pools
+    /// file is one `parse_pools` accepts. Documentation that has drifted
+    /// from the code is worse than none, and nothing else would notice:
+    /// every one of these files can go stale without a single other test
+    /// failing.
+    ///
+    /// Each document's names are collected as a set and compared whole —
+    /// never searched for as substrings, since `HTTP_PORT=` contains
+    /// `PORT=`, and never as mentions anywhere in the reference, since
+    /// most variables are named in prose or in another variable's row
+    /// too. A variable is covered by the reference only by a table row of
+    /// its own.
     #[test]
     fn the_configuration_documents_cover_exactly_the_real_settings() {
         use clap::CommandFactory;
+        use std::collections::BTreeSet;
+
         let root = env!("CARGO_MANIFEST_DIR");
         let read_file = |path: &str| {
             std::fs::read_to_string(format!("{root}/{path}"))
                 .unwrap_or_else(|error| panic!("{path}: {error}"))
         };
-        let reference = read_file("docs/configuration.md");
-        let template = read_file(".env.example");
+        // A setting's spelling, `[A-Z][A-Z0-9_]*`. The reference tabulates
+        // the pools file's keys in the same shape as its settings, and those
+        // are lowercase, so this is what keeps them out.
+        let is_setting = |name: &str| {
+            let mut chars = name.chars();
+            chars.next().is_some_and(|first| first.is_ascii_uppercase())
+                && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        };
+        let differences = |named: &BTreeSet<String>, real: &BTreeSet<String>| {
+            let missing: Vec<&String> = real.difference(named).collect();
+            let unread: Vec<&String> = named.difference(real).collect();
+            format!("missing {missing:?}; names what nothing reads {unread:?}")
+        };
 
         // Read straight from the environment, never through clap, so
         // `Args::command()` cannot see them. A new one must be added here.
@@ -2742,37 +2766,44 @@ supported_lot = ["*"]
             "AUCTIONEER_SECRET_KEY",
             "RUST_LOG",
         ];
-        let mut real: std::collections::BTreeSet<String> = Args::command()
+        let mut real: BTreeSet<String> = Args::command()
             .get_arguments()
             .filter_map(|arg| arg.get_env())
             .map(|env| env.to_string_lossy().into_owned())
             .collect();
         real.extend(direct.iter().map(|name| (*name).to_string()));
 
-        for name in &real {
-            assert!(
-                reference.contains(&format!("`{name}`")),
-                "docs/configuration.md never names `{name}`"
-            );
-            assert!(
-                template.contains(&format!("{name}=")),
-                ".env.example never names {name}"
-            );
-        }
+        // `.env.example`: every `NAME=` that opens a line, commented out or
+        // not.
+        let template: BTreeSet<String> = read_file(".env.example")
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim_start_matches(|c: char| c == '#' || c.is_whitespace());
+                let (name, _) = line.split_once('=')?;
+                is_setting(name).then(|| name.to_owned())
+            })
+            .collect();
+        assert_eq!(
+            template,
+            real,
+            ".env.example: {}",
+            differences(&template, &real)
+        );
 
-        // The reverse: every variable `.env.example` names is real.
-        let named = template.lines().filter_map(|line| {
-            let line = line.trim_start_matches(['#', ' ']);
-            let (name, _) = line.split_once('=')?;
-            (!name.is_empty() && name.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
-                .then_some(name)
-        });
-        for name in named {
-            assert!(
-                real.contains(name),
-                ".env.example names {name}, which nothing reads"
-            );
-        }
+        // The reference: the first column of every table row, `` | `NAME` | ``.
+        let reference: BTreeSet<String> = read_file("docs/configuration.md")
+            .lines()
+            .filter_map(|line| {
+                let (name, rest) = line.strip_prefix("| `")?.split_once('`')?;
+                (rest.starts_with(" |") && is_setting(name)).then(|| name.to_owned())
+            })
+            .collect();
+        assert_eq!(
+            reference,
+            real,
+            "docs/configuration.md: {}",
+            differences(&reference, &real)
+        );
 
         // The annotated example is a file the bot accepts; with
         // `deny_unknown_fields` on every table, that also proves each of

@@ -9,9 +9,12 @@ value it suggests is not the one you want, or when the bot refuses to start
 and you need to know why.
 
 Some of these settings change what the bot does with funds it controls, not
-just how it logs or where it listens. `DRY_RUN`, the two signing keys, the
-health-factor thresholds and `TARGET_HF` are that group — see "Safety
-first" below before changing any of them on a deployment that holds a key.
+just how it logs or where it listens. `DRY_RUN` and the two signing keys
+(§1, "Safety first"), the health-factor thresholds (each pool's
+`min_health_factor` in §4, `LIQ_HF_THRESHOLD` and `SCAN_HF_THRESHOLD` in
+§5, `HF_SAFETY_MULTIPLIER` in §7) and `TARGET_HF` (§6) are that group —
+read their sections before changing any of them on a deployment that
+holds a key.
 
 Every variable here is read once, at startup, by `Args` (`src/config.rs`)
 or, for the five secrets and `RUST_LOG`, straight from the process
@@ -34,7 +37,7 @@ also works as a bare command-line switch: `--dry-run` alone means `true`.
 | `DRY_RUN` | `true` | Only `true` or `false` (exact match) parses. `false` requires `FILLER_SECRET_KEY` to be set. |
 | `FILLER_SECRET_KEY` | unset | Secret, read from the environment only — never a `clap` argument, so it never appears in argv. Parsed at startup whether or not it signs anything. |
 | `AUCTIONEER_SECRET_KEY` | unset | Secret, same as above. Unset, the auctioneer signs with `FILLER_SECRET_KEY` instead, through the one submission queue that key needs. |
-| `STARTUP_DELAY_LEDGERS` | `0` | A count of ledgers from the first one the auctioneer sees, before any submission is attempted. |
+| `STARTUP_DELAY_LEDGERS` | `0` | Ledgers the chain must advance past the first tick a task sees before that task submits anything. The auctioneer and the filler each count their own. |
 
 The two signing keys are read straight from the environment in
 `src/main.rs`, never through `clap`, for the same reason `DATABASE_URL` and
@@ -63,11 +66,15 @@ Two rules bind the pair, both checked once both keys are parsed
   key: leave AUCTIONEER_SECRET_KEY unset and the auctioneer signs with the
   filler's key, through the one queue that key needs`.
 
-`STARTUP_DELAY_LEDGERS` defaults to `0`, so a fresh deployment with an
-up-to-date poller starts submitting as soon as it is ready. Set it above
-zero deliberately to give a poller that is catching up on a backlog room
-to reach current chain state before the bot acts on health factors it has
-not yet re-verified against it — the default does not choose that for you.
+`STARTUP_DELAY_LEDGERS` defaults to `0`, so each task may submit from the
+first tick it sees. Inside the delay the auctioneer and the filler still
+decide and plan, and send nothing. A tick is published only once a
+poller has drained its events up to the chain head it read, so the count
+starts at chain head. Its use is a rolling deploy that runs two revisions
+at once: set above the old revision's shutdown drain, it keeps the new
+revision from submitting while the old one still may. The drain is
+measured in seconds and this in ledgers — see `docs/deploy.md`, "5. Arm
+it", for the conversion.
 
 ## 2. Network and RPC
 
@@ -75,7 +82,7 @@ not yet re-verified against it — the default does not choose that for you.
 |---|---|---|
 | `NETWORK` | unset | One of `mainnet` or `testnet`. Give this or `NETWORK_PASSPHRASE`, never both — `clap` refuses both being set at once. |
 | `NETWORK_PASSPHRASE` | unset | The network passphrase directly, for any network `NETWORK` does not name. Exactly one of `NETWORK`/`NETWORK_PASSPHRASE` is required; neither set is a startup error (`NETWORK_PASSPHRASE or NETWORK is required`). |
-| `RPC_URL` | unset | Required — `RPC_URL is required` if missing. |
+| `RPC_URL` | unset | Required — `RPC_URL is required` if missing. Must carry no credential: a provider's key goes in `RPC_API_KEY` (see below). |
 | `RPC_API_KEY` | unset | Secret, read from the environment only. Both this and `RPC_API_KEY_HEADER` or neither: one alone is a startup error. |
 | `RPC_API_KEY_HEADER` | unset | The header name the key is sent under. Validated as a well-formed HTTP header name. |
 | `BASE_FEE` | `5000` | Inclusion-fee floor for normal-priority transactions, in stroops. |
@@ -95,6 +102,14 @@ itself is a secret and, like `DATABASE_URL` and `TELEGRAM_BOT_TOKEN`, is
 read from the environment only — it is never a `clap` argument and never
 appears in this bot's own argv.
 
+`RPC_URL` is not a secret, and must not carry one: put no credential in
+it, and give a keyed provider's key through `RPC_API_KEY` with
+`RPC_API_KEY_HEADER` instead. The resolved-configuration line shows only
+the URL's origin, but an RPC call that fails at the transport level (DNS,
+TLS, a timeout) logs the full URL, and the poller's `RpcFailing`
+notification sends it to the notification channel. A provider that only
+takes a key in its URL cannot be used safely with this release.
+
 ## 3. Store
 
 | Variable | Default | Constraint |
@@ -102,12 +117,12 @@ appears in this bot's own argv.
 | `DATABASE_URL` | unset | Secret, read from the environment only. Required — `DATABASE_URL is required` if missing. |
 | `DATABASE_MAX_CONNECTIONS` | `10` | At least 1, at most 100. |
 
-`DATABASE_URL` must cover every task that queries Postgres concurrently:
-one ledger poller per pool, the tracker, the auctioneer and the filler —
-roughly `pools + 3`, and the default of `10` covers up to seven pools.
-Sizing it below that does not deadlock; it times out acquiring a
-connection, and every store error in this bot is fatal, so a load spike
-becomes a process exit rather than a slowdown.
+`DATABASE_MAX_CONNECTIONS` must cover every task that queries Postgres
+concurrently: one ledger poller per pool, the tracker, the auctioneer and
+the filler — roughly `pools + 3`, and the default of `10` covers up to
+seven pools. Sizing it below that does not deadlock; it times out
+acquiring a connection, and every store error in this bot is fatal, so a
+load spike becomes a process exit rather than a slowdown.
 
 ## 4. Pools
 
@@ -128,7 +143,7 @@ Every table below rejects a key it does not recognize.
 |---|---|---|---|
 | `address` | string | required | The pool contract address. |
 | `primary_asset` | string | required | The asset the bot keeps as collateral in this pool. |
-| `min_primary_collateral` | decimal string | required | The least of the primary asset to hold, in its own decimals. Parsed as an integer amount (`min_primary_collateral: '<text>' is not an integer amount` on failure) and refused negative (`min_primary_collateral must not be negative`). |
+| `min_primary_collateral` | decimal string | required | Primary-asset collateral to keep supplied to this pool — the filler's position in the pool, not its wallet balance — in the asset's own decimals. The unwind pass withdraws the primary down to it and never supplies to reach it. Parsed as an integer amount (`min_primary_collateral: '<text>' is not an integer amount` on failure) and refused negative (`min_primary_collateral must not be negative`). |
 | `min_health_factor` | decimal (7 places) | required | The health factor the filler keeps its own position above after a fill. Must be strictly above `1.00001` (the contract's own post-submit minimum) — at or under it, every failure names the pool: `min_health_factor is at or under the contract's own post-submit minimum (1.00001), so the filler would plan fills the contract refuses as InvalidHf`. |
 | `default_profit_bps` | integer | required | Profit required, in basis points, when no `[[pools.profits]]` rule matches. |
 | `force_fill` | boolean | `false` | Caps whichever ledger `fill_objective` picks at the 350-ledger mark, however little the lot covers by then. Does not waive the health check. |
@@ -244,7 +259,7 @@ every wallet balance on every tick.
 |---|---|---|
 | `RUN_MODE` | `loop` | `loop` (follow the configured pools until shut down) or `check-config` (validate everything, print it redacted, and exit). |
 | `LOG_FORMAT` | `text` | `text` for a terminal, `json` for a log shipper (one JSON object per line). |
-| `RUST_LOG` | unset | Not a `clap` argument — read by `tracing_subscriber`'s `EnvFilter` in `src/main.rs`. When unset or invalid, the bot falls back to `info,blend_liquidator=debug`. |
+| `RUST_LOG` | `info,blend_liquidator=debug` in the image; unset outside it | Not a `clap` argument — read by `tracing_subscriber`'s `EnvFilter` in `src/main.rs`. The image sets it with `ENV` (and `docker-compose.yml` sets the same value); unset or invalid, the bot falls back to that same filter. |
 | `PORT` | unset | Turns the `/healthz`, `/livez` and `/metrics` server on. Wins over `HTTP_PORT` when both are set — this is the variable a platform such as Cloud Run injects. |
 | `HTTP_PORT` | unset | Also turns the HTTP server on, for a deployment that does not inject `PORT`. Neither set leaves the server off entirely. |
 | `HTTP_BIND_ADDR` | `127.0.0.1` | The address the HTTP server binds. Loopback by default; a `0.0.0.0` bind belongs behind an ingress that admits only the platform's probes and scraper, since the endpoints carry no authentication. |
@@ -257,9 +272,9 @@ every wallet balance on every tick.
 `TELEGRAM_CHAT_ID is set but TELEGRAM_BOT_TOKEN is not`, and the reverse
 fails with `TELEGRAM_BOT_TOKEN is set but TELEGRAM_CHAT_ID is not` — a
 token with nowhere to send is as useless as a destination with nothing to
-send it with. Neither variable's value is ever logged: the token is
-`Secret`-wrapped, and `TELEGRAM_CHAT_ID` — not a secret itself — is only
-ever printed as part of a config that never bundles it with the token.
+send it with. The token's value is never logged: it is `Secret`-wrapped
+and renders as `Secret(<redacted>)`. `TELEGRAM_CHAT_ID` is not a secret,
+and the resolved-configuration line prints it beside the redacted token.
 
 `HEALTH_MAX_LAG_LEDGERS` at `0` is refused: a bot exactly at chain head
 would still report not-ready on every ledger boundary its own poll

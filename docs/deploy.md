@@ -19,9 +19,10 @@ The image is published to `ghcr.io/templar-protocol/blend-liquidator`
 only on a `v*` tag push (`.github/workflows/release.yml`), tagged with
 the version the tag names — its leading `v` stripped, so the git tag
 `v0.1.0` publishes as image tag `0.1.0`, never `v0.1.0`
-(`docs/deployment-contract.md`, "What this repository guarantees"). This
-repository is private, so the package is private too: pulling it needs a
-token with the `read:packages` scope.
+(`docs/deployment-contract.md`, "What this repository guarantees").
+Whether the package is public is a GitHub package setting, not something
+this repository controls; while it is private, pulling it needs a token
+with the `read:packages` scope.
 
 ```bash
 echo "$GHCR_TOKEN" | docker login ghcr.io -u <github-username> --password-stdin
@@ -38,14 +39,16 @@ you are running.
 
 ## 2. Configure it
 
-Everything the process reads arrives through the environment, and the
-pools it follows through `POOLS_FILE` or `POOLS_TOML` — nothing else on
-disk, and nothing it writes back (`docs/deployment-contract.md`, "What
-this repository guarantees"). The required minimum to start it in any
+Its configuration arrives through the environment, the pools it follows
+through `POOLS_FILE` or `POOLS_TOML`, and — only when `SEED_FILE` is set —
+a seed file of accounts to track. It reads no other configuration file,
+and writes nothing back (`docs/deployment-contract.md`, "What this
+repository guarantees"). A file named by `POOLS_FILE` or `SEED_FILE` must
+be mounted into the container. The required minimum to start it in any
 mode:
 
 - One of `NETWORK` (`mainnet` or `testnet`) or `NETWORK_PASSPHRASE`.
-- `RPC_URL`, a Soroban RPC endpoint.
+- `RPC_URL`, a Soroban RPC endpoint, carrying no credential (see below).
 - `DATABASE_URL`, a Postgres instance the process can run DDL on — `loop`
   mode migrates it at every startup, under an advisory lock, so nothing
   else needs to create the schema first.
@@ -67,6 +70,13 @@ through your platform's own secret-injection mechanism (a Kubernetes
 `Secret`, Cloud Run's `--set-secrets`, and so on), not a plain
 environment block a config dump would echo back.
 
+Put no credential in `RPC_URL`. A keyed RPC provider's key goes in
+`RPC_API_KEY`, sent under the header `RPC_API_KEY_HEADER` names, and goes
+through the secret mechanism with the rest. The bot logs the full
+`RPC_URL` whenever an RPC call fails at the transport level, and a run of
+such failures sends it to the notification channel, so a provider that
+only takes a key in its URL cannot be used safely with this release.
+
 ## 3. Smoke-test it
 
 Before trusting a configuration with real traffic, run the image once
@@ -75,21 +85,48 @@ validates every configured pool against chain (each pool answers, they
 share one backstop, the configured assets are reserves, `max_positions`
 is at least 2), validates the filler account when a key is configured,
 and — when Telegram is configured — calls `getMe` to prove the bot token
-works. It changes nothing on either path: no migration runs and no
+works. It changes nothing in either mode: no migration runs and no
 transaction is sent.
 
 ```bash
-docker run --rm --env-file .env \
+docker run --rm --env-file check.env \
   -e RUN_MODE=check-config \
+  -e POOLS_FILE=/config/pools.toml \
+  -v "$PWD/pools.toml:/config/pools.toml:ro" \
   ghcr.io/templar-protocol/blend-liquidator:<version>
 ```
+
+`check.env` is an environment file on a machine you control. Three
+things about it:
+
+- **`DATABASE_URL` must be an address the container can reach.** The one
+  `.env.example` ships is the host-side loopback address
+  `docker-compose.yml` publishes Postgres on; inside a container,
+  `127.0.0.1` is the container itself.
+- **`--env-file` takes every line literally.** It strips no quotes — a
+  quoted value arrives with its quotes — and it cannot carry the
+  multi-line `POOLS_TOML` form `.env.example` shows, which is why the
+  pools file is mounted instead.
+- **Values passed with `--env-file` or `-e` are visible to `docker
+  inspect`.** On the real platform, the secrets go through its own
+  secret mechanism (step 2), not an environment file.
 
 A pass logs the resolved configuration (redacted — no secret value is
 ever printed) and every warning it found, then exits `0`. A failure logs
 the reason at `ERROR` and exits `2` — the same code a bad signing key or
 any other startup configuration problem uses. Run this again after any
-change to the environment or the pools file, and always before the first
-time a deployment sets `DRY_RUN=false`.
+change to the environment or the pools file.
+
+**A pass with `DRY_RUN=true` does not prove the filler is ready.** In
+dry-run a filler account that does not exist, or holds less than
+`XLM_FEE_RESERVE`, is only a warning and the check still exits `0`, and
+the per-pool `min_primary_collateral` check is skipped. Before the first
+time a deployment sets `DRY_RUN=false`, run `check-config` once more with
+`DRY_RUN=false` and `FILLER_SECRET_KEY` set: that run fails on either
+account problem, and it is still safe, because `check-config` never sends
+a transaction in either mode. Its first log lines read "LIVE:
+transactions will be submitted" all the same — that banner reads only
+`DRY_RUN`, not the run mode.
 
 ## 4. Run it dry
 
@@ -115,7 +152,9 @@ shows starting and finishing. What to watch:
   `succeeded`/`failed`, since nothing was sent), so a nonzero
   `creations_total{result="attempted"}` on a pool with an unhealthy
   borrower is the dry run doing its job. `skips_total{reason=...}`
-  explains every borrower it declined to act on.
+  counts the filler's skips, once per auction per reason; the
+  auctioneer's reasons for leaving a borrower alone are not in
+  `/metrics`, only in its `debug` log line "skip: no action taken".
 - **`/healthz` and `/livez`**, if the HTTP server is on: both should
   settle to `200` once every configured pool's poller has caught up to
   chain head.
@@ -128,7 +167,8 @@ is durable and reviewable, not just a log line that scrolled past.
 
 Arming means the bot signs and sends. Do this only once a dry run's
 decisions look right and `check-config` passes against the real
-configuration. `docs/deployment-contract.md` makes that ordering a
+configuration with `DRY_RUN=false` and `FILLER_SECRET_KEY` set (see "3.
+Smoke-test it"). `docs/deployment-contract.md` makes that ordering a
 requirement of the deployment, not a guarantee the image enforces on its
 own: nothing in `src/` stops `DRY_RUN=false` from being set before
 `check-config` has ever run against that configuration — this is the
@@ -171,27 +211,29 @@ primary asset supplied to a pool *down* to `min_primary_collateral` —
 never up. So an operator who wants a standing buffer supplies it to the
 pool directly, outside the bot, and sets `min_primary_collateral` to
 exactly what they mean the bot to keep supplied there: anything supplied
-above that floor is trimmed back to the wallet on the run's first tick.
+above that floor is trimmed back to the wallet by the run's first unwind
+pass that may submit — once armed, and once `STARTUP_DELAY_LEDGERS` has
+passed. A dry run trims nothing.
 
 **`STARTUP_DELAY_LEDGERS`** is the window in which the bot plans and
 records but does not submit. The auctioneer and the filler each hold
-their own gate for it, each counted in ledgers from the first one that
+their own gate for it, each counted in ledgers from the first tick that
 task itself saw, so the two are not necessarily in lockstep at startup.
-It defaults to `0` — an operator setting, not something the image chooses
-for you (`docs/deployment-contract.md`, "What a deployment must
-provide"). Set it deliberately in two situations:
+A tick is published only once a poller has caught up to the chain head,
+so the count starts there. It defaults to `0` — an operator setting, not
+something the image chooses for you (`docs/deployment-contract.md`,
+"What a deployment must provide").
 
-- **A poller catching up on a backlog.** A bot pointed at a pool it has
-  not followed recently re-seeds and replays a range of history before
-  its view of chain state is current; a nonzero delay gives that catch-up
-  room to finish before the bot acts on health factors it has not yet
-  re-verified against current chain state.
-- **A rolling deploy that runs overlapping revisions** (a new container
-  starts before the old one has fully drained). Set it above the old
-  revision's shutdown drain time (`stop_grace_period` in Compose, the
-  platform's own termination grace period elsewhere), so the two
-  revisions are never both submitting for the same pools at once. The
-  image does not keep that window empty on its own at the default of `0`.
+Set it for **a rolling deploy that runs overlapping revisions** (a new
+container starts before the old one has fully drained), above the old
+revision's shutdown drain, so the two revisions are never both
+submitting for the same pools at once. The image does not keep that
+window empty on its own at the default of `0`. The drain is measured in
+seconds (`stop_grace_period` in Compose, the platform's own termination
+grace period elsewhere) and the delay in ledgers, so convert: divide the
+drain by the network's ledger close time — about 5–6 seconds on mainnet —
+round up, and add headroom. A 30-second grace period is 6 ledgers at 5
+seconds each; set 10 or more.
 
 ## 6. Observe it
 
@@ -226,17 +268,26 @@ to that chat, and to the log only when delivery fails or a burst has
 taken every in-flight delivery permit. A notification failure never
 blocks or delays trading — delivery is fire-and-forget.
 
-**The one thing never to do: run a Telegram-configured bot at
-`RUST_LOG=trace`.** The bot token sits in the Telegram Bot API request
-*path* (`/bot<token>/sendMessage`), never a header or the body, and every
-error this bot displays near the Telegram client is already scrubbed of
-it (`reqwest::Error::without_url`) — but at `TRACE`, hyper's own
-byte-level request logging prints the request line, token included,
-before this bot's own code ever sees it, and `tracing_subscriber`'s `log`
-bridge captures that line into your logs regardless. The default filter
-and `RUST_LOG=debug` are both clear of this. If you need `TRACE`-level
-diagnostics for something else, do it against a deployment with no
-Telegram credentials configured.
+**On a stock pool, expect `StockWasmDetected`.** The bot raises this
+notification at `High` severity on every `bad_debt` event — once per
+pool and account within `FAILURE_NOTIFICATION_COOLDOWN_HOURS` — because
+the fork it targets can never emit one. A stock pool emits one whenever a
+defaulted borrower's debt moves to the backstop — through the bot's own
+`bad_debt` call too — and stock pools are the only Blend v2 pools that
+exist today: the fork is deployed nowhere yet. On a stock pool the alert
+is expected; on a fork pool it means the wrong wasm is deployed.
+
+**The one thing never to do: run a deployment that holds a secret at
+`RUST_LOG=trace`.** That no secret reaches a log line holds at the
+default filter and at `RUST_LOG=debug`; logging at `TRACE`,
+dependencies' included, is not audited for secrets. The Telegram bot
+token is the plainest risk: it sits in the Bot API request *path*
+(`/bot<token>/sendMessage`), never a header or the body, and every error
+this bot displays near the Telegram client is scrubbed of it
+(`reqwest::Error::without_url`), but a dependency's request-level
+logging at `TRACE` could print that path, and `tracing_subscriber`'s
+`log` bridge would carry it into your logs. If you need `TRACE`-level
+diagnostics, take them from a deployment that holds no secret.
 
 ## 7. Upgrade it
 
@@ -249,19 +300,18 @@ running and the one you are moving to — the deployment contract's own
 called out there.
 
 For a rolling deploy specifically, see `STARTUP_DELAY_LEDGERS` in
-"5. Arm it" above: set it above the old revision's shutdown drain so the
-new revision is not submitting for a pool the old one might still be
-finishing.
+"5. Arm it" above: set it above the old revision's shutdown drain,
+converted to ledgers, so the new revision is not submitting for a pool
+the old one might still be finishing.
 
-**`fill_objective`'s default makes fills wait for the free-fill point.** A
-pool with no `fill_objective` set in its `[[pools]]` table aims fills at
+**`fill_objective` is a per-pool choice of when fills land.** A pool
+with no `fill_objective` set in its `[[pools]]` table aims fills at
 `"free-fill"` — the ledger the auction's bid has ramped away to nothing,
-the most the auction can pay, and the last ledger to get it. If you are
-used to an earlier deployment of this bot that filled sooner, set
-`fill_objective = "earliest-profitable"` on a pool to keep that timing:
-filling at the first ledger the lot covers the bid plus that pool's
-profit margin, trading profit for landing where competition for the
-auction is real rather than waiting out the whole ramp. See
+the most the auction can pay, and the last ledger to get it, which
+forfeits the auction to anyone who fills sooner. `fill_objective =
+"earliest-profitable"` fills at the first ledger the lot covers the bid
+plus that pool's profit margin instead, trading profit per fill for
+landing where competition for the auction is real. See
 `docs/configuration.md` §4 for the exact trade-off and error text.
 
 ## 8. Locally

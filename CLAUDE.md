@@ -175,8 +175,13 @@ make help                           # Docker Compose lifecycle
   named error) into `PoolConfig::fill_objective`, `math::fill`'s
   `FillObjective`. A test in this file,
   `the_configuration_documents_cover_exactly_the_real_settings`, fails
-  unless every setting named here also appears in `docs/configuration.md`
-  and `.env.example`; a new variable read directly through
+  unless the set of settings the code reads — every `clap` argument's
+  `env` name plus a hard-coded list of the ones read directly — equals
+  both the set of `NAME=` lines in `.env.example` (commented out or not)
+  and the set of first-column names in `docs/configuration.md`'s settings
+  tables (`` | `NAME` | ``, uppercase only, so the pools-file key table
+  never counts), printing each set difference on failure; and unless
+  `pools.example.toml` parses. A new variable read directly through
   `std::env::var` must be added to that test's hard-coded list by hand.
 - `src/main.rs` — binary entry point: tracing setup, argument parsing, exit.
 - `src/math/` — the pure port of the pool contract's arithmetic: `fixed`
@@ -584,10 +589,13 @@ make help                           # Docker Compose lifecycle
   notifier (`Notifier::drain(DRAIN_BUDGET)`) on both the `Ok` and the `Err`
   path — the two exits that skip it are the second `SIGINT`/`SIGTERM`
   (`spawn_shutdown_listener`'s `exit(130)`, deliberately: a second signal
-  means now) and a task panic (`resume_on_panic` unwinds straight out of
-  `drain_tasks`, past `finish_run` entirely). The tracker loop treats a
-  `TrackerError::Store` as fatal and a `Chain` or `Math` one as transient —
-  it declines the tick, and the same range is read again. Both entry
+  means now) and a task panic. A release build — the image's — sets
+  `panic = "abort"` (`Cargo.toml`'s `[profile.release]`), so there a
+  panic aborts the process where it happens, with no unwind at all; in a
+  debug or test build it unwinds, `resume_on_panic` carrying it straight
+  out of `drain_tasks`, past `finish_run` entirely. The tracker loop treats
+  a `TrackerError::Store` as fatal and a `Chain` or `Math` one as transient
+  — it declines the tick, and the same range is read again. Both entry
   points share `validate` and `validate_filler`: the filler's account must
   exist on the network and hold at least `XLM_FEE_RESERVE` of the native
   asset — armed, either failure is a startup *error*; in dry-run each is a
@@ -1074,7 +1082,7 @@ Status above for what remains.
   by design (spec §1's capital model is "unwind to the wallet and hold").
   Set `min_primary_collateral` to exactly what you mean the bot to keep
   supplied in the pool: anything above it goes to the wallet on the first
-  tick.
+  pass allowed to submit — armed, and past `STARTUP_DELAY_LEDGERS`.
 - An unwind's repay is capped at what the wallet can spend, never the raw
   balance: `Inventory::available`'s figure, net of `XLM_FEE_RESERVE` and
   every open `Reservation` — the same rule a fill's repay uses. The
@@ -1103,11 +1111,12 @@ Status above for what remains.
   goes through `reqwest::Error::without_url()` first. A new log line that
   prints a raw `reqwest::Error` from `notifier::telegram` or
   `service::telegram_channel`/`verify_telegram` leaks the token into the
-  log. The one leak this crate cannot close is `RUST_LOG=trace`: hyper's
-  byte-level logging prints the request line — `/bot<TOKEN>/sendMessage`
-  — and `tracing_subscriber`'s `log` bridge captures it. The default
-  filter and `debug` are both clear; **a Telegram-configured bot is never
-  run at TRACE.**
+  log. The one leak this crate cannot rule out is `RUST_LOG=trace`:
+  logging there, dependencies' included, is not audited for secrets, and
+  a dependency's request-level logging could print the request line —
+  `/bot<TOKEN>/sendMessage` — which `tracing_subscriber`'s `log` bridge
+  would capture. The default filter and `debug` are both clear; **a
+  Telegram-configured bot is never run at TRACE.**
 - `PORT` wins over `HTTP_PORT` when both are set, because `PORT` is the
   one a deployment platform controls (Cloud Run injects it); either alone
   turns the HTTP server on, neither leaves it off. A bind failure never
@@ -1126,15 +1135,17 @@ Status above for what remains.
   readiness blip would kill and respawn the process on exactly the
   outages its backoff exists to ride out, while a wedged poller — which
   `/livez` alone catches — is precisely what a restart can fix. The
-  Docker `HEALTHCHECK` stays `pgrep` for the same reason; see the
-  Dockerfile's own comment. A pool that has never heartbeated at all is
-  measured from the run's start rather than reported dead, so the initial
-  seed is not a restart loop; `/healthz` carries the mirror-image rule,
-  failing once no chain head has been read for that same window, because
-  an RPC outage freezes the lag it would otherwise be judged by — and its
-  lag bound is symmetric for the same kind of reason, a head more than
-  `max_lag_ledgers` *behind* the processed ledger being a lagging node
-  rather than a bot at chain head.
+  Docker `HEALTHCHECK` stays `pgrep` first because the HTTP server is off
+  unless `PORT`/`HTTP_PORT` is set, so a check against `/livez` would mark
+  every default container unhealthy — and is never wired to a readiness
+  endpoint either, for the reason above; see the Dockerfile's own comment. A
+  pool that has never heartbeated at all is measured from the run's start
+  rather than reported dead, so the initial seed is not a restart loop;
+  `/healthz` carries the mirror-image rule, failing once no chain head has
+  been read for that same window, because an RPC outage freezes the lag it
+  would otherwise be judged by — and its lag bound is symmetric for the same
+  kind of reason, a head more than `max_lag_ledgers` *behind* the processed
+  ledger being a lagging node rather than a bot at chain head.
 - A `Notifier` must be used from inside a tokio runtime: `notify` spawns
   the delivery task, and calling it outside one panics.
 - `notifications_total{kind,delivery}` is the one metric whose label set
