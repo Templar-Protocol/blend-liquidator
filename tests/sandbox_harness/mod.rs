@@ -41,7 +41,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use blend_liquidator::chain::xdr::AuctionType;
 use blend_liquidator::chain::{PoolReader, RpcClient};
+use blend_liquidator::math::AuctionData;
 use blend_liquidator::store::Store;
 use sqlx::postgres::PgPool;
 
@@ -972,6 +974,238 @@ pub(crate) async fn wait_for_tx_hash(
     }
 }
 
+/// The first dry-run row this scenario's borrower has in `creations`, with
+/// the ledger the decision was made at. Ordered oldest first: a dry run
+/// that keeps deciding (the borrower stays flagged for as long as no
+/// auction ever lands) writes a new row every pass, and the first one is
+/// the evidence the `dry_run` scenario's phase A waits for.
+pub(crate) const DRY_RUN_CREATION_ROW: &str = "SELECT tx_hash, ledger FROM creations \
+     WHERE pool = $1 AND account = $2 AND dry_run = true ORDER BY id ASC LIMIT 1";
+
+/// The same shape for `fills`.
+pub(crate) const DRY_RUN_FILL_ROW: &str = "SELECT tx_hash, fill_ledger FROM fills \
+     WHERE pool = $1 AND account = $2 AND dry_run = true ORDER BY id ASC LIMIT 1";
+
+/// Counts every `creations` row for this account that is *not* what a dry
+/// run may ever write: armed (`dry_run = false`) or carrying a transaction
+/// hash. Zero is the only value the `dry_run` scenario's phase A accepts.
+pub(crate) const CREATIONS_VIOLATING_DRY_RUN: &str =
+    "SELECT count(*) FROM creations WHERE pool = $1 AND account = $2 \
+     AND (dry_run = false OR tx_hash IS NOT NULL)";
+
+/// The same shape for `fills`.
+pub(crate) const FILLS_VIOLATING_DRY_RUN: &str =
+    "SELECT count(*) FROM fills WHERE pool = $1 AND account = $2 \
+     AND (dry_run = false OR tx_hash IS NOT NULL)";
+
+/// Waits for `statement`'s row to exist and answers its transaction hash
+/// (`None` for a dry run that never submitted) and the ledger the row
+/// names.
+///
+/// Shared by the `dry_run` scenario's two audit tables (`creations`'
+/// `ledger`, `fills`' `fill_ledger`): both are one bigint alongside the
+/// hash, and the whole assertion there is "a row exists and its hash is
+/// null", which needs nothing table-specific beyond the query text.
+pub(crate) async fn wait_for_dry_run_row(
+    bot: &mut Bot,
+    store: &Store,
+    statement: &'static str,
+    what: &'static str,
+    budget: Duration,
+    pool: &str,
+    account: &str,
+) -> (Option<String>, i64) {
+    let mut wait = Wait::new(what, budget);
+    loop {
+        let found = sqlx::query_as::<_, (Option<String>, i64)>(statement)
+            .bind(pool)
+            .bind(account)
+            .fetch_optional(store.pool())
+            .await;
+        match found {
+            Ok(Some((tx_hash, ledger))) => {
+                println!(
+                    "{what} at {:.1} s (ledger {ledger}, tx_hash {tx_hash:?})",
+                    bot.elapsed()
+                );
+                return (tx_hash, ledger);
+            }
+            Ok(None) => {}
+            Err(error) => fail(bot, &format!("could not read the audit table: {error}")),
+        }
+        if !wait.tick(bot).await {
+            let message = wait.timed_out();
+            fail(bot, &message);
+        }
+    }
+}
+
+/// Asserts `statement` — one of the `*_VIOLATING_DRY_RUN` counts above —
+/// answers zero: every row this account's table holds was written in dry
+/// run and never carried a transaction hash, however many times a pass
+/// decided.
+pub(crate) async fn assert_all_dry_run(
+    bot: &Bot,
+    store: &Store,
+    statement: &'static str,
+    what: &'static str,
+    pool: &str,
+    account: &str,
+) {
+    let violations = sqlx::query_scalar::<_, i64>(statement)
+        .bind(pool)
+        .bind(account)
+        .fetch_one(store.pool())
+        .await;
+    match violations {
+        Ok(0) => println!("asserted: every {what} row is dry_run = true and tx_hash IS NULL"),
+        Ok(count) => fail(
+            bot,
+            &format!(
+                "{count} {what} row(s) are armed or carry a transaction hash — a dry run must \
+                 never submit"
+            ),
+        ),
+        Err(error) => fail(bot, &format!("could not check {what} rows: {error}")),
+    }
+}
+
+/// Asserts no open auction entry exists on chain for `user`, right now.
+///
+/// Not a wait: an entry existing at all is the failure this is for, so
+/// there is nothing to wait out — the `dry_run` scenario calls this once
+/// immediately after a dry-run creation and once after the chain has
+/// moved, never in a loop.
+pub(crate) async fn assert_no_auction(
+    bot: &Bot,
+    rpc: &RpcClient,
+    pool: &str,
+    user: &str,
+    auction_type: AuctionType,
+    context: &str,
+) {
+    let reader = PoolReader::new(rpc, pool);
+    match reader.auction(user, auction_type).await {
+        Ok(None) => println!("asserted: no auction entry on chain for {user} ({context})"),
+        Ok(Some((ledger, data))) => fail(
+            bot,
+            &format!(
+                "{context}: an auction entry exists on chain for {user} at ledger {ledger} \
+                 (bid {:?}, lot {:?}) — a dry run must never create one",
+                data.bid, data.lot
+            ),
+        ),
+        Err(error) => fail(
+            bot,
+            &format!("{context}: could not read the auction entry: {error}"),
+        ),
+    }
+}
+
+/// Waits for `PoolReader::auction` to answer `Some` for `(pool, user,
+/// auction_type)`, and answers it with the ledger it was read at.
+pub(crate) async fn wait_for_auction(
+    bot: &mut Bot,
+    rpc: &RpcClient,
+    pool: &str,
+    user: &str,
+    auction_type: AuctionType,
+    what: &'static str,
+    budget: Duration,
+) -> (u32, AuctionData) {
+    let reader = PoolReader::new(rpc, pool);
+    let mut wait = Wait::new(what, budget);
+    loop {
+        match reader.auction(user, auction_type).await {
+            Ok(Some((ledger, data))) => {
+                println!(
+                    "{what} at {:.1} s (ledger {ledger}, start block {}, bid {:?}, lot {:?})",
+                    bot.elapsed(),
+                    data.block,
+                    data.bid,
+                    data.lot
+                );
+                return (ledger, data);
+            }
+            Ok(None) => {}
+            Err(error) => fail(bot, &format!("could not read the auction entry: {error}")),
+        }
+        if !wait.tick(bot).await {
+            let message = wait.timed_out();
+            fail(bot, &message);
+        }
+    }
+}
+
+/// Asserts the auction still on chain for `user` carries the same bid and
+/// lot as `expected` — the evidence a dry-run filler never touched it.
+pub(crate) async fn assert_auction_unchanged(
+    bot: &Bot,
+    rpc: &RpcClient,
+    pool: &str,
+    user: &str,
+    auction_type: AuctionType,
+    expected: &AuctionData,
+    context: &str,
+) {
+    let reader = PoolReader::new(rpc, pool);
+    match reader.auction(user, auction_type).await {
+        Ok(Some((ledger, data))) if data.bid == expected.bid && data.lot == expected.lot => {
+            println!(
+                "asserted: the auction at ledger {ledger} still has the same bid and lot \
+                 ({context})"
+            );
+        }
+        Ok(Some((ledger, data))) => fail(
+            bot,
+            &format!(
+                "{context}: the auction's bid or lot changed at ledger {ledger} — expected bid \
+                 {:?} lot {:?}, found bid {:?} lot {:?}",
+                expected.bid, expected.lot, data.bid, data.lot
+            ),
+        ),
+        Ok(None) => fail(
+            bot,
+            &format!("{context}: the auction entry is gone — a dry run must never fill one"),
+        ),
+        Err(error) => fail(
+            bot,
+            &format!("{context}: could not read the auction entry: {error}"),
+        ),
+    }
+}
+
+/// Waits until the chain has closed at least `count` ledgers past `since`.
+pub(crate) async fn wait_for_ledgers_past(
+    bot: &mut Bot,
+    rpc: &RpcClient,
+    since: u32,
+    count: u32,
+    what: &'static str,
+    budget: Duration,
+) -> u32 {
+    let target = since.saturating_add(count);
+    let mut wait = Wait::new(what, budget);
+    loop {
+        match rpc.latest_ledger().await {
+            Ok(latest) if latest.sequence >= target => {
+                println!(
+                    "{what}: now at ledger {} (target {target}) at {:.1} s",
+                    latest.sequence,
+                    bot.elapsed()
+                );
+                return latest.sequence;
+            }
+            Ok(_) => {}
+            Err(error) => fail(bot, &format!("could not read the latest ledger: {error}")),
+        }
+        if !wait.tick(bot).await {
+            let message = wait.timed_out();
+            fail(bot, &message);
+        }
+    }
+}
+
 /// What a filler holds in the pool: its primary-asset collateral in
 /// underlying, how many liabilities are left, and whether it has a position
 /// at all.
@@ -1138,7 +1372,7 @@ fn series(metrics: &str, name: &str) -> Option<i64> {
 /// the run moved, and repeating the ones it asserts would only make the
 /// artefact harder to read. A failure names the series, what it held and
 /// what was expected.
-fn assert_counter(bot: &Bot, metrics: &str, name: &str, expected: i64) {
+pub(crate) fn assert_counter(bot: &Bot, metrics: &str, name: &str, expected: i64) {
     match series(metrics, name) {
         Some(value) if value == expected => {}
         Some(value) => {

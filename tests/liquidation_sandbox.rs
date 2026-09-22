@@ -11,6 +11,11 @@
 //! - [`check_config`]: `RUN_MODE=check-config` against the same deploy,
 //!   proving its six cases' exit codes and messages and that none of them
 //!   sends a transaction or migrates the database.
+//! - [`dry_run`]: the tier's most important safety test. A dry-run bot
+//!   holding the real filler key never signs or sends anything — not to
+//!   create a borrower's auction, and not to fill one an armed run of the
+//!   same bot created for it — proven on the filler's own sequence number
+//!   as well as on the audit tables and the chain.
 //!
 //! `mod sandbox_harness` (`tests/sandbox_harness/mod.rs`) is the machinery
 //! every scenario in this tier shares: the standalone-network gate, the
@@ -43,19 +48,26 @@
 
 mod sandbox_harness;
 
+use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use blend_liquidator::chain::RpcClient;
+use blend_liquidator::chain::xdr::AuctionType;
+use blend_liquidator::chain::{PoolReader, RpcClient};
 use blend_liquidator::config::ChainConfig;
+use blend_liquidator::math::AuctionData;
 use blend_liquidator::store::Store;
 use sqlx::postgres::PgPool;
 
 use sandbox_harness::{
-    assert_metrics, crash, create_run_database, create_run_database_unmigrated, drop_run_database,
-    fail, fail_check, fill_budget, note_run_database, pools_toml, read_metrics, repo_root,
-    require_standalone_rpc, required, run_check_config, sandbox_env, spawn_bot, terminate,
-    wait_for_ready, wait_for_tx_hash, wait_for_unwind, with_database, BotConfig, CREATION_TIMEOUT,
-    CREATION_TX_HASH, FILL_TX_HASH,
+    assert_all_dry_run, assert_auction_unchanged, assert_counter, assert_metrics,
+    assert_no_auction, crash, create_run_database, create_run_database_unmigrated,
+    drop_run_database, fail, fail_check, fill_budget, note_run_database, pools_toml, read_metrics,
+    repo_root, require_standalone_rpc, required, run_check_config, sandbox_env, spawn_bot,
+    terminate, wait_for_auction, wait_for_dry_run_row, wait_for_ledgers_past, wait_for_ready,
+    wait_for_tx_hash, wait_for_unwind, with_database, Bot, BotConfig, CREATIONS_VIOLATING_DRY_RUN,
+    CREATION_TIMEOUT, CREATION_TX_HASH, DRY_RUN_CREATION_ROW, DRY_RUN_FILL_ROW,
+    FILLS_VIOLATING_DRY_RUN, FILL_TX_HASH,
 };
 
 /// The whole tier's original scenario: an armed bot creates the auction,
@@ -435,5 +447,475 @@ async fn check_config() {
 
     // Last, and only here: every case passed and the two assertions above
     // held, so reaching this line is what "the run succeeded" means.
+    drop_run_database(&root, &maintenance_url, &database).await;
+}
+
+/// How long the auction entry has to appear on chain once phase B's
+/// creation has a transaction hash. It is the same transaction: the entry
+/// exists the moment that hash is confirmed, so this is slack for the RPC
+/// to catch up, not a real wait.
+const AUCTION_ENTRY_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// How long the chain has to close the handful of ledgers `dry_run`'s
+/// phases A and C each wait out. A fixed budget, not a measured one, like
+/// [`sandbox_harness::CREATION_TIMEOUT`]: unlike the fill wait, these
+/// waits do not depend on the auction's own ramp, only on the sandbox
+/// closing ledgers at all, which [`fill_budget`] has already proven it
+/// does by the time phase C reaches its own wait.
+const LEDGER_ADVANCE_TIMEOUT: Duration = Duration::from_mins(3);
+
+/// What every phase of [`dry_run`] shares: the pool's identity, the chain
+/// and store handles, and the pools config a dry-run bot spawns with.
+/// Grouped into one struct rather than passed field by field, so each
+/// phase function takes one argument instead of the dozen a flat parameter
+/// list would need.
+struct DryRunCtx<'a> {
+    root: &'a Path,
+    env: &'a BTreeMap<String, String>,
+    rpc: &'a RpcClient,
+    store: &'a Store,
+    http: &'a reqwest::Client,
+    pool: &'a str,
+    xlm: &'a str,
+    borrower: &'a str,
+    filler: &'a str,
+    database_url: &'a str,
+    seed_path: &'a Path,
+    /// `supported_bid` includes USDC, the auction's actual bid asset — the
+    /// pools config every phase but B spawns with.
+    standard_pools: &'a str,
+}
+
+/// The filler's sequence number, before any bot in `phase` has been
+/// spawned. Pre-spawn, so a failure here `panic!`s directly rather than
+/// going through [`fail`] — there is no bot yet for it to tail.
+async fn read_sequence(rpc: &RpcClient, filler: &str, phase: &str) -> i64 {
+    match rpc.account(filler).await {
+        Ok(account) => account.sequence,
+        Err(error) => {
+            panic!("{phase}: could not read the filler's sequence number before spawning: {error}")
+        }
+    }
+}
+
+/// Asserts the filler's sequence number still matches `before`, once
+/// `bot` has drained and exited — the proof that whatever `phase` decided,
+/// it never signed or sent a transaction with the real key it held.
+async fn assert_sequence_unchanged(
+    bot: &Bot,
+    rpc: &RpcClient,
+    filler: &str,
+    before: i64,
+    phase: &str,
+) {
+    let after = match rpc.account(filler).await {
+        Ok(account) => account.sequence,
+        Err(error) => fail(
+            bot,
+            &format!("{phase}: could not read the filler's sequence number after SIGTERM: {error}"),
+        ),
+    };
+    println!("{phase}: the filler's sequence number after SIGTERM: {after}");
+    if before != after {
+        fail(
+            bot,
+            &format!(
+                "{phase}: the filler's sequence number moved from {before} to {after} — a \
+                 dry-run bot signed and sent something"
+            ),
+        );
+    }
+}
+
+/// Fails if a dry-run row carries a transaction hash: a dry run only ever
+/// writes an audit row, never submits it, so any hash at all is the
+/// finding this whole scenario exists to catch.
+fn assert_no_tx_hash(bot: &Bot, tx_hash: Option<String>, ledger: i64, table: &str, phase: &str) {
+    if let Some(hash) = tx_hash {
+        fail(
+            bot,
+            &format!(
+                "{phase}: the dry-run {table} row (ledger {ledger}) carries a transaction hash \
+                 ({hash}) — a dry run must never submit"
+            ),
+        );
+    }
+}
+
+/// Phase A of [`dry_run`]: a dry-run bot holding the real filler key must
+/// decide and record a liquidation without ever signing or sending
+/// anything. The filler's own sequence number is the proof a `creations`
+/// row with no `tx_hash` cannot fake on its own — a row is only ever
+/// written, never submitted, but the sequence number is chain state this
+/// test does not control at all.
+async fn dry_run_phase_a(ctx: &DryRunCtx<'_>) {
+    let sequence_before = read_sequence(ctx.rpc, ctx.filler, "phase A").await;
+    println!("phase A: the filler's sequence number before spawning: {sequence_before}");
+
+    let mut bot = spawn_bot(
+        ctx.root,
+        ctx.env,
+        BotConfig {
+            dry_run: true,
+            filler_secret: Some(required(ctx.env, "SANDBOX_FILLER_SECRET_KEY")),
+            pools: ctx.standard_pools.to_string(),
+            database_url: ctx.database_url.to_string(),
+            log_name: "bot-dry-run-a.log",
+            extra_env: vec![("SEED_FILE", ctx.seed_path.display().to_string())],
+        },
+    );
+
+    wait_for_ready(&mut bot, ctx.http).await;
+
+    println!("phase A: crashing XLM's price at {:.1} s", bot.elapsed());
+    crash(&bot, ctx.root);
+
+    let baseline_ledger = match ctx.rpc.latest_ledger().await {
+        Ok(ledger) => ledger.sequence,
+        Err(error) => fail(&bot, &format!("could not read the latest ledger: {error}")),
+    };
+
+    let (tx_hash, decided_at_ledger) = wait_for_dry_run_row(
+        &mut bot,
+        ctx.store,
+        DRY_RUN_CREATION_ROW,
+        "a dry-run creations row for the borrower",
+        CREATION_TIMEOUT,
+        ctx.pool,
+        ctx.borrower,
+    )
+    .await;
+    assert_no_tx_hash(&bot, tx_hash, decided_at_ledger, "creations", "phase A");
+
+    assert_all_dry_run(
+        &bot,
+        ctx.store,
+        CREATIONS_VIOLATING_DRY_RUN,
+        "creations",
+        ctx.pool,
+        ctx.borrower,
+    )
+    .await;
+
+    assert_no_auction(
+        &bot,
+        ctx.rpc,
+        ctx.pool,
+        ctx.borrower,
+        AuctionType::UserLiquidation,
+        "phase A, immediately after the dry-run creation",
+    )
+    .await;
+
+    wait_for_ledgers_past(
+        &mut bot,
+        ctx.rpc,
+        baseline_ledger,
+        10,
+        "the chain to advance 10 ledgers past the crash",
+        LEDGER_ADVANCE_TIMEOUT,
+    )
+    .await;
+
+    assert_no_auction(
+        &bot,
+        ctx.rpc,
+        ctx.pool,
+        ctx.borrower,
+        AuctionType::UserLiquidation,
+        "phase A, 10 ledgers later",
+    )
+    .await;
+
+    let metrics = read_metrics(&bot, ctx.http).await;
+    assert_counter(
+        &bot,
+        &metrics,
+        "blend_liquidator_creations_total{result=\"succeeded\"}",
+        0,
+    );
+
+    terminate(&mut bot).await;
+    assert_sequence_unchanged(&bot, ctx.rpc, ctx.filler, sequence_before, "phase A").await;
+
+    println!("phase A done in {:.1} s", bot.elapsed());
+}
+
+/// Phase B of [`dry_run`]: an armed creator whose filler cannot fill the
+/// auction it creates — `supported_bid` excludes USDC, the auction's own
+/// bid asset — proving the bot creates a real, on-chain auction when
+/// armed, for phase C's dry-run filler to sit in front of without ever
+/// touching it. Answers the auction entry it created.
+async fn armed_creation_phase_b(ctx: &DryRunCtx<'_>) -> AuctionData {
+    let unfillable_pools = pools_toml(ctx.pool, ctx.xlm, &[ctx.xlm]);
+    let mut bot = spawn_bot(
+        ctx.root,
+        ctx.env,
+        BotConfig {
+            dry_run: false,
+            filler_secret: Some(required(ctx.env, "SANDBOX_FILLER_SECRET_KEY")),
+            pools: unfillable_pools,
+            database_url: ctx.database_url.to_string(),
+            log_name: "bot-creator-b.log",
+            extra_env: vec![("SEED_FILE", ctx.seed_path.display().to_string())],
+        },
+    );
+
+    wait_for_ready(&mut bot, ctx.http).await;
+
+    let creation_tx = wait_for_tx_hash(
+        &mut bot,
+        ctx.store,
+        CREATION_TX_HASH,
+        "the armed auctioneer to create the borrower's liquidation auction",
+        CREATION_TIMEOUT,
+        ctx.pool,
+        ctx.borrower,
+    )
+    .await;
+
+    let (ledger, entry) = wait_for_auction(
+        &mut bot,
+        ctx.rpc,
+        ctx.pool,
+        ctx.borrower,
+        AuctionType::UserLiquidation,
+        "the auction entry to exist on chain",
+        AUCTION_ENTRY_TIMEOUT,
+    )
+    .await;
+    println!(
+        "phase B: auction created (tx {creation_tx}) at ledger {ledger}, start block {}, bid \
+         {:?}, lot {:?}",
+        entry.block, entry.bid, entry.lot
+    );
+
+    terminate(&mut bot).await;
+    println!("phase B done in {:.1} s", bot.elapsed());
+    entry
+}
+
+/// Phase C of [`dry_run`]: a second dry-run bot, on the same database,
+/// must plan a fill for the auction phase B created and never submit it —
+/// the auction entry outlives 20 more ledgers unchanged, and the filler's
+/// sequence number again does not move.
+async fn dry_run_phase_c(ctx: &DryRunCtx<'_>, expected_entry: &AuctionData) {
+    let sequence_before = read_sequence(ctx.rpc, ctx.filler, "phase C").await;
+    println!("phase C: the filler's sequence number before spawning: {sequence_before}");
+
+    // Read fresh rather than trust phase B's own read: this is this
+    // phase's own baseline, and the 20-ledger check below must compare
+    // against what phase C itself observed, not an assumption that
+    // nothing moved between the two phases.
+    let entry_at_start = match PoolReader::new(ctx.rpc, ctx.pool)
+        .auction(ctx.borrower, AuctionType::UserLiquidation)
+        .await
+    {
+        Ok(Some((_, entry))) => entry,
+        Ok(None) => panic!(
+            "phase C: no auction entry exists for the borrower at the start of phase C — \
+             phase B's auction is gone"
+        ),
+        Err(error) => panic!("phase C: could not read the auction entry: {error}"),
+    };
+    assert!(
+        entry_at_start.bid == expected_entry.bid && entry_at_start.lot == expected_entry.lot,
+        "phase C: the auction entry changed between phase B and phase C — expected bid {:?} \
+         lot {:?}, found bid {:?} lot {:?}",
+        expected_entry.bid,
+        expected_entry.lot,
+        entry_at_start.bid,
+        entry_at_start.lot
+    );
+
+    let mut bot = spawn_bot(
+        ctx.root,
+        ctx.env,
+        BotConfig {
+            dry_run: true,
+            filler_secret: Some(required(ctx.env, "SANDBOX_FILLER_SECRET_KEY")),
+            pools: ctx.standard_pools.to_string(),
+            database_url: ctx.database_url.to_string(),
+            log_name: "bot-dry-run-c.log",
+            extra_env: vec![("SEED_FILE", ctx.seed_path.display().to_string())],
+        },
+    );
+
+    wait_for_ready(&mut bot, ctx.http).await;
+
+    let budget = fill_budget(&mut bot, ctx.rpc).await;
+    let (tx_hash, fill_ledger) = wait_for_dry_run_row(
+        &mut bot,
+        ctx.store,
+        DRY_RUN_FILL_ROW,
+        "a dry-run fills row for the borrower",
+        budget,
+        ctx.pool,
+        ctx.borrower,
+    )
+    .await;
+    assert_no_tx_hash(&bot, tx_hash, fill_ledger, "fills", "phase C");
+
+    assert_all_dry_run(
+        &bot,
+        ctx.store,
+        FILLS_VIOLATING_DRY_RUN,
+        "fills",
+        ctx.pool,
+        ctx.borrower,
+    )
+    .await;
+
+    let observed_at = match ctx.rpc.latest_ledger().await {
+        Ok(ledger) => ledger.sequence,
+        Err(error) => fail(&bot, &format!("could not read the latest ledger: {error}")),
+    };
+
+    wait_for_ledgers_past(
+        &mut bot,
+        ctx.rpc,
+        observed_at,
+        20,
+        "the chain to advance 20 ledgers past the dry-run fill row",
+        LEDGER_ADVANCE_TIMEOUT,
+    )
+    .await;
+
+    assert_auction_unchanged(
+        &bot,
+        ctx.rpc,
+        ctx.pool,
+        ctx.borrower,
+        AuctionType::UserLiquidation,
+        &entry_at_start,
+        "phase C, 20 ledgers after the dry-run fill",
+    )
+    .await;
+
+    let metrics = read_metrics(&bot, ctx.http).await;
+    assert_counter(
+        &bot,
+        &metrics,
+        "blend_liquidator_fills_total{result=\"succeeded\"}",
+        0,
+    );
+
+    terminate(&mut bot).await;
+    assert_sequence_unchanged(&bot, ctx.rpc, ctx.filler, sequence_before, "phase C").await;
+
+    println!("phase C done in {:.1} s", bot.elapsed());
+}
+
+/// The `dry_run` scenario: three bots in a row on one network and one
+/// database — a dry-run bot holding the real filler key (phase A), an
+/// armed creator whose filler cannot fill what it creates (phase B), and a
+/// second dry-run bot facing that live auction (phase C) — proving that
+/// `DRY_RUN=true` never signs or sends anything, whether the decision is
+/// to create an auction or to fill one, however real the key it holds.
+///
+/// Three phases, each its own bot, log and set of assertions: one function
+/// per phase, with the sequence-number and no-tx-hash checks they share
+/// factored out above, keeps this and each of them under clippy's line
+/// count without an `#[allow]`.
+#[tokio::test]
+#[ignore = "needs the local sandbox network: scripts/sandbox/up.sh && scripts/sandbox/deploy.sh"]
+async fn dry_run() {
+    let root = repo_root();
+    let env = sandbox_env(&root.join("target/sandbox/sandbox.env"), "dry_run");
+
+    let passphrase = required(&env, "SANDBOX_PASSPHRASE").to_string();
+    let pool = required(&env, "SANDBOX_POOL").to_string();
+    let xlm = required(&env, "SANDBOX_XLM").to_string();
+    let usdc = required(&env, "SANDBOX_USDC").to_string();
+    let borrower = required(&env, "SANDBOX_BORROWER").to_string();
+    let filler = required(&env, "SANDBOX_FILLER").to_string();
+    let rpc_url = required(&env, "SANDBOX_RPC_URL").to_string();
+
+    // Ordered with the two refusals `sandbox_env` just made, and for the
+    // same reason every other scenario keeps it first: nothing below this
+    // line may run against an endpoint whose own answer has not been
+    // checked — and this scenario, of all of them, is the one where that
+    // matters most, since every phase hands the real filler key to a
+    // spawned bot.
+    require_standalone_rpc(&rpc_url).await;
+
+    let Ok(maintenance_url) = std::env::var("DATABASE_URL") else {
+        panic!("DATABASE_URL is not set — the store tests need it too; see `make db-up`")
+    };
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or_default();
+    let database = format!("sandbox_{stamp}");
+    println!("creating the run's database {database}");
+    let database_url = create_run_database(&root, &maintenance_url, &database).await;
+    // Noted once the database exists, so every failure from here on says it
+    // was kept; the success path at the bottom drops it and it is never
+    // read again.
+    note_run_database(&database);
+
+    let sandbox_dir = root.join("target/sandbox");
+    let seed_path = sandbox_dir.join("seed-dry-run.toml");
+    let seed = format!("[accounts]\n\"{pool}\" = [\"{borrower}\"]\n");
+    if let Err(error) = std::fs::write(&seed_path, seed) {
+        panic!("could not write {}: {error}", seed_path.display());
+    }
+
+    let http = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => panic!("could not build an HTTP client: {error}"),
+    };
+    let store = match Store::connect(&database_url, 4).await {
+        Ok(store) => store,
+        Err(error) => panic!("could not connect to {database}: {error}"),
+    };
+    let chain = ChainConfig {
+        network_passphrase: passphrase,
+        rpc_url,
+        rpc_api_key: None,
+        base_fee: 5_000,
+        high_fee: 10_000,
+        tx_poll_ledgers: 30,
+    };
+    let rpc = match RpcClient::from_config(&chain) {
+        Ok(rpc) => rpc,
+        Err(error) => panic!("could not build an RPC client: {error}"),
+    };
+
+    let standard_pools = pools_toml(&pool, &xlm, &[usdc.as_str()]);
+
+    let ctx = DryRunCtx {
+        root: root.as_path(),
+        env: &env,
+        rpc: &rpc,
+        store: &store,
+        http: &http,
+        pool: &pool,
+        xlm: &xlm,
+        borrower: &borrower,
+        filler: &filler,
+        database_url: &database_url,
+        seed_path: seed_path.as_path(),
+        standard_pools: &standard_pools,
+    };
+
+    println!("--- phase A: a dry-run bot holding the real filler key ---");
+    dry_run_phase_a(&ctx).await;
+
+    println!("--- phase B: an armed creator that cannot fill ---");
+    let entry = armed_creation_phase_b(&ctx).await;
+
+    println!("--- phase C: a dry-run bot facing that live auction ---");
+    dry_run_phase_c(&ctx, &entry).await;
+
+    println!("dry_run passed: no creation and no fill ever landed for {borrower}");
+
+    // Last, and only here: every phase either passed or panicked, so
+    // reaching this line is what "the run succeeded" means, and a database
+    // nobody will read is a database worth not keeping.
+    store.pool().close().await;
     drop_run_database(&root, &maintenance_url, &database).await;
 }
