@@ -4,12 +4,15 @@ name: Sandbox
 # v2 deployed on it, and the real binary run against it **armed** — the one
 # place anything in this repository submits a transaction it signed.
 #
-# Nightly and on demand, never on `push` or `pull_request`. The run stands up
-# a network, deploys eight contracts and then waits out an auction's ledger
-# ramp, which is minutes of wall clock nobody would pay per PR; and what it
-# catches is the world moving — a quickstart image, a pinned wasm, a contract
-# that changed its mind — rather than a diff being wrong, which is what the
-# PR gate is for.
+# Nightly and on demand, never on `push` or `pull_request`. The tier has five
+# scenarios (liquidation, check_config, dry_run, unwind_repay, restart_adopt;
+# see tests/liquidation_sandbox.rs's module doc for what each proves), and
+# the job below runs every one of them as its own matrix entry, each on its
+# own runner: its own network stood up, its own eight contracts deployed, and
+# — for the scenarios that wait on an auction's ledger ramp — its own minutes
+# of wall clock nobody would pay per PR. What it catches is the world moving
+# — a quickstart image, a pinned wasm, a contract that changed its mind —
+# rather than a diff being wrong, which is what the PR gate is for.
 #
 # Deliberately NOT in ci.yml's `ci-summary` needs list. That gate treats a
 # skipped job as a failure, which is right for a workflow where nothing is
@@ -21,10 +24,14 @@ on:
     - cron: "17 4 * * *"
   workflow_dispatch:
 
-# One sandbox at a time. The job binds host port 8000 and names its container
-# `blend-sandbox`, and up.sh refuses to start when a container by that name
-# already exists. Queued rather than cancelled: a cancelled run never reaches
-# its teardown.
+# This group serialises whole *workflow runs*, not the matrix jobs within
+# one: GitHub schedules every job in the matrix below on its own runner, so
+# five scenarios run at once without contending for anything. What the group
+# prevents is two runs of this workflow overlapping — each job still binds
+# host port 8000 and the container name `blend-sandbox` on its own runner,
+# and up.sh refuses to start when a container by that name already exists,
+# which a second concurrent run of the whole workflow would hit. Queued
+# rather than cancelled: a cancelled run never reaches its teardown.
 concurrency:
   group: sandbox
   cancel-in-progress: false
@@ -43,8 +50,17 @@ env:
 
 jobs:
   sandbox:
+    name: sandbox (${{ matrix.scenario }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      # One matrix job per scenario, none cancelling the others: a scenario
+      # failing (dry_run finding a bot that signed when it should not, say)
+      # is exactly the case where the other four's results are still worth
+      # having, not a reason to lose them.
+      fail-fast: false
+      matrix:
+        scenario: [liquidation, check_config, dry_run, unwind_repay, restart_adopt]
     services:
       postgres:
         image: postgres:17-alpine
@@ -136,6 +152,8 @@ jobs:
         run: ./scripts/sandbox/fetch-artifacts.sh
 
       - name: Deploy Blend v2, leaving one borrower a price move from liquidation
+        env:
+          SANDBOX_SCENARIO: ${{ matrix.scenario }}
         run: ./scripts/sandbox/deploy.sh
 
       # Immediately after the deploy that writes it, and before any step that
@@ -164,8 +182,8 @@ jobs:
       - name: Build the bot
         run: cargo build --bin liquidator
 
-      - name: Run the end-to-end liquidation
-        run: make sandbox-test
+      - name: Run this matrix job's scenario
+        run: make sandbox-test SANDBOX_SCENARIO=${{ matrix.scenario }}
 
       # Logs only, and *by extension*: target/sandbox/ also holds sandbox.env
       # — the signing key — and the fetched wasm. `*.log` is bot.log and
@@ -177,7 +195,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: sandbox-logs
+          name: sandbox-logs-${{ matrix.scenario }}
           path: target/sandbox/*.log
           if-no-files-found: warn
           retention-days: 14
