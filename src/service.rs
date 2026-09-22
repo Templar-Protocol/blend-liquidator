@@ -52,7 +52,11 @@
 //! that has stopped answering costs a bounded number of tasks and drops
 //! what does not fit.
 //!
-//! # Every exit of `run` drains
+//! # Every exit of `run` once its tasks run drains
+//!
+//! `run`'s earlier `?`s — validation and the seed pass — return before
+//! `finish_run`, with nothing to drain: nothing before the task set
+//! notifies.
 //!
 //! What a shutdown owes the sends still in flight is
 //! [`crate::notifier::Notifier::drain`], and `finish_run` is where both
@@ -61,10 +65,12 @@
 //! way too — every in-flight delivery gets
 //! [`crate::notifier::DRAIN_BUDGET`] to finish, a timeout is a warning
 //! and nothing more, and the result `drain_tasks` answered is returned
-//! unchanged. The one exit that does not drain is deliberate: the *second*
+//! unchanged. Two exits do not drain. One is deliberate: the *second*
 //! `SIGINT`/`SIGTERM` is answered by `spawn_shutdown_listener` with
 //! `exit(130)`, because a second signal means now and a drain is exactly
-//! the delay it is refusing.
+//! the delay it is refusing. The other is a task panic in a release build,
+//! which sets `panic = "abort"`: the process ends where the panic happened
+//! (see `finish_run`).
 //!
 //! # The deciding tasks are joined to the tracker by a tick
 //!
@@ -2095,6 +2101,10 @@ async fn wait_for_signal() {
 /// into [`LiquidatorError`]'s taxonomy: a panic is an internal bug, not one
 /// of the phases that enum distinguishes, and swallowing it into, say,
 /// `Config` would misreport a bug as a bad configuration.
+///
+/// Reached only where panics unwind — debug and test builds. The release
+/// profile sets `panic = "abort"`, so there a task's panic ends the process
+/// before its `JoinHandle` can answer.
 fn resume_on_panic(error: tokio::task::JoinError) -> ! {
     match error.try_into_panic() {
         Ok(payload) => std::panic::resume_unwind(payload),
@@ -2541,7 +2551,8 @@ fn spawn_filler(
 /// has returned on its own. The error path and the graceful-shutdown path
 /// are then the same path, which is what the queue's doc already assumes.
 /// Only the *first* error is reported: the ones after it are usually this
-/// shutdown's own consequences, and a panic still propagates as a panic.
+/// shutdown's own consequences, and a panic still propagates as a panic —
+/// in a build that unwinds; a release build aborts where the panic happened.
 async fn drain_tasks(
     mut tasks: JoinSet<Result<(), LiquidatorError>>,
     shutdown: &watch::Sender<bool>,
@@ -2594,10 +2605,12 @@ async fn drain_tasks(
 ///
 /// Two exits skip this and leave whatever was in flight behind: the
 /// second `SIGINT`/`SIGTERM`, deliberately, per the paragraph above; and a
-/// task panic, which is not deliberate but has the same shape —
-/// `resume_on_panic` calls [`std::panic::resume_unwind`] from inside
-/// [`drain_tasks`], so the panic unwinds straight out of `Service::run`
-/// and never reaches this function at all.
+/// task panic, which is not deliberate but has the same shape. A release
+/// build — the image's — sets `panic = "abort"`, so there a panic ends the
+/// process where it happens, with no unwind and no graceful shutdown at
+/// all. A debug or test build unwinds instead: `resume_on_panic` calls
+/// [`std::panic::resume_unwind`] from inside [`drain_tasks`], so the panic
+/// unwinds straight out of `Service::run` and never reaches this function.
 async fn finish_run(
     result: Result<(), LiquidatorError>,
     notifier: &Notifier,
@@ -2669,8 +2682,12 @@ impl Service {
     /// tick the tracker publishes after it acknowledges, one watchdog,
     /// one HTTP server when a port is set, and — only when armed — one
     /// submission-queue worker per distinct signing key — until a
-    /// shutdown signal arrives and every task has returned. However it
-    /// ends, it leaves through `finish_run`, which drains the notifier.
+    /// shutdown signal arrives and every task has returned. Once its
+    /// tasks are running, every return goes through `finish_run`, which
+    /// drains the notifier; an earlier `?` returns with nothing in flight,
+    /// since nothing before the tasks notifies. The second shutdown
+    /// signal's `exit(130)` and a release build's panic abort end the
+    /// process without returning.
     ///
     /// `keys` holds both of `AUCTIONEER_SECRET_KEY` and
     /// `FILLER_SECRET_KEY`, either or both of which may be absent — neither

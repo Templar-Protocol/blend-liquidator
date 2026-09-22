@@ -19,7 +19,7 @@ publication, release, deployment, activation, or handling funds", and it
 publishes no release, which is why the sandbox tier below still pins stock
 wasm.
 
-**Status: Phase 8 complete.** Phase 1 landed the pure fixed-point math
+**Status: Phase 9 complete.** Phase 1 landed the pure fixed-point math
 (`math`) and the ScVal/ledger-entry codecs (`chain::xdr`); Phase 2 landed
 the chain layer (`chain::rpc`, `chain::pool`, `chain::signer`, `chain::tx`);
 Phase 3 landed the Postgres store, a per-pool ledger poller and a tracker
@@ -56,7 +56,7 @@ synchronously and spawns the send behind a bounded semaphore
 (`NOTIFY_IN_FLIGHT`), answering `Delivery::Queued`/`Deduplicated`/`Dropped`
 rather than waiting on the channel — and `Notifier::drain` gives whatever
 is still in flight a bounded `DRAIN_BUDGET` on every exit but the second
-shutdown signal. The poller records a heartbeat every iteration and the
+shutdown signal and a release build's panic abort. The poller records a heartbeat every iteration and the
 chain head every pass, and reports `NotificationKind::RpcFailing` after
 `RPC_FAILING_AFTER` consecutive failures; a watchdog task the run spawns
 beside the pollers reports a pool whose heartbeat has gone past
@@ -64,8 +64,8 @@ beside the pollers reports a pool whose heartbeat has gone past
 seven kinds of task — one `LedgerPoller` per pool, one tracker, one
 auctioneer, one filler, one watchdog, one HTTP server when a port is
 configured, and one submission-queue worker per distinct signing key when
-armed — and every exit but the second shutdown signal drains the notifier
-before it returns. Phase 7 landed the sandbox integration tier
+armed — and every exit but the second shutdown signal and a release
+build's panic abort drains the notifier before it returns. Phase 7 landed the sandbox integration tier
 (`scripts/sandbox/`, `tests/liquidation_sandbox.rs`,
 `.github/workflows/sandbox.yml`) and the dev-container additions it needs
 (`scripts/cargo-jobs.sh`, the `stellar` CLI): a throwaway Stellar network
@@ -95,8 +95,14 @@ by exact search rather than skipping only once the chain refuses it
 (`FillSkip`/`SkipLabel::SupplyCapped`); and never treats the pool's own
 contract address — a `Positions` holder on the fork, since confiscated
 collateral lands there as ordinary supply — as a borrower to liquidate.
-What remains is Phase 9: the docs set, the deployment contract, the first
-release tag, and the testnet soak the design spec's §9 ends with.
+Phase 9 landed the documentation set — `docs/configuration.md`,
+`docs/deploy.md`, `docs/deployment-contract.md` and `docs/architecture.md`
+— the deployment contract, and a `check-release.sh`-green `0.1.0`
+changelog section. The `v0.1.0` tag itself is the maintainer's to push:
+pushing it is what publishes the GHCR image and cuts the GitHub Release,
+not anything landed on this branch. What remains is the testnet soak the
+design spec's §9 ends with, which needs a decision on which contracts to
+soak against first, since the fork is not deployed anywhere yet.
 Everything Phases 1 through 7 built still stands: the fork's differences
 are additions to this crate's arithmetic port, not corrections to it. The
 repository scaffolding is complete and enforced.
@@ -167,7 +173,16 @@ make help                           # Docker Compose lifecycle
   more per-pool knob than the fields above: `fill_objective`
   (`free-fill`, the default, or `earliest-profitable`, anything else a
   named error) into `PoolConfig::fill_objective`, `math::fill`'s
-  `FillObjective`.
+  `FillObjective`. A test in this file,
+  `the_configuration_documents_cover_exactly_the_real_settings`, fails
+  unless the set of settings the code reads — every `clap` argument's
+  `env` name plus a hard-coded list of the ones read directly — equals
+  both the set of `NAME=` lines in `.env.example` (commented out or not)
+  and the set of first-column names in `docs/configuration.md`'s settings
+  tables (`` | `NAME` | ``, uppercase only, so the pools-file key table
+  never counts), printing each set difference on failure; and unless
+  `pools.example.toml` parses. A new variable read directly through
+  `std::env::var` must be added to that test's hard-coded list by hand.
 - `src/main.rs` — binary entry point: tracing setup, argument parsing, exit.
 - `src/math/` — the pure port of the pool contract's arithmetic: `fixed`
   (checked rounding), `reserve` (accrual and token conversions), `position`
@@ -570,14 +585,19 @@ make help                           # Docker Compose lifecycle
   (`build_notifier`: the Telegram channel when both credentials are
   configured, `LogChannel` otherwise) are built once, before the seed pass,
   and carried together as one `Instruments` to every loop that needs both.
-  However `run` ends, it leaves through `finish_run`, which drains the
-  notifier (`Notifier::drain(DRAIN_BUDGET)`) on both the `Ok` and the `Err`
-  path — the two exits that skip it are the second `SIGINT`/`SIGTERM`
+  Once its tasks are running, however `run` ends it leaves through
+  `finish_run`, which drains the notifier (`Notifier::drain(DRAIN_BUDGET)`)
+  on both the `Ok` and the `Err` path; an earlier `?` (validation, the
+  seed pass) has nothing in flight, since nothing before the tasks
+  notifies. The two exits that skip it are the second `SIGINT`/`SIGTERM`
   (`spawn_shutdown_listener`'s `exit(130)`, deliberately: a second signal
-  means now) and a task panic (`resume_on_panic` unwinds straight out of
-  `drain_tasks`, past `finish_run` entirely). The tracker loop treats a
-  `TrackerError::Store` as fatal and a `Chain` or `Math` one as transient —
-  it declines the tick, and the same range is read again. Both entry
+  means now) and a task panic. A release build — the image's — sets
+  `panic = "abort"` (`Cargo.toml`'s `[profile.release]`), so there a
+  panic aborts the process where it happens, with no unwind at all; in a
+  debug or test build it unwinds, `resume_on_panic` carrying it straight
+  out of `drain_tasks`, past `finish_run` entirely. The tracker loop treats
+  a `TrackerError::Store` as fatal and a `Chain` or `Math` one as transient
+  — it declines the tick, and the same range is read again. Both entry
   points share `validate` and `validate_filler`: the filler's account must
   exist on the network and hold at least `XLM_FEE_RESERVE` of the native
   asset — armed, either failure is a startup *error*; in dry-run each is a
@@ -1064,7 +1084,7 @@ Status above for what remains.
   by design (spec §1's capital model is "unwind to the wallet and hold").
   Set `min_primary_collateral` to exactly what you mean the bot to keep
   supplied in the pool: anything above it goes to the wallet on the first
-  tick.
+  pass allowed to submit — armed, and past `STARTUP_DELAY_LEDGERS`.
 - An unwind's repay is capped at what the wallet can spend, never the raw
   balance: `Inventory::available`'s figure, net of `XLM_FEE_RESERVE` and
   every open `Reservation` — the same rule a fill's repay uses. The
@@ -1093,11 +1113,12 @@ Status above for what remains.
   goes through `reqwest::Error::without_url()` first. A new log line that
   prints a raw `reqwest::Error` from `notifier::telegram` or
   `service::telegram_channel`/`verify_telegram` leaks the token into the
-  log. The one leak this crate cannot close is `RUST_LOG=trace`: hyper's
-  byte-level logging prints the request line — `/bot<TOKEN>/sendMessage`
-  — and `tracing_subscriber`'s `log` bridge captures it. The default
-  filter and `debug` are both clear; **a Telegram-configured bot is never
-  run at TRACE.**
+  log. The one leak this crate cannot rule out is `RUST_LOG=trace`:
+  logging there, dependencies' included, is not audited for secrets, and
+  a dependency's request-level logging could print the request line —
+  `/bot<TOKEN>/sendMessage` — which `tracing_subscriber`'s `log` bridge
+  would capture. The default filter and `debug` are both clear; **a
+  Telegram-configured bot is never run at TRACE.**
 - `PORT` wins over `HTTP_PORT` when both are set, because `PORT` is the
   one a deployment platform controls (Cloud Run injects it); either alone
   turns the HTTP server on, neither leaves it off. A bind failure never
@@ -1116,15 +1137,17 @@ Status above for what remains.
   readiness blip would kill and respawn the process on exactly the
   outages its backoff exists to ride out, while a wedged poller — which
   `/livez` alone catches — is precisely what a restart can fix. The
-  Docker `HEALTHCHECK` stays `pgrep` for the same reason; see the
-  Dockerfile's own comment. A pool that has never heartbeated at all is
-  measured from the run's start rather than reported dead, so the initial
-  seed is not a restart loop; `/healthz` carries the mirror-image rule,
-  failing once no chain head has been read for that same window, because
-  an RPC outage freezes the lag it would otherwise be judged by — and its
-  lag bound is symmetric for the same kind of reason, a head more than
-  `max_lag_ledgers` *behind* the processed ledger being a lagging node
-  rather than a bot at chain head.
+  Docker `HEALTHCHECK` stays `pgrep` first because the HTTP server is off
+  unless `PORT`/`HTTP_PORT` is set, so a check against `/livez` would mark
+  every default container unhealthy — and is never wired to a readiness
+  endpoint either, for the reason above; see the Dockerfile's own comment. A
+  pool that has never heartbeated at all is measured from the run's start
+  rather than reported dead, so the initial seed is not a restart loop;
+  `/healthz` carries the mirror-image rule, failing once no chain head has
+  been read for that same window, because an RPC outage freezes the lag it
+  would otherwise be judged by — and its lag bound is symmetric for the same
+  kind of reason, a head more than `max_lag_ledgers` *behind* the processed
+  ledger being a lagging node rather than a bot at chain head.
 - A `Notifier` must be used from inside a tokio runtime: `notify` spawns
   the delivery task, and calling it outside one panics.
 - `notifications_total{kind,delivery}` is the one metric whose label set
@@ -1381,6 +1404,11 @@ reasoning and the work each one implies, is
   sandbox tier (`sandbox/`).
 - `tests/` — the fixtures the math is pinned against, and
   `liquidation_sandbox.rs`, the tier's one `#[ignore]`d end-to-end test.
+- `docs/` — `configuration.md` (every setting, its default and bound),
+  `deploy.md` (the operator's guide from pulling the image to running it
+  armed), `deployment-contract.md` (what the image guarantees and what a
+  deployment must provide) and `architecture.md` (the one-sitting
+  overview). Committed.
 - `docs/specs/` — the design specs, the durable half of the documentation
   and the authority every plan argues from. Committed.
 - `docs/plans/` — per-phase implementation plans. Working documents that go

@@ -6,9 +6,10 @@
 # ============================================
 # Build Stage
 # ============================================
-# Pinned by digest (not just tag) so the same source revision always produces
-# the same image, even after upstream retags rust:1.97.0-bookworm or the Debian
-# repository underneath it changes. Tag kept alongside the digest for
+# Pinned by digest (not just tag) so the same source revision always builds on
+# the same base image, even after upstream retags rust:1.97.0-bookworm. (The
+# runtime stage's apt packages are not pinned, so the image as a whole is not
+# byte-reproducible.) Tag kept alongside the digest for
 # readability; the digest is what's actually resolved. Matches
 # rust-toolchain.toml's `channel` and Cargo.toml's `rust-version` — all three
 # move together, and scripts/check-repo-invariants.sh fails the build if they
@@ -76,10 +77,16 @@ USER liquidator
 ENV RUST_LOG=info,blend_liquidator=debug
 ENV RUST_BACKTRACE=1
 
-# Liveness check: is the `liquidator` process still running. When a readiness
-# endpoint exists, do NOT wire this to it — restarting a process stuck because
-# an upstream is down does not fix the upstream being down, it just hides the
-# outage behind a restart loop.
+# Liveness check: is the `liquidator` process still running. Deliberately NOT
+# wired to /livez, even though that endpoint exists precisely for this: the
+# HTTP server only starts when PORT or HTTP_PORT is set (see src/config.rs),
+# so a check against it would mark every container unhealthy in the default
+# configuration. A platform with its own probe mechanism — Cloud Run, a
+# Kubernetes livenessProbe — should probe /livez itself rather than rely on
+# this HEALTHCHECK. And on general principle: do NOT wire this to a readiness
+# endpoint either — restarting a process stuck because an upstream is down
+# does not fix the upstream being down, it just hides the outage behind a
+# restart loop.
 HEALTHCHECK --interval=60s --timeout=10s --start-period=10s --retries=3 \
     CMD ["pgrep", "-x", "liquidator"]
 

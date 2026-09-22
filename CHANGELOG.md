@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-22
+
+The first release: a Blend v2 liquidation bot targeting the ADR-0008
+security fork of the Blend contracts (`Templar-Protocol/blend-contracts-v2`)
+and also running against stock pools, dry-run by default. This being the
+first release, the `Changed` entries below record how behaviour settled
+during development rather than a difference from an earlier release.
+
 ### Added
 
 - The ADR-0008 fork reconciliation (`docs/specs/2026-09-20-adr-0008-fork-semantics.md`
@@ -163,11 +171,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seed pass and every other task after it — sharing one `Metrics` and one
   `Notifier` built before the seed pass (`build_notifier`: the Telegram
   channel when both credentials are configured, `LogChannel` otherwise);
-  every exit but the second shutdown signal and a task panic drains the
-  notifier (`finish_run`) before returning — a panic unwinds out of
-  `drain_tasks` past `finish_run`, so notifications still in flight are
-  lost with it. `Service::check_config` verifies a
-  configured Telegram token with one `getMe` call, a refusal a
+  once the tasks are running, every exit but the second shutdown signal
+  and a task panic drains the notifier (`finish_run`) before returning;
+  nothing before them notifies, so an earlier startup failure has nothing
+  in flight. A release build, the image's,
+  sets `panic = "abort"`, so a panic there aborts the process on the spot;
+  a debug build unwinds out of `drain_tasks` past `finish_run`. Either way
+  notifications still in flight are lost with it. `Service::check_config`
+  verifies a configured Telegram token with one `getMe` call, a refusal a
   configuration error, since spec §10 makes it the deploy smoke test.
 - The filler and its executor now report themselves: `fills_total{result}`,
   `skips_total{reason}`, `estimated_profit_total`/`estimated_loss_total`,
@@ -454,11 +465,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   borrower is liquidatable — below the contract's own strict `1.0` test,
   so the margin absorbs rounding and the interest accrued between planning
   and execution), `TARGET_HF` (the health factor a liquidation aims to
-  leave the borrower at — refused at parse outside the contract's own
-  `InvalidLiqTooSmall`/`InvalidLiqTooLarge` band of `[1.03, 1.15)`, since
-  `TARGET_HF=0` would make every liquidatable borrower a silent
-  "no plan" for ever; `LIQ_HF_THRESHOLD` at or above `SCAN_HF_THRESHOLD`
-  is refused for the mirror reason),
+  leave the borrower at — refused at parse outside `[1.03, 1.15)`, since
+  `TARGET_HF=0` would make every liquidatable borrower a silent "no plan"
+  for ever; the floor is the contract's own `InvalidLiqTooSmall` bound,
+  and the ceiling is this bot's own margin, one notch inside the
+  contract's `InvalidLiqTooLarge` check, which accepts exactly `1.15`;
+  `LIQ_HF_THRESHOLD` at or above `SCAN_HF_THRESHOLD` is refused for the
+  mirror reason),
   `ORACLE_SCAN_LEDGERS`, `PRICE_DELTA_BPS` and `PLAN_ITERATIONS` (both
   refused at zero rather than clamped — a zero price delta flags every
   borrower on every scan forever, and zero plan iterations would simulate
@@ -650,6 +663,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Dependabot ignores it, since a bump of it alone only adds a second copy;
   the check fails unless `Cargo.lock` holds exactly one — two is the signal
   to bump it in the same PR as a `stellar-xdr` that moves its own.
+- The documentation set: `docs/configuration.md` (every setting, its
+  default and bound), `docs/deploy.md` (the operator's guide from
+  pulling the image to running it armed), `docs/deployment-contract.md`
+  (what the image guarantees and what a deployment must provide) and
+  `docs/architecture.md` (the one-sitting overview), plus
+  `the_configuration_documents_cover_exactly_the_real_settings`
+  (`src/config.rs`), a test that fails unless the settings the code reads
+  — every `clap` argument's `env` name and the six read directly — are
+  exactly the set of `NAME=` lines in `.env.example` and exactly the set
+  of first-column names in the reference's settings tables, no more and
+  no fewer, printing the differences when they are not, and unless
+  `pools.example.toml` parses.
 
 ### Changed
 
@@ -702,3 +727,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   optimistically inserted and writes the notification through `LogChannel`
   instead, so the operator still sees it even though nothing upstream —
   which never waited to be told — learns whether it arrived.
+
+### Fixed
+
+- SIGPIPE-safe `grep` pipelines in `scripts/check-repo-invariants.sh` and
+  `scripts/check-release.sh`: a `grep -q` consumer under `pipefail` could
+  read its upstream's `SIGPIPE` exit as a failed match even though the
+  pattern was found.
+- The Dockerfile's `HEALTHCHECK` comment, corrected: it predated `/livez`
+  and never explained why the check isn't wired to it.
+
+[Unreleased]: https://github.com/Templar-Protocol/blend-liquidator/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Templar-Protocol/blend-liquidator/releases/tag/v0.1.0
