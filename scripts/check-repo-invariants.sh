@@ -29,6 +29,11 @@
 # sqlx-cli regenerates a file CI then rejects, and the diff blames the query
 # rather than the tool.
 #
+# ONE LIST OF SANDBOX SCENARIOS. deploy.sh, the Makefile, the Rust harness,
+# the nightly matrix and the test fns each name the tier's scenarios, and a
+# scenario missing from any one of them is a scenario that silently never
+# deploys, never runs nightly, or runs under plain `cargo test`.
+#
 # Run it locally the same way CI does: ./scripts/check-repo-invariants.sh
 set -euo pipefail
 
@@ -149,6 +154,76 @@ elif [ -n "${sqlx_version}" ] && [ "${ci_sqlx}" != "${sqlx_version}" ]; then
 	bad "sqlx-cli versions disagree: ${ci_workflow} installs ${ci_sqlx}, scripts/sandbox/versions.env pins SQLX_CLI_VERSION=${sqlx_version} (which .devcontainer/post-create.sh installs) — bump both together"
 else
 	note "${ci_workflow} installs sqlx-cli ${ci_sqlx}, matching versions.env"
+fi
+
+echo
+echo "One list of sandbox scenarios"
+# The sandbox tier's scenarios are named in five places that no build step
+# derives from one another — a shell script, a Makefile, a Rust const, a
+# workflow matrix and the test fns themselves — and a disagreement is
+# silent in the worst direction: `make sandbox-test` refuses a name that
+# matches no test fn, but a scenario missing from the matrix is never run
+# nightly at all, one missing from deploy.sh can never be deployed for, and
+# a test fn that has lost its #[ignore] runs under plain `cargo test`. So
+# the five must name the same set, duplicates included, and each is parsed
+# from the one shape it is written in, a shape this cannot read being a
+# failure rather than an empty list that happens to agree with another.
+#
+# `|| true` on each parse, because under `set -euo pipefail` a grep that
+# matches nothing fails the assignment, which would abort here instead of
+# reaching the message that names the file. No consumer below exits before
+# its input ends (no `grep -q`, no `head`), so no producer can be cut off by
+# SIGPIPE.
+scenario_set() { tr -s '[:space:],|' '\n' | sed '/^$/d' | sort | paste -sd' ' -; }
+
+scenarios_deploy=$(grep -E '^sandbox_scenarios=\(' scripts/sandbox/deploy.sh | sed -E 's/^sandbox_scenarios=\(([^)]*)\).*/\1/' | scenario_set || true)
+scenarios_make=$(grep -E '^SANDBOX_SCENARIOS[[:space:]]*\?=' Makefile | sed -E 's/^[^=]*\?=//' | scenario_set || true)
+# The const may be rustfmt'd onto one line or several: everything from its
+# declaration to the first `];` is the array, and its quoted strings are
+# the names.
+scenarios_harness=$(awk '/const SCENARIOS/ { on = 1 } on { print } on && /\];/ { exit }' tests/sandbox_harness/mod.rs | grep -oE '"[^"]*"' | tr -d '"' | scenario_set || true)
+# A one-line flow sequence, `scenario: [a, b, …]`, which is how the matrix
+# is written; a block sequence would parse as nothing and fail below.
+scenarios_matrix=$(grep -E '^[[:space:]]+scenario:[[:space:]]*\[' .github/workflows/sandbox.yml | sed -E 's/^[^[]*\[([^]]*)\].*/\1/' | scenario_set || true)
+# Every fn whose attributes include #[ignore] or #[ignore = "…"]: the
+# attribute lines between the #[ignore] and the fn are skipped, and
+# anything else in between ends the match.
+scenarios_tests=$(awk '
+	/^[ \t]*#\[ignore([ \t]*=|\])/ { pending = 1; next }
+	pending && /(^|[ \t])fn[ \t]+[A-Za-z_]/ {
+		name = $0
+		sub(/^.*fn[ \t]+/, "", name)
+		sub(/[^A-Za-z0-9_].*$/, "", name)
+		print name
+		pending = 0
+		next
+	}
+	pending && !/^[ \t]*(#\[|\/\/)/ { pending = 0 }
+' tests/liquidation_sandbox.rs | scenario_set || true)
+
+scenario_sources=(
+	"scripts/sandbox/deploy.sh sandbox_scenarios:${scenarios_deploy}"
+	"Makefile SANDBOX_SCENARIOS:${scenarios_make}"
+	"tests/sandbox_harness/mod.rs SCENARIOS:${scenarios_harness}"
+	".github/workflows/sandbox.yml matrix.scenario:${scenarios_matrix}"
+	"tests/liquidation_sandbox.rs #[ignore]d test fns:${scenarios_tests}"
+)
+scenarios_agree=1
+for source in "${scenario_sources[@]}"; do
+	if [ -z "${source#*:}" ]; then
+		bad "could not parse the sandbox scenarios from ${source%%:*}"
+		scenarios_agree=0
+	elif [ "${source#*:}" != "${scenarios_deploy}" ]; then
+		scenarios_agree=0
+	fi
+done
+if [ "${scenarios_agree}" -eq 1 ]; then
+	note "all five name: ${scenarios_deploy}"
+else
+	bad "the sandbox scenario lists disagree — add or remove a scenario in all five places together:"
+	for source in "${scenario_sources[@]}"; do
+		note "${source%%:*} = ${source#*:}"
+	done
 fi
 
 if [ "${fail}" -ne 0 ]; then

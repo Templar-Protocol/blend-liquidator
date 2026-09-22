@@ -210,39 +210,57 @@ mocked below the wire format.
 
 **The sandbox**, a throwaway Stellar network in Docker with Blend v2
 deployed on it and this binary run against it **armed** — the one place
-anything in this repository signs and sends a transaction:
+anything in this repository signs and sends a transaction. Five scenarios
+(`liquidation`, `check_config`, `dry_run`, `unwind_repay`,
+`restart_adopt` — see `tests/liquidation_sandbox.rs`'s module doc for what
+each proves):
 
 ```bash
-make sandbox        # up → fetch → deploy → test → down, about five minutes
-make sandbox-down   # tear it down by hand (SANDBOX_KEEP=1 left it up)
+make sandbox                                # all five, about 25 minutes
+SANDBOX_SCENARIO=liquidation make sandbox   # just one
+make sandbox-down                           # tear it down by hand (SANDBOX_KEEP=1 left it up)
 ```
+
+`make sandbox` stops at the first scenario that fails, leaving its
+database and logs to inspect. `SANDBOX_KEEP=1` leaves the network up
+too, and so takes exactly one scenario (`SANDBOX_SCENARIO=x`).
 
 It needs Docker, the `stellar` CLI (the dev container installs it; it is
 pinned and checksum-verified from `scripts/sandbox/versions.env`), and a
-Postgres at `DATABASE_URL` — the test creates and migrates a database of
-its own per run. Everything it deploys comes from wasm pinned by SHA-256,
-and every script refuses to proceed unless the RPC's own `getNetwork`
-answers the standalone network's passphrase, so none of it can be pointed
-at a public network. The keys it generates are funded by friendbot and
-belong to a network that is gone the moment it is torn down; the bot's copy
-of the filler's key lives in `target/sandbox/sandbox.env` at mode `0600`,
-and the teardown deletes it.
+Postgres at `DATABASE_URL` — each scenario creates its own databases per
+run (`restart_adopt` one per bot) and migrates them, except
+`check_config`, which leaves its one database unmigrated because it
+asserts that `check-config` never migrates it. Everything it deploys
+comes from wasm pinned by SHA-256, and every script refuses to proceed
+unless the RPC's own `getNetwork` answers the standalone network's
+passphrase, so none of it can be pointed at a public network. The keys it generates are funded by friendbot — with
+a retry while `deploy.sh` waits, since the network's own health gate can
+go green before friendbot behind it is ready to fund an account — and
+belong to a network that is gone the moment it is torn down; the bot's
+copy of the filler's key lives in `target/sandbox/sandbox.env` at mode
+`0600`, and the teardown deletes it.
 
-The same run is the nightly `Sandbox` workflow (`schedule` and
+The same five runs are the nightly `Sandbox` workflow (`schedule` and
 `workflow_dispatch` only — never a pull request, so it is deliberately
-outside the `CI Summary` gate). It deploys the pool with two reserves,
-leaves a borrower at a health factor of ~1.19, crashes XLM's price 25% to
-put it at ~0.89, and then asserts that the bot, on its own: recorded a
-`creations` row carrying a transaction hash, recorded a `fills` row
-carrying one, left its own on-chain position with no liabilities and its
-primary collateral back at `min_primary_collateral` (the fill's own repay
-clears the bid here, so the unwind exercises the withdraw step only — a
-filler whose wallet cannot cover the bid is the follow-up scenario, for
-the testnet soak), reported exactly one succeeded creation, exactly one
-succeeded fill and at least one unwind pass at `/metrics`, and exited `0`
-on `SIGTERM`. What it catches is the world moving — a quickstart image, a
-pinned wasm, a contract that changed its mind — rather than a diff being
-wrong, which is what the pull-request gate is for.
+outside the `CI Summary` gate), one matrix job per scenario on its own
+runner. `liquidation`'s deploy leaves a borrower at a health factor of
+~1.19 and `crash.sh` takes it to ~0.89 with a 25% move in XLM's price;
+the bot then creates the borrower's liquidation auction, fills it and
+unwinds the position it took, asserted through the audit tables' own
+transaction hashes, the filler's on-chain position and `/metrics`. The
+other four prove `check-config`'s exit codes and warnings, a wrong
+`NETWORK_PASSPHRASE`'s included, without ever sending a transaction or
+migrating the database; that a dry-run bot holding a real signing key
+never sends a transaction, whether deciding to create an auction or to
+fill one — shown by the key's sequence number, the chain and the audit
+rows; that the unwind's repay branch clears debt a
+fill's own repay could not cover, once the wallet is funded and a second
+bot restarts; and that a bot `SIGKILL`ed right after creating an auction
+is followed by a fresh instance that adopts and fills that same auction
+rather than trying to create a second one. What it catches is the world
+moving — a quickstart image, a pinned wasm, a contract that changed its
+mind — rather than a diff being wrong, which is what the pull-request
+gate is for.
 
 ## Layout
 
@@ -252,7 +270,7 @@ wrong, which is what the pull-request gate is for.
 | `src/config.rs` | CLI and environment configuration |
 | `src/main.rs` | Binary entry point |
 | `scripts/` | Repo-invariant and release preflight checks, review tooling, the sandbox tier |
-| `tests/` | Fixtures, and the sandbox tier's end-to-end test |
+| `tests/` | Fixtures, and the sandbox tier's five scenario tests |
 | `docs/` | Guides and reference (see Documentation above) and design specs |
 
 ## Licence

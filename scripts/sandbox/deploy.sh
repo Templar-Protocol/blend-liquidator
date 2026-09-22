@@ -25,6 +25,14 @@
 # CLI network: the environment can redirect a `--network`, and this script
 # generates keys, funds them and signs with them.
 #
+# SANDBOX_SCENARIO picks which of this tier's scenarios (sandbox_scenarios,
+# below) this deploy is for, defaulting to liquidation. It changes exactly
+# one thing below: unwind_repay skips minting the filler's USDC in step 2,
+# so a fill's bid arrives with nothing to cover it. It is written into
+# sandbox.env in step 10, which is what lets a scenario's own test
+# (tests/sandbox_harness/mod.rs's sandbox_env) refuse a deploy meant for a
+# different one before it creates a database or spawns anything.
+#
 # ## Argument names and shapes
 #
 # Every name below was read from the wasm's own spec with
@@ -43,6 +51,32 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${script_dir}/lib.sh"
 
 : "${SANDBOX_PORT:=8000}"
+: "${SANDBOX_SCENARIO:=liquidation}"
+
+# The scenarios this deploy accepts. The same five names are written in
+# four more places — the Makefile's SANDBOX_SCENARIOS default, SCENARIOS in
+# tests/sandbox_harness/mod.rs, the matrix in .github/workflows/sandbox.yml
+# and the #[ignore]d test fns in tests/liquidation_sandbox.rs — and
+# scripts/check-repo-invariants.sh fails unless all five name the same set.
+# No other script reads SANDBOX_SCENARIO: the Rust side's sandbox_env is
+# what compares a test against the SANDBOX_SCENARIO this writes into
+# sandbox.env.
+#
+# Compared by exact string equality, one name at a time, because the value
+# is written into sandbox.env, which crash.sh and mint.sh later source.
+# Refused here, before require_standalone_network, for the same reason the
+# env-file check below is: it touches no network, and an operator who
+# mistyped it deserves that answer immediately rather than after a network
+# has been verified.
+sandbox_scenarios=(liquidation check_config dry_run unwind_repay restart_adopt)
+scenario_known=false
+for scenario in "${sandbox_scenarios[@]}"; do
+	if [ "${scenario}" = "${SANDBOX_SCENARIO}" ]; then
+		scenario_known=true
+	fi
+done
+"${scenario_known}" \
+	|| die "deploy: SANDBOX_SCENARIO must be one of ${sandbox_scenarios[*]} — got '${SANDBOX_SCENARIO}'"
 
 sandbox_root="$(sandbox_dir)"
 wasm_dir="${sandbox_root}/wasm"
@@ -158,24 +192,40 @@ generate_key() {
 # under the wrong step's name. This is that failure, named where it
 # happened.
 #
-# Horizon's /accounts/<G> is the check because friendbot is the same
+# It does not just wait for that funding, it keeps asking for it: up.sh's
+# own health gate (wait_for_rpc) only proves the RPC is answering and
+# closing ledgers, not that friendbot behind it is ready to fund an
+# account, so `generate_key`'s own `--fund` request can land in the gap
+# between the two and be dropped with nothing to retry it. Re-requesting
+# here, every few seconds while this function waits, is what closes that
+# race. Each pass asks Horizon first and friendbot only when Horizon holds
+# no account yet, so an account `--fund` already funded costs no request
+# at all; a request that races a funding in flight is answered 400 once
+# the account exists, which is harmless and why its result is ignored.
+#
+# Horizon's /accounts/<G> is still the proof, because friendbot is the same
 # service on the same port: if Horizon cannot answer, nothing funded
-# anything. Retried for a few seconds only — friendbot returns once its
-# transaction is in a closed ledger, so a miss here is Horizon's ingestion
-# lagging by a ledger, never a slow account.
+# anything. The budget is 90s rather than the ordinary few seconds of
+# ingestion lag, wide enough to ride out a friendbot that is itself still
+# coming up when the health gate goes green.
 require_funded() {
-	local name=$1 address=$2 deadline body
-	deadline=$(($(date +%s) + 30))
+	local name=$1 address=$2 deadline body now last_request=0
+	deadline=$(($(date +%s) + 90))
 	while :; do
+		now=$(date +%s)
 		body=$(curl -fsS --max-time 5 "http://localhost:${SANDBOX_PORT}/accounts/${address}" 2>/dev/null) || body=""
 		if [ "$(printf '%s' "${body}" | jq -r '.id // empty' 2>/dev/null)" = "${address}" ]; then
 			log "${name} is funded"
 			return 0
 		fi
-		[ "$(date +%s)" -lt "${deadline}" ] || break
+		[ "${now}" -lt "${deadline}" ] || break
+		if [ "${now}" -ge "$((last_request + 5))" ]; then
+			curl -fsS --max-time 10 "http://localhost:${SANDBOX_PORT}/friendbot?addr=${address}" >/dev/null 2>&1 || true
+			last_request=${now}
+		fi
 		sleep 1
 	done
-	die "step 1 keys: friendbot did not fund ${name} (${address}) — http://localhost:${SANDBOX_PORT}/accounts/${address} holds no such account after 30s"
+	die "step 1 keys: friendbot did not fund ${name} (${address}) — http://localhost:${SANDBOX_PORT}/accounts/${address} holds no such account after 90s"
 }
 
 # deploy_wasm ROLE KEY WASM [-- constructor args…] — deploys WASM as KEY
@@ -299,7 +349,15 @@ trust "${SANDBOX_KEY_BORROWER}" "USDC:${ISSUER}"
 
 invoke "${SANDBOX_KEY_ISSUER}" "${BLND}" mint --to "${ADMIN}" --amount "${MINT_BLND_ADMIN}" >/dev/null
 invoke "${SANDBOX_KEY_ISSUER}" "${USDC}" mint --to "${ADMIN}" --amount "${MINT_USDC_ADMIN}" >/dev/null
-invoke "${SANDBOX_KEY_ISSUER}" "${USDC}" mint --to "${FILLER}" --amount "${MINT_USDC_FILLER}" >/dev/null
+# unwind_repay is the one scenario that skips this: its filler must reach
+# the fill with no USDC of its own, so the fill's repay leaves debt behind
+# for the unwind pass — and later a restart's startup unwind — to repay.
+# scripts/sandbox/mint.sh is how that scenario funds the wallet afterwards.
+if [ "${SANDBOX_SCENARIO}" = "unwind_repay" ]; then
+	log "unwind_repay: skipping the filler's USDC mint — its wallet must not be able to cover a fill's bid"
+else
+	invoke "${SANDBOX_KEY_ISSUER}" "${USDC}" mint --to "${FILLER}" --amount "${MINT_USDC_FILLER}" >/dev/null
+fi
 
 ########################################################################
 # 3. Oracle
@@ -566,6 +624,7 @@ log "=== step 10: sandbox.env ==="
 env_write "${env_file}" <<EOF
 SANDBOX_RPC_URL="${SANDBOX_RPC_URL}"
 SANDBOX_PASSPHRASE="${SANDBOX_PASSPHRASE}"
+SANDBOX_SCENARIO="${SANDBOX_SCENARIO}"
 SANDBOX_POOL="${POOL}"
 SANDBOX_XLM="${XLM}"
 SANDBOX_USDC="${USDC}"
