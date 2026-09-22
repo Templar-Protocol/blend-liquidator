@@ -20,7 +20,8 @@ Every variable here is read once, at startup, by `Args` (`src/config.rs`)
 or, for the five secrets and `RUST_LOG`, straight from the process
 environment. There is no reload: changing a value means restarting the
 process. An empty string counts as unset everywhere a variable is
-described below as optional.
+described below as optional — except `RUST_LOG`, where an empty value is
+a filter with no directives and silences every log line.
 
 ## 1. Safety first
 
@@ -259,7 +260,7 @@ every wallet balance on every tick.
 |---|---|---|
 | `RUN_MODE` | `loop` | `loop` (follow the configured pools until shut down) or `check-config` (validate everything, print it redacted, and exit). |
 | `LOG_FORMAT` | `text` | `text` for a terminal, `json` for a log shipper (one JSON object per line). |
-| `RUST_LOG` | `info,blend_liquidator=debug` in the image; unset outside it | Not a `clap` argument — read by `tracing_subscriber`'s `EnvFilter` in `src/main.rs`. The image sets it with `ENV` (and `docker-compose.yml` sets the same value); unset or invalid, the bot falls back to that same filter. |
+| `RUST_LOG` | `info,blend_liquidator=debug` in the image; unset outside it | Not a `clap` argument — read by `tracing_subscriber`'s `EnvFilter` in `src/main.rs`. The image sets it with `ENV` (and `docker-compose.yml` sets the same value); unset or invalid, the bot falls back to that same filter. Set but empty, it is a filter with no directives and the bot logs nothing at all, a startup error included. |
 | `PORT` | unset | Turns the `/healthz`, `/livez` and `/metrics` server on. Wins over `HTTP_PORT` when both are set — this is the variable a platform such as Cloud Run injects. |
 | `HTTP_PORT` | unset | Also turns the HTTP server on, for a deployment that does not inject `PORT`. Neither set leaves the server off entirely. |
 | `HTTP_BIND_ADDR` | `127.0.0.1` | The address the HTTP server binds. Loopback by default; a `0.0.0.0` bind belongs behind an ingress that admits only the platform's probes and scraper, since the endpoints carry no authentication. |

@@ -56,7 +56,7 @@ synchronously and spawns the send behind a bounded semaphore
 (`NOTIFY_IN_FLIGHT`), answering `Delivery::Queued`/`Deduplicated`/`Dropped`
 rather than waiting on the channel — and `Notifier::drain` gives whatever
 is still in flight a bounded `DRAIN_BUDGET` on every exit but the second
-shutdown signal. The poller records a heartbeat every iteration and the
+shutdown signal and a release build's panic abort. The poller records a heartbeat every iteration and the
 chain head every pass, and reports `NotificationKind::RpcFailing` after
 `RPC_FAILING_AFTER` consecutive failures; a watchdog task the run spawns
 beside the pollers reports a pool whose heartbeat has gone past
@@ -64,8 +64,8 @@ beside the pollers reports a pool whose heartbeat has gone past
 seven kinds of task — one `LedgerPoller` per pool, one tracker, one
 auctioneer, one filler, one watchdog, one HTTP server when a port is
 configured, and one submission-queue worker per distinct signing key when
-armed — and every exit but the second shutdown signal drains the notifier
-before it returns. Phase 7 landed the sandbox integration tier
+armed — and every exit but the second shutdown signal and a release
+build's panic abort drains the notifier before it returns. Phase 7 landed the sandbox integration tier
 (`scripts/sandbox/`, `tests/liquidation_sandbox.rs`,
 `.github/workflows/sandbox.yml`) and the dev-container additions it needs
 (`scripts/cargo-jobs.sh`, the `stellar` CLI): a throwaway Stellar network

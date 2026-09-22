@@ -67,8 +67,9 @@ default and bound beyond what is stated below.
   exiting with a code — `SIGABRT` (`134`) ordinarily; as a container's
   PID 1, where the kernel discards a self-sent `SIGABRT`, glibc's
   `abort()` ends in a fault signal instead, whose number depends on the
-  architecture (`SIGTRAP`, `133`, on arm64). Treat any death by signal as
-  a crash.
+  architecture: `SIGTRAP` (`133`), measured on arm64; the published image
+  is amd64, where glibc's fallback is expected to raise `SIGSEGV` (`139`),
+  unmeasured. Treat any death by signal as a crash.
 - **Two exits skip draining notifications still in flight**: `130` and a
   panic's abort.
 - **Logs go to stdout**, one line per event; `LOG_FORMAT=json` renders

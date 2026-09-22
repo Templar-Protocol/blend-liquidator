@@ -124,7 +124,13 @@ the per-pool `min_primary_collateral` check is skipped. Before the first
 time a deployment sets `DRY_RUN=false`, run `check-config` once more with
 `DRY_RUN=false` and `FILLER_SECRET_KEY` set: that run fails on either
 account problem, and it is still safe, because `check-config` never sends
-a transaction in either mode. Its first log lines read "LIVE:
+a transaction in either mode. Give it the key the way the real deployment
+will — through the platform's secret mechanism, as a one-off run of the
+same service — rather than by writing it into `check.env`: a signing key
+belongs in no file on disk. If you must run it locally, pass
+`-e FILLER_SECRET_KEY` with no `=value`, so Docker copies it from your
+shell's environment rather than from a file, keep `--rm`, and know it is
+visible to `docker inspect` for as long as that container exists. Its first log lines read "LIVE:
 transactions will be submitted" all the same — that banner reads only
 `DRY_RUN`, not the run mode.
 
@@ -231,9 +237,11 @@ submitting for the same pools at once. The image does not keep that
 window empty on its own at the default of `0`. The drain is measured in
 seconds (`stop_grace_period` in Compose, the platform's own termination
 grace period elsewhere) and the delay in ledgers, so convert: divide the
-drain by the network's ledger close time — about 5–6 seconds on mainnet —
-round up, and add headroom. A 30-second grace period is 6 ledgers at 5
-seconds each; set 10 or more.
+drain by the network's *shortest* ledger close time — mainnet closes a
+ledger about every 5–6 seconds, so use 5, since dividing by a longer
+close time gives fewer ledgers than the drain lasts — round up, and add
+headroom. A 30-second grace period is 6 ledgers at 5 seconds each; set 10
+or more.
 
 ## 6. Observe it
 

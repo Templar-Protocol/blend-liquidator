@@ -52,7 +52,7 @@
 //! that has stopped answering costs a bounded number of tasks and drops
 //! what does not fit.
 //!
-//! # Every exit of `run` drains
+//! # Every exit of `run` that returns drains
 //!
 //! What a shutdown owes the sends still in flight is
 //! [`crate::notifier::Notifier::drain`], and `finish_run` is where both
@@ -2547,7 +2547,8 @@ fn spawn_filler(
 /// has returned on its own. The error path and the graceful-shutdown path
 /// are then the same path, which is what the queue's doc already assumes.
 /// Only the *first* error is reported: the ones after it are usually this
-/// shutdown's own consequences, and a panic still propagates as a panic.
+/// shutdown's own consequences, and a panic still propagates as a panic —
+/// in a build that unwinds; a release build aborts where the panic happened.
 async fn drain_tasks(
     mut tasks: JoinSet<Result<(), LiquidatorError>>,
     shutdown: &watch::Sender<bool>,
@@ -2677,8 +2678,10 @@ impl Service {
     /// tick the tracker publishes after it acknowledges, one watchdog,
     /// one HTTP server when a port is set, and — only when armed — one
     /// submission-queue worker per distinct signing key — until a
-    /// shutdown signal arrives and every task has returned. However it
-    /// ends, it leaves through `finish_run`, which drains the notifier.
+    /// shutdown signal arrives and every task has returned. Whenever it
+    /// returns, it leaves through `finish_run`, which drains the notifier;
+    /// the second shutdown signal's `exit(130)` and a release build's
+    /// panic abort end the process without returning.
     ///
     /// `keys` holds both of `AUCTIONEER_SECRET_KEY` and
     /// `FILLER_SECRET_KEY`, either or both of which may be absent — neither
