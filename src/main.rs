@@ -3,7 +3,10 @@
 //!
 //! Exit codes: `0` success, `1` a fatal failure once running (chain, store,
 //! ledger or tracker), `2` a configuration problem — including a failed
-//! `check-config` — caught before any of that ran.
+//! `check-config` — caught before any of that ran, and `130` for a second
+//! `SIGINT`/`SIGTERM` (`service::spawn_shutdown_listener`). A release
+//! build sets `panic = "abort"`, so a panic ends the process by a signal
+//! rather than with any of these codes.
 
 use blend_liquidator::config::{Args, LogFormat, RunMode};
 use blend_liquidator::service::Service;

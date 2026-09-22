@@ -560,8 +560,9 @@ pub struct ServiceConfig {
     /// does nothing. `PLAN_ITERATIONS=0` is refused at parse (see `Args`),
     /// so this field is never constructed with it.
     pub plan_iterations: u32,
-    /// A count of ledgers, measured from the first ledger the auctioneer
-    /// sees, before any submission is attempted.
+    /// A count of ledgers the chain must advance past the first tick a
+    /// task sees before that task submits anything; the auctioneer and the
+    /// filler each count their own.
     pub startup_delay_ledgers: u32,
     /// Seeding.
     pub seed: SeedConfig,

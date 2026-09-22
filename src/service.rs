@@ -61,10 +61,12 @@
 //! way too — every in-flight delivery gets
 //! [`crate::notifier::DRAIN_BUDGET`] to finish, a timeout is a warning
 //! and nothing more, and the result `drain_tasks` answered is returned
-//! unchanged. The one exit that does not drain is deliberate: the *second*
+//! unchanged. Two exits do not drain. One is deliberate: the *second*
 //! `SIGINT`/`SIGTERM` is answered by `spawn_shutdown_listener` with
 //! `exit(130)`, because a second signal means now and a drain is exactly
-//! the delay it is refusing.
+//! the delay it is refusing. The other is a task panic in a release build,
+//! which sets `panic = "abort"`: the process ends where the panic happened
+//! (see `finish_run`).
 //!
 //! # The deciding tasks are joined to the tracker by a tick
 //!
@@ -2095,6 +2097,10 @@ async fn wait_for_signal() {
 /// into [`LiquidatorError`]'s taxonomy: a panic is an internal bug, not one
 /// of the phases that enum distinguishes, and swallowing it into, say,
 /// `Config` would misreport a bug as a bad configuration.
+///
+/// Reached only where panics unwind — debug and test builds. The release
+/// profile sets `panic = "abort"`, so there a task's panic ends the process
+/// before its `JoinHandle` can answer.
 fn resume_on_panic(error: tokio::task::JoinError) -> ! {
     match error.try_into_panic() {
         Ok(payload) => std::panic::resume_unwind(payload),

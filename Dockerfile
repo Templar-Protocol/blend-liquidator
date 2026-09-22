@@ -6,9 +6,10 @@
 # ============================================
 # Build Stage
 # ============================================
-# Pinned by digest (not just tag) so the same source revision always produces
-# the same image, even after upstream retags rust:1.97.0-bookworm or the Debian
-# repository underneath it changes. Tag kept alongside the digest for
+# Pinned by digest (not just tag) so the same source revision always builds on
+# the same base image, even after upstream retags rust:1.97.0-bookworm. (The
+# runtime stage's apt packages are not pinned, so the image as a whole is not
+# byte-reproducible.) Tag kept alongside the digest for
 # readability; the digest is what's actually resolved. Matches
 # rust-toolchain.toml's `channel` and Cargo.toml's `rust-version` — all three
 # move together, and scripts/check-repo-invariants.sh fails the build if they
