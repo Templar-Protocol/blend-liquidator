@@ -16,28 +16,28 @@ liquidation auction the pool's contract should accept, fills auctions —
 its own and anyone else's — that its configured assets support, and
 unwinds the position a fill leaves it holding back toward its wallet. It
 is not non-custodial: it holds a signing key and submits transactions
-itself, which is the point of a liquidation bot (`src/liquidator.rs:4-7`).
+itself, which is the point of a liquidation bot (`src/liquidator.rs`'s crate doc).
 Dry-run is the default for exactly that reason — see §4.
 
 ## 2. The process
 
 One binary (`src/main.rs`) runs one `Service`. `Service::run`
-(`src/service.rs:2689`) connects and migrates the store, seeds any pool
+(`src/service.rs`) connects and migrates the store, seeds any pool
 that needs it, then spawns seven kinds of task and runs until a shutdown
 signal arrives and every one has returned:
 
-1. one `LedgerPoller` per configured pool (`src/ledger.rs:202`,
-   `spawn_pollers` at `src/service.rs:2200`);
+1. one `LedgerPoller` per configured pool (`src/ledger.rs`, spawned by
+   `spawn_pollers` in `src/service.rs`);
 2. one tracker task consuming every poller's shared channel
    (`tracker_loop`, fed by `spawn_pollers`' `mpsc::Sender`);
-3. one auctioneer task (`spawn_auctioneer`, `src/service.rs:2431`);
-4. one filler task (`spawn_filler`, `src/service.rs:2483`);
+3. one auctioneer task (`spawn_auctioneer`, `src/service.rs`);
+4. one filler task (`spawn_filler`, `src/service.rs`);
 5. one watchdog task (`spawn_watchdog`/`watchdog_loop`,
-   `src/service.rs:2238`/`2274`);
+   `src/service.rs`);
 6. one HTTP server, only when `PORT` or `HTTP_PORT` is set
    (`http::serve`, wired in `Service::run` before the seed pass);
 7. only when armed (`DRY_RUN=false`), one submission-queue worker per
-   *distinct* signing key (`spawn_queues`, `src/service.rs:2356`) — the
+   *distinct* signing key (`spawn_queues`, `src/service.rs`) — the
    auctioneer and the filler share one worker whenever the auctioneer has
    fallen back to the filler's key, because two queues on one key is the
    race `src/queue.rs` exists to make unreachable.
@@ -52,7 +52,7 @@ tracker acknowledges a tick it publishes the ledger on a
 `Tick` arm), and the auctioneer and the filler are two independent readers
 of that watch — never a second reader of the poller channel itself, which
 would break the per-sender ordering the cursor rests on. Each holds its
-own `StartupGate` (`src/service.rs:1737`), because each measures
+own `StartupGate` (`src/service.rs`), because each measures
 `STARTUP_DELAY_LEDGERS` from the first tick *it* saw and each answers for
 its own signing key.
 
@@ -80,10 +80,10 @@ poller: getEvents ──Event──► tracker.apply (stage accounts)
 A poller drains a range of events, sends each as `PollerMessage::Event`
 (the tracker applies it and stages the accounts it named), then sends
 `PollerMessage::Tick` carrying a `oneshot` acknowledgement
-(`src/ledger.rs:584-591`). Only once the tracker has refreshed and flagged
+(`src/ledger.rs`). Only once the tracker has refreshed and flagged
 those accounts in the store does it answer that channel — and only that
 answer lets `LedgerPoller::poll_once` write the events cursor
-(`src/ledger.rs:600-614`). The tracker then publishes the ledger on the
+(`src/ledger.rs`). The tracker then publishes the ledger on the
 watch every deciding task reads. The auctioneer decides and acts on
 whichever pools' users are flagged; the filler walks every pool's open
 auctions. Both submit, when armed, through the one `SubmissionQueue` their
@@ -94,7 +94,7 @@ signing key owns.
 - **The events cursor means "applied", never "sent".** A poller only
   writes its cursor after the tracker's `oneshot` acknowledgement, which
   it sends only once a tick's whole effect is in the store
-  (`src/ledger.rs:584-614`). Committing on send instead would let a kill
+  (`src/ledger.rs`). Committing on send instead would let a kill
   drop whatever was still queued while the store claimed those ledgers
   done — and nothing re-reads the ledgers behind a cursor, so the loss
   would be silent.
@@ -103,14 +103,14 @@ signing key owns.
   account's sequence number at prepare time, so two in-flight
   transactions on one key race to consume it. `SubmissionQueue` resolves
   every submission to a terminal outcome before it takes the next
-  (`src/queue.rs:1-23`); only a failure that provably sent nothing is
+  (`src/queue.rs`'s module doc); only a failure that provably sent nothing is
   retried.
 - **Dry-run is the default, with exactly one opt-out.** `DRY_RUN` parses
   only the literal strings `true` or `false` (`strict_bool`,
-  `src/config.rs:17`), wired to `Args::dry_run` with a default of `true`
-  (`src/config.rs:602-619`); live trading requires setting it to exactly
-  `false`. Accepting any other spelling would be another way into live
-  trading, and the dangerous direction must be the loud one.
+  `src/config.rs`), wired to `Args::dry_run` with a default of `true`;
+  live trading requires setting it to exactly `false`. Accepting any
+  other spelling would be another way into live trading, and the
+  dangerous direction must be the loud one.
 - **The maths agrees with the contract, and a fixture proves it.**
   `tests/fixtures/mainnet-fixed-v2.json` holds one mainnet ledger's
   entries and the contract's own attested answers at that ledger.
@@ -195,10 +195,10 @@ Postgres holds two kinds of state, and they are not equally disposable.
 **Tracking state** — the per-pool events cursor (`cursors`), tracked
 borrowers (`users`), and open auctions (`auctions`), all from
 `migrations/0001_initial.sql` — is a cache the bot rebuilds from chain.
-`seed_pools_needing_it` (`src/service.rs:546`) reseeds a pool only when
+`seed_pools_needing_it` (`src/service.rs`) reseeds a pool only when
 its `users` table is empty *or* its events cursor is missing
 (`user_count != 0 && cursor.is_some()` is the one condition that skips
-it); `Tracker::seed` (`src/tracker.rs:301`) then pulls the account list
+it); `Tracker::seed` (`src/tracker.rs`) then pulls the account list
 from every configured seed source and refreshes each from chain. Losing
 this half costs one reseed pass per affected pool, not correctness.
 
