@@ -723,7 +723,7 @@ pub(crate) async fn spawn_bot(
         extra_env,
     } = config;
 
-    refuse_network_overrides(&extra_env);
+    refuse_reserved_overrides(&extra_env);
     let rpc_url = required(env, "SANDBOX_RPC_URL");
     require_standalone_rpc(rpc_url).await;
 
@@ -788,26 +788,40 @@ pub(crate) async fn spawn_bot(
     }
 }
 
-/// Refuses an `extra_env` that names `RPC_URL`, `NETWORK_PASSPHRASE`,
-/// `NETWORK` or `RUN_MODE`.
+/// The environment variables a spawn helper sets itself, which an
+/// `extra_env` entry may never name.
 ///
-/// The first three are the network a spawned binary talks to, set from the
-/// check [`spawn_bot`] and [`run_check_config`] have just made; an
-/// `extra_env` entry, applied after them, would replace what was verified
-/// with what was not. `RUN_MODE` is each helper's own, and the one thing
-/// that keeps [`run_check_config`]'s passphrase override short-lived.
-/// Pre-spawn, so this panics directly.
-fn refuse_network_overrides(extra_env: &[(&str, String)]) {
+/// - `RPC_URL`, `NETWORK_PASSPHRASE`, `NETWORK`: the network, set from the
+///   check [`spawn_bot`] and [`run_check_config`] have just made. An
+///   `extra_env` entry, applied after them, would replace what was verified
+///   with what was not.
+/// - `DRY_RUN`, `FILLER_SECRET_KEY`, `AUCTIONEER_SECRET_KEY`: the mode and
+///   the keys, set from `BotConfig` or the helper's own arguments. An
+///   override would arm a bot whose scenario declared it a dry run, or hand
+///   it a key its assertions know nothing about.
+/// - `RUN_MODE`: each helper's own, and the one thing that keeps
+///   [`run_check_config`]'s passphrase override short-lived — `check-config`
+///   validates and exits on its own, and an `extra_env` that turned it into
+///   `loop` would start a long-running bot on a passphrase nobody verified.
+const RESERVED_ENV: [&str; 7] = [
+    "RPC_URL",
+    "NETWORK_PASSPHRASE",
+    "NETWORK",
+    "DRY_RUN",
+    "FILLER_SECRET_KEY",
+    "AUCTIONEER_SECRET_KEY",
+    "RUN_MODE",
+];
+
+/// Refuses an `extra_env` that names any of [`RESERVED_ENV`]. Pre-spawn, so
+/// this panics directly.
+fn refuse_reserved_overrides(extra_env: &[(&str, String)]) {
     for (key, _) in extra_env {
-        // RUN_MODE with the rest: `run_check_config`'s passphrase override is
-        // safe only because `check-config` validates and exits on its own,
-        // and an extra_env that turned it into `loop` would start a
-        // long-running bot on a passphrase nobody verified.
         assert!(
-            !["RPC_URL", "NETWORK_PASSPHRASE", "NETWORK", "RUN_MODE"].contains(key),
-            "extra_env sets {key}, which decides the network a spawned binary talks to or how \
-             long it runs — the network is always the one require_standalone_rpc has just \
-             verified and the mode is the helper's own, never a scenario's to override"
+            !RESERVED_ENV.contains(key),
+            "extra_env sets {key}, which the spawn helper sets itself — the network is always the \
+             one require_standalone_rpc has just verified, and the mode and the keys are the \
+             config's, never a scenario's to override"
         );
     }
 }
@@ -850,7 +864,7 @@ pub(crate) async fn run_check_config(
     extra_env: &[(&str, String)],
     passphrase_override: Option<&str>,
 ) -> (std::process::ExitStatus, String) {
-    refuse_network_overrides(extra_env);
+    refuse_reserved_overrides(extra_env);
     let rpc_url = required(env, "SANDBOX_RPC_URL");
     require_standalone_rpc(rpc_url).await;
 

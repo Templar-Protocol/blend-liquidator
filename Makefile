@@ -183,6 +183,11 @@ sandbox-down: ## Tear the sandbox down and drop the databases failed runs kept
 # refuses before anything starts, naming SANDBOX_SCENARIO=x as the way to
 # pick one.
 #
+# An empty selection (`SANDBOX_SCENARIOS=` with no SANDBOX_SCENARIO) is
+# refused the same way, before anything starts: the loop would otherwise
+# run no scenario and report every one passed — the vacuous pass
+# sandbox-test's own match check exists to rule out, one level up.
+#
 # The failure path runs down.sh rather than the sandbox-down target,
 # deliberately: the network goes, and the run's database stays, because it
 # is what a failed run is diagnosed from. `make sandbox-down` is what
@@ -202,6 +207,10 @@ sandbox-down: ## Tear the sandbox down and drop the databases failed runs kept
 sandbox: ## fetch, then up → deploy → test → down for each of SANDBOX_SCENARIOS (default all five; SANDBOX_SCENARIO=x runs just x; SANDBOX_KEEP=1, with one scenario selected, leaves its sandbox up)
 	@scenarios="$${SANDBOX_SCENARIO:-$(SANDBOX_SCENARIOS)}"; \
 	set -- $$scenarios; \
+	if [ "$$#" -eq 0 ]; then \
+		echo "sandbox: no scenarios selected — set SANDBOX_SCENARIO=x, or leave SANDBOX_SCENARIOS at its default"; \
+		exit 2; \
+	fi; \
 	if [ -n "$${SANDBOX_KEEP:-}" ] && [ "$$#" -ne 1 ]; then \
 		echo "sandbox: SANDBOX_KEEP=1 keeps one scenario's network up, but $$# are selected ($$scenarios) — pick one with SANDBOX_SCENARIO=x"; \
 		exit 2; \

@@ -1493,8 +1493,9 @@ reasoning and the work each one implies, is
 - `scripts/` — repo-invariant and release preflight checks, review tooling,
   the build-job cap (`cargo-jobs.sh`, `cargo-jobs-config.sh`) and the
   sandbox tier (`sandbox/`).
-- `tests/` — the fixtures the math is pinned against, and
-  `liquidation_sandbox.rs`, the tier's one `#[ignore]`d end-to-end test.
+- `tests/` — the fixtures the math is pinned against;
+  `liquidation_sandbox.rs`, the sandbox tier's five `#[ignore]`d scenario
+  tests; and `sandbox_harness/mod.rs`, the harness they share.
 - `docs/` — `configuration.md` (every setting, its default and bound),
   `deploy.md` (the operator's guide from pulling the image to running it
   armed), `deployment-contract.md` (what the image guarantees and what a
