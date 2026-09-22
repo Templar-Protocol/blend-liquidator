@@ -121,7 +121,7 @@ cargo test --lib --bins             # unit tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 make sqlx-prepare                   # after changing a query in src/store.rs
-make sandbox                        # the whole sandbox tier, ~5 min (Docker + stellar CLI)
+make sandbox                        # all five scenarios, ~25 min (Docker + stellar CLI); SANDBOX_SCENARIO=x for one
 make help                           # Docker Compose lifecycle
 ```
 
@@ -651,28 +651,44 @@ make help                           # Docker Compose lifecycle
   health factors.
 - `examples/capture_fixture.rs` — refreshes `tests/fixtures/` from a live
   RPC through `curl`. See that directory's README.
-- `tests/liquidation_sandbox.rs` — the sandbox tier's one test, and the
-  only place the bot is run with `DRY_RUN=false` and a signing key. It
-  spawns the built binary against the local network `up.sh` starts and
-  `deploy.sh` populates, waits for `/healthz`, runs `crash.sh`, and
-  asserts in order: a `creations` row for the borrower carrying a
-  `tx_hash`, a `fills` row carrying one, the filler's own on-chain
-  position left with no liabilities and its XLM collateral back inside
-  `MIN_PRIMARY_COLLATERAL`..=`MAX_PRIMARY_COLLATERAL` (the floor plus the
-  one percent a b-token burn rounds up by, not slack), and `/metrics`
-  holding exactly one succeeded creation, exactly one succeeded fill and
-  at least one unwind pass — then `SIGTERM` and exit `0`. What the
-  unwind assertion does *not* prove: the fill's own request list repays
-  the bid from the filler's wallet in this scenario, so the position it
-  takes over arrives with no liabilities and the unwind runs the withdraw
-  step only — the `liabilities == 0` half is the fill's doing, and the
-  unwind's repay branch is uncovered until a scenario whose filler cannot
-  cover the bid (the testnet soak, now Phase 9's). `#[ignore]`d, so
-  `cargo test` never starts a container, and it refuses to run at all
-  unless `target/sandbox/sandbox.env` exists and names the standalone
-  network. Nothing in it panics through `unwrap`/`expect`: every failure
-  after the spawn goes through `fail`, which prints the tail of the bot's
-  own log first.
+- `tests/liquidation_sandbox.rs` and `tests/sandbox_harness/mod.rs` — the
+  sandbox tier's five scenario tests, and the only place the bot is run
+  with `DRY_RUN=false` and a signing key. `tests/sandbox_harness/mod.rs`
+  is the machinery every scenario shares — the standalone-network gate,
+  the spawned bot, the per-run database(s) and every named wait — and
+  holds `SCENARIOS`, the same five names `deploy.sh`'s own
+  `SANDBOX_SCENARIO` case is written against;
+  `tests/liquidation_sandbox.rs` is one `#[tokio::test]` per scenario, and
+  `make sandbox-test SANDBOX_SCENARIO=x` runs one, `--exact`, against
+  this one binary. `liquidation` is the standard run: an armed bot
+  creates a borrower's liquidation auction after `crash.sh` moves the
+  oracle's price, fills it, and unwinds the position it took, proved
+  through the `creations`/`fills` audit rows' transaction hashes, the
+  filler's on-chain position and `/metrics`. `check_config` runs
+  `RUN_MODE=check-config`'s six table-driven exit-code and warning cases
+  against a live network, proving none of them sends a transaction or
+  migrates the database. `dry_run` is the tier's most important safety
+  test: across three phases — deciding to create an auction, an armed
+  creator whose filler cannot fill what it creates, and deciding to fill
+  that live auction — a dry-run bot holding the real filler key never
+  signs or sends anything, proved on the filler's own sequence number as
+  well as the audit tables and the chain. `unwind_repay` is deployed with
+  the filler holding no USDC, so its fill leaves debt behind for the
+  unwind's repay branch to clear once `scripts/sandbox/mint.sh` funds the
+  wallet and a second bot restarts — the one branch `liquidation`'s own
+  run never exercises, since its fill repays the bid outright.
+  `restart_adopt` `SIGKILL`s a bot right after it creates an auction, then
+  runs a second instance on a database that never recorded it: that bot
+  adopts the auction on chain (`AuctionInProgress`, 1212) rather than
+  trying to create a second one, and fills it — the only path in this
+  tier that reaches `Auctioneer::adopt`. Every scenario is `#[ignore]`d,
+  so `cargo test` never starts a container, and each refuses to run at
+  all unless `target/sandbox/sandbox.env` exists, names the standalone
+  network and was deployed for that scenario. Nothing in either file
+  panics through `unwrap`/`expect`: every failure after a bot is spawned
+  goes through `fail`, or — for `check_config`'s short-lived runs, which
+  have no bot to tail — `fail_check`, either of which prints what it has
+  before it panics.
 - `scripts/sandbox/` — the tier's scripts, all `set -euo pipefail`. Every
   one that drives the sandbox itself — `fetch-artifacts.sh`, `up.sh`,
   `deploy.sh`, `crash.sh`, `down.sh` and `test-network-pinning.sh` —
@@ -699,8 +715,18 @@ make help                           # Docker Compose lifecycle
   and could not bring up is its to clean up, since `make sandbox` never
   reaches `down.sh` on that path and the next run refuses on it;
   `deploy.sh` stands Blend v2 up in ten steps and writes
-  `target/sandbox/sandbox.env`; `crash.sh` moves the oracle's XLM price;
-  `down.sh` removes the container and `sandbox.env`.
+  `target/sandbox/sandbox.env`, keyed by `SANDBOX_SCENARIO` (one of the
+  tier's five names, `liquidation` by default): the only thing it changes
+  is step 2's mint, which `unwind_repay` alone skips, leaving the filler's
+  wallet with no USDC to repay a fill's bid; `deploy.sh`'s own
+  `require_funded` re-requests friendbot funding every few seconds, on a
+  90 s budget, while it polls Horizon for an account to exist, because
+  `up.sh`'s health gate can go green before friendbot behind it is ready
+  and `stellar keys generate --fund` exits `0` either way; `crash.sh`
+  moves the oracle's XLM price; `mint.sh AMOUNT` mints the filler more
+  USDC, signed by the issuer — `unwind_repay`'s way of funding the wallet
+  its own deploy left empty, once the debt it means to prove is already
+  outstanding; `down.sh` removes the container and `sandbox.env`.
   `test-cargo-jobs.sh`, `test-cargo-config.sh` and
   `test-network-pinning.sh` are shell tests — the first two for the two
   scripts below, the third for the network pinning the gotcha below
@@ -730,12 +756,20 @@ make help                           # Docker Compose lifecycle
   `pull_request`, and deliberately outside `ci.yml`'s `ci-summary` needs
   list: that gate reads a skipped job as a failure, which is right for a
   workflow where nothing is conditional and wrong for one that has no
-  pull-request run to skip. One run at a time — a `concurrency` group of
-  `sandbox`, with `cancel-in-progress: false` — because the job binds host
-  port 8000 and a cancelled run never reaches its teardown. It masks the filler's key
-  (`::add-mask::`) immediately after the deploy that writes it and before
-  anything runs the bot, and uploads `target/sandbox/*.log` — a path, not
-  a mask, because uploaded artifacts are not masked.
+  pull-request run to skip. `strategy.matrix.scenario` runs all five
+  scenarios, `fail-fast: false`, each its own job on its own runner: the
+  deploy step passes `SANDBOX_SCENARIO: ${{ matrix.scenario }}`, the test
+  step runs `make sandbox-test SANDBOX_SCENARIO=${{ matrix.scenario }}`,
+  and the uploaded log artifact is named `sandbox-logs-${{
+  matrix.scenario }}` so five jobs' logs do not collide. The workflow-level
+  `concurrency` group of `sandbox`, with `cancel-in-progress: false`,
+  serialises whole *workflow runs* rather than the matrix jobs inside one
+  — those already run concurrently on separate runners, each binding host
+  port 8000 on its own machine — and queues rather than cancels because a
+  cancelled run never reaches its teardown. Every job masks the filler's
+  key (`::add-mask::`) immediately after its own deploy writes it and
+  before anything runs the bot, and uploads `target/sandbox/*.log` — a
+  path, not a mask, because uploaded artifacts are not masked.
 
 The module layout beyond this follows
 `docs/specs/2026-09-04-blend-liquidator-bot-design.md`; see
@@ -1294,6 +1328,18 @@ Status above for what remains.
   `check-repo-invariants.sh` fails unless that literal equals
   `SQLX_CLI_VERSION` — cross-file equality, the shape the three-way Rust
   pin already uses. Bump both together.
+- **`check-config` never checks `NETWORK_PASSPHRASE` against the network
+  it is pointed at.** `Service::check_config` validates the pools against
+  chain and pings the database, but the passphrase itself is taken as
+  given rather than compared against the RPC's own `getNetwork` — so a
+  wrong passphrase still passes the deploy smoke test spec §10 makes of
+  `check-config`. It fails closed later rather than silently: every armed
+  transaction is signed against the configured passphrase, and a network
+  whose own differs rejects that signature outright, so the first thing
+  an armed bot with the wrong one does is fail every submission loudly,
+  never trade quietly on the wrong chain. The sandbox's own `check_config`
+  scenario (`tests/liquidation_sandbox.rs`) documents this gap rather than
+  asserting either way; nothing here closes it.
 
 ## The fork's gotchas
 

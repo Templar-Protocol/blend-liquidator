@@ -127,11 +127,21 @@ const UNWIND_TIMEOUT: Duration = Duration::from_mins(2);
 const LIABILITY_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// How long `unwind_repay`'s first bot has to reach an unwind pass that is
-/// idle with debt still outstanding. `plan_unwind`'s step-3 withdrawal is
-/// sized by exact projection in one call, so an empty wallet converges in a
-/// handful of landed passes rather than many, but each landed pass is still
-/// a real chain submission — a repay or a withdrawal, prepared, signed and
-/// sent — so this stays in the same range as [`UNWIND_TIMEOUT`]'s own
+/// idle with debt still outstanding.
+///
+/// Not a search over many small steps: `plan_unwind`'s step-3 withdrawal is
+/// sized by exact projection in one call, with no chain round-trip inside
+/// it, so a single landed withdrawal is the ordinary way this converges —
+/// this budget is room for the *tick-spaced* passes around it, not for many
+/// withdrawals. The likely shape is three: the run's first tick finds no
+/// position at all yet and goes idle immediately (`remaining_liabilities`
+/// is empty, so nothing is notified — every pool starts pending, per
+/// `src/filler.rs`'s Ruling 3); the pass after the fill lands narrows the
+/// collateral to whatever the outstanding debt still allows, one real
+/// withdrawal prepared, signed and sent; and the pass after that finds
+/// nothing left to move and is the one `note_idle` raises
+/// `UnwindLeftovers` from. Each landed pass is still a real chain
+/// submission, so this stays in the same range as [`UNWIND_TIMEOUT`]'s own
 /// budget rather than the near-instant [`LIABILITY_TIMEOUT`] above.
 const LEFTOVERS_TIMEOUT: Duration = Duration::from_mins(3);
 

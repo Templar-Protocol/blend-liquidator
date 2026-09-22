@@ -257,6 +257,117 @@ fn expect_case(
     println!("case {name}: exit {expected_code}, matched: {line}");
 }
 
+/// One `check_config` case: [`sandbox_harness::run_check_config`]'s own
+/// arguments, and the exit code and output substring [`expect_case`]
+/// checks the run against. [`check_config_cases`] builds the table of six,
+/// so [`check_config`] itself is one loop over them rather than six
+/// repetitions of the same four lines; the comment on each case in that
+/// table carries the reasoning this struct has no field for.
+struct CheckConfigCase<'a> {
+    label: &'static str,
+    pools: &'a str,
+    dry_run: bool,
+    filler_secret: Option<&'a str>,
+    extra_env: Vec<(&'static str, String)>,
+    database_url: &'a str,
+    expected_code: i32,
+    expected_text: &'static str,
+}
+
+/// The six cases [`check_config`] runs, in the one order the brief lists
+/// them: wiring, not logic — kept out of that function itself so its own
+/// length stays under clippy's line count without an `#[allow]`. The
+/// comment on each case carries the reasoning `src/service.rs` and
+/// `src/config.rs` give for that exact code and text.
+fn check_config_cases<'a>(
+    default_pools: &'a str,
+    blnd_pools: &'a str,
+    filler_secret: &'a str,
+    database_url: &'a str,
+    absent_url: &'a str,
+) -> Vec<CheckConfigCase<'a>> {
+    vec![
+        // (a) armed, real key: the account exists and clears the default
+        // XLM_FEE_RESERVE, but has supplied nothing as collateral, so
+        // `validate_filler` warns about `min_primary_collateral` rather
+        // than refusing to start — a warning is exactly what an armed but
+        // under-collateralised filler deserves, not a refusal to run at
+        // all.
+        CheckConfigCase {
+            label: "a",
+            pools: default_pools,
+            dry_run: false,
+            filler_secret: Some(filler_secret),
+            extra_env: vec![],
+            database_url,
+            expected_code: 0,
+            expected_text: "short of min_primary_collateral",
+        },
+        // (b) dry run, real key, an XLM_FEE_RESERVE no sandbox wallet
+        // holds: a warning, not a refusal, because a dry run submits
+        // nothing either way.
+        CheckConfigCase {
+            label: "b",
+            pools: default_pools,
+            dry_run: true,
+            filler_secret: Some(filler_secret),
+            extra_env: vec![("XLM_FEE_RESERVE", "1000000".to_string())],
+            database_url,
+            expected_code: 0,
+            expected_text: "XLM_FEE_RESERVE asks for",
+        },
+        // (c) the same shortfall, armed: now a refusal, exit 2 — the same
+        // message `validate_filler` raises as an error rather than a
+        // warning.
+        CheckConfigCase {
+            label: "c",
+            pools: default_pools,
+            dry_run: false,
+            filler_secret: Some(filler_secret),
+            extra_env: vec![("XLM_FEE_RESERVE", "1000000".to_string())],
+            database_url,
+            expected_code: 2,
+            expected_text: "XLM_FEE_RESERVE asks for",
+        },
+        // (d) DRY_RUN=false with no FILLER_SECRET_KEY: `Args::signing_keys`'
+        // own refusal, raised before `check_config` reads chain or
+        // database at all.
+        CheckConfigCase {
+            label: "d",
+            pools: default_pools,
+            dry_run: false,
+            filler_secret: None,
+            extra_env: vec![],
+            database_url,
+            expected_code: 2,
+            expected_text: "DRY_RUN=false needs FILLER_SECRET_KEY",
+        },
+        // (e) a pools config naming BLND as a supported bid asset, which
+        // is not one of this pool's reserves.
+        CheckConfigCase {
+            label: "e",
+            pools: blnd_pools,
+            dry_run: true,
+            filler_secret: None,
+            extra_env: vec![],
+            database_url,
+            expected_code: 2,
+            expected_text: "is not a reserve",
+        },
+        // (f) a DATABASE_URL naming a database this test never created.
+        CheckConfigCase {
+            label: "f",
+            pools: default_pools,
+            dry_run: true,
+            filler_secret: None,
+            extra_env: vec![],
+            database_url: absent_url,
+            expected_code: 2,
+            expected_text: "connecting to the database failed",
+        },
+    ]
+}
+
 /// The `check_config` scenario: `RUN_MODE=check-config` against the
 /// standard deploy, proving the deploy-smoke-test contract spec §10
 /// promises — the right exit code and the right warning or error text for
@@ -281,9 +392,12 @@ fn expect_case(
 /// Ignored on purpose — it needs `scripts/sandbox/up.sh` and
 /// `SANDBOX_SCENARIO=check_config scripts/sandbox/deploy.sh` to have run,
 /// and a Postgres at `DATABASE_URL`.
-// Six cases, each its own `run_check_config` call and `expect_case`
-// assertion, in the one order the brief lists them: wiring, not logic —
-// same reason `Service::run` carries the same allow.
+// The six cases themselves are `check_config_cases`' table now, not six
+// repetitions here — but what is left is still over the limit: the chain
+// and database wiring around them (two databases, an RPC client, a
+// sequence number read before and after, a migration check), each its own
+// handful of lines of its own reason to fail closed. Wiring, not logic —
+// the same reason `Service::run` carries the same allow.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
 #[ignore = "needs the local sandbox network: scripts/sandbox/up.sh && scripts/sandbox/deploy.sh"]
@@ -352,66 +466,35 @@ async fn check_config() {
     let blnd_pools = pools_toml(&pool, &xlm, &[blnd.as_str()]);
     let started = Instant::now();
 
-    // (a) armed, real key: the account exists and clears the default
-    // XLM_FEE_RESERVE, but has supplied nothing as collateral, so
-    // `validate_filler` warns about `min_primary_collateral` rather than
-    // refusing to start — a warning is exactly what an armed but
-    // under-collateralised filler deserves, not a refusal to run at all.
-    let (status, output) = run_check_config(
-        &env,
-        &database_url,
+    // Table-driven: each case is `run_check_config`'s own arguments plus
+    // the exit code and output substring `expect_case` checks the run
+    // against. `check_config_cases` holds the table itself and the
+    // reasoning behind each case.
+    let cases = check_config_cases(
         &default_pools,
-        false,
-        Some(filler_secret.as_str()),
-        &[],
-    );
-    expect_case("a", status, &output, 0, "short of min_primary_collateral");
-
-    // (b) dry run, real key, an XLM_FEE_RESERVE no sandbox wallet holds:
-    // a warning, not a refusal, because a dry run submits nothing either
-    // way.
-    let (status, output) = run_check_config(
-        &env,
+        &blnd_pools,
+        filler_secret.as_str(),
         &database_url,
-        &default_pools,
-        true,
-        Some(filler_secret.as_str()),
-        &[("XLM_FEE_RESERVE", "1000000".to_string())],
-    );
-    expect_case("b", status, &output, 0, "XLM_FEE_RESERVE asks for");
-
-    // (c) the same shortfall, armed: now a refusal, exit 2 — the same
-    // message `validate_filler` raises as an error rather than a warning.
-    let (status, output) = run_check_config(
-        &env,
-        &database_url,
-        &default_pools,
-        false,
-        Some(filler_secret.as_str()),
-        &[("XLM_FEE_RESERVE", "1000000".to_string())],
-    );
-    expect_case("c", status, &output, 2, "XLM_FEE_RESERVE asks for");
-
-    // (d) DRY_RUN=false with no FILLER_SECRET_KEY: `Args::signing_keys`'
-    // own refusal, raised before `check_config` reads chain or database
-    // at all.
-    let (status, output) = run_check_config(&env, &database_url, &default_pools, false, None, &[]);
-    expect_case(
-        "d",
-        status,
-        &output,
-        2,
-        "DRY_RUN=false needs FILLER_SECRET_KEY",
+        &absent_url,
     );
 
-    // (e) a pools config naming BLND as a supported bid asset, which is
-    // not one of this pool's reserves.
-    let (status, output) = run_check_config(&env, &database_url, &blnd_pools, true, None, &[]);
-    expect_case("e", status, &output, 2, "is not a reserve");
-
-    // (f) a DATABASE_URL naming a database this test never created.
-    let (status, output) = run_check_config(&env, &absent_url, &default_pools, true, None, &[]);
-    expect_case("f", status, &output, 2, "connecting to the database failed");
+    for case in &cases {
+        let (status, output) = run_check_config(
+            &env,
+            case.database_url,
+            case.pools,
+            case.dry_run,
+            case.filler_secret,
+            &case.extra_env,
+        );
+        expect_case(
+            case.label,
+            status,
+            &output,
+            case.expected_code,
+            case.expected_text,
+        );
+    }
 
     println!(
         "all six cases ran in {:.1} s",
@@ -1298,7 +1381,33 @@ struct RestartAdoptCtx<'a> {
 /// point: nothing about a graceful exit runs, and bot #2's database never
 /// hears from this bot at all, so whatever bot #2 later does with this
 /// auction has to be the adoption path, not a resumed session on the same
-/// database. Answers the auction entry it created, read from chain.
+/// database.
+///
+/// Two things make that sound rather than merely likely:
+///
+/// - **Adoption is the only possible writer of database 2's `auctions`
+///   row.** `Tracker::seed` (`src/service.rs`'s `seed_pools_needing_it`)
+///   writes only `users`, never `auctions`; and once bot #2 is seeded, its
+///   poller starts its events cursor at the seed's own head ledger plus
+///   one (`src/ledger.rs`'s `poll_once`: `cursor.ledger.saturating_add(1)`
+///   once a cursor exists) — a ledger past this auction's creation, since
+///   the seed pass runs, and that cursor is written, before
+///   `Service::run` starts a single poller and so before
+///   [`wait_for_ready`] can answer 200 for bot #2. The `NewAuction` event
+///   this auction was created by is therefore never replayed to bot #2's
+///   tracker at all; the only way its store can come to hold the row is
+///   the adoption path this scenario means to prove.
+/// - **The `SIGKILL` leaves no submission in flight.** Bot #1's one
+///   submission, the creation, is confirmed on chain before the kill —
+///   [`wait_for_auction`] below reads the entry itself from the ledger,
+///   not merely a `tx_hash` this test trusts. Its filler cannot fill its
+///   own auction (the same `unfillable_pools` trick named above), and a
+///   fresh deploy gives its startup unwind pass no position to act on, so
+///   neither ever submits anything else. Bot #2 therefore reads a settled
+///   sequence number, never one an unresolved transaction might still
+///   consume.
+///
+/// Answers the auction entry it created, read from chain.
 async fn restart_adopt_bot_one(ctx: &RestartAdoptCtx<'_>, database_url: &str) -> AuctionData {
     let store = match Store::connect(database_url, 2).await {
         Ok(store) => store,

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Four more sandbox scenarios alongside the original `liquidation` run —
+  `check_config`, `dry_run`, `unwind_repay` and `restart_adopt` (see
+  `tests/liquidation_sandbox.rs`'s module doc for what each proves) —
+  sharing a new `tests/sandbox_harness/mod.rs` harness that factors out
+  the standalone-network gate, the spawned bot, the per-run database(s)
+  and every named wait. `deploy.sh` takes `SANDBOX_SCENARIO` to pick
+  which of the five it deploys for (`liquidation` by default), and a new
+  `scripts/sandbox/mint.sh` mints the filler more USDC on a running
+  network — `unwind_repay`'s way of funding a wallet its own deploy left
+  empty. `.github/workflows/sandbox.yml`'s nightly run now matrices over
+  all five scenarios, one job per scenario on its own runner,
+  `fail-fast: false`.
+
+### Fixed
+
+- `scripts/sandbox/deploy.sh`'s `require_funded` re-requests friendbot
+  funding every few seconds, on a widened 90s budget, while it polls
+  Horizon for an account to exist. `up.sh`'s own health gate proves the
+  RPC is answering and closing ledgers, not that friendbot behind it is
+  ready to fund an account, and `stellar keys generate --fund` exits `0`
+  whether or not its own funding request landed — so the only previous
+  symptom of that race was a 30s Horizon-polling timeout reported under
+  the wrong step's name.
+
 ## [0.1.0] - 2026-09-22
 
 The first release: a Blend v2 liquidation bot targeting the ADR-0008
