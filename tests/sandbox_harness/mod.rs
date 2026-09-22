@@ -17,7 +17,11 @@
 //!   misconfigured run can never point an armed bot at a real network;
 //! - [`spawn_bot`] and [`run_check_config`] ask the node again themselves,
 //!   immediately before each spawn, and hand the binary the URL they just
-//!   asked and the passphrase it answered with. A scenario's spawns can be
+//!   asked and — for every long-running bot — the passphrase it answered
+//!   with. `run_check_config` alone may be given another passphrase, for
+//!   the cases that pin how a wrong one behaves; `RPC_URL` is always the
+//!   verified URL, and `RUN_MODE` is always `check-config` there, which
+//!   exits on its own. A scenario's spawns can be
 //!   minutes after its first check, so no binary is ever started on the
 //!   strength of an answer older than one RPC call.
 //!
@@ -784,18 +788,26 @@ pub(crate) async fn spawn_bot(
     }
 }
 
-/// Refuses an `extra_env` that names `RPC_URL` or `NETWORK_PASSPHRASE`.
+/// Refuses an `extra_env` that names `RPC_URL`, `NETWORK_PASSPHRASE`,
+/// `NETWORK` or `RUN_MODE`.
 ///
-/// Both are the network a spawned binary talks to, and both are set from
-/// the check [`spawn_bot`] and [`run_check_config`] have just made; an
+/// The first three are the network a spawned binary talks to, set from the
+/// check [`spawn_bot`] and [`run_check_config`] have just made; an
 /// `extra_env` entry, applied after them, would replace what was verified
-/// with what was not. Pre-spawn, so this panics directly.
+/// with what was not. `RUN_MODE` is each helper's own, and the one thing
+/// that keeps [`run_check_config`]'s passphrase override short-lived.
+/// Pre-spawn, so this panics directly.
 fn refuse_network_overrides(extra_env: &[(&str, String)]) {
     for (key, _) in extra_env {
+        // RUN_MODE with the rest: `run_check_config`'s passphrase override is
+        // safe only because `check-config` validates and exits on its own,
+        // and an extra_env that turned it into `loop` would start a
+        // long-running bot on a passphrase nobody verified.
         assert!(
-            *key != "RPC_URL" && *key != "NETWORK_PASSPHRASE",
-            "extra_env sets {key}, which is the network a spawned binary talks to — it is always \
-             the one require_standalone_rpc has just verified, never a scenario's to override"
+            !["RPC_URL", "NETWORK_PASSPHRASE", "NETWORK", "RUN_MODE"].contains(key),
+            "extra_env sets {key}, which decides the network a spawned binary talks to or how \
+             long it runs — the network is always the one require_standalone_rpc has just \
+             verified and the mode is the helper's own, never a scenario's to override"
         );
     }
 }
