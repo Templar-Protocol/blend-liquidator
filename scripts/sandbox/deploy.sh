@@ -25,6 +25,16 @@
 # CLI network: the environment can redirect a `--network`, and this script
 # generates keys, funds them and signs with them.
 #
+# SANDBOX_SCENARIO picks which of this tier's five scenarios (liquidation,
+# check_config, dry_run, unwind_repay, restart_adopt — the one list every
+# later script and test takes as given) this deploy is for, defaulting to
+# liquidation. It changes exactly one thing below: unwind_repay skips
+# minting the filler's USDC in step 2, so a fill's bid arrives with
+# nothing to cover it. It is written into sandbox.env in step 10, which is
+# what lets a scenario's own test (tests/sandbox_harness/mod.rs's
+# sandbox_env) refuse a deploy meant for a different one before it creates
+# a database or spawns anything.
+#
 # ## Argument names and shapes
 #
 # Every name below was read from the wasm's own spec with
@@ -43,6 +53,19 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${script_dir}/lib.sh"
 
 : "${SANDBOX_PORT:=8000}"
+: "${SANDBOX_SCENARIO:=liquidation}"
+
+# The one place this list is written: every other script and test takes it
+# as given, either by comparing against sandbox.env's own SANDBOX_SCENARIO
+# (mint.sh, crash.sh's siblings) or, on the Rust side, as its own `const`
+# array (tests/sandbox_harness/mod.rs). Refused here, before
+# require_standalone_network, for the same reason the env-file check below
+# is: it touches no network, and an operator who mistyped it deserves that
+# answer immediately rather than after a network has been verified.
+case "${SANDBOX_SCENARIO}" in
+liquidation | check_config | dry_run | unwind_repay | restart_adopt) ;;
+*) die "deploy: SANDBOX_SCENARIO must be one of liquidation, check_config, dry_run, unwind_repay, restart_adopt — got '${SANDBOX_SCENARIO}'" ;;
+esac
 
 sandbox_root="$(sandbox_dir)"
 wasm_dir="${sandbox_root}/wasm"
@@ -299,7 +322,15 @@ trust "${SANDBOX_KEY_BORROWER}" "USDC:${ISSUER}"
 
 invoke "${SANDBOX_KEY_ISSUER}" "${BLND}" mint --to "${ADMIN}" --amount "${MINT_BLND_ADMIN}" >/dev/null
 invoke "${SANDBOX_KEY_ISSUER}" "${USDC}" mint --to "${ADMIN}" --amount "${MINT_USDC_ADMIN}" >/dev/null
-invoke "${SANDBOX_KEY_ISSUER}" "${USDC}" mint --to "${FILLER}" --amount "${MINT_USDC_FILLER}" >/dev/null
+# unwind_repay is the one scenario that skips this: its filler must reach
+# the fill with no USDC of its own, so the fill's repay leaves debt behind
+# for the unwind pass — and later a restart's startup unwind — to repay.
+# scripts/sandbox/mint.sh is how that scenario funds the wallet afterwards.
+if [ "${SANDBOX_SCENARIO}" = "unwind_repay" ]; then
+	log "unwind_repay: skipping the filler's USDC mint — its wallet must not be able to cover a fill's bid"
+else
+	invoke "${SANDBOX_KEY_ISSUER}" "${USDC}" mint --to "${FILLER}" --amount "${MINT_USDC_FILLER}" >/dev/null
+fi
 
 ########################################################################
 # 3. Oracle
@@ -566,6 +597,7 @@ log "=== step 10: sandbox.env ==="
 env_write "${env_file}" <<EOF
 SANDBOX_RPC_URL="${SANDBOX_RPC_URL}"
 SANDBOX_PASSPHRASE="${SANDBOX_PASSPHRASE}"
+SANDBOX_SCENARIO="${SANDBOX_SCENARIO}"
 SANDBOX_POOL="${POOL}"
 SANDBOX_XLM="${XLM}"
 SANDBOX_USDC="${USDC}"

@@ -14,6 +14,13 @@ ENV_FILE := .env
 DATABASE_URL ?= postgres://liquidator:liquidator@127.0.0.1:55432/liquidator
 export DATABASE_URL
 
+# The sandbox tier's five scenarios (scripts/sandbox/deploy.sh holds the
+# same list, for its own SANDBOX_SCENARIO refusal). SANDBOX_SCENARIO picks
+# the one `sandbox-deploy` and `sandbox-test` act on; SANDBOX_SCENARIOS is
+# what `sandbox` loops over when no single SANDBOX_SCENARIO is given.
+SANDBOX_SCENARIO ?= liquidation
+SANDBOX_SCENARIOS ?= liquidation check_config dry_run unwind_repay restart_adopt
+
 help: ## Show available commands
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -68,11 +75,11 @@ sandbox-up: ## Start the pinned local Stellar network in Docker
 sandbox-fetch: ## Download and verify the pinned Blend v2 wasm artefacts
 	./scripts/sandbox/fetch-artifacts.sh
 
-sandbox-deploy: ## Deploy Blend v2 on the local network, with one borrower a price move from liquidation
-	./scripts/sandbox/deploy.sh
+sandbox-deploy: ## Deploy Blend v2 on the local network for SANDBOX_SCENARIO (default liquidation)
+	SANDBOX_SCENARIO=$(SANDBOX_SCENARIO) ./scripts/sandbox/deploy.sh
 
-sandbox-test: ## Run the end-to-end liquidation against the deployed sandbox (~5 min)
-	cargo test --test liquidation_sandbox -- --ignored --nocapture
+sandbox-test: ## Run SANDBOX_SCENARIO's end-to-end test against the deployed sandbox (default liquidation, ~5 min)
+	cargo test --test liquidation_sandbox -- --ignored --exact --nocapture $(SANDBOX_SCENARIO)
 
 # The database sweep is here rather than in down.sh because it is not the
 # network's: the test creates one `sandbox_<unix seconds>` database per
@@ -129,43 +136,67 @@ sandbox-down: ## Tear the sandbox down and drop the databases failed runs kept
 		mv "$$kept" "$$list"; \
 	fi
 
-# up → fetch → deploy → test → down, with the teardown on the failure
-# path too: a run that dies half way through still leaves a container and
-# an armed key behind, and the next `sandbox-up` refuses to start until
-# they are gone. SANDBOX_KEEP=1 skips it, for inspecting the network a
-# run failed against.
+# fetch → (up → deploy → test → down) per scenario, with the teardown on
+# the failure path too: a run that dies half way through still leaves a
+# container and an armed key behind, and the next `sandbox-up` refuses to
+# start until they are gone. Fetching once, ahead of the loop, is enough —
+# the wasm artefacts are keyed by content hash, not by scenario, and
+# deploy.sh re-verifies them itself regardless.
+#
+# SANDBOX_SCENARIOS is the list each of its own network, database and log
+# file is made for, defaulting to all five this tier has
+# (tests/sandbox_harness/mod.rs's own SCENARIOS holds the same list, for
+# the Rust side's refusal); SANDBOX_SCENARIO=x runs the one x instead. The
+# loop stops at the first scenario that fails and names it — a later
+# scenario's pass cannot make up for an earlier one's failure, so there is
+# nothing useful left to run.
+#
+# SANDBOX_KEEP=1 skips that scenario's teardown, for inspecting the network
+# it ran against, and also stops the loop there: a container already up is
+# what the next `sandbox-up` refuses to start on, so a kept network is a
+# kept network only for the one scenario that made it.
 #
 # The failure path runs down.sh rather than the sandbox-down target,
-# deliberately: the network goes, and this run's database stays, because
-# it is what a failed run is diagnosed from. `make sandbox-down` is what
+# deliberately: the network goes, and the run's database stays, because it
+# is what a failed run is diagnosed from. `make sandbox-down` is what
 # reclaims it once it has been.
 #
-# sandbox-up is outside the teardown for its own reason: it refuses to
+# sandbox-up is outside every teardown for its own reason: it refuses to
 # start when a container is already there, and that refusal is usually a
-# network somebody is still using (SANDBOX_KEEP=1 left it up). Tearing
-# that down because this run could not start would destroy exactly what
-# was being kept.
+# network somebody is still using (SANDBOX_KEEP=1 left it up). Tearing that
+# down because this run could not start would destroy exactly what was
+# being kept.
 #
 # A sandbox-down that fails after a green test fails the whole target: it
 # removes the container and sweeps the run databases, so its failure is a
 # container still holding port 8000 and databases still on the server —
 # precisely what the next run refuses on, and reporting success would hide
 # it until then.
-sandbox: ## up → fetch → deploy → test → down (SANDBOX_KEEP=1 leaves the sandbox up)
-	@$(MAKE) sandbox-up || exit $$?; \
-	status=0; \
-	$(MAKE) sandbox-fetch && $(MAKE) sandbox-deploy && $(MAKE) sandbox-test \
-		|| status=$$?; \
-	if [ -n "$${SANDBOX_KEEP:-}" ]; then \
-		echo 'SANDBOX_KEEP is set — leaving the sandbox up; make sandbox-down tears it down'; \
-	elif [ "$$status" -eq 0 ]; then \
-		$(MAKE) sandbox-down || status=$$?; \
-	else \
-		echo 'the run failed — tearing the network down and keeping its database;'; \
-		echo 'make sandbox-down drops it once you are done with it'; \
-		./scripts/sandbox/down.sh || true; \
-	fi; \
-	exit $$status
+sandbox: ## fetch, then up → deploy → test → down for each of SANDBOX_SCENARIOS (default all five; SANDBOX_SCENARIO=x runs just x; SANDBOX_KEEP=1 leaves a scenario's sandbox up)
+	@$(MAKE) sandbox-fetch || exit $$?; \
+	scenarios="$${SANDBOX_SCENARIO:-$(SANDBOX_SCENARIOS)}"; \
+	for scenario in $$scenarios; do \
+		echo "=== sandbox: $$scenario ==="; \
+		$(MAKE) sandbox-up || exit $$?; \
+		status=0; \
+		$(MAKE) SANDBOX_SCENARIO=$$scenario sandbox-deploy \
+			&& $(MAKE) SANDBOX_SCENARIO=$$scenario sandbox-test \
+			|| status=$$?; \
+		if [ -n "$${SANDBOX_KEEP:-}" ]; then \
+			echo "SANDBOX_KEEP is set — leaving $$scenario's sandbox up; make sandbox-down tears it down"; \
+			[ "$$status" -eq 0 ] || echo "sandbox: $$scenario failed"; \
+			exit $$status; \
+		elif [ "$$status" -eq 0 ]; then \
+			$(MAKE) sandbox-down || exit $$?; \
+		else \
+			echo 'the run failed — tearing the network down and keeping its database;'; \
+			echo 'make sandbox-down drops it once you are done with it'; \
+			./scripts/sandbox/down.sh || true; \
+			echo "sandbox: $$scenario failed"; \
+			exit $$status; \
+		fi; \
+	done; \
+	echo 'sandbox: every scenario passed'
 
 build: ## Build Docker image
 	docker build -t $(IMAGE):$(TAG) -f Dockerfile .

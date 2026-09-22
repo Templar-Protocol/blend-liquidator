@@ -56,7 +56,7 @@ use sandbox_harness::{
 #[ignore = "needs the local sandbox network: scripts/sandbox/up.sh && scripts/sandbox/deploy.sh"]
 async fn liquidation() {
     let root = repo_root();
-    let env = sandbox_env(&root.join("target/sandbox/sandbox.env"));
+    let env = sandbox_env(&root.join("target/sandbox/sandbox.env"), "liquidation");
 
     let passphrase = required(&env, "SANDBOX_PASSPHRASE").to_string();
     let pool = required(&env, "SANDBOX_POOL").to_string();

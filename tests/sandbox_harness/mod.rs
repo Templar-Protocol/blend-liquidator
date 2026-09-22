@@ -52,6 +52,20 @@ use sqlx::postgres::PgPool;
 /// `sandbox.env` was produced.
 const STANDALONE_PASSPHRASE: &str = "Standalone Network ; February 2017";
 
+/// The tier's five scenarios, in the order `scripts/sandbox/deploy.sh`
+/// refuses anything outside of and the Makefile's `sandbox` target loops
+/// over. `deploy.sh` holds this same list for its own `SANDBOX_SCENARIO`
+/// refusal; the two are not derived from one another — a shell script and a
+/// Rust test share no build step that could — so a sixth scenario is added
+/// to both by hand.
+pub(crate) const SCENARIOS: [&str; 5] = [
+    "liquidation",
+    "check_config",
+    "dry_run",
+    "unwind_repay",
+    "restart_adopt",
+];
+
 /// How long a bot has to bind its HTTP port and report ready. Readiness
 /// needs a store ping and one processed ledger per pool, so it covers
 /// migration, the seed and the first poll.
@@ -1060,16 +1074,30 @@ pub(crate) async fn terminate(bot: &mut Bot) {
     }
 }
 
-/// Reads `sandbox.env` and refuses the run unless it names the standalone
-/// network.
+/// Reads `sandbox.env` and refuses the run unless it was deployed for
+/// `scenario` and names the standalone network.
 ///
-/// Both of the file's refusals live here, before the caller has created a
-/// database or spawned anything: this tier arms a bot with a real signing
-/// key, and the only thing that makes that safe is the network it points
-/// at. What the file *claims* is only half of that, so
-/// [`require_standalone_rpc`] asks the node itself before the caller goes
-/// any further.
-pub(crate) fn sandbox_env(env_path: &Path) -> BTreeMap<String, String> {
+/// The scenario check comes first — before anything else, including the
+/// passphrase assertion below it — because a mismatch here means this
+/// test is about to run its own assertions against a network some *other*
+/// scenario's deploy set up: the fixture is wrong, not merely the network,
+/// and the file is checked before any of the file's other claims are worth
+/// reading at all. `scenario` is asserted against [`SCENARIOS`] too, since
+/// a typo in the test's own argument to this function deserves the same
+/// answer as a typo in `SANDBOX_SCENARIO`.
+///
+/// Both of the file's refusals — this one and the passphrase's — live
+/// here, before the caller has created a database or spawned anything:
+/// this tier arms a bot with a real signing key, and the only thing that
+/// makes that safe is the network it points at. What the file *claims* is
+/// only half of that, so [`require_standalone_rpc`] asks the node itself
+/// before the caller goes any further.
+pub(crate) fn sandbox_env(env_path: &Path, scenario: &str) -> BTreeMap<String, String> {
+    assert!(
+        SCENARIOS.contains(&scenario),
+        "sandbox_env: {scenario:?} is not one of {SCENARIOS:?} — this test named its own \
+         scenario wrong"
+    );
     let Ok(text) = std::fs::read_to_string(env_path) else {
         panic!(
             "{} does not exist — run scripts/sandbox/up.sh and scripts/sandbox/deploy.sh first",
@@ -1077,6 +1105,17 @@ pub(crate) fn sandbox_env(env_path: &Path) -> BTreeMap<String, String> {
         )
     };
     let env = parse_env_file(&text);
+
+    let deployed = env
+        .get("SANDBOX_SCENARIO")
+        .map_or("(not set)", String::as_str);
+    assert!(
+        deployed == scenario,
+        "{} was deployed for the '{deployed}' scenario, but this test is '{scenario}' — run \
+         `SANDBOX_SCENARIO={scenario} make sandbox-deploy` first",
+        env_path.display()
+    );
+
     let passphrase = required(&env, "SANDBOX_PASSPHRASE");
     assert_eq!(
         passphrase,
@@ -1151,6 +1190,40 @@ pub(crate) fn crash(bot: &Bot, root: &Path) {
         Ok(output) => {
             let message = format!(
                 "crash.sh failed ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            fail(bot, &message);
+        }
+        Err(error) => fail(bot, &format!("could not run {}: {error}", script.display())),
+    }
+}
+
+/// Runs `scripts/sandbox/mint.sh amount`, which mints `amount` of USDC
+/// stroops to the sandbox filler — the `unwind_repay` scenario's way of
+/// funding a wallet its own deploy left empty, once whatever it means to
+/// prove with the debt still outstanding has already happened.
+///
+/// Unused until that scenario's own test exists (a later task): this
+/// module is shared plumbing for all five scenarios, landed ahead of the
+/// tests that call each other piece of it.
+#[allow(dead_code)]
+pub(crate) fn mint(bot: &Bot, root: &Path, amount: i128) {
+    let script = root.join("scripts/sandbox/mint.sh");
+    match Command::new(&script)
+        .arg(amount.to_string())
+        .current_dir(root)
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            println!(
+                "mint.sh: the filler's USDC balance is now {}",
+                String::from_utf8_lossy(&output.stdout).trim()
+            );
+        }
+        Ok(output) => {
+            let message = format!(
+                "mint.sh failed ({}): {}",
                 output.status,
                 String::from_utf8_lossy(&output.stderr)
             );
