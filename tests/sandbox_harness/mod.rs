@@ -121,6 +121,12 @@ const UNWIND_TIMEOUT: Duration = Duration::from_mins(2);
 /// How long the bot has to drain and exit after `SIGTERM`.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a `RUN_MODE=check-config` run has to exit on its own — a read
+/// of the chain and a store ping, never a follow — before
+/// [`run_check_config`] kills it and fails the case rather than waiting
+/// out the ordinary bot timeouts above, which this mode never approaches.
+const CHECK_CONFIG_TIMEOUT: Duration = Duration::from_mins(1);
+
 /// Every wait polls at this cadence.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -257,6 +263,32 @@ pub(crate) fn fail(bot: &Bot, message: &str) -> ! {
     panic!("{message}");
 }
 
+/// Prints `output` and panics, for a `check-config` case.
+///
+/// [`fail`] tails a running bot's log file; a `check-config` case has no
+/// [`Bot`] at all — it is a short-lived process that has already exited by
+/// the time a case can fail its assertion — so this prints the captured
+/// stdout/stderr [`run_check_config`] returned instead, and otherwise
+/// mirrors `fail`'s "say what is kept before panicking" shape, including
+/// this run's databases, since a failing case is exactly the kind of
+/// failure that database was created to be inspected for.
+pub(crate) fn fail_check(output: &str, message: &str) -> ! {
+    println!("\n--- check-config output ---");
+    println!("{output}");
+    println!("--- end of check-config output ---\n");
+    let databases = match RUN_DATABASE.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    for database in &databases {
+        println!(
+            "the database {database} is kept for inspection — it is listed in {RUN_DATABASES}, \
+             and `make sandbox-down` drops what that file names\n"
+        );
+    }
+    panic!("{message}");
+}
+
 /// One named wait: a budget, a 500 ms poll, and a line saying what it is for.
 ///
 /// Every wait in this tier is one of these, so a hung run names what it was
@@ -359,7 +391,7 @@ pub(crate) fn required<'a>(env: &'a BTreeMap<String, String>, key: &str) -> &'a 
 
 /// `url` with its database replaced by `name`, keeping user, host, port and
 /// any query string.
-fn with_database(url: &str, name: &str) -> String {
+pub(crate) fn with_database(url: &str, name: &str) -> String {
     let (base, query) = match url.split_once('?') {
         Some((base, query)) => (base, Some(query)),
         None => (url, None),
@@ -487,6 +519,41 @@ pub(crate) async fn create_run_database(root: &Path, maintenance_url: &str, name
     // database it was written to reclaim.
     store.pool().close().await;
     url
+}
+
+/// Creates this run's database **without** migrating it, answering its URL.
+///
+/// [`create_run_database`] migrates so the row polls it feeds treat a query
+/// error as real; `check_config` asserts the opposite — that `check-config`
+/// itself never migrates — so its database must be left exactly as a plain
+/// `CREATE DATABASE` leaves it: no `_sqlx_migrations` table, nothing else
+/// either. Otherwise identical: the same identifier audit
+/// ([`AssertSqlSafe`](sqlx::AssertSqlSafe) on a name this process built, a
+/// digit string it was never handed), and [`record_run_database`] before
+/// anything past the `CREATE` could fail and leave an unrecorded database
+/// behind.
+pub(crate) async fn create_run_database_unmigrated(
+    root: &Path,
+    maintenance_url: &str,
+    name: &str,
+) -> String {
+    let maintenance = match PgPool::connect(maintenance_url).await {
+        Ok(pool) => pool,
+        Err(error) => panic!(
+            "could not connect to DATABASE_URL to create this run's database: {error} — is \
+             `make db-up` running?"
+        ),
+    };
+    let statement = format!("CREATE DATABASE \"{name}\"");
+    if let Err(error) = sqlx::raw_sql(sqlx::AssertSqlSafe(statement))
+        .execute(&maintenance)
+        .await
+    {
+        panic!("could not create the database {name}: {error}");
+    }
+    maintenance.close().await;
+    record_run_database(root, name);
+    with_database(maintenance_url, name)
 }
 
 /// Drops this run's database, on the success path only.
@@ -647,6 +714,122 @@ pub(crate) fn spawn_bot(root: &Path, env: &BTreeMap<String, String>, config: Bot
         }
         Err(error) => panic!("could not spawn the liquidator binary: {error}"),
     }
+}
+
+/// Spawns the binary with `RUN_MODE=check-config`, waits up to
+/// [`CHECK_CONFIG_TIMEOUT`] for it to exit — killing it if that budget
+/// runs out — and answers its exit status and its combined stdout and
+/// stderr.
+///
+/// There is no [`Bot`] here: `check-config` reads the chain, pings the
+/// database and exits — it serves no HTTP port and outlives no wait this
+/// module already has a shape for — so each call is its own short-lived
+/// process rather than the one long-running bot the rest of this module
+/// spawns, and [`fail_check`] is its own failure path over the captured
+/// output rather than a log file.
+///
+/// `env_clear`, exactly the chain variables [`spawn_bot`] sets
+/// (`NETWORK_PASSPHRASE`, `RPC_URL`, `PATH`) plus `RUN_MODE=check-config`
+/// and no `PORT` — a `check-config` run has nothing to serve. The signing
+/// key goes through [`Command::env`] only, never argv, the same rule
+/// [`spawn_bot`] keeps.
+pub(crate) fn run_check_config(
+    env: &BTreeMap<String, String>,
+    database_url: &str,
+    pools: &str,
+    dry_run: bool,
+    filler_secret: Option<&str>,
+    extra_env: &[(&str, String)],
+) -> (std::process::ExitStatus, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_liquidator"));
+    command
+        .env_clear()
+        .env("DATABASE_URL", database_url)
+        .env("NETWORK_PASSPHRASE", required(env, "SANDBOX_PASSPHRASE"))
+        .env("RPC_URL", required(env, "SANDBOX_RPC_URL"))
+        .env("DRY_RUN", if dry_run { "true" } else { "false" })
+        .env("POOLS_TOML", pools)
+        .env("SEED_URL", "")
+        .env("RUN_MODE", "check-config")
+        .env("LOG_FORMAT", "json")
+        .env("RUST_LOG", "info,blend_liquidator=debug")
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(secret) = filler_secret {
+        command.env("FILLER_SECRET_KEY", secret);
+    }
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => panic!("could not spawn the liquidator binary for check-config: {error}"),
+    };
+
+    // Read stdout and stderr on their own threads from the moment the
+    // process starts: `check-config` runs under `LOG_FORMAT=json`, which
+    // can print more than a pipe's buffer holds, and a `wait` performed
+    // without draining both pipes concurrently can deadlock against a
+    // child still writing to the one nobody is reading.
+    let Some(stdout) = child.stdout.take() else {
+        panic!("check-config's child had no stdout pipe");
+    };
+    let Some(stderr) = child.stderr.take() else {
+        panic!("check-config's child had no stderr pipe");
+    };
+    let stdout_reader = std::thread::spawn(move || std::io::read_to_string(stdout));
+    let stderr_reader = std::thread::spawn(move || std::io::read_to_string(stderr));
+
+    let deadline = Instant::now() + CHECK_CONFIG_TIMEOUT;
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => panic!("could not poll the check-config run: {error}"),
+        }
+        if Instant::now() >= deadline {
+            println!(
+                "check-config did not exit within {} s — killing it",
+                CHECK_CONFIG_TIMEOUT.as_secs()
+            );
+            timed_out = true;
+            let _ = child.kill();
+            break match child.wait() {
+                Ok(status) => status,
+                Err(error) => panic!("could not reap the killed check-config run: {error}"),
+            };
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    };
+
+    let stdout_text = match stdout_reader.join() {
+        Ok(Ok(text)) => text,
+        Ok(Err(error)) => format!("(could not read stdout: {error})"),
+        Err(_) => "(the stdout reader thread panicked)".to_string(),
+    };
+    let stderr_text = match stderr_reader.join() {
+        Ok(Ok(text)) => text,
+        Ok(Err(error)) => format!("(could not read stderr: {error})"),
+        Err(_) => "(the stderr reader thread panicked)".to_string(),
+    };
+    let combined = format!("{stdout_text}{stderr_text}");
+    if timed_out {
+        // A budget failure, not one of the six cases' own assertions, so
+        // it goes through `fail_check` here rather than handing the
+        // caller a status no case expects.
+        fail_check(
+            &combined,
+            &format!(
+                "check-config did not exit within {} s",
+                CHECK_CONFIG_TIMEOUT.as_secs()
+            ),
+        );
+    }
+    (status, combined)
 }
 
 /// Waits for `/healthz` to answer 200.
