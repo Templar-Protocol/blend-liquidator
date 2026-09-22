@@ -181,24 +181,38 @@ generate_key() {
 # under the wrong step's name. This is that failure, named where it
 # happened.
 #
-# Horizon's /accounts/<G> is the check because friendbot is the same
+# It does not just wait for that funding, it keeps asking for it: up.sh's
+# own health gate (wait_for_rpc) only proves the RPC is answering and
+# closing ledgers, not that friendbot behind it is ready to fund an
+# account, so `generate_key`'s own `--fund` request can land in the gap
+# between the two and be dropped with nothing to retry it. Re-requesting
+# here, every few seconds while this function waits, is what closes that
+# race — friendbot answers 400 once an account already exists, which is
+# harmless and why the request's result is ignored.
+#
+# Horizon's /accounts/<G> is still the proof, because friendbot is the same
 # service on the same port: if Horizon cannot answer, nothing funded
-# anything. Retried for a few seconds only — friendbot returns once its
-# transaction is in a closed ledger, so a miss here is Horizon's ingestion
-# lagging by a ledger, never a slow account.
+# anything. The budget is 90s rather than the ordinary few seconds of
+# ingestion lag, wide enough to ride out a friendbot that is itself still
+# coming up when the health gate goes green.
 require_funded() {
-	local name=$1 address=$2 deadline body
-	deadline=$(($(date +%s) + 30))
+	local name=$1 address=$2 deadline body now last_request=0
+	deadline=$(($(date +%s) + 90))
 	while :; do
+		now=$(date +%s)
+		if [ "${now}" -ge "$((last_request + 5))" ]; then
+			curl -fsS --max-time 10 "http://localhost:${SANDBOX_PORT}/friendbot?addr=${address}" >/dev/null 2>&1 || true
+			last_request=${now}
+		fi
 		body=$(curl -fsS --max-time 5 "http://localhost:${SANDBOX_PORT}/accounts/${address}" 2>/dev/null) || body=""
 		if [ "$(printf '%s' "${body}" | jq -r '.id // empty' 2>/dev/null)" = "${address}" ]; then
 			log "${name} is funded"
 			return 0
 		fi
-		[ "$(date +%s)" -lt "${deadline}" ] || break
+		[ "${now}" -lt "${deadline}" ] || break
 		sleep 1
 	done
-	die "step 1 keys: friendbot did not fund ${name} (${address}) — http://localhost:${SANDBOX_PORT}/accounts/${address} holds no such account after 30s"
+	die "step 1 keys: friendbot did not fund ${name} (${address}) — http://localhost:${SANDBOX_PORT}/accounts/${address} holds no such account after 90s"
 }
 
 # deploy_wasm ROLE KEY WASM [-- constructor args…] — deploys WASM as KEY
