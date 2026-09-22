@@ -64,12 +64,10 @@ default and bound beyond what is stated below.
 - **A panic in any task aborts the process** (the image is a release
   build, and the release profile sets `panic = "abort"`): no unwind and
   no graceful shutdown. The process is killed by a signal rather than
-  exiting with a code — `SIGABRT` (`134`) ordinarily; as a container's
-  PID 1, where the kernel discards a self-sent `SIGABRT`, glibc's
-  `abort()` ends in a fault signal instead, whose number depends on the
-  architecture: `SIGTRAP` (`133`) on arm64, where it was measured; the
-  published image is amd64, and its signal there has not been measured.
-  Treat any death by signal as a crash.
+  exiting with one of the codes above, and which signal is not part of
+  this contract — it depends on the architecture and on whether the
+  binary runs as the container's PID 1 — so treat any death by signal as
+  a crash.
 - **Two exits skip draining notifications still in flight**: `130` and a
   panic's abort.
 - **Logs go to stdout**, one line per event; `LOG_FORMAT=json` renders
