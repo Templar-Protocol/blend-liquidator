@@ -182,8 +182,14 @@ jobs:
       - name: Build the bot
         run: cargo build --bin liquidator
 
+      # Through env:, as the deploy step does, never a `${{ }}` spliced into
+      # the script: the values are this file's own literals, but a template
+      # expanded into a shell is the pattern that becomes an injection the
+      # day one of them is not.
       - name: Run this matrix job's scenario
-        run: make sandbox-test SANDBOX_SCENARIO=${{ matrix.scenario }}
+        env:
+          SANDBOX_SCENARIO: ${{ matrix.scenario }}
+        run: make sandbox-test SANDBOX_SCENARIO="${SANDBOX_SCENARIO}"
 
       # Logs only, and *by extension*: target/sandbox/ also holds sandbox.env
       # — the signing key — and the fetched wasm. `*.log` is bot.log and
