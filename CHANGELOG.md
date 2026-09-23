@@ -24,6 +24,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that does not name exactly one test fn, rather than passing having run
   none, and `scripts/check-repo-invariants.sh` fails unless the five
   places that name the scenarios agree.
+- The testnet soak tier: `scripts/testnet/{lib.sh,deploy.sh,crash.sh,
+  run-bot.sh}` and the Makefile's `testnet-deploy`, `testnet-crash`,
+  `testnet-run` and `testnet-run-armed` targets stand the same Blend v2
+  protocol up on public Stellar testnet, funded by friendbot's XLM, and
+  run the bot against it dry (`testnet-run`) or armed
+  (`testnet-run-armed`) — the only place outside the sandbox tier this
+  bot ever signs and sends a transaction with real, if testnet-only,
+  consequences. `deploy.sh` is `scripts/sandbox/deploy.sh`'s own ten
+  steps against testnet instead of a local container, taking the native
+  asset's id from the Stellar Asset Contract testnet already carries
+  rather than deploying one and ending by writing
+  `target/testnet/testnet.env` (mode 0600) with the filler's secret key;
+  `crash.sh` moves the deployment's own oracle price; `run-bot.sh
+  [--armed]` is the one path `DRY_RUN=false` ever reaches the binary on
+  testnet, regenerating its pools and seed files from `testnet.env` every
+  armed run. Two new read-only tools read the evidence back:
+  `examples/scan_borrowers.rs` finds accounts worth tracking from a
+  pool's own recent event history — the answer to a pool with no
+  analytics API to seed from — and `examples/soak_report.rs` prints a
+  pool's tracked-user count, open auctions, and every `creations`/`fills`
+  row with its `dry_run` and `tx_hash`. `docs/testnet-soak.md` is the
+  runbook for both stages.
 
 ### Fixed
 
@@ -35,6 +57,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whether or not its own funding request landed — so that race used to
   fail a deploy at step 1 after 30s with "friendbot did not fund …", on a
   network with nothing wrong with it but timing.
+- `scripts/sandbox/lib.sh`'s network gate is factored into
+  `require_network_passphrase URL EXPECTED LABEL`, with
+  `require_standalone_network` now one line on top of it and
+  `scripts/testnet/lib.sh`'s `require_testnet_network` a second caller
+  pinned to testnet's own passphrase instead. Before this, the flags
+  every `stellar` call was handed (`sandbox_network_args`) were always
+  built from `SANDBOX_PASSPHRASE`, whatever passphrase the node just
+  proved it actually answers with — so a gate checking a network other
+  than the sandbox's own would confirm the right node and then hand the
+  CLI the wrong passphrase regardless, every call failing on a mismatch
+  despite the gate itself having passed. `sandbox_set_network` now takes
+  the matched passphrase explicitly rather than assuming its own.
 
 ## [0.1.0] - 2026-09-22
 

@@ -33,6 +33,10 @@ A liquidation bot for [Blend Protocol](https://blend.capital) lending pools on
 - [`docs/deployment-contract.md`](docs/deployment-contract.md) — what this
   repository guarantees about the image and the binary, and what a
   deployment must provide around it.
+- [`docs/testnet-soak.md`](docs/testnet-soak.md) — the design spec's §9
+  soak: running the bot dry against Blend's own public-testnet pool, then
+  armed against this repository's own throwaway deployment on the same
+  network.
 
 ## Safety
 
