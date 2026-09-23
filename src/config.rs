@@ -2978,7 +2978,7 @@ supported_lot = ["*"]
     /// `FILLER_SECRET_KEY` is exported in the armed arm alone, so were it
     /// dropped from the `unset` block a dry run would inherit the shell's
     /// key while a mode-blind check still passed. Nor may an export pass
-    /// the shell's own value through: `export PRICE_DELTA_BPS="${PRICE_DELTA_BPS:-100}"`
+    /// the shell's own value through: `export POLL_INTERVAL_MS="${POLL_INTERVAL_MS:-5000}"`
     /// would count as set while the operator's value still reached the
     /// bot, so no export's value may expand a real setting that the block
     /// did not clear first. The one exception is the dry run's `RUST_LOG`,
