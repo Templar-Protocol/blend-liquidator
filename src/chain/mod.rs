@@ -21,6 +21,7 @@ pub mod xdr;
 pub use pool::{PoolReader, PoolSnapshot};
 pub use rpc::RpcClient;
 pub use signer::{Network, Signer};
+pub use transport::TransportError;
 pub use tx::{LedgerWindow, Prepared, Priority, Submitter, TxConfig, TxOutcome};
 
 /// A failure anywhere between the bot and the chain.
@@ -29,8 +30,12 @@ pub use tx::{LedgerWindow, Prepared, Priority, Submitter, TxConfig, TxOutcome};
 #[derive(Debug, thiserror::Error)]
 pub enum ChainError {
     /// The HTTP request never produced a response (DNS, TLS, timeout).
+    ///
+    /// This variant's text reaches the log and, as `RpcFailing`, the
+    /// notification channel, so it never carries the request URL: see
+    /// [`TransportError`].
     #[error("rpc transport: {0}")]
-    Transport(#[from] reqwest::Error),
+    Transport(TransportError),
     /// The RPC answered with a non-2xx status.
     #[error("rpc http status {0}")]
     Http(u16),
@@ -98,6 +103,49 @@ pub enum ChainError {
     /// transaction was built from is stale and must be rebuilt, never resent.
     #[error("the account's sequence number moved under this transaction")]
     BadSequence,
+}
+
+/// Its own module, not a part of this one: a private field is visible to
+/// the module that declares it and every module inside that one, and
+/// `rpc`, `pool` and `tx` — where every `reqwest` call is — are inside
+/// `chain`. Declared here, the field is private to this module alone.
+mod transport {
+    /// A `reqwest` failure with its request URL removed.
+    ///
+    /// `reqwest` renders the URL it was sending to in both its `Display` and
+    /// its `Debug`, and an RPC URL is the one part of a request an operator
+    /// may have put a credential in. The field is private to this module and
+    /// [`TransportError::new`] is the only way to build one, so no
+    /// `ChainError::Transport` can hold an error that still carries the URL.
+    #[derive(Debug)]
+    pub struct TransportError(reqwest::Error);
+
+    impl TransportError {
+        /// `error`, with `reqwest::Error::without_url` applied.
+        #[must_use]
+        pub fn new(error: reqwest::Error) -> Self {
+            Self(error.without_url())
+        }
+    }
+
+    impl std::fmt::Display for TransportError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.0.fmt(f)
+        }
+    }
+
+    impl std::error::Error for TransportError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+}
+
+impl From<reqwest::Error> for ChainError {
+    /// Every `?` on a `reqwest` call lands here.
+    fn from(error: reqwest::Error) -> Self {
+        Self::Transport(TransportError::new(error))
+    }
 }
 
 /// A transaction hash: rendered as 64 lowercase hex digits; parsed

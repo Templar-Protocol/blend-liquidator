@@ -16,6 +16,10 @@ default and bound beyond what is stated below.
   neither. Whether the package is public is a GitHub package setting,
   not something this repository controls; while it is private, pulling
   it needs a token with `read:packages`.
+- **Release.** The same tag push cuts a GitHub Release with generated
+  notes, once the image has been pushed. A prerelease tag — the same `-`
+  suffix test the image tags use — is marked a prerelease there, so it
+  is never shown as the latest release.
 - **Both build stages pin their base image by digest**, not only by tag,
   so what a tag later resolves to cannot change either base image. The
   runtime stage's apt packages (`ca-certificates`, `procps`) are not
@@ -52,10 +56,11 @@ default and bound beyond what is stated below.
   render as their public address only, and the other three render as
   `Secret(<redacted>)`. This holds only while `RPC_URL` carries no
   credential. Put a provider's key in `RPC_API_KEY` (with
-  `RPC_API_KEY_HEADER`), never in the URL: an RPC call that fails at the
-  transport level logs the full URL, and a run of such failures sends it
-  to the notification channel, so a provider that only takes a key in its
-  URL cannot be used safely with this release.
+  `RPC_API_KEY_HEADER`), never in the URL. A transport failure's error
+  text no longer carries the URL, but `RPC_URL` is configuration rather
+  than a secret: nothing keeps it off the command line, and a debug print
+  of the RPC client renders it in full. So a provider that only takes a
+  key in its URL cannot be used safely with this release.
 - **Exit codes**: `0` on graceful shutdown or a passing `check-config`;
   `2` on a configuration error — including a failed `check-config`, a
   command-line parse error, and a database that cannot be reached when

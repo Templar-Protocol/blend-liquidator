@@ -207,7 +207,7 @@ pub struct PoolReader<'a> {
 
 /// How many attempts `snapshot` makes; a moved ledger is retried until the
 /// last.
-const SNAPSHOT_ATTEMPTS: usize = 3;
+pub(crate) const SNAPSHOT_ATTEMPTS: usize = 3;
 
 fn same_ledger(expected: u32, actual: u32) -> Result<(), ChainError> {
     if expected == actual {

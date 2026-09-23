@@ -2720,6 +2720,46 @@ supported_lot = ["*"]
         assert!(rendered.contains("Secret(<redacted>)"));
     }
 
+    /// A setting's spelling, `[A-Z][A-Z0-9_]*`. The reference tabulates
+    /// the pools file's keys in the same shape as its settings, and those
+    /// are lowercase, so this is what keeps them out.
+    fn is_setting(name: &str) -> bool {
+        let mut chars = name.chars();
+        chars.next().is_some_and(|first| first.is_ascii_uppercase())
+            && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    }
+
+    /// Every environment variable the bot reads: each `clap` argument's
+    /// `env` name, and the ones read straight from the environment.
+    fn real_settings() -> std::collections::BTreeSet<String> {
+        use clap::CommandFactory;
+
+        // Read straight from the environment, never through clap, so
+        // `Args::command()` cannot see them. A new one must be added here.
+        let direct = [
+            "RPC_API_KEY",
+            "DATABASE_URL",
+            "TELEGRAM_BOT_TOKEN",
+            "FILLER_SECRET_KEY",
+            "AUCTIONEER_SECRET_KEY",
+            "RUST_LOG",
+        ];
+        let mut real: std::collections::BTreeSet<String> = Args::command()
+            .get_arguments()
+            .filter_map(|arg| arg.get_env())
+            .map(|env| env.to_string_lossy().into_owned())
+            .collect();
+        real.extend(direct.iter().map(|name| (*name).to_string()));
+        real
+    }
+
+    /// A file under the crate root, read whole.
+    fn read_repo_file(path: &str) -> String {
+        let root = env!("CARGO_MANIFEST_DIR");
+        std::fs::read_to_string(format!("{root}/{path}"))
+            .unwrap_or_else(|error| panic!("{path}: {error}"))
+    }
+
     /// The configuration reference, `.env.example` and the real `clap`
     /// definition name exactly the same variables, and the example pools
     /// file is one `parse_pools` accepts. Documentation that has drifted
@@ -2735,44 +2775,15 @@ supported_lot = ["*"]
     /// its own.
     #[test]
     fn the_configuration_documents_cover_exactly_the_real_settings() {
-        use clap::CommandFactory;
         use std::collections::BTreeSet;
 
-        let root = env!("CARGO_MANIFEST_DIR");
-        let read_file = |path: &str| {
-            std::fs::read_to_string(format!("{root}/{path}"))
-                .unwrap_or_else(|error| panic!("{path}: {error}"))
-        };
-        // A setting's spelling, `[A-Z][A-Z0-9_]*`. The reference tabulates
-        // the pools file's keys in the same shape as its settings, and those
-        // are lowercase, so this is what keeps them out.
-        let is_setting = |name: &str| {
-            let mut chars = name.chars();
-            chars.next().is_some_and(|first| first.is_ascii_uppercase())
-                && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-        };
+        let read_file = read_repo_file;
         let differences = |named: &BTreeSet<String>, real: &BTreeSet<String>| {
             let missing: Vec<&String> = real.difference(named).collect();
             let unread: Vec<&String> = named.difference(real).collect();
             format!("missing {missing:?}; names what nothing reads {unread:?}")
         };
-
-        // Read straight from the environment, never through clap, so
-        // `Args::command()` cannot see them. A new one must be added here.
-        let direct = [
-            "RPC_API_KEY",
-            "DATABASE_URL",
-            "TELEGRAM_BOT_TOKEN",
-            "FILLER_SECRET_KEY",
-            "AUCTIONEER_SECRET_KEY",
-            "RUST_LOG",
-        ];
-        let mut real: BTreeSet<String> = Args::command()
-            .get_arguments()
-            .filter_map(|arg| arg.get_env())
-            .map(|env| env.to_string_lossy().into_owned())
-            .collect();
-        real.extend(direct.iter().map(|name| (*name).to_string()));
+        let real = real_settings();
 
         // `.env.example`: every `NAME=` that opens a line, commented out or
         // not.
@@ -2810,5 +2821,212 @@ supported_lot = ["*"]
         // `deny_unknown_fields` on every table, that also proves each of
         // its keys is real.
         parse_pools(&read_file("pools.example.toml")).expect("pools.example.toml parses");
+    }
+
+    /// What `scripts/testnet/run-bot.sh` does to the environment it hands
+    /// the binary, read from the script's text.
+    struct RunnerEnvironment {
+        /// Every name in its `unset \` block.
+        cleared: std::collections::BTreeSet<String>,
+        /// Every setting-shaped name `export`ed after that block, in any mode.
+        exported: std::collections::BTreeSet<String>,
+        /// The ones exported in every mode: at the script's top level, or in
+        /// both arms of an `if` that has an `else`.
+        every_mode: std::collections::BTreeSet<String>,
+        /// Each export's name, and every setting-shaped name its value
+        /// expands (`$NAME` or `${NAME…}`).
+        expands: Vec<(String, String)>,
+    }
+
+    /// Every setting-shaped name `value` expands: each `$` followed,
+    /// through an optional `{`, by a shell name that [`is_setting`] accepts.
+    /// Quoting is not followed — no export in the script single-quotes a
+    /// `$` — so this errs toward reporting an expansion, never toward
+    /// missing one.
+    fn expanded_settings(value: &str) -> Vec<String> {
+        value
+            .split('$')
+            .skip(1)
+            .filter_map(|rest| {
+                let rest = rest.strip_prefix('{').unwrap_or(rest);
+                let end = rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len());
+                let name = &rest[..end];
+                is_setting(name).then(|| name.to_owned())
+            })
+            .collect()
+    }
+
+    impl RunnerEnvironment {
+        /// Reads `script`. The `unset \` block must sit at the script's top
+        /// level, so that it runs in every mode, and nothing exported before
+        /// it survives it, so only what follows it is read for exports. The
+        /// script branches only through `if`/`else`/`fi` around its exports;
+        /// an `elif`, or an export inside a `case`, is a shape this reading
+        /// does not follow, so it panics rather than guess.
+        fn read(script: &str) -> Self {
+            use std::collections::BTreeSet;
+
+            let mut lines = script.lines().map(str::trim);
+            let mut depth = 0_usize;
+            loop {
+                let line = lines.next().expect("run-bot.sh has no `unset \\` block");
+                if line.starts_with("if ") {
+                    depth += 1;
+                } else if line == "fi" {
+                    depth -= 1;
+                } else if line == "unset \\" {
+                    assert_eq!(depth, 0, "run-bot.sh's `unset \\` block is inside an `if`");
+                    break;
+                }
+            }
+            // Its opening line and every continuation line after it, up to
+            // the first that does not end in `\`.
+            let mut cleared = BTreeSet::new();
+            for line in lines.by_ref() {
+                let continues = line.ends_with('\\');
+                cleared.extend(
+                    line.trim_end_matches('\\')
+                        .split_whitespace()
+                        .map(str::to_owned),
+                );
+                if !continues {
+                    break;
+                }
+            }
+
+            let mut exported = BTreeSet::new();
+            let mut every_mode = BTreeSet::new();
+            let mut expands = Vec::new();
+            // One set per arm of each `if` still open: the names that arm
+            // has exported in every path through it so far.
+            let mut open: Vec<(Vec<BTreeSet<String>>, bool)> = Vec::new();
+            let mut in_case = 0_usize;
+            for line in lines {
+                if line.starts_with("if ") {
+                    open.push((vec![BTreeSet::new()], false));
+                } else if line == "else" {
+                    let (arms, has_else) = open.last_mut().expect("an `else` outside any `if`");
+                    arms.push(BTreeSet::new());
+                    *has_else = true;
+                } else if line == "fi" {
+                    let (arms, has_else) = open.pop().expect("a `fi` outside any `if`");
+                    // Made in every path through this `if` only when it has
+                    // an `else` and every arm made it.
+                    let made = if has_else {
+                        let mut arms = arms.into_iter();
+                        let first = arms.next().unwrap_or_default();
+                        arms.fold(first, |made, arm| {
+                            made.intersection(&arm).cloned().collect()
+                        })
+                    } else {
+                        BTreeSet::new()
+                    };
+                    match open.last_mut() {
+                        Some((arms, _)) => arms.last_mut().expect("an arm").extend(made),
+                        None => every_mode.extend(made),
+                    }
+                } else if line.starts_with("elif ") {
+                    panic!("run-bot.sh uses `elif`, which this reading does not follow");
+                } else if line.starts_with("case ") {
+                    in_case += 1;
+                } else if line == "esac" {
+                    in_case -= 1;
+                } else if let Some((name, value)) = line
+                    .strip_prefix("export ")
+                    .and_then(|rest| rest.split_once('='))
+                    .filter(|(name, _)| is_setting(name))
+                {
+                    expands.extend(
+                        expanded_settings(value)
+                            .into_iter()
+                            .map(|expanded| (name.to_owned(), expanded)),
+                    );
+                    assert_eq!(
+                        in_case, 0,
+                        "run-bot.sh exports {name} inside a `case`, which this reading does not \
+                         follow"
+                    );
+                    exported.insert(name.to_owned());
+                    match open.last_mut() {
+                        Some((arms, _)) => {
+                            arms.last_mut().expect("an arm").insert(name.to_owned());
+                        }
+                        None => {
+                            every_mode.insert(name.to_owned());
+                        }
+                    }
+                }
+            }
+            assert!(open.is_empty(), "run-bot.sh has an `if` with no `fi`");
+            Self {
+                cleared,
+                exported,
+                every_mode,
+                expands,
+            }
+        }
+    }
+
+    /// `scripts/testnet/run-bot.sh` hands the binary an environment of its
+    /// own making: every setting the bot reads is either in its `unset`
+    /// block or `export`ed after it **in every mode**, so an operator's
+    /// shell — plausibly exported for a mainnet deployment — can neither
+    /// hand the testnet bot a signing key nor retune it, dry run or armed.
+    /// An export inside an `if` counts only when both of its arms make it:
+    /// `FILLER_SECRET_KEY` is exported in the armed arm alone, so were it
+    /// dropped from the `unset` block a dry run would inherit the shell's
+    /// key while a mode-blind check still passed. Nor may an export pass
+    /// the shell's own value through: `export POLL_INTERVAL_MS="${POLL_INTERVAL_MS:-5000}"`
+    /// would count as set while the operator's value still reached the
+    /// bot, so no export's value may expand a real setting that the block
+    /// did not clear first. The one exception is the dry run's `RUST_LOG`,
+    /// kept from the shell on purpose once a `trace` filter has been
+    /// refused. And every name either list carries must be a real setting:
+    /// `unset` of a misspelt name clears nothing, and `export` of one sets
+    /// nothing the bot reads.
+    #[test]
+    fn the_testnet_runner_clears_or_sets_every_real_setting() {
+        use std::collections::BTreeSet;
+
+        let runner = RunnerEnvironment::read(&read_repo_file("scripts/testnet/run-bot.sh"));
+        let real = real_settings();
+        assert!(
+            !runner.cleared.is_empty(),
+            "the `unset` block names nothing"
+        );
+
+        let misspelt: Vec<&String> = runner
+            .cleared
+            .union(&runner.exported)
+            .filter(|name| !real.contains(*name))
+            .collect();
+        assert!(
+            misspelt.is_empty(),
+            "run-bot.sh unsets or exports what the bot never reads, which clears or sets \
+             nothing: {misspelt:?}"
+        );
+        let passed_through: Vec<&(String, String)> = runner
+            .expands
+            .iter()
+            .filter(|(export, expanded)| {
+                real.contains(expanded)
+                    && !runner.cleared.contains(expanded)
+                    && !(export == "RUST_LOG" && expanded == "RUST_LOG")
+            })
+            .collect();
+        assert!(
+            passed_through.is_empty(),
+            "run-bot.sh exports a setting from one the shell still holds, passing the \
+             operator's value through as (export, expanded): {passed_through:?}"
+        );
+        let handled: BTreeSet<String> = runner.cleared.union(&runner.every_mode).cloned().collect();
+        let inherited: Vec<&String> = real.difference(&handled).collect();
+        assert!(
+            inherited.is_empty(),
+            "run-bot.sh neither unsets nor exports in every mode {inherited:?}, so the \
+             operator's shell hands it to the testnet bot in at least one"
+        );
     }
 }

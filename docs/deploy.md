@@ -72,10 +72,13 @@ environment block a config dump would echo back.
 
 Put no credential in `RPC_URL`. A keyed RPC provider's key goes in
 `RPC_API_KEY`, sent under the header `RPC_API_KEY_HEADER` names, and goes
-through the secret mechanism with the rest. The bot logs the full
-`RPC_URL` whenever an RPC call fails at the transport level, and a run of
-such failures sends it to the notification channel, so a provider that
-only takes a key in its URL cannot be used safely with this release.
+through the secret mechanism with the rest. An RPC call that fails at the
+transport level is logged, and a run of such failures is sent to the
+notification channel, with the URL stripped from the error. But `RPC_URL`
+is still configuration, not a secret: it is an ordinary argument, so
+nothing keeps it off the command line, and a debug print of the RPC
+client renders it in full. A provider that only takes a key in its URL
+cannot be used safely with this release.
 
 ## 3. Smoke-test it
 

@@ -243,7 +243,11 @@ log "log: ${log_file}"
 #   settings would otherwise retune a testnet run without a word.
 #
 # A setting added to src/config.rs belongs in this list as well, or in the
-# exports below.
+# exports below in every mode. src/config.rs's
+# the_testnet_runner_clears_or_sets_every_real_setting fails otherwise — an
+# export in one arm of an if does not cover the other — and fails on a name
+# here or exported below that the bot does not read, since unset or export
+# of a misspelt name clears or sets nothing.
 unset \
 	AUCTIONEER_SECRET_KEY FILLER_SECRET_KEY \
 	RPC_API_KEY RPC_API_KEY_HEADER TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID \

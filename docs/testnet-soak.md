@@ -206,17 +206,20 @@ live ones to see whether it is tracking.
   which reads the store directly: the number of accounts the store holds a
   position for right now.
 
-**Full scan only:** `blend_liquidator_users_tracked{pool=...}` and the
-"full scan" and "tracked borrower" log lines are written by the tracker's
-full scan and nothing else (`full_scan` in `src/service.rs`). It runs once
-when the process starts and then once in every `FULL_SCAN_LEDGERS` period
-(1,200 ledgers, about 100 minutes at testnet's ~5 s ledgers), at a random
-phase. Between scans the gauge holds the last scan's count, and "tracked
-borrower" lists only accounts below `SCAN_HF_THRESHOLD` (1.2), at most 20
-per scan. This run's own log shows the gap: the watched position below was
-first decided ("skip … Healthy") at 01:54:52, after the full scan at
-01:52:31 had reported `user_count` 0, and it was the next one, at 02:52:56,
-that first reported 1 and logged it as a tracked borrower.
+**Full scan only:** the "full scan" and "tracked borrower" log lines are
+written by the tracker's full scan and nothing else (`full_scan` in
+`src/service.rs`). It runs once when the process starts and then once in
+every `FULL_SCAN_LEDGERS` period (1,200 ledgers, about 100 minutes at
+testnet's ~5 s ledgers), at a random phase. "Tracked borrower" lists only
+accounts below `SCAN_HF_THRESHOLD` (1.2), at most 20 per scan.
+`blend_liquidator_users_tracked{pool=...}` is not full-scan only: every
+tick whose refresh touched an account, and every seed, re-reads the
+store's count, so the gauge follows the store to within a ledger. In the stage 1 run recorded
+below it was still written by the full scan alone, and this run's own log
+shows the gap that caused: the watched position was first decided ("skip
+… Healthy") at 01:54:52, after the full scan at 01:52:31 had reported
+`user_count` 0, and it was the next one, at 02:52:56, that first reported
+1 and logged it as a tracked borrower.
 
 On a stock pool — which is what testnet runs; see `docs/deploy.md`'s "On a
 stock pool, expect `StockWasmDetected`" — every `bad_debt` event the poller
@@ -567,9 +570,13 @@ see "Testnet resets" above). Dry run, no key configured.
     rather than unlucky; a load-balanced public RPC whose `latestLedger` is
     not monotonic across calls is a possible further cause, and the logs do
     not say which. The read fails closed rather than mixing two ledgers,
-    and the scan runs again next period — about 5 minutes at the default
-    `ORACLE_SCAN_LEDGERS` of 60. None of the sandbox runs whose logs this
-    container still holds failed a snapshot this way.
+    and in this run the scan then waited for its next period — about 5
+    minutes at the default `ORACLE_SCAN_LEDGERS` of 60. It no longer
+    does: a scan refused as `LedgerMoved` now gets one retry on the very
+    next tick, while a second move in a row, like any other failure, still
+    waits a period. None of the
+    sandbox runs whose logs this container still holds failed a snapshot
+    this way.
   - 1 `PollerStalled` at 02:50:55 ("no poller heartbeat for 60s, limit
     55s"), with recovery logged five seconds later — the only stall in
     the run, in the same second as a transport error. The code's premise

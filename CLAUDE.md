@@ -203,7 +203,19 @@ make help                           # Docker Compose lifecycle
   tables (`` | `NAME` | ``, uppercase only, so the pools-file key table
   never counts), printing each set difference on failure; and unless
   `pools.example.toml` parses. A new variable read directly through
-  `std::env::var` must be added to that test's hard-coded list by hand.
+  `std::env::var` must be added to `real_settings`' hard-coded list by
+  hand. A second test on the same set,
+  `the_testnet_runner_clears_or_sets_every_real_setting`, fails unless
+  every real setting is in `scripts/testnet/run-bot.sh`'s `unset \` block
+  or `export`ed after it in **every** mode — an export inside an `if`
+  counts only when both arms make it, since the armed-only
+  `FILLER_SECRET_KEY` export would otherwise cover a dry run that inherits
+  the shell's key — unless no export's value expands a real setting the
+  block did not clear first, which would pass the operator's value
+  through while counting as set (the dry run's `RUST_LOG` is the one
+  sanctioned exception) — and unless every name either list carries is a
+  real one: `unset` or `export` of a misspelt name clears or sets
+  nothing.
 - `src/main.rs` — binary entry point: tracing setup, argument parsing, exit.
 - `src/math/` — the pure port of the pool contract's arithmetic: `fixed`
   (checked rounding), `reserve` (accrual and token conversions), `position`
@@ -874,11 +886,13 @@ make help                           # Docker Compose lifecycle
   armed run also ignores an inherited `RUST_LOG`, and **either** mode
   refuses one naming `trace`, since both hold `DATABASE_URL` and the
   armed one the filler's key besides, and `docs/deploy.md` §6 forbids
-  `trace` on a bot holding a secret. That list is by hand: a setting
-  added to `src/config.rs` belongs in it too. Its last step before the
-  `exec` takes `flock -n` on `target/testnet/<database>.lock`, held on a
-  descriptor the `exec` hands the bot, so it is released only when the
-  bot exits: one run per database at a time, which is what stops a
+  `trace` on a bot holding a secret. That list is written by hand, and
+  `the_testnet_runner_clears_or_sets_every_real_setting` (`src/config.rs`)
+  fails when a setting the bot reads is in neither it nor exported in
+  every mode, or when either names one the bot does not read. Its last
+  step before the `exec` takes `flock -n` on
+  `target/testnet/<database>.lock`, held on a descriptor the `exec` hands
+  the bot, so it is released only when the bot exits: one run per database at a time, which is what stops a
   second `make testnet-run-armed` signing with the live run's key.
   `TESTNET_RUN_PORT` and `TESTNET_RUN_DATABASE`, together or not at all,
   move a dry run to its own port, database and `run-<database>.log` so the
@@ -1532,14 +1546,19 @@ Status above for what remains.
   modes export `SEED_URL=""` (next to the `POOLS_FILE` export)
   — never the default, which answers for mainnet's own analytics API and
   would seed mainnet accounts into a testnet pool.
-- `users_tracked` is a full-scan gauge, not a live count. `full_scan`
-  (`src/service.rs:1089`) is its only writer
-  (`instruments.metrics.users_tracked(pool, user_count)` at
-  `src/service.rs:1109`), run on `FULL_SCAN_LEDGERS`'s cadence — 1,200
-  ledgers by default, about 100 minutes at testnet's ~5 s ledgers.
-  Between scans the gauge can trail what `Store::count_users` would
-  answer right now; `examples/soak_report.rs` reads the store directly
-  for that reason rather than trusting `/metrics`.
+- `users_tracked` is written by `regauge_users` (`src/service.rs`)
+  wherever a `users` row can have been inserted or deleted: after any
+  tick whose refresh touched an account (`apply_tick` — a tick that
+  refreshed nothing skips the read), after every seed (the startup one,
+  a gap's reseed and the full scan's retry), and by `full_scan` itself
+  on `FULL_SCAN_LEDGERS`'s cadence. So the gauge trails the store by at
+  most a ledger. Before these writers, the full scan was its only
+  writer and it trailed by up to a whole scan period — about 100 minutes
+  at testnet's ~5 s ledgers, which is what the stage 1 soak's own log
+  shows. The "full scan" and "tracked borrower" log lines are still the
+  full scan's alone. `examples/soak_report.rs` reads the store directly
+  regardless: it is a process of its own, with no bot's `/metrics` to
+  read.
 - Testnet's ledgers close about every 5 seconds, not the sandbox's ~1
   second, so every wait budget written around the sandbox is roughly
   five times longer here: an auction's 400-ledger ramp (`RAMP_END_BLOCKS`,

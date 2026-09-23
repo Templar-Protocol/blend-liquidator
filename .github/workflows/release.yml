@@ -33,9 +33,10 @@ jobs:
       - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         id: meta
         with:
-          # This repository is private, so the published package is private
-          # too: pulling it needs a token with `read:packages`, not just a
-          # `docker pull`.
+          # Whether the package is public is its own GHCR setting, not this
+          # repository's visibility, and nothing here sets it. While it is
+          # private, pulling needs a token with `read:packages`
+          # (docs/deploy.md, docs/deployment-contract.md).
           images: ghcr.io/templar-protocol/blend-liquidator
           # `latest=auto` only moves :latest for a non-prerelease semver tag —
           # an unconditional raw tag would repoint :latest at a release
@@ -60,3 +61,7 @@ jobs:
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           generate_release_notes: true
+          # The same test the image tags use: a `-` suffix (`v0.2.0-rc.1`)
+          # is a prerelease, which GitHub then never shows as the latest
+          # release — the Release page agrees with `:latest`.
+          prerelease: ${{ contains(github.ref_name, '-') }}

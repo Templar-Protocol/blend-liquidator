@@ -996,6 +996,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_transport_failure_never_renders_the_rpc_url() {
+        // A port nothing listens on: bound, read back and released, so the
+        // request is refused at connect — a transport failure, not an HTTP
+        // one.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let client = RpcClient::new(&format!("http://127.0.0.1:{port}/path-key-42"), None).unwrap();
+        let error = client.health().await.unwrap_err();
+        assert!(matches!(error, ChainError::Transport(_)), "{error:?}");
+        assert!(!error.to_string().contains("path-key-42"), "{error}");
+        assert!(!format!("{error:?}").contains("path-key-42"), "{error:?}");
+    }
+
+    #[tokio::test]
     async fn from_config_sends_the_header_from_the_secret() {
         let rpc = ScriptedRpc::start().await;
         rpc.expect("getHealth", health_json());

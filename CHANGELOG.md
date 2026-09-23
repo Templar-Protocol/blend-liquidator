@@ -57,8 +57,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   row with its `dry_run` and `tx_hash`. `docs/testnet-soak.md` is the
   runbook for both stages.
 
+### Changed
+
+- A `v*` tag with a `-` suffix (`v0.2.0-rc.1`) now cuts its GitHub
+  Release marked as a prerelease, the same test `release.yml` already
+  applies to the image's `latest` and `{{major}}.{{minor}}` tags, so a
+  release candidate is never shown as the repository's latest release.
+  The workflow's comment no longer claims the package is private because
+  the repository is: its visibility is its own GHCR setting.
+
 ### Fixed
 
+- An oracle scan refused because the ledger moved between its reads
+  (`ChainError::LedgerMoved`, after the snapshot's own three attempts)
+  gets one retry on the next tick instead of waiting a whole
+  `ORACLE_SCAN_LEDGERS` period — about 5 minutes at the default of 60,
+  during which a price move the scan would have caught went unflagged.
+  The testnet soak saw three such refusals in about three hours on the
+  public RPC. A second move in a row waits the period, as does every
+  other scan failure, so an RPC whose answers keep straddling ledgers,
+  or an oracle that has stopped answering, is not re-read every ledger.
+- `users_tracked{pool}` follows the store to within a ledger: every tick
+  whose refresh touched an account, and every seed — the startup one, a
+  gap's reseed and the full scan's retry alike — re-reads the pool's
+  tracked-user count. Before, only the full scan set it, so it trailed
+  the store by up to a whole `FULL_SCAN_LEDGERS` period — about 100
+  minutes on testnet, which the soak's first stage recorded. The "full
+  scan" and "tracked borrower" log lines are still the full scan's alone.
 - `scripts/sandbox/deploy.sh`'s `require_funded` re-requests friendbot
   funding every few seconds, on a widened 90s budget, while it polls
   Horizon for an account to exist. `up.sh`'s own health gate proves the
@@ -67,6 +92,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whether or not its own funding request landed — so that race used to
   fail a deploy at step 1 after 30s with "friendbot did not fund …", on a
   network with nothing wrong with it but timing.
+
+### Security
+
+- An RPC call that fails at the transport level (DNS, TLS, a timeout, a
+  refused connection) no longer renders the RPC URL. `ChainError::Transport`
+  holds a `TransportError`, whose field is private and whose one
+  constructor — which `ChainError`'s `From<reqwest::Error>` goes through —
+  strips the URL with `reqwest::Error::without_url()`, so nothing can build
+  the variant with the URL still in it before the error is logged or, as
+  `RpcFailing`, sent to the notification channel. `RPC_URL` must still carry no credential — it is
+  an ordinary argument, and a debug print of the RPC client renders it.
 
 ## [0.1.0] - 2026-09-22
 

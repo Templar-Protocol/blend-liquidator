@@ -106,10 +106,12 @@ appears in this bot's own argv.
 `RPC_URL` is not a secret, and must not carry one: put no credential in
 it, and give a keyed provider's key through `RPC_API_KEY` with
 `RPC_API_KEY_HEADER` instead. The resolved-configuration line shows only
-the URL's origin, but an RPC call that fails at the transport level (DNS,
-TLS, a timeout) logs the full URL, and the poller's `RpcFailing`
-notification sends it to the notification channel. A provider that only
-takes a key in its URL cannot be used safely with this release.
+the URL's origin, and an RPC call that fails at the transport level (DNS,
+TLS, a timeout) is logged, and reported through the poller's
+`RpcFailing` notification, with the URL stripped from the error. But
+nothing keeps `RPC_URL` off the command line, and a debug print of the RPC
+client renders it in full, so a provider that only takes a key in its URL
+cannot be used safely with this release.
 
 ## 3. Store
 

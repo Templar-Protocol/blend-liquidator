@@ -115,6 +115,27 @@ pub(crate) fn script_snapshot(rpc: &ScriptedRpc, accounts: &[&str]) {
     }
 }
 
+/// Scripts one `PoolReader::snapshot` *attempt* the chain moves under: the
+/// shape read answers at `ledger` and the entry read after it at
+/// `ledger + 1`, so the attempt ends in `ChainError::LedgerMoved` before
+/// any oracle read. `snapshot` makes `SNAPSHOT_ATTEMPTS` of these before
+/// it returns the refusal to its caller, so a test that needs the caller
+/// to see one scripts that many.
+pub(crate) fn script_moved_snapshot(rpc: &ScriptedRpc, ledger: u32) {
+    let fixture = mainnet_fixed_v2();
+    rpc.expect(
+        "getLedgerEntries",
+        json!({"latestLedger": ledger, "entries": [
+            entry(&keys::instance(POOL).expect("key"), text(&fixture, &["instance_entry_xdr"])),
+            entry(&keys::reserve_list(POOL).expect("key"), text(&fixture, &["res_list_entry_xdr"])),
+        ]}),
+    );
+    rpc.expect(
+        "getLedgerEntries",
+        json!({"latestLedger": ledger + 1, "entries": []}),
+    );
+}
+
 /// The fixture's ledger and close time, as a tick.
 pub(crate) fn fixture_tick() -> crate::ledger::LedgerTick {
     let fixture = mainnet_fixed_v2();
