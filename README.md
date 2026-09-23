@@ -33,6 +33,10 @@ A liquidation bot for [Blend Protocol](https://blend.capital) lending pools on
 - [`docs/deployment-contract.md`](docs/deployment-contract.md) — what this
   repository guarantees about the image and the binary, and what a
   deployment must provide around it.
+- [`docs/testnet-soak.md`](docs/testnet-soak.md) — the design spec's §9
+  soak: running the bot dry against Blend's own public-testnet pool, then
+  armed against this repository's own throwaway deployment on the same
+  network.
 
 ## Safety
 
@@ -209,8 +213,10 @@ timeout and every decoded contract error, with no network and nothing
 mocked below the wire format.
 
 **The sandbox**, a throwaway Stellar network in Docker with Blend v2
-deployed on it and this binary run against it **armed** — the one place
-anything in this repository signs and sends a transaction. Five scenarios
+deployed on it and this binary run against it **armed** — one of the two
+places anything in this repository signs and sends a transaction; the
+other is the testnet soak's armed stage (`docs/testnet-soak.md`), on
+public testnet with friendbot's XLM. Five scenarios
 (`liquidation`, `check_config`, `dry_run`, `unwind_repay`,
 `restart_adopt` — see `tests/liquidation_sandbox.rs`'s module doc for what
 each proves):

@@ -233,52 +233,111 @@ sandbox_network_args=()
 # Called immediately before **every** expansion of sandbox_network_args:
 # invoke() and invoke_view() here, and each direct `stellar` call in
 # deploy.sh. That is the rule a new call site has to follow, and it is
-# load-bearing rather than tidy: a call made before
-# require_standalone_network would carry no flags, and a flagless CLI
-# call goes to a public network rather than failing. The one place the
-# check itself is proved is test-network-pinning.sh.
+# load-bearing rather than tidy: a call made before the tier's gate —
+# require_standalone_network here, require_testnet_network in
+# scripts/testnet/, both of them require_network_passphrase — would carry
+# no flags, and a flagless CLI call goes to a public network rather than
+# failing. The one place the check itself is proved is
+# test-network-pinning.sh.
 sandbox_require_network() {
 	[ "${#sandbox_network_args[@]}" -ge 4 ] \
-		|| die "sandbox network not verified: call require_standalone_network first"
+		|| die "network not verified: call the tier's gate (require_standalone_network, or require_testnet_network under scripts/testnet/) first"
 }
 
-# sandbox_set_network URL — records URL as this sandbox's RPC, exports it
-# as SANDBOX_RPC_URL (the one name the rest of the tier reads it under)
-# and builds the flag array from it.
+# sandbox_set_network URL [PASSPHRASE] — records URL as this sandbox's RPC,
+# exports it as SANDBOX_RPC_URL (the one name the rest of the tier reads it
+# under) and builds the flag array from URL and PASSPHRASE.
 #
-# require_standalone_network calls this with the URL it has just verified,
-# which is the only way a script should reach it; test-network-pinning.sh
-# calls it directly, deriving a contract id offline against a URL it never
-# contacts.
+# PASSPHRASE defaults to SANDBOX_PASSPHRASE, never to a passphrase this
+# process merely verified elsewhere: require_network_passphrase calls this
+# with the URL *and the EXPECTED passphrase it just matched* — testnet's,
+# when the caller is require_testnet_network — precisely so the flags this
+# builds are pinned to the network that was actually checked, not
+# whichever network this file happens to be the sandbox's own. Without the
+# explicit second argument, a tier gating on a passphrase other than
+# SANDBOX_PASSPHRASE would verify the right node and then hand the CLI the
+# wrong one's passphrase anyway — every call would fail with "provided
+# network passphrase does not match the server" despite the gate itself
+# having passed. require_standalone_network's own call (through
+# require_network_passphrase) supplies SANDBOX_PASSPHRASE as EXPECTED, and
+# test-network-pinning.sh's direct, single-argument call takes the default,
+# so both build the standalone network's flags.
 sandbox_set_network() {
-	[ -n "${SANDBOX_PASSPHRASE:-}" ] \
-		|| die "sandbox_set_network: SANDBOX_PASSPHRASE is unset — ${SANDBOX_SCRIPT_DIR}/versions.env did not define it"
-	SANDBOX_RPC_URL=$1
+	local url=$1 passphrase=${2:-${SANDBOX_PASSPHRASE:-}}
+	[ -n "${passphrase}" ] \
+		|| die "sandbox_set_network: no passphrase given and SANDBOX_PASSPHRASE is unset — ${SANDBOX_SCRIPT_DIR}/versions.env did not define it"
+	SANDBOX_RPC_URL=$url
 	export SANDBOX_RPC_URL
-	sandbox_network_args=(--rpc-url "${SANDBOX_RPC_URL}" --network-passphrase "${SANDBOX_PASSPHRASE}")
+	sandbox_network_args=(--rpc-url "${SANDBOX_RPC_URL}" --network-passphrase "${passphrase}")
 }
 
-# require_standalone_network URL — dies unless URL's getNetwork answers
-# exactly SANDBOX_PASSPHRASE — which this file sources from
-# versions.env in its own directory, and which no caller supplies or can
-# redirect — and on success makes URL the network every later CLI call
-# names, through sandbox_set_network. This is the one gate every later
-# sandbox script calls first: the sandbox exists to never touch a public
-# network, so refusing on any other passphrase — including no answer at
-# all — has to happen before that script does anything else, however its
-# RPC URL got configured.
+# _SANDBOX_PUBLIC_PASSPHRASE — mainnet's own, refused by name regardless of
+# what a caller of require_network_passphrase expected, below. Not sourced
+# from anywhere pinnable: it names the one network this whole tier must
+# never touch, so it is a literal here rather than a value some file could
+# be redirected away from — the same reasoning versions.env's own header
+# gives for SANDBOX_PASSPHRASE.
+_SANDBOX_PUBLIC_PASSPHRASE="Public Global Stellar Network ; September 2015"
+
+# require_network_passphrase URL EXPECTED LABEL — dies unless URL's
+# getNetwork answers exactly EXPECTED, and on success makes URL *and
+# EXPECTED* the network every later CLI call names, through
+# sandbox_set_network(url, expected) — the passphrase every later `stellar`
+# call carries is the one this function just matched, never
+# SANDBOX_PASSPHRASE by default, which is what makes this helper correct
+# for a network other than the sandbox's (require_testnet_network's
+# "testnet" among them). LABEL is prose only — the network this call
+# believes URL to be, worded to read as a possessive in the messages below
+# ("the sandbox", "testnet") — used solely to make a failure legible; it
+# decides nothing.
+#
+# Three ways to fail, in order:
+#   1. no answer, or no passphrase in the answer — the node might not even
+#      be the right kind of thing to ask;
+#   2. the answer is mainnet's own passphrase, whatever EXPECTED is — the
+#      one network no script here may ever act on, refused by name before
+#      the ordinary comparison below so that a script pointed at mainnet
+#      says so, rather than reporting a generic "expected testnet" that
+#      buries the one failure that matters most. This also catches the
+#      degenerate case of a caller whose own EXPECTED is mainnet's
+#      passphrase: matching mainnet against mainnet must still die, not
+#      quietly "pass", which is exactly why this check does not read
+#      EXPECTED at all;
+#   3. any other answer that is not EXPECTED.
 #
 # Verifying and pinning in the one function is the point: what the node
 # answered for is then exactly what every `stellar` call is handed, so the
 # gate cannot be passed about one network while the work happens on
 # another.
-require_standalone_network() {
-	local url=$1 body passphrase
+require_network_passphrase() {
+	local url=$1 expected=$2 label=$3 body passphrase
 	body=$(_sandbox_rpc_call "${url}" getNetwork)
 	passphrase=$(printf '%s' "${body}" | jq -r '.result.passphrase // empty' 2>/dev/null) || passphrase=""
-	[ -n "${passphrase}" ] || die "require_standalone_network: ${url} did not answer getNetwork"
-	[ "${passphrase}" = "${SANDBOX_PASSPHRASE}" ] || die "require_standalone_network: ${url} reports passphrase '${passphrase}', expected the sandbox's standalone passphrase '${SANDBOX_PASSPHRASE}' — refusing to touch a network that is not this sandbox's own"
-	sandbox_set_network "${url}"
+	[ -n "${passphrase}" ] || die "require_network_passphrase: ${url} did not answer getNetwork (expected ${label}'s network)"
+	[ "${passphrase}" != "${_SANDBOX_PUBLIC_PASSPHRASE}" ] \
+		|| die "require_network_passphrase: ${url} reports the public network passphrase '${_SANDBOX_PUBLIC_PASSPHRASE}' — refusing to touch mainnet in place of ${label}'s own"
+	[ "${passphrase}" = "${expected}" ] \
+		|| die "require_network_passphrase: ${url} reports passphrase '${passphrase}', expected ${label}'s '${expected}' — refusing to touch a network that is not ${label}'s own"
+	sandbox_set_network "${url}" "${expected}"
+}
+
+# require_standalone_network URL — dies unless URL's getNetwork answers
+# exactly SANDBOX_PASSPHRASE — which this file sources from versions.env in
+# its own directory, and which no caller supplies or can redirect — and on
+# success makes URL the network every later CLI call names, through
+# sandbox_set_network (see require_network_passphrase above, which this
+# calls). This is the one gate every later sandbox script calls first: the
+# sandbox exists to never touch a public network, so refusing on any other
+# passphrase — including no answer at all — has to happen before that
+# script does anything else, however its RPC URL got configured.
+#
+# SANDBOX_PASSPHRASE is "Standalone Network ; February 2017", so
+# require_network_passphrase's own mismatch message names the standalone
+# network by quoting it as EXPECTED — the label "the sandbox" below is prose
+# only, and does not change that. Its no-answer message names no
+# passphrase: there is none to quote when the node gave none.
+require_standalone_network() {
+	require_network_passphrase "$1" "${SANDBOX_PASSPHRASE}" "the sandbox"
 }
 
 # The stellar CLI identity names deploy.sh creates and crash.sh signs

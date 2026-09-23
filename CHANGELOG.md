@@ -24,6 +24,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that does not name exactly one test fn, rather than passing having run
   none, and `scripts/check-repo-invariants.sh` fails unless the five
   places that name the scenarios agree.
+- The testnet soak tier: `scripts/testnet/{lib.sh,deploy.sh,crash.sh,
+  run-bot.sh}` and the Makefile's `testnet-deploy`, `testnet-crash`,
+  `testnet-run` and `testnet-run-armed` targets stand the same Blend v2
+  protocol up on public Stellar testnet, funded by friendbot's XLM, and
+  run the bot against it dry (`testnet-run`) or armed
+  (`testnet-run-armed`) — the only place outside the sandbox tier this
+  bot ever signs and sends a transaction with real, if testnet-only,
+  consequences. `deploy.sh` is `scripts/sandbox/deploy.sh`'s own ten
+  steps against testnet instead of a local container, taking the native
+  asset's id from the Stellar Asset Contract testnet already carries
+  rather than deploying one and ending by writing
+  `target/testnet/testnet.env` (mode 0600) with the filler's secret key;
+  `crash.sh` moves the deployment's own oracle price; `run-bot.sh
+  [--armed]` is the one path `DRY_RUN=false` ever reaches the binary on
+  testnet, regenerating its pools and seed files from `testnet.env` every
+  armed run, handing the binary exactly the RPC URL its gate verified, and
+  unsetting every other setting the bot reads first, so an operator's
+  shell cannot give a testnet run a signing key, an RPC credential or a
+  Telegram channel. Both tiers share one network gate:
+  `scripts/sandbox/lib.sh`'s `require_network_passphrase URL EXPECTED
+  LABEL`, with `require_standalone_network` one line on top of it and
+  `scripts/testnet/lib.sh`'s `require_testnet_network` a second, pinned to
+  testnet's passphrase. It refuses the public mainnet passphrase by name
+  before any other comparison, and builds the flags every later `stellar`
+  call carries from the URL it checked and the passphrase that node
+  answered with. Two new read-only tools read the evidence back:
+  `examples/scan_borrowers.rs` finds accounts worth tracking from a
+  pool's own recent event history — the answer to a pool with no
+  analytics API to seed from — and `examples/soak_report.rs` prints a
+  pool's tracked-user count, open auctions, and every `creations`/`fills`
+  row with its `dry_run` and `tx_hash`. `docs/testnet-soak.md` is the
+  runbook for both stages.
 
 ### Fixed
 

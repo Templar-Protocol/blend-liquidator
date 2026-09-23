@@ -71,8 +71,9 @@ build's panic abort drains the notifier before it returns. Phase 7 landed the sa
 (`scripts/cargo-jobs.sh`, the `stellar` CLI): a throwaway Stellar network
 in Docker, Blend v2 deployed on it from pinned wasm with one borrower a
 price move from liquidation, and the real binary run against it **armed**
-— the only place in this repository anything signs and sends a
-transaction — asserting on chain and in the store that it created the
+— the only place in this repository, besides the testnet tier Phase 9
+added, that anything signs and sends a transaction — asserting on chain
+and in the store that it created the
 auction, filled it, unwound the position it took, and counted all three.
 Phase 8 reconciled the bot with the ADR-0008 fork
 (`docs/specs/2026-09-20-adr-0008-fork-semantics.md` §4, A through J,
@@ -100,12 +101,28 @@ Phase 9 landed the documentation set — `docs/configuration.md`,
 — the deployment contract, and a `check-release.sh`-green `0.1.0`
 changelog section. The `v0.1.0` tag itself is the maintainer's to push:
 pushing it is what publishes the GHCR image and cuts the GitHub Release,
-not anything landed on this branch. What remains is the testnet soak the
-design spec's §9 ends with, which needs a decision on which contracts to
-soak against first, since the fork is not deployed anywhere yet.
-Everything Phases 1 through 7 built still stands: the fork's differences
-are additions to this crate's arithmetic port, not corrections to it. The
-repository scaffolding is complete and enforced.
+not anything landed on this branch. Phase 9 also ran the testnet soak the
+design spec's §9 ends with (`scripts/testnet/`, `docs/testnet-soak.md`),
+against stock wasm on public Stellar testnet — the fork still is not
+deployed anywhere, so the soak targets what actually is: Blend's own
+testnet pool for stage 1 (observe) and this repository's own throwaway
+deployment for stage 2 (armed). Stage 1 has run the bot in dry run
+against a pool this repository does not control, seeded with the 15
+accounts a scan of the pool's own recent events found and given one
+position of the soak's own to follow. It proved the bot validates its
+configuration and tracks and values whatever borrowers it can see —
+bounded by the RPC's own event-retention window, not an index of every
+position, since testnet has no analytics API — without ever submitting a
+transaction. Stage 2 stood up its own pool, crashed the
+oracle's price, and ran the bot armed against public infrastructure end
+to end — the only place outside the sandbox tier this bot ever signs and
+sends there: a recorded run created the borrower's liquidation auction,
+filled it near the ledger `fill_objective = "earliest-profitable"`
+targets, and unwound the filler's position back to zero liabilities
+(`docs/testnet-soak.md`'s own Stage 2 results). Everything Phases 1
+through 7 built still stands: the fork's differences are additions to
+this crate's arithmetic port, not corrections to it. The repository
+scaffolding is complete and enforced.
 
 **This bot is NOT non-custodial.** It is designed to hold a signing key and
 submit transactions itself — that is the point of a liquidation bot. Treat
@@ -122,6 +139,10 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 make sqlx-prepare                   # after changing a query in src/store.rs
 make sandbox                        # all five scenarios, ~25 min (Docker + stellar CLI); SANDBOX_SCENARIO=x for one
+make testnet-deploy                 # stand Blend v2 up on public Stellar testnet for the soak's armed stage
+make testnet-crash                  # move the testnet soak's oracle price (default $0.075)
+make testnet-run                    # run the bot against testnet in dry run (no key; nothing is ever submitted)
+make testnet-run-armed              # run the bot against testnet ARMED — the only target that runs the bot armed on testnet
 make help                           # Docker Compose lifecycle
 ```
 
@@ -652,8 +673,9 @@ make help                           # Docker Compose lifecycle
 - `examples/capture_fixture.rs` — refreshes `tests/fixtures/` from a live
   RPC through `curl`. See that directory's README.
 - `tests/liquidation_sandbox.rs` and `tests/sandbox_harness/mod.rs` — the
-  sandbox tier's five scenario tests, and the only place the bot is run
-  with `DRY_RUN=false` and a signing key. `tests/sandbox_harness/mod.rs`
+  sandbox tier's five scenario tests, and the one place outside the
+  testnet soak's armed stage (`scripts/testnet/run-bot.sh --armed`) where
+  the bot is run with `DRY_RUN=false` and a signing key. `tests/sandbox_harness/mod.rs`
   is the machinery every scenario shares — the standalone-network gate,
   the spawned bot, the per-run database(s) and every named wait — and
   holds `SCENARIOS`, one of five places the scenario names are written:
@@ -714,10 +736,20 @@ make help                           # Docker Compose lifecycle
   `versions.env`; `test-cargo-jobs.sh` and `test-cargo-config.sh` source
   neither, because what they test is `scripts/cargo-jobs*.sh`, which
   reaches no network and no pin. `lib.sh` holds log/die, `sandbox_dir`, `sha256_check`/`fetch`, `wait_for_rpc`,
-  `require_standalone_network` and the `sandbox_network_args` flags it
-  pins, the `invoke`/`invoke_view` wrappers that log a contract's *role*
-  and never an argument, and `env_write`, which truncates and `chmod
-  600`s before it writes. `versions.env` holds every pin: the five wasm
+  the shared network gate — `require_network_passphrase URL EXPECTED
+  LABEL` refuses the public mainnet passphrase by name before it compares
+  anything else, dies unless `URL`'s own `getNetwork` answers exactly
+  `EXPECTED`, and only then builds `sandbox_network_args` from *that* URL
+  and *that* passphrase, never a default — and the `sandbox_network_args`
+  flags it pins, with `require_standalone_network URL` now one line on
+  top of it (`require_network_passphrase(url, SANDBOX_PASSPHRASE,
+  "sandbox")`); the `invoke`/`invoke_view` wrappers that log a contract's
+  *role* and never an argument; and `env_write`, which truncates and
+  `chmod 600`s before it writes. `scripts/testnet/lib.sh`'s
+  `require_testnet_network` is the same shape pinned to testnet's own
+  passphrase instead — one gate shared by both tiers, each pinning every
+  later `stellar` call to the passphrase its own node actually answered
+  with, never a tier's assumed one. `versions.env` holds every pin: the five wasm
   URLs with their SHA-256s, the `stellar` CLI release and both tarball
   hashes, the quickstart image by digest, `SANDBOX_PASSPHRASE`, and
   `SQLX_CLI_VERSION`, which is not the sandbox's but has the same
@@ -798,6 +830,84 @@ make help                           # Docker Compose lifecycle
   anything runs the bot, and uploads `target/sandbox/*.log` — `sandbox.log`
   and the scenario's `bot*.log` files — a path, not a mask, because
   uploaded artifacts are not masked.
+- `scripts/testnet/` — the soak's own tier (`docs/testnet-soak.md`), a
+  sibling of `scripts/sandbox/` rather than a mode of it: the same
+  protocol stood up on public Stellar testnet, with friendbot's testnet
+  XLM as the only capital. `lib.sh` sources `scripts/sandbox/lib.sh` and
+  adds `require_testnet_network` — one line over the shared
+  `require_network_passphrase`, pinned to testnet's own passphrase
+  (`Test SDF Network ; September 2015`) — `testnet_dir` (`target/testnet`,
+  this tier's own scratch directory), the `testnet-soak-` key names, and
+  `require_funded_testnet`, which polls testnet Horizon and re-requests
+  testnet's own public friendbot on a 120 s budget, wider than the
+  sandbox's 90 s since this friendbot is a shared public service rather
+  than a container a moment behind its own health check. `deploy.sh` is
+  `scripts/sandbox/deploy.sh`'s own ten steps run against testnet instead:
+  it derives the native asset's id with `stellar contract id asset
+  --asset native` rather than deploying one (testnet already carries that
+  SAC — see the Gotchas below), uploads the pool wasm as its own
+  preflight step and stops, naming the reason, if testnet's protocol
+  rejects bytes pinned against an older `soroban-sdk`, computes the Comet
+  approval's live-until ledger from testnet's own current ledger rather
+  than a fixed literal, and ends by writing `target/testnet/testnet.env`
+  (mode 0600) with the deployed addresses and the filler's secret key —
+  read once, never echoed, logged or passed as an argument. There is no
+  `down.sh`: testnet is not this repository's network to reset, only to
+  rebuild on top of. `crash.sh [PRICE]` moves that deployment's own
+  oracle's XLM price, the one lever that turns `deploy.sh`'s healthy
+  borrower liquidatable. `run-bot.sh [--armed]` is the only path by which
+  `DRY_RUN=false` ever reaches the binary on testnet: plain (`make
+  testnet-run`) reads `target/testnet/pools.toml` — not generated by any
+  script, and `docs/testnet-soak.md`'s own job to specify — and always
+  sets `DRY_RUN=true` with no key read; `--armed` (`make
+  testnet-run-armed`) regenerates `pools.armed.toml` and
+  `seed.armed.toml` from `testnet.env` on every run and exports
+  `DRY_RUN=false` and `FILLER_SECRET_KEY` into the child process's own
+  environment only, after confirming `testnet.env` exists. Its gate runs
+  on exactly the URL the binary is handed — armed, `testnet.env`'s
+  `TESTNET_RPC_URL`, sourced and its passphrase compared with the pin
+  first, as `crash.sh` does — and the binary's `RPC_URL` is the
+  `SANDBOX_RPC_URL` that gate exported. Before its exports it unsets every
+  other setting the bot reads, so the operator's shell hands the binary
+  no signing key (the dry run's "no key" is literal: both key variables
+  are unset), no RPC credential, no Telegram pair and no tuning knob; an
+  armed run also ignores an inherited `RUST_LOG`, and **either** mode
+  refuses one naming `trace`, since both hold `DATABASE_URL` and the
+  armed one the filler's key besides, and `docs/deploy.md` §6 forbids
+  `trace` on a bot holding a secret. That list is by hand: a setting
+  added to `src/config.rs` belongs in it too. Its last step before the
+  `exec` takes `flock -n` on `target/testnet/<database>.lock`, held on a
+  descriptor the `exec` hands the bot, so it is released only when the
+  bot exits: one run per database at a time, which is what stops a
+  second `make testnet-run-armed` signing with the live run's key.
+  `TESTNET_RUN_PORT` and `TESTNET_RUN_DATABASE`, together or not at all,
+  move a dry run to its own port, database and `run-<database>.log` so the
+  script can be exercised beside a live run — never with `--armed`, which
+  refuses them because a second armed bot would sign with the live run's
+  key, and never on a mode's own database, which `TESTNET_RUN_DATABASE`
+  refuses to name.
+  Every script here calls `require_testnet_network` before its first
+  `stellar` call or chain read, exactly the sandbox's own discipline with
+  testnet's passphrase pinned in place of the standalone network's.
+- `examples/scan_borrowers.rs` — finds accounts worth tracking in a
+  pool's recent event history: pages `getEvents` from a start ledger to
+  chain head the way `LedgerPoller` does and collects every account any
+  decoded event names, printing them and a ready-to-paste `[accounts]`
+  block in `SEED_FILE`'s shape. Read-only: no key, no store, nothing
+  signed. This is the soak's answer to a pool with no analytics API to
+  seed from, and it is explicit about its own limit — a start ledger
+  older than the RPC's retained window is narrowed rather than failed,
+  and a scan that stops at its own page cap says so, since either reads
+  exactly like "this pool has no other borrowers" unless it says
+  otherwise.
+- `examples/soak_report.rs` — prints the evidence either soak stage has
+  produced for one pool: the tracked-user count and open auctions, every
+  `creations` and `fills` row with its `dry_run` and `tx_hash`, and, for
+  accounts named on the command line, their on-chain position read
+  fresh. Read-only — it opens the store without migrating it and takes no
+  key — and reads `creations`/`fills` with runtime `sqlx::query_as`
+  rather than the compile-time macros, since `.sqlx/`'s offline metadata
+  covers only `--lib --bins`, never `examples/`.
 
 The module layout beyond this follows
 `docs/specs/2026-09-04-blend-liquidator-bot-design.md`; see
@@ -1385,6 +1495,59 @@ Status above for what remains.
   the testnet passphrase in dry run, exits `2` naming `chain: simulation
   failed`; case (h), the same passphrase keyless, exits `0`. Nothing here
   closes the gap.
+- Testnet is wiped 2 to 4 times a year, contracts and accounts alike —
+  Stellar's own policy, not something this repository can prevent or
+  detect. Anything `scripts/testnet/deploy.sh` stood up is disposable,
+  and every address in `docs/testnet-soak.md` is an example of the shape
+  an address takes, never a fact that outlives a reset: after one,
+  `deploy.sh` rebuilds stage 2 from scratch (remove
+  `target/testnet/testnet.env` first — it still names the now-gone pool)
+  and stage 1's `pools.toml` needs its addresses re-derived from Blend's
+  own current `blend-utils/testnet.contracts.json`.
+- The native asset's Stellar Asset Contract already exists on testnet —
+  every network but a brand-new standalone one carries it — so
+  `scripts/sandbox/deploy.sh`'s own `stellar contract asset deploy
+  --asset native` would fail there. `scripts/testnet/deploy.sh`'s
+  `native_asset_id` (`scripts/testnet/deploy.sh:190-198`) takes the id
+  instead from `stellar contract id asset --asset native`, which derives
+  it purely from the network passphrase, no source account or
+  transaction involved.
+- Discovery on a pool this repository does not control is bounded by
+  what the RPC's `getEvents` still retains, not an index of every
+  position the pool has ever held — testnet has no analytics API for
+  `SEED_URL` to enumerate positions from the way mainnet's does.
+  On 2026-09-23 `examples/scan_borrowers.rs` found 9 accounts in Blend's
+  testnet pool's last 24 hours and 15 in its last 7 days, and none of
+  either set held debt: those positions were taken long before the window
+  and their owners had not acted since (`docs/testnet-soak.md`, "Seeding
+  it with `scan_borrowers`"). So a dry run's tracked set on a pool like this
+  is only what acts while it watches, plus whatever a scan like that
+  found — which is the argument for `SEED_URL`'s mainnet-analytics-API
+  default existing at all.
+- The armed runner seeds its own borrower. `deploy.sh`'s borrower takes
+  its position inside its own step 9, before the bot or its events
+  cursor exists, so no event in the range the poller ever reads names
+  it. `run-bot.sh --armed` writes `target/testnet/seed.armed.toml`
+  naming it for exactly that reason (its `seed_file=` heredoc), and both
+  modes export `SEED_URL=""` (next to the `POOLS_FILE` export)
+  — never the default, which answers for mainnet's own analytics API and
+  would seed mainnet accounts into a testnet pool.
+- `users_tracked` is a full-scan gauge, not a live count. `full_scan`
+  (`src/service.rs:1089`) is its only writer
+  (`instruments.metrics.users_tracked(pool, user_count)` at
+  `src/service.rs:1109`), run on `FULL_SCAN_LEDGERS`'s cadence — 1,200
+  ledgers by default, about 100 minutes at testnet's ~5 s ledgers.
+  Between scans the gauge can trail what `Store::count_users` would
+  answer right now; `examples/soak_report.rs` reads the store directly
+  for that reason rather than trusting `/metrics`.
+- Testnet's ledgers close about every 5 seconds, not the sandbox's ~1
+  second, so every wait budget written around the sandbox is roughly
+  five times longer here: an auction's 400-ledger ramp (`RAMP_END_BLOCKS`,
+  `src/math/auction.rs:18`) takes about 33 minutes rather than the
+  sandbox's few, and `fill_objective = "earliest-profitable"` — this
+  tier's own pool setting — lands around 15 minutes in rather than under
+  one. `docs/testnet-soak.md`'s own "What to expect, and when" budgets a
+  full hour for an armed pass end to end for this reason.
 
 ## The fork's gotchas
 
@@ -1473,8 +1636,10 @@ reasoning and the work each one implies, is
   which is always, for a reserve anybody borrows from. Orphaned collateral is
   dead capital, and the bot deliberately does not chase it.
 - **`bstop_rate` must be zero at initialize** (`1201` otherwise), which
-  `scripts/sandbox/deploy.sh` will have to satisfy before it can stand a fork
-  pool up.
+  both `scripts/sandbox/deploy.sh` and `scripts/testnet/deploy.sh` will have
+  to satisfy before either can stand a fork pool up: both pass
+  `--backstop_take_rate 1000000` today, which is right for the stock wasm
+  they pin and fails the fork's initialize at step 6.
 
 ## Workflow
 
@@ -1499,8 +1664,10 @@ reasoning and the work each one implies, is
 - `docs/` — `configuration.md` (every setting, its default and bound),
   `deploy.md` (the operator's guide from pulling the image to running it
   armed), `deployment-contract.md` (what the image guarantees and what a
-  deployment must provide) and `architecture.md` (the one-sitting
-  overview). Committed.
+  deployment must provide), `architecture.md` (the one-sitting overview)
+  and `testnet-soak.md` (the design spec's §9 soak: observe against
+  Blend's own public-testnet pool, then armed against this repository's
+  own throwaway deployment on the same network). Committed.
 - `docs/specs/` — the design specs, the durable half of the documentation
   and the authority every plan argues from. Committed.
 - `docs/plans/` — per-phase implementation plans. Working documents that go

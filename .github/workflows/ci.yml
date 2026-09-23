@@ -80,7 +80,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - run: shellcheck --severity=error scripts/*.sh scripts/sandbox/*.sh .devcontainer/*.sh
+      - run: shellcheck --severity=error scripts/*.sh scripts/sandbox/*.sh scripts/testnet/*.sh .devcontainer/*.sh
 
   # ── CI Summary ──────────────────────────────────────
   # Aggregate gate: the single required status check on main. Requiring this
