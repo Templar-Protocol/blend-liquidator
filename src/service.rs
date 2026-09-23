@@ -1824,7 +1824,9 @@ impl StartupGate {
 struct AuctioneerState {
     /// Each pool's oracle-scan reference prices.
     price_watches: BTreeMap<String, PriceWatch>,
-    /// The ledger each pool's oracle scan last fired at.
+    /// The ledger each pool's oracle scan last fired at — except a scan
+    /// refused as `ChainError::LedgerMoved`, which is left unrecorded so
+    /// the next tick is due again (see `auctioneer_tick`).
     last_oracle_scan: BTreeMap<String, u32>,
     /// The ledger each pool's full scan last fired at.
     last_full_scan: BTreeMap<String, u32>,
