@@ -68,6 +68,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail a deploy at step 1 after 30s with "friendbot did not fund …", on a
   network with nothing wrong with it but timing.
 
+### Security
+
+- An RPC call that fails at the transport level (DNS, TLS, a timeout, a
+  refused connection) no longer renders the RPC URL: `ChainError`'s
+  `From<reqwest::Error>` strips it with `reqwest::Error::without_url()`
+  before the error is logged or, as `RpcFailing`, sent to the
+  notification channel. `RPC_URL` must still carry no credential — it is
+  an ordinary argument, and a debug print of the RPC client renders it.
+
 ## [0.1.0] - 2026-09-22
 
 The first release: a Blend v2 liquidation bot targeting the ADR-0008

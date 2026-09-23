@@ -29,8 +29,13 @@ pub use tx::{LedgerWindow, Prepared, Priority, Submitter, TxConfig, TxOutcome};
 #[derive(Debug, thiserror::Error)]
 pub enum ChainError {
     /// The HTTP request never produced a response (DNS, TLS, timeout).
+    ///
+    /// Always built through this type's `From<reqwest::Error>`, which strips
+    /// the request URL first: this variant's text reaches the log and, as
+    /// `RpcFailing`, the notification channel, and an RPC URL is the one
+    /// part of a request an operator may have put a credential in.
     #[error("rpc transport: {0}")]
-    Transport(#[from] reqwest::Error),
+    Transport(reqwest::Error),
     /// The RPC answered with a non-2xx status.
     #[error("rpc http status {0}")]
     Http(u16),
@@ -98,6 +103,15 @@ pub enum ChainError {
     /// transaction was built from is stale and must be rebuilt, never resent.
     #[error("the account's sequence number moved under this transaction")]
     BadSequence,
+}
+
+impl From<reqwest::Error> for ChainError {
+    /// Every `?` on a `reqwest` call lands here, so this is the one place
+    /// the URL is removed — `Display` and `Debug` alike render `reqwest`'s
+    /// own text without it.
+    fn from(error: reqwest::Error) -> Self {
+        Self::Transport(error.without_url())
+    }
 }
 
 /// A transaction hash: rendered as 64 lowercase hex digits; parsed
