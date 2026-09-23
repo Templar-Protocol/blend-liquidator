@@ -871,9 +871,15 @@ make help                           # Docker Compose lifecycle
   other setting the bot reads, so the operator's shell hands the binary
   no signing key (the dry run's "no key" is literal: both key variables
   are unset), no RPC credential, no Telegram pair and no tuning knob; an
-  armed run also ignores an inherited `RUST_LOG`, since `docs/deploy.md`
-  §6 forbids running a key-holding bot at `trace`. That list is by hand:
-  a setting added to `src/config.rs` belongs in it too.
+  armed run also ignores an inherited `RUST_LOG`, and **either** mode
+  refuses one naming `trace`, since both hold `DATABASE_URL` and the
+  armed one the filler's key besides, and `docs/deploy.md` §6 forbids
+  `trace` on a bot holding a secret. That list is by hand: a setting
+  added to `src/config.rs` belongs in it too. Its last step before the
+  `exec` takes `flock -n` on `target/testnet/<database>.lock`, held on a
+  descriptor the `exec` hands the bot, so it is released only when the
+  bot exits: one run per database at a time, which is what stops a
+  second `make testnet-run-armed` signing with the live run's key.
   `TESTNET_RUN_PORT` and `TESTNET_RUN_DATABASE`, together or not at all,
   move a dry run to its own port, database and `run-<database>.log` so the
   script can be exercised beside a live run — never with `--armed`, which
