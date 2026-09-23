@@ -1532,14 +1532,18 @@ Status above for what remains.
   modes export `SEED_URL=""` (next to the `POOLS_FILE` export)
   — never the default, which answers for mainnet's own analytics API and
   would seed mainnet accounts into a testnet pool.
-- `users_tracked` is a full-scan gauge, not a live count. `full_scan`
-  (`src/service.rs:1089`) is its only writer
-  (`instruments.metrics.users_tracked(pool, user_count)` at
-  `src/service.rs:1109`), run on `FULL_SCAN_LEDGERS`'s cadence — 1,200
-  ledgers by default, about 100 minutes at testnet's ~5 s ledgers.
-  Between scans the gauge can trail what `Store::count_users` would
-  answer right now; `examples/soak_report.rs` reads the store directly
-  for that reason rather than trusting `/metrics`.
+- `users_tracked` has two writers: `apply_tick` (`src/service.rs`),
+  which re-reads `Store::count_users` after any tick whose refresh
+  touched an account — only a refresh inserts or deletes a `users` row,
+  so a tick that refreshed nothing skips the read — and `full_scan`, on
+  `FULL_SCAN_LEDGERS`'s cadence. So the gauge trails the store by at most
+  a ledger. Before `apply_tick` wrote it, the full scan was its only
+  writer and it trailed by up to a whole scan period — about 100 minutes
+  at testnet's ~5 s ledgers, which is what the stage 1 soak's own log
+  shows. The "full scan" and "tracked borrower" log lines are still the
+  full scan's alone. `examples/soak_report.rs` reads the store directly
+  regardless: it is a process of its own, with no bot's `/metrics` to
+  read.
 - Testnet's ledgers close about every 5 seconds, not the sandbox's ~1
   second, so every wait budget written around the sandbox is roughly
   five times longer here: an auction's 400-ledger ramp (`RAMP_END_BLOCKS`,

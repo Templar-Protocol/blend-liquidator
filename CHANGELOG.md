@@ -67,6 +67,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The testnet soak saw three such refusals in about three hours on the
   public RPC. Every other scan failure still waits a period, so an
   oracle or RPC that has stopped answering is not re-read every ledger.
+- `users_tracked{pool}` follows the store to within a ledger: every tick
+  whose refresh touched an account re-reads the pool's tracked-user
+  count. Before, only the full scan set it, so it trailed the store by up
+  to a whole `FULL_SCAN_LEDGERS` period — about 100 minutes on testnet,
+  which the soak's first stage recorded. The "full scan" and "tracked
+  borrower" log lines are still the full scan's alone.
 - `scripts/sandbox/deploy.sh`'s `require_funded` re-requests friendbot
   funding every few seconds, on a widened 90s budget, while it polls
   Horizon for an account to exist. `up.sh`'s own health gate proves the

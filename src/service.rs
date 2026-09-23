@@ -643,9 +643,9 @@ async fn seed_pools_needing_it(
         // the top of this loop was read *before* the seed, so it is stale
         // by the time the seed finishes — a pool with users but no cursor
         // is seeded on a count that was never zero, and one seeded from
-        // empty has stopped being zero by here. `full_scan` sets
-        // `users_tracked` from a count taken after the seed, within one
-        // scan period.
+        // empty has stopped being zero by here. `users_tracked` is set
+        // from a count taken after the seed by the first tick that
+        // refreshes an account (`apply_tick`), or by the full scan.
         instruments
             .metrics
             .seed_accounts_loaded(&pool.address, outcome.refresh.tracked);
@@ -1041,6 +1041,14 @@ async fn apply_tick(
             .store()
             .flag_recheck(pool, account, tick.sequence)
             .await?;
+    }
+    // Only a refresh inserts or deletes a `users` row, so a tick that
+    // refreshed nothing cannot have moved the count and pays for no read.
+    // Without this the gauge moved only on the full scan, trailing the
+    // store by up to a whole `FULL_SCAN_LEDGERS` period.
+    if !accounts.is_empty() || !stale_accounts.is_empty() {
+        let user_count = tracker.store().count_users(pool).await?;
+        instruments.metrics.users_tracked(pool, user_count);
     }
     if scan_due(
         tick.sequence,
@@ -5003,6 +5011,75 @@ mod tests {
             "the account this tick's event named is flagged for an auctioneer decision"
         );
         assert_eq!(flagged[0].recheck_ledger, Some(tick.sequence));
+        Ok(())
+    }
+
+    /// `users_tracked` follows the tick's own refresh, in both directions,
+    /// with no full scan anywhere in this test (`quiet_cadence` disables
+    /// it): a gauge only the full scan wrote trailed the store by up to a
+    /// whole `FULL_SCAN_LEDGERS` period — about 100 minutes on testnet.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_tick_that_refreshes_accounts_regauges_users_tracked(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        // Tick one values USER_ONE's position; tick two's read no longer
+        // holds it, so the refresh deletes the row.
+        harness::script_snapshot(&rpc, &[harness::USER_ONE]);
+        harness::script_snapshot(&rpc, &[]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let tracker = Tracker::new(&client, &store);
+        let (_flag, shutdown) = watch::channel(false);
+        let (tick_tx, _tick_rx) = tick_watch();
+        let instruments = Instruments::for_tests();
+        let mut state = LoopState::default();
+        let gauge = |count: u32| format!("users_tracked{{pool=\"{}\"}} {count}", harness::POOL);
+
+        let tick = harness::fixture_tick();
+        for (sequence, tracked) in [(tick.sequence, 1), (tick.sequence + 1, 0)] {
+            handle_message(
+                &tracker,
+                &[],
+                quiet_cadence(),
+                &mut state,
+                &shutdown,
+                &instruments,
+                &tick_tx,
+                borrow(harness::POOL, harness::USER_ONE),
+            )
+            .await
+            .expect("apply the event");
+            let (message, applied) = tick_message(
+                harness::POOL,
+                LedgerTick {
+                    sequence,
+                    close_time: tick.close_time,
+                },
+            );
+            handle_message(
+                &tracker,
+                &[],
+                quiet_cadence(),
+                &mut state,
+                &shutdown,
+                &instruments,
+                &tick_tx,
+                message,
+            )
+            .await
+            .expect("apply the tick");
+            assert!(applied.await.is_ok());
+            assert_eq!(
+                store.count_users(harness::POOL).await.expect("count"),
+                i64::from(tracked)
+            );
+            let rendered = instruments.metrics.render();
+            assert!(
+                rendered.contains(&gauge(tracked)),
+                "the gauge reads the store's count after tick {sequence}: {rendered}"
+            );
+        }
         Ok(())
     }
 
