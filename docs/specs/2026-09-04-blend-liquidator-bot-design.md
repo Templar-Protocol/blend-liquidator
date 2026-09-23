@@ -674,8 +674,14 @@ after a cursor fell out of the retained window, unfunded fill skipped.
 - **Executor.** Reservation settlement happens on every non-panicking path,
   including early returns and task cancellation during shutdown, through a
   drop guard that releases an unsettled token and logs a warning. A panic
-  aborts the process under the release profile, and the in-memory ledger dies
-  with it; the next start rebuilds inventory from chain.
+  unwinds, in the release profile as in every other (`panic = "unwind"`), so
+  that drop guard runs on the panic's path too. The run then treats the panic
+  as it treats a task's error: shutdown is raised and every other task
+  finishes what it is doing — a transaction the submission queue has already
+  sent is resolved, not abandoned — the notifier drains, and the process exits
+  `101`. Nothing trades after the panic, so the ledger the guard released into
+  is never sized against again; the next start rebuilds inventory from
+  chain.
 - **Notifier and metrics** failures never affect trading.
 - **Store** errors are `Store`-phase errors; a store outage makes `/healthz`
   fail and pauses submissions rather than trading on stale state.

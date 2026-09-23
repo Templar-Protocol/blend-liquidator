@@ -59,6 +59,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A panic in any of the bot's tasks now shuts the bot down gracefully
+  before it ends the process, rather than aborting it on the spot. The
+  release profile unwinds (`panic = "unwind"`, where it had been
+  `"abort"`), and `drain_tasks` treats a task's panic as it already
+  treated a task's error: it raises shutdown and waits for every other
+  task to finish what it is doing — so a transaction the submission queue
+  has already sent is resolved rather than abandoned between its send and
+  its outcome — and the notifier drains before the panic is resumed. The
+  process then exits `101`, Rust's panic exit code, where it used to die
+  by a signal; a panic is reported over any error the same run hit. The
+  release binary is somewhat larger for carrying unwind tables.
 - A `v*` tag with a `-` suffix (`v0.2.0-rc.1`) now cuts its GitHub
   Release marked as a prerelease, the same test `release.yml` already
   applies to the image's `latest` and `{{major}}.{{minor}}` tags, so a

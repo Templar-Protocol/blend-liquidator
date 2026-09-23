@@ -56,7 +56,7 @@ synchronously and spawns the send behind a bounded semaphore
 (`NOTIFY_IN_FLIGHT`), answering `Delivery::Queued`/`Deduplicated`/`Dropped`
 rather than waiting on the channel — and `Notifier::drain` gives whatever
 is still in flight a bounded `DRAIN_BUDGET` on every exit but the second
-shutdown signal and a release build's panic abort. The poller records a heartbeat every iteration and the
+shutdown signal. The poller records a heartbeat every iteration and the
 chain head every pass, and reports `NotificationKind::RpcFailing` after
 `RPC_FAILING_AFTER` consecutive failures; a watchdog task the run spawns
 beside the pollers reports a pool whose heartbeat has gone past
@@ -64,8 +64,8 @@ beside the pollers reports a pool whose heartbeat has gone past
 seven kinds of task — one `LedgerPoller` per pool, one tracker, one
 auctioneer, one filler, one watchdog, one HTTP server when a port is
 configured, and one submission-queue worker per distinct signing key when
-armed — and every exit but the second shutdown signal and a release
-build's panic abort drains the notifier before it returns. Phase 7 landed the sandbox integration tier
+armed — and every exit but the second shutdown signal drains the
+notifier before it returns, a task's panic included. Phase 7 landed the sandbox integration tier
 (`scripts/sandbox/`, `tests/liquidation_sandbox.rs`,
 `.github/workflows/sandbox.yml`) and the dev-container additions it needs
 (`scripts/cargo-jobs.sh`, the `stellar` CLI): a throwaway Stellar network
@@ -622,13 +622,17 @@ make help                           # Docker Compose lifecycle
   `finish_run`, which drains the notifier (`Notifier::drain(DRAIN_BUDGET)`)
   on both the `Ok` and the `Err` path; an earlier `?` (validation, the
   seed pass) has nothing in flight, since nothing before the tasks
-  notifies. The two exits that skip it are the second `SIGINT`/`SIGTERM`
+  notifies. The one exit that skips it is the second `SIGINT`/`SIGTERM`
   (`spawn_shutdown_listener`'s `exit(130)`, deliberately: a second signal
-  means now) and a task panic. A release build — the image's — sets
-  `panic = "abort"` (`Cargo.toml`'s `[profile.release]`), so there a
-  panic aborts the process where it happens, with no unwind at all; in a
-  debug or test build it unwinds, `resume_on_panic` carrying it straight
-  out of `drain_tasks`, past `finish_run` entirely. The tracker loop treats
+  means now). A task's panic does not: every build unwinds — the release
+  profile says `panic = "unwind"` explicitly, and must never go back to
+  `abort`, which ended the process wherever the panic happened, a
+  transaction's send and its outcome included — and `drain_tasks` treats
+  a panic as it treats an error, raising shutdown and joining every other
+  task to its own end, then answers `Drained::Panicked`, which
+  `finish_run` resumes only after the drain. The process then exits `101`,
+  Rust's panic code, and a panic wins over any error the same run
+  reported. The tracker loop treats
   a `TrackerError::Store` as fatal and a `Chain` or `Math` one as transient
   — it declines the tick, and the same range is read again. Both entry
   points share `validate` and `validate_filler`: the filler's account must

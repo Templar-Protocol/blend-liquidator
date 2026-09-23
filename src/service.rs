@@ -65,12 +65,11 @@
 //! way too — every in-flight delivery gets
 //! [`crate::notifier::DRAIN_BUDGET`] to finish, a timeout is a warning
 //! and nothing more, and the result `drain_tasks` answered is returned
-//! unchanged. Two exits do not drain. One is deliberate: the *second*
-//! `SIGINT`/`SIGTERM` is answered by `spawn_shutdown_listener` with
-//! `exit(130)`, because a second signal means now and a drain is exactly
-//! the delay it is refusing. The other is a task panic in a release build,
-//! which sets `panic = "abort"`: the process ends where the panic happened
-//! (see `finish_run`).
+//! unchanged. A task's panic leaves the same way too, resumed only after
+//! the drain (see `drain_tasks`). One exit does not drain, deliberately:
+//! the *second* `SIGINT`/`SIGTERM` is answered by
+//! `spawn_shutdown_listener` with `exit(130)`, because a second signal
+//! means now and a drain is exactly the delay it is refusing.
 //!
 //! # The deciding tasks are joined to the tracker by a tick
 //!
@@ -2188,25 +2187,22 @@ async fn wait_for_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-/// Propagates a spawned task's panic into this task rather than wedging it
-/// into [`LiquidatorError`]'s taxonomy: a panic is an internal bug, not one
-/// of the phases that enum distinguishes, and swallowing it into, say,
-/// `Config` would misreport a bug as a bad configuration.
+/// How [`drain_tasks`] ended, once every task has returned.
 ///
-/// Reached only where panics unwind — debug and test builds. The release
-/// profile sets `panic = "abort"`, so there a task's panic ends the process
-/// before its `JoinHandle` can answer.
-fn resume_on_panic(error: tokio::task::JoinError) -> ! {
-    match error.try_into_panic() {
-        Ok(payload) => std::panic::resume_unwind(payload),
-        Err(cancelled) => {
-            // Nothing in this service ever calls `.abort()`, so a task
-            // ending cancelled rather than panicked never happens in
-            // practice; if it ever does, say so loudly rather than return
-            // successfully as if the task had finished its work.
-            panic!("a service task was cancelled unexpectedly: {cancelled}")
-        }
-    }
+/// A panic is kept apart from [`LiquidatorError`] rather than wedged into
+/// its taxonomy: it is an internal bug, not one of the phases that enum
+/// distinguishes, and swallowing it into, say, `Config` would misreport a
+/// bug as a bad configuration — and exit `2`, telling the operator to fix
+/// something they did not break.
+enum Drained {
+    /// Every task returned: `Ok` when all of them did, else the first
+    /// error, the ones after it being usually this shutdown's own doing.
+    Returned(Result<(), LiquidatorError>),
+    /// A task panicked: the first panic's payload, which [`finish_run`]
+    /// resumes only once the notifier has drained, so the process still
+    /// ends as a panic — Rust's exit code `101`, the message already on
+    /// stderr from when it happened.
+    Panicked(Box<dyn std::any::Any + Send + 'static>),
 }
 
 /// Waits for the first shutdown signal, flips `shutdown` so every task
@@ -2642,40 +2638,68 @@ fn spawn_filler(
 /// has returned on its own. The error path and the graceful-shutdown path
 /// are then the same path, which is what the queue's doc already assumes.
 /// Only the *first* error is reported: the ones after it are usually this
-/// shutdown's own consequences, and a panic still propagates as a panic —
-/// in a build that unwinds; a release build aborts where the panic happened.
+/// shutdown's own consequences.
+///
+/// A task's panic takes the same path, for the same reason. Resuming it the
+/// moment its `JoinHandle` answered would unwind out of here and drop the
+/// [`JoinSet`] just the same, and the release profile unwinds for exactly
+/// this (`Cargo.toml`): with `panic = "abort"` a bug in any task — an
+/// overflow check tripping in the maths, say — ended the process between a
+/// `sendTransaction` and its outcome. The first panic wins over any error,
+/// since it is a bug and must end the process as one; a cancelled task,
+/// which nothing here ever causes, is treated as a panic rather than as a
+/// task that finished its work.
 async fn drain_tasks(
     mut tasks: JoinSet<Result<(), LiquidatorError>>,
     shutdown: &watch::Sender<bool>,
-) -> Result<(), LiquidatorError> {
+) -> Drained {
     let mut failure: Option<LiquidatorError> = None;
+    let mut panicked: Option<Box<dyn std::any::Any + Send + 'static>> = None;
     while let Some(outcome) = tasks.join_next().await {
         match outcome {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
-                if failure.is_none() {
+                if failure.is_none() && panicked.is_none() {
                     tracing::error!(
                         %error,
                         "a service task failed; shutting down and waiting for the rest"
                     );
                     let _ = shutdown.send(true);
-                    failure = Some(error);
                 } else {
                     tracing::warn!(%error, "another task failed while shutting down");
                 }
+                failure.get_or_insert(error);
             }
-            Err(error) => resume_on_panic(error),
+            Err(error) => {
+                if panicked.is_none() {
+                    tracing::error!(
+                        %error,
+                        "a service task panicked; shutting down and waiting for the rest"
+                    );
+                    let _ = shutdown.send(true);
+                } else {
+                    tracing::warn!(%error, "another task panicked while shutting down");
+                }
+                let payload = error.try_into_panic().unwrap_or_else(|cancelled| {
+                    Box::new(format!(
+                        "a service task was cancelled unexpectedly: {cancelled}"
+                    ))
+                });
+                panicked.get_or_insert(payload);
+            }
         }
     }
-    match failure {
-        Some(error) => Err(error),
-        None => Ok(()),
+    match (panicked, failure) {
+        (Some(payload), _) => Drained::Panicked(payload),
+        (None, Some(error)) => Drained::Returned(Err(error)),
+        (None, None) => Drained::Returned(Ok(())),
     }
 }
 
 /// The last thing every exit of [`Service::run`] does: gives the
 /// notifications still in flight [`DRAIN_BUDGET`] to leave, then returns
-/// `result` unchanged.
+/// what [`drain_tasks`] answered unchanged — or, for a task's panic,
+/// resumes it, so the process ends as the panic it was.
 ///
 /// Spec §7 asks for `drain()` on every exit path, and this is where both
 /// of `run`'s are — a task failure and a shutdown signal join the same way
@@ -2694,18 +2718,12 @@ async fn drain_tasks(
 /// log instead of in the channel, which [`Notifier`] has already written
 /// there.
 ///
-/// Two exits skip this and leave whatever was in flight behind: the
-/// second `SIGINT`/`SIGTERM`, deliberately, per the paragraph above; and a
-/// task panic, which is not deliberate but has the same shape. A release
-/// build — the image's — sets `panic = "abort"`, so there a panic ends the
-/// process where it happens, with no unwind and no graceful shutdown at
-/// all. A debug or test build unwinds instead: `resume_on_panic` calls
-/// [`std::panic::resume_unwind`] from inside [`drain_tasks`], so the panic
-/// unwinds straight out of `Service::run` and never reaches this function.
-async fn finish_run(
-    result: Result<(), LiquidatorError>,
-    notifier: &Notifier,
-) -> Result<(), LiquidatorError> {
+/// One exit skips this, deliberately, per the paragraph above: the second
+/// `SIGINT`/`SIGTERM`. A task's panic does not: every build unwinds
+/// (`Cargo.toml`'s release profile says so explicitly), [`drain_tasks`]
+/// shuts the other tasks down behind it as it would behind an error, and
+/// only here, after the drain, is it resumed.
+async fn finish_run(drained: Drained, notifier: &Notifier) -> Result<(), LiquidatorError> {
     if notifier.drain(DRAIN_BUDGET).await {
         tracing::info!("notifications drained");
     } else {
@@ -2715,7 +2733,10 @@ async fn finish_run(
             "notifications still in flight at the drain budget; leaving them behind"
         );
     }
-    result
+    match drained {
+        Drained::Returned(result) => result,
+        Drained::Panicked(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 /// The bot's two entry points: [`run`](Service::run) follows the configured
@@ -2776,9 +2797,9 @@ impl Service {
     /// shutdown signal arrives and every task has returned. Once its
     /// tasks are running, every return goes through `finish_run`, which
     /// drains the notifier; an earlier `?` returns with nothing in flight,
-    /// since nothing before the tasks notifies. The second shutdown
-    /// signal's `exit(130)` and a release build's panic abort end the
-    /// process without returning.
+    /// since nothing before the tasks notifies — a task's panic included,
+    /// which is resumed after the drain rather than returned. The second
+    /// shutdown signal's `exit(130)` ends the process without returning.
     ///
     /// `keys` holds both of `AUCTIONEER_SECRET_KEY` and
     /// `FILLER_SECRET_KEY`, either or both of which may be absent — neither
@@ -5714,9 +5735,10 @@ mod tests {
         });
         tasks.spawn(async { Err(LiquidatorError::Config("a task failed".to_string())) });
 
-        let error = drain_tasks(tasks, &shutdown_tx)
-            .await
-            .expect_err("the failure is reported");
+        let Drained::Returned(result) = drain_tasks(tasks, &shutdown_tx).await else {
+            panic!("no task panicked");
+        };
+        let error = result.expect_err("the failure is reported");
         assert!(
             matches!(error, LiquidatorError::Config(_)),
             "and it is the first error, not a shutdown artefact"
@@ -5729,6 +5751,66 @@ mod tests {
             *shutdown_rx.borrow(),
             "the failure raised the shutdown flag, so the error path and the signal \
              path drain by the same route"
+        );
+    }
+
+    /// A task's panic drains the rest exactly as an error does, and is what
+    /// the run reports even when an error came too.
+    ///
+    /// Resumed the moment its `JoinHandle` answered, a panic would unwind
+    /// out of `drain_tasks` and drop the `JoinSet` — aborting `run_queue`
+    /// between a send and its outcome just as surely as returning on an
+    /// error would. The watcher below returns only once shutdown is raised
+    /// and records that it did, so an abort cannot pass for a drain. The
+    /// error task returns only after the panic has raised shutdown, so
+    /// both have happened by the time the run reports, and the panic, a
+    /// bug, is what it reports.
+    #[tokio::test]
+    async fn a_panicking_task_shuts_the_rest_down_and_is_reported_over_an_error() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let finished = Arc::new(AtomicBool::new(false));
+        let mut tasks: JoinSet<Result<(), LiquidatorError>> = JoinSet::new();
+
+        let until_shutdown = |mut watcher: watch::Receiver<bool>| async move {
+            while !*watcher.borrow_and_update() {
+                if watcher.changed().await.is_err() {
+                    break;
+                }
+            }
+        };
+        let flag = Arc::clone(&finished);
+        let watcher = until_shutdown(shutdown_rx.clone());
+        tasks.spawn(async move {
+            watcher.await;
+            flag.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        let watcher = until_shutdown(shutdown_rx.clone());
+        tasks.spawn(async move {
+            watcher.await;
+            Err(LiquidatorError::Config(
+                "failed after the panic".to_string(),
+            ))
+        });
+        tasks.spawn(async { panic!("a task panicked") });
+
+        let Drained::Panicked(payload) = drain_tasks(tasks, &shutdown_tx).await else {
+            panic!("the panic is what the run reports");
+        };
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"a task panicked"),
+            "and it is the task's own panic, carried through unchanged"
+        );
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "the other task ran to its own end rather than being aborted mid-flight"
+        );
+        assert!(
+            *shutdown_rx.borrow(),
+            "the panic raised the shutdown flag, as a failure does"
         );
     }
 
@@ -7833,7 +7915,7 @@ mod tests {
 
         let finishing = tokio::spawn({
             let notifier = Arc::clone(&notifier);
-            async move { finish_run(Ok(()), &notifier).await }
+            async move { finish_run(Drained::Returned(Ok(())), &notifier).await }
         });
         // The send is still held, so the drain cannot have finished: a
         // `finish_run` that returned here would be one that left a
@@ -7854,11 +7936,56 @@ mod tests {
 
         // The error path drains the same way and reports the same error.
         let error = finish_run(
-            Err(LiquidatorError::Config("a task failed".to_string())),
+            Drained::Returned(Err(LiquidatorError::Config("a task failed".to_string()))),
             &notifier,
         )
         .await
         .expect_err("an Err is returned unchanged");
         assert!(matches!(error, LiquidatorError::Config(message) if message == "a task failed"));
+    }
+
+    /// A task's panic is resumed only once the notifier has drained: the
+    /// send the gated channel holds must leave before the panic ends the
+    /// run, and the panic that ends it is the task's own.
+    #[tokio::test]
+    async fn a_panic_is_resumed_only_after_the_notifier_drains() {
+        let gated = Arc::new(GatedChannel::new());
+        let notifier = Arc::new(Notifier::new(
+            Box::new(Arc::clone(&gated)),
+            std::time::Duration::from_hours(1),
+        ));
+        assert_eq!(
+            notifier.notify(Notification {
+                kind: NotificationKind::SubmissionDropped,
+                severity: Severity::High,
+                pool: POOL_A.to_string(),
+                account: None,
+                message: "sent just before the panic".to_string(),
+            }),
+            crate::notifier::Delivery::Queued
+        );
+
+        let finishing = tokio::spawn({
+            let notifier = Arc::clone(&notifier);
+            async move { finish_run(Drained::Panicked(Box::new("a task panicked")), &notifier).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !finishing.is_finished(),
+            "the panic waits for the send the channel is holding"
+        );
+        assert_eq!(gated.sent_count(), 0);
+
+        gated.release();
+        let payload = finishing
+            .await
+            .expect_err("the run ends as a panic, not a return")
+            .into_panic();
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"a task panicked"));
+        assert_eq!(
+            gated.sent_count(),
+            1,
+            "the held send left before the panic did"
+        );
     }
 }

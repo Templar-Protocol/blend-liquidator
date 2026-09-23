@@ -103,6 +103,10 @@ codegen-units = 1
 opt-level = "z"
 lto = "fat"
 debug = false
-panic = "abort"
+# Unwind, never abort, and said explicitly so a size pass does not flip it
+# back. A task's panic must shut the other tasks down the way an error does
+# (`drain_tasks` in src/service.rs): aborting ends the process wherever the
+# panic happened, which can be between a transaction's send and its outcome.
+panic = "unwind"
 strip = "symbols"
 overflow-checks = true
