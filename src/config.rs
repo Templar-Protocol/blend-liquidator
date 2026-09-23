@@ -2833,6 +2833,29 @@ supported_lot = ["*"]
         /// The ones exported in every mode: at the script's top level, or in
         /// both arms of an `if` that has an `else`.
         every_mode: std::collections::BTreeSet<String>,
+        /// Each export's name, and every setting-shaped name its value
+        /// expands (`$NAME` or `${NAME…}`).
+        expands: Vec<(String, String)>,
+    }
+
+    /// Every setting-shaped name `value` expands: each `$` followed,
+    /// through an optional `{`, by a shell name that [`is_setting`] accepts.
+    /// Quoting is not followed — no export in the script single-quotes a
+    /// `$` — so this errs toward reporting an expansion, never toward
+    /// missing one.
+    fn expanded_settings(value: &str) -> Vec<String> {
+        value
+            .split('$')
+            .skip(1)
+            .filter_map(|rest| {
+                let rest = rest.strip_prefix('{').unwrap_or(rest);
+                let end = rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len());
+                let name = &rest[..end];
+                is_setting(name).then(|| name.to_owned())
+            })
+            .collect()
     }
 
     impl RunnerEnvironment {
@@ -2875,6 +2898,7 @@ supported_lot = ["*"]
 
             let mut exported = BTreeSet::new();
             let mut every_mode = BTreeSet::new();
+            let mut expands = Vec::new();
             // One set per arm of each `if` still open: the names that arm
             // has exported in every path through it so far.
             let mut open: Vec<(Vec<BTreeSet<String>>, bool)> = Vec::new();
@@ -2909,11 +2933,16 @@ supported_lot = ["*"]
                     in_case += 1;
                 } else if line == "esac" {
                     in_case -= 1;
-                } else if let Some((name, _)) = line
+                } else if let Some((name, value)) = line
                     .strip_prefix("export ")
                     .and_then(|rest| rest.split_once('='))
                     .filter(|(name, _)| is_setting(name))
                 {
+                    expands.extend(
+                        expanded_settings(value)
+                            .into_iter()
+                            .map(|expanded| (name.to_owned(), expanded)),
+                    );
                     assert_eq!(
                         in_case, 0,
                         "run-bot.sh exports {name} inside a `case`, which this reading does not \
@@ -2935,6 +2964,7 @@ supported_lot = ["*"]
                 cleared,
                 exported,
                 every_mode,
+                expands,
             }
         }
     }
@@ -2947,9 +2977,15 @@ supported_lot = ["*"]
     /// An export inside an `if` counts only when both of its arms make it:
     /// `FILLER_SECRET_KEY` is exported in the armed arm alone, so were it
     /// dropped from the `unset` block a dry run would inherit the shell's
-    /// key while a mode-blind check still passed. And every name either
-    /// list carries must be a real setting: `unset` of a misspelt name
-    /// clears nothing, and `export` of one sets nothing the bot reads.
+    /// key while a mode-blind check still passed. Nor may an export pass
+    /// the shell's own value through: `export PRICE_DELTA_BPS="${PRICE_DELTA_BPS:-100}"`
+    /// would count as set while the operator's value still reached the
+    /// bot, so no export's value may expand a real setting that the block
+    /// did not clear first. The one exception is the dry run's `RUST_LOG`,
+    /// kept from the shell on purpose once a `trace` filter has been
+    /// refused. And every name either list carries must be a real setting:
+    /// `unset` of a misspelt name clears nothing, and `export` of one sets
+    /// nothing the bot reads.
     #[test]
     fn the_testnet_runner_clears_or_sets_every_real_setting() {
         use std::collections::BTreeSet;
@@ -2970,6 +3006,20 @@ supported_lot = ["*"]
             misspelt.is_empty(),
             "run-bot.sh unsets or exports what the bot never reads, which clears or sets \
              nothing: {misspelt:?}"
+        );
+        let passed_through: Vec<&(String, String)> = runner
+            .expands
+            .iter()
+            .filter(|(export, expanded)| {
+                real.contains(expanded)
+                    && !runner.cleared.contains(expanded)
+                    && !(export == "RUST_LOG" && expanded == "RUST_LOG")
+            })
+            .collect();
+        assert!(
+            passed_through.is_empty(),
+            "run-bot.sh exports a setting from one the shell still holds, passing the \
+             operator's value through as (export, expanded): {passed_through:?}"
         );
         let handled: BTreeSet<String> = runner.cleared.union(&runner.every_mode).cloned().collect();
         let inherited: Vec<&String> = real.difference(&handled).collect();

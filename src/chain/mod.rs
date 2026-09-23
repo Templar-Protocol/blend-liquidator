@@ -21,6 +21,7 @@ pub mod xdr;
 pub use pool::{PoolReader, PoolSnapshot};
 pub use rpc::RpcClient;
 pub use signer::{Network, Signer};
+pub use transport::TransportError;
 pub use tx::{LedgerWindow, Prepared, Priority, Submitter, TxConfig, TxOutcome};
 
 /// A failure anywhere between the bot and the chain.
@@ -104,33 +105,39 @@ pub enum ChainError {
     BadSequence,
 }
 
-/// A `reqwest` failure with its request URL removed.
-///
-/// `reqwest` renders the URL it was sending to in both its `Display` and its
-/// `Debug`, and an RPC URL is the one part of a request an operator may have
-/// put a credential in. The field is private and [`TransportError::new`] is
-/// the only way to build one, so no `ChainError::Transport` can hold an
-/// error that still carries the URL.
-#[derive(Debug)]
-pub struct TransportError(reqwest::Error);
+/// Its own module, not a part of this one: a private field is visible to
+/// the module that declares it and every module inside that one, and
+/// `rpc`, `pool` and `tx` — where every `reqwest` call is — are inside
+/// `chain`. Declared here, the field is private to this module alone.
+mod transport {
+    /// A `reqwest` failure with its request URL removed.
+    ///
+    /// `reqwest` renders the URL it was sending to in both its `Display` and
+    /// its `Debug`, and an RPC URL is the one part of a request an operator
+    /// may have put a credential in. The field is private to this module and
+    /// [`TransportError::new`] is the only way to build one, so no
+    /// `ChainError::Transport` can hold an error that still carries the URL.
+    #[derive(Debug)]
+    pub struct TransportError(reqwest::Error);
 
-impl TransportError {
-    /// `error`, with `reqwest::Error::without_url` applied.
-    #[must_use]
-    pub fn new(error: reqwest::Error) -> Self {
-        Self(error.without_url())
+    impl TransportError {
+        /// `error`, with `reqwest::Error::without_url` applied.
+        #[must_use]
+        pub fn new(error: reqwest::Error) -> Self {
+            Self(error.without_url())
+        }
     }
-}
 
-impl std::fmt::Display for TransportError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+    impl std::fmt::Display for TransportError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.0.fmt(f)
+        }
     }
-}
 
-impl std::error::Error for TransportError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.0)
+    impl std::error::Error for TransportError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
     }
 }
 

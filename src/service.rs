@@ -4030,7 +4030,7 @@ mod tests {
         );
         let rendered = instruments.metrics.render();
         assert!(
-            rendered.contains(&format!("users_tracked{{pool=\"{}\"}} 1", harness::POOL)),
+            rendered.contains(&format!("users_tracked{{pool=\"{}\"}} 1\n", harness::POOL)),
             "the reseed gauges the count it left, before any full scan: {rendered}"
         );
 
@@ -4090,7 +4090,7 @@ mod tests {
             instruments
                 .metrics
                 .render()
-                .contains(&format!("users_tracked{{pool=\"{}\"}} 1", harness::POOL)),
+                .contains(&format!("users_tracked{{pool=\"{}\"}} 1\n", harness::POOL)),
             "the full scan published the count it read"
         );
         assert!(
@@ -5103,7 +5103,7 @@ mod tests {
         let (tick_tx, _tick_rx) = tick_watch();
         let instruments = Instruments::for_tests();
         let mut state = LoopState::default();
-        let gauge = |count: u32| format!("users_tracked{{pool=\"{}\"}} {count}", harness::POOL);
+        let gauge = |count: u32| format!("users_tracked{{pool=\"{}\"}} {count}\n", harness::POOL);
 
         let tick = harness::fixture_tick();
         for (sequence, tracked) in [(tick.sequence, 1), (tick.sequence + 1, 0)] {

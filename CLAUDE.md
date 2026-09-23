@@ -210,8 +210,12 @@ make help                           # Docker Compose lifecycle
   or `export`ed after it in **every** mode — an export inside an `if`
   counts only when both arms make it, since the armed-only
   `FILLER_SECRET_KEY` export would otherwise cover a dry run that inherits
-  the shell's key — and unless every name either list carries is a real
-  one: `unset` or `export` of a misspelt name clears or sets nothing.
+  the shell's key — unless no export's value expands a real setting the
+  block did not clear first, which would pass the operator's value
+  through while counting as set (the dry run's `RUST_LOG` is the one
+  sanctioned exception) — and unless every name either list carries is a
+  real one: `unset` or `export` of a misspelt name clears or sets
+  nothing.
 - `src/main.rs` — binary entry point: tracing setup, argument parsing, exit.
 - `src/math/` — the pure port of the pool contract's arithmetic: `fixed`
   (checked rounding), `reserve` (accrual and token conversions), `position`
