@@ -75,7 +75,23 @@ async fn scan(client: &RpcClient, pool: &str, start: u32) -> Result<BTreeSet<Str
                 }
             }
         }
-        if count < PAGE_LIMIT as usize || pages >= MAX_PAGES {
+        // The two ways this loop ends are not the same answer, so they do not
+        // share an exit. A short page is the range drained: every event in it
+        // was read. The page cap is a scan that stopped early, and a list
+        // printed from it names fewer accounts than the range holds — which
+        // reads exactly like "this pool has no other borrowers" unless it
+        // says otherwise. `src/ledger.rs`'s own paging draws the same
+        // distinction, and for the same reason.
+        if count < PAGE_LIMIT as usize {
+            return Ok(accounts);
+        }
+        if pages >= MAX_PAGES {
+            println!(
+                "  (stopped at the {MAX_PAGES}-page cap with {} accounts so far — the range was \
+                 NOT fully scanned, and this list is incomplete; re-run with a smaller `ledgers` \
+                 and combine the results)",
+                accounts.len()
+            );
             return Ok(accounts);
         }
         match page.cursor {
