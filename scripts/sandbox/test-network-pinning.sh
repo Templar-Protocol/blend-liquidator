@@ -182,5 +182,94 @@ else
 	no "VERSIONS_ENV=/dev/null changed the pins: SANDBOX_PASSPHRASE came back as '${overridden}', expected '${STANDALONE_PASSPHRASE}'"
 fi
 
+# ---- require_network_passphrase -------------------------------------------
+#
+# The helper require_standalone_network is now built from, tested directly
+# rather than only through the standalone wrapper above. No live node here
+# either: _sandbox_rpc_call is the one function that would reach for one,
+# and it is private to lib.sh, so a case that defines a same-named function
+# replaces it for anything that calls it afterwards — bash resolves a
+# function call at call time, never at definition time. Each case below
+# runs its stub and its call to require_network_passphrase inside one
+# `$( … )` command substitution, which is already a subshell, so the stub
+# never leaks into a later case or into anything above.
+STUB_LABEL=stub
+STUB_EXPECTED="Stub Network ; A"
+STUB_OTHER="Stub Network ; B"
+
+# 1. A matching passphrase passes and sets the flags: SANDBOX_RPC_URL
+# becomes the URL just verified, and sandbox_require_network — the same
+# guard invoke()/invoke_view() call before every `stellar` command — accepts
+# the array require_network_passphrase built through sandbox_set_network.
+match_result=$(
+	_sandbox_rpc_call() { printf '{"result":{"passphrase":"%s"}}' "${STUB_EXPECTED}"; }
+	require_network_passphrase "http://stub-match/rpc" "${STUB_EXPECTED}" "${STUB_LABEL}"
+	sandbox_require_network
+	printf 'url=%s args=%d' "${SANDBOX_RPC_URL}" "${#sandbox_network_args[@]}"
+) && match_status=0 || match_status=$?
+
+if [ "${match_status}" -eq 0 ] && [ "${match_result}" = "url=http://stub-match/rpc args=4" ]; then
+	ok "require_network_passphrase passes on a matching passphrase and sets the flags (${match_result})"
+else
+	no "require_network_passphrase on a match: exit ${match_status}, got '${match_result}'"
+fi
+
+# 2. A mismatch dies, naming the label, the URL and both passphrases — the
+# actual answer and what was expected.
+mismatch_result=$(
+	_sandbox_rpc_call() { printf '{"result":{"passphrase":"%s"}}' "${STUB_OTHER}"; }
+	require_network_passphrase "http://stub-mismatch/rpc" "${STUB_EXPECTED}" "${STUB_LABEL}" 2>&1
+) && mismatch_status=0 || mismatch_status=$?
+
+case "${mismatch_result}" in
+*"http://stub-mismatch/rpc"*"${STUB_OTHER}"*"${STUB_LABEL}"*"${STUB_EXPECTED}"*) mismatch_named=yes ;;
+*) mismatch_named=no ;;
+esac
+
+if [ "${mismatch_status}" -ne 0 ] && [ "${mismatch_named}" = yes ]; then
+	ok "require_network_passphrase dies on a mismatch, naming the label, the URL and both passphrases"
+else
+	no "require_network_passphrase on a mismatch: exit ${mismatch_status}, said: ${mismatch_result}"
+fi
+
+# 3. The public passphrase dies with its own message — distinct from case 2
+# above — even when it is itself what was asked for: the degenerate case
+# where EXPECTED is mainnet's own passphrase, so a comparison against
+# EXPECTED alone would wrongly "pass" a call onto mainnet.
+PUBLIC_PASSPHRASE="Public Global Stellar Network ; September 2015"
+
+public_result=$(
+	_sandbox_rpc_call() { printf '{"result":{"passphrase":"%s"}}' "${PUBLIC_PASSPHRASE}"; }
+	require_network_passphrase "http://stub-public/rpc" "${PUBLIC_PASSPHRASE}" "${STUB_LABEL}" 2>&1
+) && public_status=0 || public_status=$?
+
+case "${public_result}" in
+*"${PUBLIC_PASSPHRASE}"*"refusing to touch mainnet"*) public_named=yes ;;
+*) public_named=no ;;
+esac
+
+if [ "${public_status}" -ne 0 ] && [ "${public_named}" = yes ]; then
+	ok "require_network_passphrase refuses the public passphrase by its own message, even when EXPECTED is the public passphrase too"
+else
+	no "require_network_passphrase on the public passphrase (EXPECTED = public too): exit ${public_status}, said: ${public_result}"
+fi
+
+# 4. A node that answers nothing dies, naming the label and the URL.
+noanswer_result=$(
+	_sandbox_rpc_call() { printf ''; }
+	require_network_passphrase "http://stub-noanswer/rpc" "${STUB_EXPECTED}" "${STUB_LABEL}" 2>&1
+) && noanswer_status=0 || noanswer_status=$?
+
+case "${noanswer_result}" in
+*"http://stub-noanswer/rpc"*"${STUB_LABEL}"*) noanswer_named=yes ;;
+*) noanswer_named=no ;;
+esac
+
+if [ "${noanswer_status}" -ne 0 ] && [ "${noanswer_named}" = yes ]; then
+	ok "require_network_passphrase dies when the node answers nothing, naming the label and the URL"
+else
+	no "require_network_passphrase on no answer: exit ${noanswer_status}, said: ${noanswer_result}"
+fi
+
 printf '%d passed, %d failed\n' "${pass}" "${fail}"
 [ "${fail}" -eq 0 ]
