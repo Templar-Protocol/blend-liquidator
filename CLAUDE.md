@@ -203,7 +203,13 @@ make help                           # Docker Compose lifecycle
   tables (`` | `NAME` | ``, uppercase only, so the pools-file key table
   never counts), printing each set difference on failure; and unless
   `pools.example.toml` parses. A new variable read directly through
-  `std::env::var` must be added to that test's hard-coded list by hand.
+  `std::env::var` must be added to `real_settings`' hard-coded list by
+  hand. A second test on the same set,
+  `the_testnet_runner_clears_or_sets_every_real_setting`, fails unless
+  every real setting is in `scripts/testnet/run-bot.sh`'s `unset \` block
+  or on one of its `export NAME=` lines, and unless every name the block
+  lists is a real one — `unset` of a misspelt name succeeds and clears
+  nothing.
 - `src/main.rs` — binary entry point: tracing setup, argument parsing, exit.
 - `src/math/` — the pure port of the pool contract's arithmetic: `fixed`
   (checked rounding), `reserve` (accrual and token conversions), `position`
@@ -874,8 +880,10 @@ make help                           # Docker Compose lifecycle
   armed run also ignores an inherited `RUST_LOG`, and **either** mode
   refuses one naming `trace`, since both hold `DATABASE_URL` and the
   armed one the filler's key besides, and `docs/deploy.md` §6 forbids
-  `trace` on a bot holding a secret. That list is by hand: a setting
-  added to `src/config.rs` belongs in it too. Its last step before the
+  `trace` on a bot holding a secret. That list is written by hand, and
+  `the_testnet_runner_clears_or_sets_every_real_setting` (`src/config.rs`)
+  fails when a setting the bot reads is in neither it nor the exports, or
+  when it names one the bot does not read. Its last step before the
   `exec` takes `flock -n` on `target/testnet/<database>.lock`, held on a
   descriptor the `exec` hands the bot, so it is released only when the
   bot exits: one run per database at a time, which is what stops a

@@ -2720,6 +2720,46 @@ supported_lot = ["*"]
         assert!(rendered.contains("Secret(<redacted>)"));
     }
 
+    /// A setting's spelling, `[A-Z][A-Z0-9_]*`. The reference tabulates
+    /// the pools file's keys in the same shape as its settings, and those
+    /// are lowercase, so this is what keeps them out.
+    fn is_setting(name: &str) -> bool {
+        let mut chars = name.chars();
+        chars.next().is_some_and(|first| first.is_ascii_uppercase())
+            && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    }
+
+    /// Every environment variable the bot reads: each `clap` argument's
+    /// `env` name, and the ones read straight from the environment.
+    fn real_settings() -> std::collections::BTreeSet<String> {
+        use clap::CommandFactory;
+
+        // Read straight from the environment, never through clap, so
+        // `Args::command()` cannot see them. A new one must be added here.
+        let direct = [
+            "RPC_API_KEY",
+            "DATABASE_URL",
+            "TELEGRAM_BOT_TOKEN",
+            "FILLER_SECRET_KEY",
+            "AUCTIONEER_SECRET_KEY",
+            "RUST_LOG",
+        ];
+        let mut real: std::collections::BTreeSet<String> = Args::command()
+            .get_arguments()
+            .filter_map(|arg| arg.get_env())
+            .map(|env| env.to_string_lossy().into_owned())
+            .collect();
+        real.extend(direct.iter().map(|name| (*name).to_string()));
+        real
+    }
+
+    /// A file under the crate root, read whole.
+    fn read_repo_file(path: &str) -> String {
+        let root = env!("CARGO_MANIFEST_DIR");
+        std::fs::read_to_string(format!("{root}/{path}"))
+            .unwrap_or_else(|error| panic!("{path}: {error}"))
+    }
+
     /// The configuration reference, `.env.example` and the real `clap`
     /// definition name exactly the same variables, and the example pools
     /// file is one `parse_pools` accepts. Documentation that has drifted
@@ -2735,44 +2775,15 @@ supported_lot = ["*"]
     /// its own.
     #[test]
     fn the_configuration_documents_cover_exactly_the_real_settings() {
-        use clap::CommandFactory;
         use std::collections::BTreeSet;
 
-        let root = env!("CARGO_MANIFEST_DIR");
-        let read_file = |path: &str| {
-            std::fs::read_to_string(format!("{root}/{path}"))
-                .unwrap_or_else(|error| panic!("{path}: {error}"))
-        };
-        // A setting's spelling, `[A-Z][A-Z0-9_]*`. The reference tabulates
-        // the pools file's keys in the same shape as its settings, and those
-        // are lowercase, so this is what keeps them out.
-        let is_setting = |name: &str| {
-            let mut chars = name.chars();
-            chars.next().is_some_and(|first| first.is_ascii_uppercase())
-                && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-        };
+        let read_file = read_repo_file;
         let differences = |named: &BTreeSet<String>, real: &BTreeSet<String>| {
             let missing: Vec<&String> = real.difference(named).collect();
             let unread: Vec<&String> = named.difference(real).collect();
             format!("missing {missing:?}; names what nothing reads {unread:?}")
         };
-
-        // Read straight from the environment, never through clap, so
-        // `Args::command()` cannot see them. A new one must be added here.
-        let direct = [
-            "RPC_API_KEY",
-            "DATABASE_URL",
-            "TELEGRAM_BOT_TOKEN",
-            "FILLER_SECRET_KEY",
-            "AUCTIONEER_SECRET_KEY",
-            "RUST_LOG",
-        ];
-        let mut real: BTreeSet<String> = Args::command()
-            .get_arguments()
-            .filter_map(|arg| arg.get_env())
-            .map(|env| env.to_string_lossy().into_owned())
-            .collect();
-        real.extend(direct.iter().map(|name| (*name).to_string()));
+        let real = real_settings();
 
         // `.env.example`: every `NAME=` that opens a line, commented out or
         // not.
@@ -2810,5 +2821,66 @@ supported_lot = ["*"]
         // `deny_unknown_fields` on every table, that also proves each of
         // its keys is real.
         parse_pools(&read_file("pools.example.toml")).expect("pools.example.toml parses");
+    }
+
+    /// `scripts/testnet/run-bot.sh` hands the binary an environment of its
+    /// own making: every setting the bot reads is either in its `unset`
+    /// block or `export`ed after it, so an operator's shell — plausibly
+    /// exported for a mainnet deployment — can neither hand the testnet
+    /// bot a signing key nor retune it. A setting added to `src/config.rs`
+    /// and to neither list would reach the binary from that shell
+    /// unannounced, which is what this test is here to catch. And every
+    /// name the `unset` block lists must be a real setting: `unset` of a
+    /// misspelt name succeeds and clears nothing, so a typo there is a
+    /// setting silently let through.
+    #[test]
+    fn the_testnet_runner_clears_or_sets_every_real_setting() {
+        use std::collections::BTreeSet;
+
+        let script = read_repo_file("scripts/testnet/run-bot.sh");
+        let real = real_settings();
+
+        // The `unset \` block: its opening line and every continuation
+        // line after it, up to the first that does not end in `\`.
+        let mut lines = script.lines().map(str::trim);
+        assert!(
+            lines.by_ref().any(|line| line == "unset \\"),
+            "run-bot.sh has no `unset \\` block"
+        );
+        let mut cleared = BTreeSet::new();
+        for line in lines {
+            let continues = line.ends_with('\\');
+            cleared.extend(
+                line.trim_end_matches('\\')
+                    .split_whitespace()
+                    .map(str::to_owned),
+            );
+            if !continues {
+                break;
+            }
+        }
+        assert!(!cleared.is_empty(), "the `unset` block names nothing");
+        let misspelt: Vec<&String> = cleared.difference(&real).collect();
+        assert!(
+            misspelt.is_empty(),
+            "run-bot.sh unsets what the bot never reads, which clears nothing: {misspelt:?}"
+        );
+
+        // Every `export NAME=`, in either mode.
+        let exported: BTreeSet<String> = script
+            .lines()
+            .filter_map(|line| {
+                let (name, _) = line.trim().strip_prefix("export ")?.split_once('=')?;
+                is_setting(name).then(|| name.to_owned())
+            })
+            .collect();
+
+        let handled: BTreeSet<String> = cleared.union(&exported).cloned().collect();
+        let inherited: Vec<&String> = real.difference(&handled).collect();
+        assert!(
+            inherited.is_empty(),
+            "run-bot.sh neither unsets nor exports {inherited:?}, so the operator's shell hands \
+             it to the testnet bot"
+        );
     }
 }
