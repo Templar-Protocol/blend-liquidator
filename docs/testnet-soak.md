@@ -82,9 +82,16 @@ pool they follow and whether a key is ever handed to the process.
   `POOLS_TOML`, `SEED_FILE`, `RUN_MODE`, the HTTP bind settings and every
   tuning knob. A shell exported for another deployment therefore cannot
   hand a testnet run its key, its RPC credential or its alert channel, and
-  the soak runs on the defaults this document describes. An armed run also
-  ignores an inherited `RUST_LOG`: it holds a key, and `docs/deploy.md` §6
-  forbids running a key-holding bot at `trace`.
+  the soak runs on the defaults this document describes. Either mode
+  refuses a `RUST_LOG` naming `trace`: both hold `DATABASE_URL`, and armed a
+  signing key too, and `docs/deploy.md` §6 forbids running at `trace` while
+  holding a secret. An armed run also ignores any other inherited
+  `RUST_LOG` and logs at the script's own filter.
+- **One run per database at a time.** `run-bot.sh` takes a lock on
+  `target/testnet/<database>.lock` and holds it for the bot's whole life,
+  so a second `make testnet-run` or `make testnet-run-armed` on the same
+  database refuses to start rather than run a second bot on one store —
+  and, armed, one key.
 - **The two `examples/` have no network gate.** `scan_borrowers` and
   `soak_report` never ask the node which network it is: what they print is
   whatever the node `RPC_URL` names answers for. They hold no key and send

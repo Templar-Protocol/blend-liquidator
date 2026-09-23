@@ -160,12 +160,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
             // ledger `health` itself called retained. Either way: narrow to
             // a freshly read retained edge and try once more rather than
             // failing outright.
-            println!(
-                "getEvents refused the start ledger ({code}: {message}); \
-                 narrowing to the retained window's edge and retrying"
-            );
+            // Never earlier than the start already chosen: a refusal of any
+            // kind (a later page, a rate limit) must not turn a narrow scan
+            // into one over the whole retained window, which is both far
+            // longer and a list of accounts outside the requested range.
             let health = client.health().await?;
-            scan(&client, &pool, health.oldest_ledger).await?
+            let retry_start = start.max(health.oldest_ledger);
+            println!(
+                "getEvents refused the scan ({code}: {message}); retrying once from ledger \
+                 {retry_start}, the later of the requested start and the retained window's edge"
+            );
+            scan(&client, &pool, retry_start).await?
         }
         Err(error) => return Err(error.into()),
     };

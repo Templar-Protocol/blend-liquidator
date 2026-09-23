@@ -109,7 +109,7 @@ async fn print_creations(store: &Store, pool: &str) -> Result<(), Box<dyn Error>
     let creations: Vec<CreationRow> = sqlx::query_as(
         "SELECT id, tx_hash, kind, account, percent, bid, lot, ledger, dry_run, \
          created_at::text AS created_at \
-         FROM creations WHERE pool = $1 ORDER BY created_at DESC",
+         FROM creations WHERE pool = $1 ORDER BY id DESC",
     )
     .bind(pool)
     .fetch_all(store.pool())
@@ -139,7 +139,7 @@ async fn print_fills(store: &Store, pool: &str) -> Result<(), Box<dyn Error>> {
         "SELECT id, tx_hash, account, auction_type, fill_ledger, percent, bid, lot, \
          bid_value::text AS bid_value, lot_value::text AS lot_value, \
          est_profit::text AS est_profit, dry_run, created_at::text AS created_at \
-         FROM fills WHERE pool = $1 ORDER BY created_at DESC",
+         FROM fills WHERE pool = $1 ORDER BY id DESC",
     )
     .bind(pool)
     .fetch_all(store.pool())

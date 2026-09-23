@@ -261,12 +261,18 @@ export RPC_URL="${SANDBOX_RPC_URL}"
 export POLL_INTERVAL_MS=5000
 export LOG_FORMAT=json
 # docs/deploy.md §6: never run a deployment that holds a secret at
-# RUST_LOG=trace. The armed bot holds the filler's key, so it always runs at
-# this script's own filter and an inherited RUST_LOG is ignored there. A dry
-# run holds no key, no RPC credential and no Telegram token (all unset
-# above), so it keeps an operator's RUST_LOG and falls back to the same
-# filter.
+# RUST_LOG=trace, since logging there — dependencies' included — is not
+# audited for secrets. Both modes hold one: the armed bot the filler's key,
+# and either bot DATABASE_URL, whose password is exactly the kind of value
+# this repository keeps off argv. So a RUST_LOG naming `trace` is refused
+# outright in both modes. The armed bot always runs at this script's own
+# filter besides; a dry run keeps any other RUST_LOG an operator set.
 default_filter="info,blend_liquidator=debug"
+case "${RUST_LOG:-}" in
+*[Tt][Rr][Aa][Cc][Ee]*)
+	die "run-bot: RUST_LOG='${RUST_LOG}' names trace, and this run holds DATABASE_URL (and, armed, a signing key) — logging at trace is not audited for secrets (docs/deploy.md §6)"
+	;;
+esac
 if [ "${armed}" = true ]; then
 	if [ -n "${RUST_LOG:-}" ] && [ "${RUST_LOG}" != "${default_filter}" ]; then
 		log "armed: ignoring the inherited RUST_LOG — an armed run always logs at ${default_filter}"
@@ -298,5 +304,15 @@ fi
 # log file this run announced above, appended rather than truncated: two
 # runs of the same mode leave one growing transcript rather than either
 # silently discarding the other's.
+#
+# One run per database at a time. Two bots on one store — and, armed, one
+# key — is the deployment contract's overlapping-instance case, which the
+# port clash does not reliably prevent: the bot binds its HTTP port after it
+# may already be polling. The lock is taken on a descriptor the final exec
+# hands to the binary, so it is held for exactly as long as the bot runs and
+# released the moment it exits, however it exits.
+exec 9>"${testnet_root}/${db_name}.lock"
+flock -n 9 \
+	|| die "run-bot: another run already holds ${testnet_root}/${db_name}.lock — one run per database at a time (stop it by pid first; see docs/testnet-soak.md, \"Stopping the bots\")"
 exec >>"${log_file}" 2>&1
 exec "${binary}"

@@ -1522,8 +1522,8 @@ Status above for what remains.
   its position inside its own step 9, before the bot or its events
   cursor exists, so no event in the range the poller ever reads names
   it. `run-bot.sh --armed` writes `target/testnet/seed.armed.toml`
-  naming it for exactly that reason (`scripts/testnet/run-bot.sh:148-158`),
-  and both modes export `SEED_URL=""` (`scripts/testnet/run-bot.sh:269-272`)
+  naming it for exactly that reason (its `seed_file=` heredoc), and both
+  modes export `SEED_URL=""` (next to the `POOLS_FILE` export)
   — never the default, which answers for mainnet's own analytics API and
   would seed mainnet accounts into a testnet pool.
 - `users_tracked` is a full-scan gauge, not a live count. `full_scan`
@@ -1630,8 +1630,10 @@ reasoning and the work each one implies, is
   which is always, for a reserve anybody borrows from. Orphaned collateral is
   dead capital, and the bot deliberately does not chase it.
 - **`bstop_rate` must be zero at initialize** (`1201` otherwise), which
-  `scripts/sandbox/deploy.sh` will have to satisfy before it can stand a fork
-  pool up.
+  both `scripts/sandbox/deploy.sh` and `scripts/testnet/deploy.sh` will have
+  to satisfy before either can stand a fork pool up: both pass
+  `--backstop_take_rate 1000000` today, which is right for the stock wasm
+  they pin and fails the fork's initialize at step 6.
 
 ## Workflow
 
