@@ -169,10 +169,12 @@ It prints the accounts found, then a ready-to-paste `[accounts]` block in
 before the next start.
 
 **This is bounded by what the RPC still retains, and that bound is the main
-thing to know about this stage.** A 24-hour scan of Blend's testnet pool
-found 9 accounts; a 7-day scan found 15 — and of either set, **none holds
-debt today**: those positions were taken long ago and their owners have not
-acted since, so there is nothing for the bot to liquidate among them. On a
+thing to know about this stage.** On 2026-09-23 a 24-hour scan of Blend's
+testnet pool found 9 accounts and a 7-day scan found 15 — and of either set,
+**none held debt**: those positions were taken long before the window and
+their owners had not acted since, so there was nothing for the bot to
+liquidate among them. A later scan will find a different set; the shape of
+the result, not its numbers, is what carries over. On a
 pool this repository does not control, "what the RPC's event window still
 holds, plus whatever acts while the bot is watching" is the entire universe
 of borrowers the bot can ever see — there is no fallback to an index of
@@ -347,7 +349,54 @@ the same way this document's own example was.
 
 ## Stage 1 results
 
-_To be filled in from a stage 1 observation run._
+Run of 2026-09-23, against Blend's testnet pool
+`CCEBVDYM32YNYCVNRXQKDFFPISJJCV557CDZEIRBEE4NCV4KHPQ44HGF` (an example;
+see "Testnet resets" above). Dry run, no key configured.
+
+- **Span:** 00:50 to 03:03 UTC, about 2 hours 12 minutes, ledgers
+  4,820,214 to 4,821,800 (about 1,590). Five starts: the first, three
+  operator restarts while its seeding was wired up, and one resume after the process was
+  killed without warning when this dev container was rebuilt at 02:53.
+- **Discovery:** `scan_borrowers` found 9 accounts in the last 24 hours
+  and 15 in the last 7 days (the oldest ledger the RPC still held was
+  4,699,988); seeding with all 15 tracked none, since none held debt.
+- **The watched position:** `testnet-soak-watched`
+  (`GB2CGACJLELPQVREA4P2T3EVNWZPZTSKBJDLQRWPOLSTNJN4UQPZLU25`) supplied
+  1,000 XLM and borrowed 771 XLM, for a health factor of 1.0505830 at
+  opening. The bot picked it up from the pool's own events, valued it at
+  1.0505836 at 02:52 and again after the resume, and decided "Healthy"
+  both times it evaluated it — correct, since the liquidation threshold is
+  0.998. Collateral and debt are the same asset, so the health factor
+  moves only by the spread between the borrow and supply rates, and it
+  stayed healthy for the whole run.
+- **Cadences:** 26 oracle scans and 6 full scans.
+- **What the public network did, and how the bot handled it:**
+  - 2 RPC transport errors (02:38:48 and 02:50:56), each retried after
+    the poller's backoff. Neither began a streak long enough for
+    `RpcFailing` (5 in a row).
+  - 3 oracle scans failed with "the ledger moved between reads": the
+    scan's snapshot spans several RPC batches, and one straddled a ledger
+    close. The read fails closed rather than mixing two ledgers, and the
+    scan runs again next period — about 5 minutes at the default
+    `ORACLE_SCAN_LEDGERS` of 60. The sandbox's single local node never
+    produces this.
+  - 1 `PollerStalled` at 02:50:55 ("no poller heartbeat for 60s, limit
+    55s"), with recovery logged five seconds later. It landed in the same
+    second as a transport error and two minutes before the container was
+    torn down, and it is the only stall in the run. The poller's
+    heartbeat covers its whole pass, the cursor write included, so this
+    is consistent with the process being frozen as the rebuild began
+    rather than with anything inside the bot.
+  - 44 slow-statement warnings and 7 slow connection acquires from 02:16
+    onward, when the repository's own test suite and builds were sharing
+    the same Postgres. They slowed the bot and changed none of its
+    decisions.
+- **Resume after the abrupt kill:** no reseed, since both users and a
+  cursor were present, and the processed ledger equalled the chain head
+  (4,821,797) within 45 seconds: the poller resumed from its last
+  committed ledger and caught up the gap.
+- **Nothing was submitted:** no key was configured, and the store holds no
+  `creations` or `fills` rows for the pool.
 
 ## Stage 2 results
 
@@ -367,10 +416,12 @@ example — see "Testnet resets" above):
 - **Unwind**: submitted tx
   `3ebd3559350baa7961816019297da7d39e52719ae8c7fda5bbdfe26bad77ad49`;
   the pass after it reported the pool's unwind had nothing left to move.
-  The filler's on-chain position afterward: 0 liabilities, primary
-  collateral valued at 56250000 in the oracle's own units (this pool's
-  `min_collateral` is 0, so the unwind trimmed toward
-  `min_primary_collateral` rather than a contract-imposed floor).
+  The filler's on-chain position afterward: 0 liabilities, and primary
+  collateral valued at 56250000 in the oracle's own units — exactly 100 XLM
+  at $0.075 and a 0.75 collateral factor, which is this pool's
+  `min_primary_collateral`. The unwind withdrew everything above that
+  floor to the wallet and kept the floor supplied, as it does in the
+  sandbox.
 - **`/metrics`**: `creations_total{result="succeeded"} 1`,
   `fills_total{result="succeeded"} 1`, `unwind_passes_total 3`,
   `estimated_profit_total 25292272`, `estimated_loss_total 0`.
