@@ -673,8 +673,9 @@ make help                           # Docker Compose lifecycle
 - `examples/capture_fixture.rs` — refreshes `tests/fixtures/` from a live
   RPC through `curl`. See that directory's README.
 - `tests/liquidation_sandbox.rs` and `tests/sandbox_harness/mod.rs` — the
-  sandbox tier's five scenario tests, and the only place the bot is run
-  with `DRY_RUN=false` and a signing key. `tests/sandbox_harness/mod.rs`
+  sandbox tier's five scenario tests, and the one place outside the
+  testnet soak's armed stage (`scripts/testnet/run-bot.sh --armed`) where
+  the bot is run with `DRY_RUN=false` and a signing key. `tests/sandbox_harness/mod.rs`
   is the machinery every scenario shares — the standalone-network gate,
   the spawned bot, the per-run database(s) and every named wait — and
   holds `SCENARIOS`, one of five places the scenario names are written:
@@ -874,9 +875,11 @@ make help                           # Docker Compose lifecycle
   §6 forbids running a key-holding bot at `trace`. That list is by hand:
   a setting added to `src/config.rs` belongs in it too.
   `TESTNET_RUN_PORT` and `TESTNET_RUN_DATABASE`, together or not at all,
-  move a run to its own port, database and `<database>.log` so the script
-  can be exercised beside a live run — never a second instance on a
-  mode's own database, which `TESTNET_RUN_DATABASE` refuses to name.
+  move a dry run to its own port, database and `run-<database>.log` so the
+  script can be exercised beside a live run — never with `--armed`, which
+  refuses them because a second armed bot would sign with the live run's
+  key, and never on a mode's own database, which `TESTNET_RUN_DATABASE`
+  refuses to name.
   Every script here calls `require_testnet_network` before its first
   `stellar` call or chain read, exactly the sandbox's own discipline with
   testnet's passphrase pinned in place of the standalone network's.

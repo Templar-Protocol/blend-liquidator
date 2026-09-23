@@ -154,14 +154,15 @@ started with is the bot's own; note it (`$!` if you start it in the
 background) — see "Stopping the bots" below.
 
 `TESTNET_RUN_PORT` and `TESTNET_RUN_DATABASE`, set together or not at all,
-are for exercising the script beside a live run of the same mode: the run
-takes that port and that (already created) database, and logs to
-`target/testnet/<database>.log` rather than the mode's own transcript, so it
-touches nothing the live run owns. They are not a way to start a second
-instance of a mode on that mode's own database — two bots on one store,
-and armed on one key, is the deployment contract's overlapping-instance
-case, which a soak should not be measuring — and `TESTNET_RUN_DATABASE`
-refuses to name `testnet_soak` or `testnet_armed`.
+are for exercising the script in dry run beside a live run: the run takes
+that port and that (already created) database, and logs to
+`target/testnet/run-<database>.log`, a name no mode's own transcript can
+take, so it touches nothing the live run owns. They are refused with
+`--armed`, because a second armed bot would sign with the live run's own
+key against its own pool whatever port and database it used — the
+deployment contract's overlapping-instance case, which a soak should not
+be measuring — and `TESTNET_RUN_DATABASE` refuses to name `testnet_soak`
+or `testnet_armed`.
 
 ### What to watch
 
@@ -313,11 +314,10 @@ What this is for: a real borrower of the soak's own, on a pool this
 repository does not control, for the observe stage to find, track and
 value. It is not a way to get a liquidation. With collateral and debt in
 the same reserve, the health factor moves only by how much faster the
-debt's rate accrues than the collateral's. On 2026-09-23 the bot valued
-the position at 1.0505836 about an hour after it opened and again nine
-minutes later, the opening ratio to 7 decimals both times (810/771 is
-1.05058365…). At that pace a crossing of `LIQ_HF_THRESHOLD` (0.998) is far
-off; a liquidation on testnet is what stage 2 is for.
+debt's rate accrues than the collateral's, so a crossing of
+`LIQ_HF_THRESHOLD` (0.998) is far off at these rates — that follows from
+the rates, not from anything the soak measured. A liquidation on testnet
+is what stage 2 is for.
 
 Nothing further is required — the bot follows this account the moment its
 `supply_collateral`/`borrow` events reach the poller, with no seed entry
@@ -372,9 +372,9 @@ its position inside `deploy.sh`, before the bot or its events cursor
 existed, so nothing in the range the poller reads would ever name it
 without this seed. `DRY_RUN=false` and `FILLER_SECRET_KEY` are exported
 into the binary's own environment only. Port `18082`, database
-`testnet_armed`, logging to `target/testnet/armed.log` (the
-`TESTNET_RUN_PORT`/`TESTNET_RUN_DATABASE` pair under "Starting it" above
-applies here too, with the same limit).
+`testnet_armed`, logging to `target/testnet/armed.log`. The
+`TESTNET_RUN_PORT`/`TESTNET_RUN_DATABASE` pair under "Starting it" above is
+refused here: it is for a dry run only.
 
 ### What to expect, and when
 
@@ -517,27 +517,33 @@ Run of 2026-09-23, against Blend's testnet pool
 `CCEBVDYM32YNYCVNRXQKDFFPISJJCV557CDZEIRBEE4NCV4KHPQ44HGF` (an example;
 see "Testnet resets" above). Dry run, no key configured.
 
-- **Span:** 00:50 to 03:03 UTC, about 2 hours 12 minutes, ledgers
-  4,820,214 to 4,821,800 (about 1,590) — the cut-off these results are
-  drawn from; the process itself was left running past it. Five starts:
-  the first, three operator restarts while its seeding was wired up, and
-  one resume after the process was killed without warning when this dev
-  container was rebuilt at 02:53.
+- **Span:** 00:50 to 04:05 UTC, about 3 hours 15 minutes, of which 9
+  minutes (02:53 to 03:02) the process was down; ledgers 4,820,214 to
+  4,822,547 (about 2,330). Five starts: the first, three operator restarts
+  while its seeding was wired up, and one resume after the process was
+  killed without warning when this dev container was rebuilt at 02:53. It
+  ended on `SIGTERM` at 04:05:30, finishing its in-flight work and
+  draining its notifications. After the resume at 03:02 it logged no
+  warning of any kind.
 - **Discovery:** `scan_borrowers` found 9 accounts in the last 24 hours
   and 15 in the last 7 days (the oldest ledger the RPC still held was
   4,699,988); seeding with all 15 tracked none, since none held debt.
 - **The watched position:** `testnet-soak-watched`
   (`GB2CGACJLELPQVREA4P2T3EVNWZPZTSKBJDLQRWPOLSTNJN4UQPZLU25`) supplied
   1,000 XLM and borrowed 771 XLM, a designed health factor of 810/771,
-  about 1.05058. The bot picked it up from the pool's own events and first
-  decided it "Healthy" at 01:54:52; the full scans at 02:52:56 and after
-  the resume (03:02:14) valued it at 1.0505836, the opening ratio to 7
-  decimals, and the auctioneer decided "Healthy" again at 03:02:16 —
-  correct, since the liquidation threshold is 0.998. Collateral and debt
-  are the same asset, so the health factor moves only by the spread
-  between the borrow and supply rates; it did not move at 7 decimals in
-  over an hour.
-- **Cadences:** 26 oracle scans and 6 full scans.
+  about 1.05058. The bot picked it up from the pool's own events, and the
+  tracker stored its health factor as 1.0505836 when those events were
+  applied. The full scans at 02:52:56 and after the resume (03:02:14)
+  reported that stored value: a full scan reads the store and values
+  nothing, and nothing refreshed this account again, since it sent no
+  further events and the stale refresh fires only after 241,920 ledgers.
+  The fresh valuations are the auctioneer's, which decided "Healthy" at
+  01:54:52 and again at 03:02:16 and 03:10:31 — correct, since the
+  liquidation threshold is 0.998. The auctioneer logs its decision, not
+  the figure behind it, so nothing logged shows whether the health factor
+  moved; with collateral and debt in the same asset it can move only by
+  the spread between the borrow and supply rates.
+- **Cadences:** 39 oracle scans and 7 full scans.
 - **What the public network did, and how the bot handled it:**
   - 2 RPC transport errors (02:38:48 and 02:50:56), each retried after
     the poller's backoff. Neither began a streak long enough for

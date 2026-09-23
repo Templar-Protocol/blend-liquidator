@@ -44,9 +44,10 @@
 #
 # TESTNET_RUN_PORT and TESTNET_RUN_DATABASE, together or not at all,
 # override the mode's port and database name, for exercising this script
-# beside a live run of the same mode. A run with them set logs to
-# target/testnet/<database>.log rather than the mode's own transcript, so
-# nothing it does lands in the live run's port, database or log. They are
+# beside a live dry run. A run with them set logs to
+# target/testnet/run-<database>.log, a name no mode's own transcript can
+# take, so nothing it does lands in the live run's port, database or log.
+# Dry run only: armed, a second bot would sign with the live run's key. They are
 # not a way to run a second instance of a mode on that mode's own database
 # — two bots on one store (and, armed, one key) is the deployment
 # contract's overlapping-instance case, noise a soak must not measure — so
@@ -75,6 +76,12 @@ if [ -n "${run_port}" ] || [ -n "${run_database}" ]; then
 	if [ -z "${run_port}" ] || [ -z "${run_database}" ]; then
 		die "run-bot: TESTNET_RUN_PORT and TESTNET_RUN_DATABASE come together — a run beside a live one needs its own port and its own database (see this script's header)"
 	fi
+	# Dry run only. Armed, a second bot would sign with the live run's own
+	# key against the live run's own pool, from another store: the
+	# deployment contract's overlapping-instance case on one key, which a
+	# separate port and database do nothing to prevent.
+	[ "${armed}" = false ] \
+		|| die "run-bot: TESTNET_RUN_PORT and TESTNET_RUN_DATABASE are for a dry run beside a live one — with --armed they would start a second bot signing with the live run's key"
 	case "${run_database}" in
 	testnet_soak | testnet_armed)
 		die "run-bot: TESTNET_RUN_DATABASE names ${run_database}, a mode's own database — it is for a run beside that mode's live one, never a second instance on the same store"
@@ -97,6 +104,11 @@ if [ "${armed}" = true ]; then
 	# against — so an env file naming a network the pins do not is refused
 	# here, rather than quietly adopted as the thing the gate checks for.
 	pinned_passphrase="${TESTNET_PASSPHRASE}"
+	# Both unset before the source, so the check below reads testnet.env's
+	# own values: lib.sh has already set each (the pinned passphrase, and a
+	# URL defaulted or taken from the environment), and a file missing
+	# either would otherwise pass as if it named them.
+	unset TESTNET_RPC_URL TESTNET_PASSPHRASE
 	# shellcheck source=/dev/null
 	source "${pool_env}"
 	for key in TESTNET_RPC_URL TESTNET_PASSPHRASE TESTNET_POOL TESTNET_XLM TESTNET_USDC TESTNET_BORROWER TESTNET_FILLER_SECRET_KEY; do
@@ -186,7 +198,7 @@ fi
 if [ -n "${run_database}" ]; then
 	port="${run_port}"
 	db_name="${run_database}"
-	log_file="${testnet_root}/${run_database}.log"
+	log_file="${testnet_root}/run-${run_database}.log"
 fi
 
 bot_database_url="${db_server}/${db_name}${db_query}"

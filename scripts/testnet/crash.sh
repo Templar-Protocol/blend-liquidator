@@ -39,9 +39,12 @@ env_file="$(testnet_dir)/testnet.env"
 # run-bot.sh is pointed at, so it is the URL that has to answer testnet's
 # passphrase.
 pinned_passphrase="${TESTNET_PASSPHRASE}"
+# Unset before the source, so the check below reads testnet.env's own
+# values rather than the ones lib.sh already set.
+unset TESTNET_RPC_URL TESTNET_PASSPHRASE
 # shellcheck source=/dev/null
 source "${env_file}"
-for key in TESTNET_RPC_URL TESTNET_ORACLE TESTNET_XLM TESTNET_USDC; do
+for key in TESTNET_RPC_URL TESTNET_PASSPHRASE TESTNET_ORACLE TESTNET_XLM TESTNET_USDC; do
 	[ -n "${!key:-}" ] || die "crash: ${env_file} does not define ${key}"
 done
 # The comparison passphrase stays lib.sh's own. testnet.env sets
