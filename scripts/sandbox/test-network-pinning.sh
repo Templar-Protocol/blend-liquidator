@@ -184,8 +184,8 @@ fi
 
 # ---- require_network_passphrase -------------------------------------------
 #
-# The helper require_standalone_network is now built from, tested directly
-# rather than only through the standalone wrapper above. No live node here
+# The helper require_standalone_network is built from, tested directly
+# rather than only through the standalone wrapper. No live node here
 # either: _sandbox_rpc_call is the one function that would reach for one,
 # and it is private to lib.sh, so a case that defines a same-named function
 # replaces it for anything that calls it afterwards — bash resolves a
@@ -277,6 +277,48 @@ if [ "${noanswer_status}" -ne 0 ] && [ "${noanswer_named}" = yes ]; then
 	ok "require_network_passphrase dies when the node answers nothing, naming the label and the URL"
 else
 	no "require_network_passphrase on no answer: exit ${noanswer_status}, said: ${noanswer_result}"
+fi
+
+# ---- require_standalone_network --------------------------------------------
+#
+# The wrapper itself, through the same stub. Every case above hands
+# require_network_passphrase its EXPECTED explicitly, so a wrapper passing
+# the wrong one — testnet's passphrase, or none — would pass all of them;
+# the sandbox's end-to-end runs would not catch it either, since they only
+# ever meet a node that is standalone. These two do.
+
+# 5. A node answering testnet's passphrase dies, and the message quotes both
+# what the node said and the standalone passphrase the wrapper expected.
+standalone_testnet_result=$(
+	_sandbox_rpc_call() { printf '{"result":{"passphrase":"%s"}}' "${POLLUTED_PASSPHRASE}"; }
+	require_standalone_network "http://stub-standalone-testnet/rpc" 2>&1
+) && standalone_testnet_status=0 || standalone_testnet_status=$?
+
+case "${standalone_testnet_result}" in
+*"http://stub-standalone-testnet/rpc"*"'${POLLUTED_PASSPHRASE}'"*"the sandbox's '${STANDALONE_PASSPHRASE}'"*) standalone_testnet_named=yes ;;
+*) standalone_testnet_named=no ;;
+esac
+
+if [ "${standalone_testnet_status}" -ne 0 ] && [ "${standalone_testnet_named}" = yes ]; then
+	ok "require_standalone_network dies on testnet's passphrase, naming it and the standalone one it expected"
+else
+	no "require_standalone_network on testnet's passphrase: exit ${standalone_testnet_status}, said: ${standalone_testnet_result}"
+fi
+
+# 6. The control for case 5: the standalone answer passes, and the flags
+# carry the standalone passphrase — so case 5 is a refusal of testnet, not
+# a wrapper that refuses everything.
+standalone_match_result=$(
+	_sandbox_rpc_call() { printf '{"result":{"passphrase":"%s"}}' "${STANDALONE_PASSPHRASE}"; }
+	require_standalone_network "http://stub-standalone-match/rpc"
+	sandbox_require_network
+	printf 'url=%s passphrase=%s' "${SANDBOX_RPC_URL}" "${sandbox_network_args[3]}"
+) && standalone_match_status=0 || standalone_match_status=$?
+
+if [ "${standalone_match_status}" -eq 0 ] && [ "${standalone_match_result}" = "url=http://stub-standalone-match/rpc passphrase=${STANDALONE_PASSPHRASE}" ]; then
+	ok "require_standalone_network passes the standalone passphrase and pins the flags to it (${standalone_match_result})"
+else
+	no "require_standalone_network on the standalone passphrase: exit ${standalone_match_status}, got '${standalone_match_result}'"
 fi
 
 printf '%d passed, %d failed\n' "${pass}" "${fail}"

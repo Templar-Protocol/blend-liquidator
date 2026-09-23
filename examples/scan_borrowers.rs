@@ -20,6 +20,12 @@
 //! `RPC_API_KEY_HEADER` and `RPC_API_KEY` are honoured together, as
 //! `pool_snapshot` does.
 //!
+//! There is no network gate here, unlike `scripts/testnet/`: nothing asks
+//! the node which network it is, so the accounts found are whatever the
+//! node `RPC_URL` names answers for. That is acceptable for a tool that
+//! holds no key and sends nothing, and it is why the command above names
+//! the RPC explicitly.
+//!
 //! Prints the accounts one per line, then a ready-to-paste `[accounts]`
 //! block in `SEED_FILE`'s TOML shape (see `seed.example.toml`), keyed by the
 //! pool address.

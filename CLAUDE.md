@@ -71,8 +71,9 @@ build's panic abort drains the notifier before it returns. Phase 7 landed the sa
 (`scripts/cargo-jobs.sh`, the `stellar` CLI): a throwaway Stellar network
 in Docker, Blend v2 deployed on it from pinned wasm with one borrower a
 price move from liquidation, and the real binary run against it **armed**
-— the only place in this repository anything signs and sends a
-transaction — asserting on chain and in the store that it created the
+— the only place in this repository, besides the testnet tier Phase 9
+added, that anything signs and sends a transaction — asserting on chain
+and in the store that it created the
 auction, filled it, unwound the position it took, and counted all three.
 Phase 8 reconciled the bot with the ADR-0008 fork
 (`docs/specs/2026-09-20-adr-0008-fork-semantics.md` §4, A through J,
@@ -106,11 +107,13 @@ against stock wasm on public Stellar testnet — the fork still is not
 deployed anywhere, so the soak targets what actually is: Blend's own
 testnet pool for stage 1 (observe) and this repository's own throwaway
 deployment for stage 2 (armed). Stage 1 has run the bot in dry run
-against a pool this repository does not control or seed, proving it
-validates its configuration and tracks and values whatever borrowers it
-can see — bounded by the RPC's own event-retention window, not an index
-of every position, since testnet has no analytics API — without ever
-submitting a transaction. Stage 2 stood up its own pool, crashed the
+against a pool this repository does not control, seeded with the 15
+accounts a scan of the pool's own recent events found and given one
+position of the soak's own to follow. It proved the bot validates its
+configuration and tracks and values whatever borrowers it can see —
+bounded by the RPC's own event-retention window, not an index of every
+position, since testnet has no analytics API — without ever submitting a
+transaction. Stage 2 stood up its own pool, crashed the
 oracle's price, and ran the bot armed against public infrastructure end
 to end — the only place outside the sandbox tier this bot ever signs and
 sends there: a recorded run created the borrower's liquidation auction,
@@ -139,7 +142,7 @@ make sandbox                        # all five scenarios, ~25 min (Docker + stel
 make testnet-deploy                 # stand Blend v2 up on public Stellar testnet for the soak's armed stage
 make testnet-crash                  # move the testnet soak's oracle price (default $0.075)
 make testnet-run                    # run the bot against testnet in dry run (no key; nothing is ever submitted)
-make testnet-run-armed              # run the bot against testnet ARMED — the only target here that signs and sends
+make testnet-run-armed              # run the bot against testnet ARMED — the only target that runs the bot armed on testnet
 make help                           # Docker Compose lifecycle
 ```
 
@@ -859,10 +862,24 @@ make help                           # Docker Compose lifecycle
   testnet-run-armed`) regenerates `pools.armed.toml` and
   `seed.armed.toml` from `testnet.env` on every run and exports
   `DRY_RUN=false` and `FILLER_SECRET_KEY` into the child process's own
-  environment only, after confirming `testnet.env` exists. Every script
-  here calls `require_testnet_network` before its first `stellar` call or
-  chain read, exactly the sandbox's own discipline with testnet's
-  passphrase pinned in place of the standalone network's.
+  environment only, after confirming `testnet.env` exists. Its gate runs
+  on exactly the URL the binary is handed — armed, `testnet.env`'s
+  `TESTNET_RPC_URL`, sourced and its passphrase compared with the pin
+  first, as `crash.sh` does — and the binary's `RPC_URL` is the
+  `SANDBOX_RPC_URL` that gate exported. Before its exports it unsets every
+  other setting the bot reads, so the operator's shell hands the binary
+  no signing key (the dry run's "no key" is literal: both key variables
+  are unset), no RPC credential, no Telegram pair and no tuning knob; an
+  armed run also ignores an inherited `RUST_LOG`, since `docs/deploy.md`
+  §6 forbids running a key-holding bot at `trace`. That list is by hand:
+  a setting added to `src/config.rs` belongs in it too.
+  `TESTNET_RUN_PORT` and `TESTNET_RUN_DATABASE`, together or not at all,
+  move a run to its own port, database and `<database>.log` so the script
+  can be exercised beside a live run — never a second instance on a
+  mode's own database, which `TESTNET_RUN_DATABASE` refuses to name.
+  Every script here calls `require_testnet_network` before its first
+  `stellar` call or chain read, exactly the sandbox's own discipline with
+  testnet's passphrase pinned in place of the standalone network's.
 - `examples/scan_borrowers.rs` — finds accounts worth tracking in a
   pool's recent event history: pages `getEvents` from a start ledger to
   chain head the way `LedgerPoller` does and collects every account any
@@ -1490,11 +1507,11 @@ Status above for what remains.
   what the RPC's `getEvents` still retains, not an index of every
   position the pool has ever held — testnet has no analytics API for
   `SEED_URL` to enumerate positions from the way mainnet's does.
-  `examples/scan_borrowers.rs` found 9 accounts in Blend's testnet pool's
-  last 24 hours and 15 in its last 7 days, and none of either set holds
-  debt today: those positions were taken long before the window and
-  their owners have not acted since (`docs/testnet-soak.md`, "Seeding it
-  with `scan_borrowers`"). So a dry run's tracked set on a pool like this
+  On 2026-09-23 `examples/scan_borrowers.rs` found 9 accounts in Blend's
+  testnet pool's last 24 hours and 15 in its last 7 days, and none of
+  either set held debt: those positions were taken long before the window
+  and their owners had not acted since (`docs/testnet-soak.md`, "Seeding
+  it with `scan_borrowers`"). So a dry run's tracked set on a pool like this
   is only what acts while it watches, plus whatever a scan like that
   found — which is the argument for `SEED_URL`'s mainnet-analytics-API
   default existing at all.
@@ -1502,8 +1519,8 @@ Status above for what remains.
   its position inside its own step 9, before the bot or its events
   cursor exists, so no event in the range the poller ever reads names
   it. `run-bot.sh --armed` writes `target/testnet/seed.armed.toml`
-  naming it for exactly that reason (`scripts/testnet/run-bot.sh:99-109`),
-  and both modes export `SEED_URL=""` (`scripts/testnet/run-bot.sh:152-155`)
+  naming it for exactly that reason (`scripts/testnet/run-bot.sh:148-158`),
+  and both modes export `SEED_URL=""` (`scripts/testnet/run-bot.sh:269-272`)
   — never the default, which answers for mainnet's own analytics API and
   would seed mainnet accounts into a testnet pool.
 - `users_tracked` is a full-scan gauge, not a live count. `full_scan`

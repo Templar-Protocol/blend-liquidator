@@ -259,9 +259,9 @@ sandbox_require_network() {
 # wrong one's passphrase anyway — every call would fail with "provided
 # network passphrase does not match the server" despite the gate itself
 # having passed. require_standalone_network's own call (through
-# require_network_passphrase) supplies SANDBOX_PASSPHRASE as EXPECTED, so
-# its behaviour is unchanged; test-network-pinning.sh's direct,
-# single-argument call is unchanged too, for the same reason.
+# require_network_passphrase) supplies SANDBOX_PASSPHRASE as EXPECTED, and
+# test-network-pinning.sh's direct, single-argument call takes the default,
+# so both build the standalone network's flags.
 sandbox_set_network() {
 	local url=$1 passphrase=${2:-${SANDBOX_PASSPHRASE:-}}
 	[ -n "${passphrase}" ] \
@@ -285,9 +285,10 @@ _SANDBOX_PUBLIC_PASSPHRASE="Public Global Stellar Network ; September 2015"
 # sandbox_set_network(url, expected) — the passphrase every later `stellar`
 # call carries is the one this function just matched, never
 # SANDBOX_PASSPHRASE by default, which is what makes this helper correct
-# for a LABEL other than "sandbox" (require_testnet_network's "testnet"
-# among them). LABEL is prose only — the network this call believes URL to
-# be ("sandbox", "testnet") — used solely to make a failure legible; it
+# for a network other than the sandbox's (require_testnet_network's
+# "testnet" among them). LABEL is prose only — the network this call
+# believes URL to be, worded to read as a possessive in the messages below
+# ("the sandbox", "testnet") — used solely to make a failure legible; it
 # decides nothing.
 #
 # Three ways to fail, in order:
@@ -331,13 +332,12 @@ require_network_passphrase() {
 # script does anything else, however its RPC URL got configured.
 #
 # SANDBOX_PASSPHRASE is "Standalone Network ; February 2017", so
-# require_network_passphrase's own mismatch message already names the
-# standalone network by quoting it as EXPECTED — the label "sandbox" below
-# is prose only, and does not change that. Its no-answer message named no
-# passphrase before this refactor either, and still does not: there is
-# none to quote when the node gave none.
+# require_network_passphrase's own mismatch message names the standalone
+# network by quoting it as EXPECTED — the label "the sandbox" below is prose
+# only, and does not change that. Its no-answer message names no
+# passphrase: there is none to quote when the node gave none.
 require_standalone_network() {
-	require_network_passphrase "$1" "${SANDBOX_PASSPHRASE}" sandbox
+	require_network_passphrase "$1" "${SANDBOX_PASSPHRASE}" "the sandbox"
 }
 
 # The stellar CLI identity names deploy.sh creates and crash.sh signs

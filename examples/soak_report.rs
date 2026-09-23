@@ -11,8 +11,15 @@
 //!   cargo run --example soak_report -- <pool> [account...]
 //! ```
 //!
-//! `RPC_API_KEY_HEADER` and `RPC_API_KEY` are honoured together, as
-//! `pool_snapshot` does.
+//! `RPC_URL` is needed only when an account is given: the store sections
+//! read nothing from chain. `RPC_API_KEY_HEADER` and `RPC_API_KEY` are
+//! honoured together, as `pool_snapshot` does.
+//!
+//! There is no network gate here, unlike `scripts/testnet/`: nothing asks
+//! the node which network it is, so the positions printed are whatever the
+//! node `RPC_URL` names answers for. That is acceptable for a tool that
+//! holds no key and sends nothing, and it is why the command above names
+//! the RPC explicitly.
 //!
 //! `creations` and `fills` have no read method on [`blend_liquidator::store::Store`]
 //! — the bot only ever writes them — so this example reads both with
@@ -199,7 +206,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let accounts: Vec<&str> = arguments.iter().skip(2).map(String::as_str).collect();
 
     let database_url = std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL is required")?;
-    let rpc_url = std::env::var("RPC_URL").map_err(|_| "RPC_URL is required")?;
+    // Read up front, before the store is opened, so a report that names an
+    // account fails on a missing RPC_URL before printing anything, as it
+    // always has; one that names none never needs it.
+    let rpc_url = if accounts.is_empty() {
+        None
+    } else {
+        Some(std::env::var("RPC_URL").map_err(|_| "RPC_URL is required when an account is given")?)
+    };
     let header = std::env::var("RPC_API_KEY_HEADER")
         .ok()
         .filter(|value| !value.is_empty());
@@ -221,8 +235,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     print_creations(&store, &pool).await?;
     print_fills(&store, &pool).await?;
 
-    if accounts.is_empty() {
-        return Ok(());
+    match rpc_url {
+        Some(rpc_url) => print_positions(&rpc_url, api_key, &pool, &accounts).await,
+        None => Ok(()),
     }
-    print_positions(&rpc_url, api_key, &pool, &accounts).await
 }

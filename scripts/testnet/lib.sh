@@ -23,9 +23,9 @@ TESTNET_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # calling a script under scripts/testnet/ from a shell that has
 # STELLAR_RPC_URL exported safe rather than silently wrong.
 #
-# What it gives us: log()/die(), require_network_passphrase() (Task 1's
-# shared gate, which every later `require_testnet_network` call below is
-# one line on top of), sandbox_set_network()/sandbox_require_network()/the
+# What it gives us: log()/die(), require_network_passphrase() (the gate
+# both tiers share, which `require_testnet_network` below is one line on
+# top of), sandbox_set_network()/sandbox_require_network()/the
 # sandbox_network_args array — one flag array and one gate shared by both
 # tiers, whichever last called require_*_network — sandbox_register_role(),
 # invoke()/invoke_view() and env_write(). versions.env's pins (the wasm
@@ -50,11 +50,13 @@ TESTNET_FRIENDBOT_URL="https://friendbot.stellar.org"
 # cannot be. That is not a hole in the gate below: require_testnet_network
 # still calls whatever URL this names and dies unless *that node's own*
 # getNetwork answers TESTNET_PASSPHRASE, so an override pointing anywhere
-# else — the local sandbox, mainnet, nothing at all — simply dies there.
-# The one thing the override is for is proving that this refuses: point it
-# at the sandbox for one run and confirm every script dies at the gate,
-# naming the network it actually found. Nothing here weakens what
-# require_testnet_network itself decides.
+# else — the local sandbox, mainnet, nothing at all — simply dies there,
+# naming the network it actually found. deploy.sh and run-bot.sh's dry-run
+# mode gate and use this value; crash.sh and run-bot.sh --armed source
+# testnet.env first, whose TESTNET_RPC_URL — the one deploy.sh verified and
+# recorded — replaces it, and gate that instead. Either way the URL a
+# script goes on to use is the one its gate verified. Nothing here weakens
+# what require_testnet_network itself decides.
 : "${TESTNET_RPC_URL:=https://soroban-testnet.stellar.org}"
 
 # require_testnet_network — dies unless TESTNET_RPC_URL's own getNetwork

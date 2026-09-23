@@ -264,7 +264,7 @@ testnet-crash: ## Move the testnet soak's oracle price (default $0.075; PRICE=<n
 testnet-run: ## Run the bot against testnet in dry run (the observe stage's own pool; no key, nothing ever submitted)
 	./scripts/testnet/run-bot.sh
 
-testnet-run-armed: ## Run the bot against testnet ARMED (DRY_RUN=false, our own deployed pool) — the only target that ever signs and sends
+testnet-run-armed: ## Run the bot against testnet ARMED (DRY_RUN=false, our own deployed pool) — the only target that runs the bot armed on testnet
 	./scripts/testnet/run-bot.sh --armed
 
 build: ## Build Docker image

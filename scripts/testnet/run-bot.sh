@@ -7,33 +7,52 @@
 #   (no argument)  Dry run against target/testnet/pools.toml — the observe
 #                  stage's own pools file, naming Blend's testnet pool.
 #                  Reads that file; never writes it. Port 18081, database
-#                  testnet_soak — the same two the observe stage's own
-#                  long-running process already uses, since this is the
-#                  supervised way to run exactly that stage. No signing key
-#                  is read or needed: DRY_RUN is always true here.
+#                  testnet_soak, log target/testnet/dry-run.log. No signing
+#                  key reaches the binary: both key variables are unset
+#                  below and neither is set again, and DRY_RUN is always
+#                  true here.
 #
 #   --armed        DRY_RUN=false against target/testnet/pools.armed.toml,
 #                  which this script (re)generates every run from
 #                  target/testnet/testnet.env — the pool deploy.sh stood
-#                  up. Port 18082, database testnet_armed. Requires
-#                  testnet.env to exist and reads TESTNET_FILLER_SECRET_KEY
-#                  from it into the child's environment only: never an
-#                  argument (argv is world-readable), never echoed, never
-#                  logged.
+#                  up. Port 18082, database testnet_armed, log
+#                  target/testnet/armed.log. Requires testnet.env to exist
+#                  and reads TESTNET_FILLER_SECRET_KEY from it into the
+#                  child's environment only: never an argument (argv is
+#                  world-readable), never echoed, never logged.
 #
-# require_testnet_network runs before either mode's own checks — "before
-# anything" — so a misdirected TESTNET_RPC_URL refuses right here, for
-# either mode, rather than ever reaching the binary. The binary itself only
-# ever gets that same verified URL, exported as RPC_URL for the child.
+# The gate verifies exactly the URL the binary is then handed. In armed
+# mode that URL is testnet.env's TESTNET_RPC_URL — the one deploy.sh
+# verified and recorded, which sourcing the file puts in place of whatever
+# the environment or lib.sh's default said — so the file is sourced, and its
+# passphrase compared with the pin, before the gate runs, exactly as
+# crash.sh orders it. In dry-run mode it is TESTNET_RPC_URL from the
+# environment, or lib.sh's default. Either way the gate is
+# require_testnet_network, and the binary's RPC_URL is the SANDBOX_RPC_URL
+# that gate exported: the verified string itself, not a second reading of a
+# variable something could have changed since.
+#
+# The binary's environment is this script's, not the operator's shell:
+# every setting the bot reads that this script does not set on purpose is
+# unset before the exports below, and the comment there says why each group
+# is.
 #
 # Execs the binary as its very last act (after redirecting output to this
 # run's log file), so signals — SIGINT, SIGTERM — reach it directly rather
-# than a shell wrapper that would have to relay them.
+# than a shell wrapper that would have to relay them, and the pid this
+# script started with is the bot's own: `kill -TERM <pid>` stops it.
 #
-# TESTNET_RUN_PORT overrides the mode's own default port. Not part of the
-# design either mode is meant to run with; it exists so this script can be
-# verified without binding a port the long-running observe process already
-# holds — see the container-level note in the soak's own runbook.
+# TESTNET_RUN_PORT and TESTNET_RUN_DATABASE, together or not at all,
+# override the mode's port and database name, for exercising this script
+# beside a live run of the same mode. A run with them set logs to
+# target/testnet/<database>.log rather than the mode's own transcript, so
+# nothing it does lands in the live run's port, database or log. They are
+# not a way to run a second instance of a mode on that mode's own database
+# — two bots on one store (and, armed, one key) is the deployment
+# contract's overlapping-instance case, noise a soak must not measure — so
+# TESTNET_RUN_DATABASE refuses either mode's own database name. The
+# database must already exist, as either mode's must (docs/testnet-soak.md,
+# "The database").
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -50,6 +69,46 @@ case "${1:-}" in
 *) die "run-bot: unknown argument '$1' — usage: run-bot.sh [--armed]" ;;
 esac
 
+run_port="${TESTNET_RUN_PORT:-}"
+run_database="${TESTNET_RUN_DATABASE:-}"
+if [ -n "${run_port}" ] || [ -n "${run_database}" ]; then
+	if [ -z "${run_port}" ] || [ -z "${run_database}" ]; then
+		die "run-bot: TESTNET_RUN_PORT and TESTNET_RUN_DATABASE come together — a run beside a live one needs its own port and its own database (see this script's header)"
+	fi
+	case "${run_database}" in
+	testnet_soak | testnet_armed)
+		die "run-bot: TESTNET_RUN_DATABASE names ${run_database}, a mode's own database — it is for a run beside that mode's live one, never a second instance on the same store"
+		;;
+	[!a-z_]* | *[!a-z0-9_]*)
+		die "run-bot: TESTNET_RUN_DATABASE must be a plain lower-case database name ([a-z_][a-z0-9_]*), got '${run_database}'"
+		;;
+	esac
+fi
+
+testnet_root="$(testnet_dir)"
+
+if [ "${armed}" = true ]; then
+	pool_env="${testnet_root}/testnet.env"
+	[ -f "${pool_env}" ] \
+		|| die "run-bot: --armed requires ${pool_env} — run scripts/testnet/deploy.sh first"
+	# The comparison passphrase stays lib.sh's own. testnet.env sets
+	# TESTNET_PASSPHRASE too, and sourcing it overwrites lib.sh's pin —
+	# which require_testnet_network then compares getNetwork's answer
+	# against — so an env file naming a network the pins do not is refused
+	# here, rather than quietly adopted as the thing the gate checks for.
+	pinned_passphrase="${TESTNET_PASSPHRASE}"
+	# shellcheck source=/dev/null
+	source "${pool_env}"
+	for key in TESTNET_RPC_URL TESTNET_PASSPHRASE TESTNET_POOL TESTNET_XLM TESTNET_USDC TESTNET_BORROWER TESTNET_FILLER_SECRET_KEY; do
+		[ -n "${!key:-}" ] || die "run-bot: ${pool_env} does not define ${key}"
+	done
+	[ "${TESTNET_PASSPHRASE}" = "${pinned_passphrase}" ] \
+		|| die "run-bot: ${pool_env} names the passphrase '${TESTNET_PASSPHRASE}', not testnet's pinned '${pinned_passphrase}' — refusing to touch a network that is not testnet's own"
+fi
+
+# The gate, on the URL the binary is about to be handed (see the header).
+# Nothing below talks to a network, and nothing is exec'd, until this has
+# passed.
 require_testnet_network
 
 repo_root="$(cd "${script_dir}/../.." && pwd)"
@@ -58,7 +117,6 @@ binary="${repo_root}/target/debug/liquidator"
 
 : "${DATABASE_URL:?run-bot: DATABASE_URL must be set in the environment}"
 
-testnet_root="$(testnet_dir)"
 mkdir -p "${testnet_root}"
 
 # Swaps DATABASE_URL's own database name for this mode's, keeping whatever
@@ -68,15 +126,6 @@ db_query="${DATABASE_URL#"${db_no_query}"}"
 db_server="${db_no_query%/*}"
 
 if [ "${armed}" = true ]; then
-	pool_env="${testnet_root}/testnet.env"
-	[ -f "${pool_env}" ] \
-		|| die "run-bot: --armed requires ${pool_env} — run scripts/testnet/deploy.sh first"
-	# shellcheck source=/dev/null
-	source "${pool_env}"
-	for key in TESTNET_POOL TESTNET_XLM TESTNET_USDC TESTNET_BORROWER TESTNET_FILLER_SECRET_KEY; do
-		[ -n "${!key:-}" ] || die "run-bot: ${pool_env} does not define ${key}"
-	done
-
 	# Regenerated every armed run from the addresses testnet.env names —
 	# never target/testnet/pools.toml, which the observe stage owns and
 	# this script never opens for writing in either mode.
@@ -110,7 +159,7 @@ EOF
 
 	mode=armed
 	pool_address="${TESTNET_POOL}"
-	port="${TESTNET_RUN_PORT:-18082}"
+	port=18082
 	db_name=testnet_armed
 	log_file="${testnet_root}/armed.log"
 else
@@ -129,23 +178,91 @@ else
 	mode=dry-run
 	pool_address="$(sed -n 's/^address = "\(.*\)"/\1/p' "${pools_file}" | head -n1)"
 	[ -n "${pool_address}" ] || die "run-bot: ${pools_file} names no pool address"
-	port="${TESTNET_RUN_PORT:-18081}"
+	port=18081
 	db_name=testnet_soak
 	log_file="${testnet_root}/dry-run.log"
+fi
+
+if [ -n "${run_database}" ]; then
+	port="${run_port}"
+	db_name="${run_database}"
+	log_file="${testnet_root}/${run_database}.log"
 fi
 
 bot_database_url="${db_server}/${db_name}${db_query}"
 
 log "mode: ${mode}"
-log "network: testnet (${TESTNET_RPC_URL})"
+log "network: testnet (${SANDBOX_RPC_URL})"
 log "pool: ${pool_address}"
+log "port: ${port}, database: ${db_name}"
 log "log: ${log_file}"
 
+# The binary's environment is this script's, not the operator's shell.
+# Every setting the bot reads — src/config.rs's clap `env =` names, and the
+# ones read straight from the environment (the two signing keys in
+# src/main.rs; DATABASE_URL, RPC_API_KEY and TELEGRAM_BOT_TOKEN in
+# Args::service and Args::chain) — that this script does not set on purpose
+# below is unset here, in four groups:
+#
+# - The signing keys. AUCTIONEER_SECRET_KEY is never this tier's: armed,
+#   the auctioneer would sign its creations on testnet with whatever key
+#   the shell held, plausibly a mainnet one. FILLER_SECRET_KEY is set again
+#   below in armed mode only, from testnet.env, so a dry run is handed no
+#   key at all rather than merely not asked to use one.
+# - Other deployments' credentials and channels. RPC_API_KEY and
+#   RPC_API_KEY_HEADER would send another provider's credential, as a
+#   header, to SDF's public testnet RPC; TELEGRAM_BOT_TOKEN and
+#   TELEGRAM_CHAT_ID would send testnet alerts to another deployment's chat.
+#   With the Telegram pair gone no bot token can reach this process, which
+#   is what makes an inherited RUST_LOG harmless to one — see RUST_LOG below
+#   for the one secret that remains, the armed mode's key.
+# - Which network, which pools, which run. NETWORK_PASSPHRASE conflicts
+#   with the NETWORK=testnet set below, and POOLS_TOML with POOLS_FILE —
+#   even an empty POOLS_TOML= — so clap refuses either pair at parse and an
+#   inherited one would stop the run rather than change it; they are cleared
+#   so that a shell exported for another deployment starts this run instead
+#   of failing it. SEED_FILE is set below only when this mode has one, so an
+#   inherited one would seed another pool's accounts into this run. RUN_MODE,
+#   HTTP_PORT and HTTP_BIND_ADDR are this script's too: check-config would
+#   validate and exit, PORT wins over HTTP_PORT anyway, and a 0.0.0.0 bind
+#   would expose the unauthenticated endpoints.
+# - The tuning knobs. A soak measures the defaults docs/configuration.md and
+#   docs/testnet-soak.md describe; a shell carrying another deployment's
+#   settings would otherwise retune a testnet run without a word.
+#
+# A setting added to src/config.rs belongs in this list as well, or in the
+# exports below.
+unset \
+	AUCTIONEER_SECRET_KEY FILLER_SECRET_KEY \
+	RPC_API_KEY RPC_API_KEY_HEADER TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID \
+	NETWORK_PASSPHRASE POOLS_TOML SEED_FILE RUN_MODE HTTP_PORT HTTP_BIND_ADDR \
+	BASE_FEE HIGH_FEE TX_POLL_LEDGERS DATABASE_MAX_CONNECTIONS \
+	USER_REFRESH_LEDGERS REFRESH_BATCH FULL_SCAN_LEDGERS SCAN_HF_THRESHOLD \
+	LIQ_HF_THRESHOLD TARGET_HF ORACLE_SCAN_LEDGERS PRICE_DELTA_BPS \
+	PLAN_ITERATIONS STARTUP_DELAY_LEDGERS HF_SAFETY_MULTIPLIER \
+	REPLAN_LEDGERS REPLAN_NEAR_LEDGERS XLM_FEE_RESERVE \
+	HIGH_FEE_PROFIT_THRESHOLD INVENTORY_REFRESH_SECS \
+	FAILURE_NOTIFICATION_COOLDOWN_HOURS SEED_HF_MAX HEALTH_MAX_LAG_LEDGERS
+
 export NETWORK=testnet
-export RPC_URL="${TESTNET_RPC_URL}"
+export RPC_URL="${SANDBOX_RPC_URL}"
 export POLL_INTERVAL_MS=5000
 export LOG_FORMAT=json
-export RUST_LOG="${RUST_LOG:-info,blend_liquidator=debug}"
+# docs/deploy.md §6: never run a deployment that holds a secret at
+# RUST_LOG=trace. The armed bot holds the filler's key, so it always runs at
+# this script's own filter and an inherited RUST_LOG is ignored there. A dry
+# run holds no key, no RPC credential and no Telegram token (all unset
+# above), so it keeps an operator's RUST_LOG and falls back to the same
+# filter.
+default_filter="info,blend_liquidator=debug"
+if [ "${armed}" = true ]; then
+	if [ -n "${RUST_LOG:-}" ] && [ "${RUST_LOG}" != "${default_filter}" ]; then
+		log "armed: ignoring the inherited RUST_LOG — an armed run always logs at ${default_filter}"
+	fi
+	export RUST_LOG="${default_filter}"
+else
+	export RUST_LOG="${RUST_LOG:-${default_filter}}"
+fi
 export PORT="${port}"
 export DATABASE_URL="${bot_database_url}"
 export POOLS_FILE="${pools_file}"

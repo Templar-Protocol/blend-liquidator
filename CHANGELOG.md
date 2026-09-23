@@ -39,7 +39,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `crash.sh` moves the deployment's own oracle price; `run-bot.sh
   [--armed]` is the one path `DRY_RUN=false` ever reaches the binary on
   testnet, regenerating its pools and seed files from `testnet.env` every
-  armed run. Two new read-only tools read the evidence back:
+  armed run, handing the binary exactly the RPC URL its gate verified, and
+  unsetting every other setting the bot reads first, so an operator's
+  shell cannot give a testnet run a signing key, an RPC credential or a
+  Telegram channel. Both tiers share one network gate:
+  `scripts/sandbox/lib.sh`'s `require_network_passphrase URL EXPECTED
+  LABEL`, with `require_standalone_network` one line on top of it and
+  `scripts/testnet/lib.sh`'s `require_testnet_network` a second, pinned to
+  testnet's passphrase. It refuses the public mainnet passphrase by name
+  before any other comparison, and builds the flags every later `stellar`
+  call carries from the URL it checked and the passphrase that node
+  answered with. Two new read-only tools read the evidence back:
   `examples/scan_borrowers.rs` finds accounts worth tracking from a
   pool's own recent event history — the answer to a pool with no
   analytics API to seed from — and `examples/soak_report.rs` prints a
@@ -57,18 +67,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whether or not its own funding request landed — so that race used to
   fail a deploy at step 1 after 30s with "friendbot did not fund …", on a
   network with nothing wrong with it but timing.
-- `scripts/sandbox/lib.sh`'s network gate is factored into
-  `require_network_passphrase URL EXPECTED LABEL`, with
-  `require_standalone_network` now one line on top of it and
-  `scripts/testnet/lib.sh`'s `require_testnet_network` a second caller
-  pinned to testnet's own passphrase instead. Before this, the flags
-  every `stellar` call was handed (`sandbox_network_args`) were always
-  built from `SANDBOX_PASSPHRASE`, whatever passphrase the node just
-  proved it actually answers with — so a gate checking a network other
-  than the sandbox's own would confirm the right node and then hand the
-  CLI the wrong passphrase regardless, every call failing on a mismatch
-  despite the gate itself having passed. `sandbox_set_network` now takes
-  the matched passphrase explicitly rather than assuming its own.
 
 ## [0.1.0] - 2026-09-22
 
