@@ -2,7 +2,8 @@
 
 .PHONY: help build build-clean start stop restart logs logs-tail clean shell ps stats check \
 	db-up db-down db-reset db-migrate sqlx-prepare \
-	sandbox sandbox-up sandbox-fetch sandbox-deploy sandbox-test sandbox-down
+	sandbox sandbox-up sandbox-fetch sandbox-deploy sandbox-test sandbox-down \
+	testnet-deploy testnet-crash testnet-run testnet-run-armed
 
 .DEFAULT_GOAL := help
 
@@ -23,6 +24,11 @@ export DATABASE_URL
 # `sandbox` loops over when no single SANDBOX_SCENARIO is given.
 SANDBOX_SCENARIO ?= liquidation
 SANDBOX_SCENARIOS ?= liquidation check_config dry_run unwind_repay restart_adopt
+
+# testnet-crash's own oracle price, in the oracle's 7-decimal units. Empty
+# by default, which leaves crash.sh to use its own default (750000,
+# $0.075); PRICE=<n> overrides it.
+PRICE ?=
 
 help: ## Show available commands
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -58,7 +64,7 @@ check: ## Run everything CI runs (needs `make db-up` first)
 	cargo sqlx prepare --check -- --lib --bins
 	RUSTDOCFLAGS='-D warnings' cargo doc --no-deps
 	./scripts/check-repo-invariants.sh
-	shellcheck --severity=error scripts/*.sh scripts/sandbox/*.sh .devcontainer/*.sh
+	shellcheck --severity=error scripts/*.sh scripts/sandbox/*.sh scripts/testnet/*.sh .devcontainer/*.sh
 
 # ── The sandbox integration tier ────────────────────
 #
@@ -238,6 +244,28 @@ sandbox: ## fetch, then up → deploy → test → down for each of SANDBOX_SCEN
 		fi; \
 	done; \
 	echo 'sandbox: every scenario passed'
+
+# ── The testnet soak tier ───────────────────────────
+#
+# scripts/testnet/*.sh, a sibling of the sandbox tier above rather than a
+# mode of it: the same protocol stood up on public Stellar testnet, with
+# friendbot's testnet XLM as the capital, for the design spec's soak (see
+# docs/testnet-soak.md). Nothing here runs in CI — it is a thing you run by
+# hand, against a network this repo does not control and cannot reset or
+# tear down; testnet.env, once deploy.sh writes it, is what every other
+# target here reads.
+
+testnet-deploy: ## Stand Blend v2 up on testnet for the soak's armed stage (writes target/testnet/testnet.env; refuses if it already exists)
+	./scripts/testnet/deploy.sh
+
+testnet-crash: ## Move the testnet soak's oracle price (default $0.075; PRICE=<n> in the oracle's 7-decimal units for another)
+	./scripts/testnet/crash.sh $(PRICE)
+
+testnet-run: ## Run the bot against testnet in dry run (the observe stage's own pool; no key, nothing ever submitted)
+	./scripts/testnet/run-bot.sh
+
+testnet-run-armed: ## Run the bot against testnet ARMED (DRY_RUN=false, our own deployed pool) — the only target that ever signs and sends
+	./scripts/testnet/run-bot.sh --armed
 
 build: ## Build Docker image
 	docker build -t $(IMAGE):$(TAG) -f Dockerfile .

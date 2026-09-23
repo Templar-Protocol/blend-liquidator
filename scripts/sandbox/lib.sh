@@ -242,20 +242,31 @@ sandbox_require_network() {
 		|| die "sandbox network not verified: call require_standalone_network first"
 }
 
-# sandbox_set_network URL — records URL as this sandbox's RPC, exports it
-# as SANDBOX_RPC_URL (the one name the rest of the tier reads it under)
-# and builds the flag array from it.
+# sandbox_set_network URL [PASSPHRASE] — records URL as this sandbox's RPC,
+# exports it as SANDBOX_RPC_URL (the one name the rest of the tier reads it
+# under) and builds the flag array from URL and PASSPHRASE.
 #
-# require_standalone_network calls this with the URL it has just verified,
-# which is the only way a script should reach it; test-network-pinning.sh
-# calls it directly, deriving a contract id offline against a URL it never
-# contacts.
+# PASSPHRASE defaults to SANDBOX_PASSPHRASE, never to a passphrase this
+# process merely verified elsewhere: require_network_passphrase calls this
+# with the URL *and the EXPECTED passphrase it just matched* — testnet's,
+# when the caller is require_testnet_network — precisely so the flags this
+# builds are pinned to the network that was actually checked, not
+# whichever network this file happens to be the sandbox's own. Without the
+# explicit second argument, a tier gating on a passphrase other than
+# SANDBOX_PASSPHRASE would verify the right node and then hand the CLI the
+# wrong one's passphrase anyway — every call would fail with "provided
+# network passphrase does not match the server" despite the gate itself
+# having passed. require_standalone_network's own call (through
+# require_network_passphrase) supplies SANDBOX_PASSPHRASE as EXPECTED, so
+# its behaviour is unchanged; test-network-pinning.sh's direct,
+# single-argument call is unchanged too, for the same reason.
 sandbox_set_network() {
-	[ -n "${SANDBOX_PASSPHRASE:-}" ] \
-		|| die "sandbox_set_network: SANDBOX_PASSPHRASE is unset — ${SANDBOX_SCRIPT_DIR}/versions.env did not define it"
-	SANDBOX_RPC_URL=$1
+	local url=$1 passphrase=${2:-${SANDBOX_PASSPHRASE:-}}
+	[ -n "${passphrase}" ] \
+		|| die "sandbox_set_network: no passphrase given and SANDBOX_PASSPHRASE is unset — ${SANDBOX_SCRIPT_DIR}/versions.env did not define it"
+	SANDBOX_RPC_URL=$url
 	export SANDBOX_RPC_URL
-	sandbox_network_args=(--rpc-url "${SANDBOX_RPC_URL}" --network-passphrase "${SANDBOX_PASSPHRASE}")
+	sandbox_network_args=(--rpc-url "${SANDBOX_RPC_URL}" --network-passphrase "${passphrase}")
 }
 
 # _SANDBOX_PUBLIC_PASSPHRASE — mainnet's own, refused by name regardless of
@@ -267,10 +278,15 @@ sandbox_set_network() {
 _SANDBOX_PUBLIC_PASSPHRASE="Public Global Stellar Network ; September 2015"
 
 # require_network_passphrase URL EXPECTED LABEL — dies unless URL's
-# getNetwork answers exactly EXPECTED, and on success makes URL the network
-# every later CLI call names, through sandbox_set_network. LABEL is prose
-# only — the network this call believes URL to be ("sandbox", "testnet") —
-# used solely to make a failure legible; it decides nothing.
+# getNetwork answers exactly EXPECTED, and on success makes URL *and
+# EXPECTED* the network every later CLI call names, through
+# sandbox_set_network(url, expected) — the passphrase every later `stellar`
+# call carries is the one this function just matched, never
+# SANDBOX_PASSPHRASE by default, which is what makes this helper correct
+# for a LABEL other than "sandbox" (require_testnet_network's "testnet"
+# among them). LABEL is prose only — the network this call believes URL to
+# be ("sandbox", "testnet") — used solely to make a failure legible; it
+# decides nothing.
 #
 # Three ways to fail, in order:
 #   1. no answer, or no passphrase in the answer — the node might not even
@@ -299,7 +315,7 @@ require_network_passphrase() {
 		|| die "require_network_passphrase: ${url} reports the public network passphrase '${_SANDBOX_PUBLIC_PASSPHRASE}' — refusing to touch mainnet in place of ${label}'s own"
 	[ "${passphrase}" = "${expected}" ] \
 		|| die "require_network_passphrase: ${url} reports passphrase '${passphrase}', expected ${label}'s '${expected}' — refusing to touch a network that is not ${label}'s own"
-	sandbox_set_network "${url}"
+	sandbox_set_network "${url}" "${expected}"
 }
 
 # require_standalone_network URL — dies unless URL's getNetwork answers

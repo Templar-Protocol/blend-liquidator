@@ -201,15 +201,23 @@ STUB_OTHER="Stub Network ; B"
 # becomes the URL just verified, and sandbox_require_network — the same
 # guard invoke()/invoke_view() call before every `stellar` command — accepts
 # the array require_network_passphrase built through sandbox_set_network.
+#
+# The passphrase *inside* sandbox_network_args is asserted explicitly, not
+# just the array's length: STUB_EXPECTED here is deliberately not
+# SANDBOX_PASSPHRASE, so a sandbox_set_network that silently fell back to
+# SANDBOX_PASSPHRASE instead of the EXPECTED passphrase it was just handed
+# would still produce a 4-element array and would pass a length-only check
+# while handing every later `stellar` call the wrong network's passphrase —
+# exactly the bug this case exists to catch.
 match_result=$(
 	_sandbox_rpc_call() { printf '{"result":{"passphrase":"%s"}}' "${STUB_EXPECTED}"; }
 	require_network_passphrase "http://stub-match/rpc" "${STUB_EXPECTED}" "${STUB_LABEL}"
 	sandbox_require_network
-	printf 'url=%s args=%d' "${SANDBOX_RPC_URL}" "${#sandbox_network_args[@]}"
+	printf 'url=%s args=%d passphrase=%s' "${SANDBOX_RPC_URL}" "${#sandbox_network_args[@]}" "${sandbox_network_args[3]}"
 ) && match_status=0 || match_status=$?
 
-if [ "${match_status}" -eq 0 ] && [ "${match_result}" = "url=http://stub-match/rpc args=4" ]; then
-	ok "require_network_passphrase passes on a matching passphrase and sets the flags (${match_result})"
+if [ "${match_status}" -eq 0 ] && [ "${match_result}" = "url=http://stub-match/rpc args=4 passphrase=${STUB_EXPECTED}" ]; then
+	ok "require_network_passphrase passes on a matching passphrase and sets the flags, with EXPECTED's own passphrase in them (${match_result})"
 else
 	no "require_network_passphrase on a match: exit ${match_status}, got '${match_result}'"
 fi
