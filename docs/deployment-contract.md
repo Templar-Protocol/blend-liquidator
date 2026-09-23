@@ -16,6 +16,10 @@ default and bound beyond what is stated below.
   neither. Whether the package is public is a GitHub package setting,
   not something this repository controls; while it is private, pulling
   it needs a token with `read:packages`.
+- **Release.** The same tag push cuts a GitHub Release with generated
+  notes, once the image has been pushed. A prerelease tag — the same `-`
+  suffix test the image tags use — is marked a prerelease there, so it
+  is never shown as the latest release.
 - **Both build stages pin their base image by digest**, not only by tag,
   so what a tag later resolves to cannot change either base image. The
   runtime stage's apt packages (`ca-certificates`, `procps`) are not

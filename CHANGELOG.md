@@ -57,6 +57,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   row with its `dry_run` and `tx_hash`. `docs/testnet-soak.md` is the
   runbook for both stages.
 
+### Changed
+
+- A `v*` tag with a `-` suffix (`v0.2.0-rc.1`) now cuts its GitHub
+  Release marked as a prerelease, the same test `release.yml` already
+  applies to the image's `latest` and `{{major}}.{{minor}}` tags, so a
+  release candidate is never shown as the repository's latest release.
+  The workflow's comment no longer claims the package is private because
+  the repository is: its visibility is its own GHCR setting.
+
 ### Fixed
 
 - An oracle scan refused because the ledger moved between its reads
