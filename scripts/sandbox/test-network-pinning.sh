@@ -123,7 +123,7 @@ fi
 # exists to stop. lib.sh answers it twice, by unsetting the name at source
 # time and by testing the array itself; either alone would pass this case,
 # and both together are what the file promises.
-GUARD_MESSAGE="sandbox network not verified: call require_standalone_network first"
+GUARD_MESSAGE="network not verified: call the tier's gate (require_standalone_network, or require_testnet_network under scripts/testnet/) first"
 
 before=$(
 	SANDBOX_RPC_URL=http://localhost:8000/rpc bash -c '

@@ -233,13 +233,15 @@ sandbox_network_args=()
 # Called immediately before **every** expansion of sandbox_network_args:
 # invoke() and invoke_view() here, and each direct `stellar` call in
 # deploy.sh. That is the rule a new call site has to follow, and it is
-# load-bearing rather than tidy: a call made before
-# require_standalone_network would carry no flags, and a flagless CLI
-# call goes to a public network rather than failing. The one place the
-# check itself is proved is test-network-pinning.sh.
+# load-bearing rather than tidy: a call made before the tier's gate —
+# require_standalone_network here, require_testnet_network in
+# scripts/testnet/, both of them require_network_passphrase — would carry
+# no flags, and a flagless CLI call goes to a public network rather than
+# failing. The one place the check itself is proved is
+# test-network-pinning.sh.
 sandbox_require_network() {
 	[ "${#sandbox_network_args[@]}" -ge 4 ] \
-		|| die "sandbox network not verified: call require_standalone_network first"
+		|| die "network not verified: call the tier's gate (require_standalone_network, or require_testnet_network under scripts/testnet/) first"
 }
 
 # sandbox_set_network URL [PASSPHRASE] — records URL as this sandbox's RPC,
