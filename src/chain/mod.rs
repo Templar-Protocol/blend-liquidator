@@ -30,12 +30,11 @@ pub use tx::{LedgerWindow, Prepared, Priority, Submitter, TxConfig, TxOutcome};
 pub enum ChainError {
     /// The HTTP request never produced a response (DNS, TLS, timeout).
     ///
-    /// Always built through this type's `From<reqwest::Error>`, which strips
-    /// the request URL first: this variant's text reaches the log and, as
-    /// `RpcFailing`, the notification channel, and an RPC URL is the one
-    /// part of a request an operator may have put a credential in.
+    /// This variant's text reaches the log and, as `RpcFailing`, the
+    /// notification channel, so it never carries the request URL: see
+    /// [`TransportError`].
     #[error("rpc transport: {0}")]
-    Transport(reqwest::Error),
+    Transport(TransportError),
     /// The RPC answered with a non-2xx status.
     #[error("rpc http status {0}")]
     Http(u16),
@@ -105,12 +104,40 @@ pub enum ChainError {
     BadSequence,
 }
 
+/// A `reqwest` failure with its request URL removed.
+///
+/// `reqwest` renders the URL it was sending to in both its `Display` and its
+/// `Debug`, and an RPC URL is the one part of a request an operator may have
+/// put a credential in. The field is private and [`TransportError::new`] is
+/// the only way to build one, so no `ChainError::Transport` can hold an
+/// error that still carries the URL.
+#[derive(Debug)]
+pub struct TransportError(reqwest::Error);
+
+impl TransportError {
+    /// `error`, with `reqwest::Error::without_url` applied.
+    #[must_use]
+    pub fn new(error: reqwest::Error) -> Self {
+        Self(error.without_url())
+    }
+}
+
+impl std::fmt::Display for TransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for TransportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
 impl From<reqwest::Error> for ChainError {
-    /// Every `?` on a `reqwest` call lands here, so this is the one place
-    /// the URL is removed — `Display` and `Debug` alike render `reqwest`'s
-    /// own text without it.
+    /// Every `?` on a `reqwest` call lands here.
     fn from(error: reqwest::Error) -> Self {
-        Self::Transport(error.without_url())
+        Self::Transport(TransportError::new(error))
     }
 }
 

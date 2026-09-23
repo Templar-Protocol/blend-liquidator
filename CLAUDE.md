@@ -207,9 +207,11 @@ make help                           # Docker Compose lifecycle
   hand. A second test on the same set,
   `the_testnet_runner_clears_or_sets_every_real_setting`, fails unless
   every real setting is in `scripts/testnet/run-bot.sh`'s `unset \` block
-  or on one of its `export NAME=` lines, and unless every name the block
-  lists is a real one — `unset` of a misspelt name succeeds and clears
-  nothing.
+  or `export`ed after it in **every** mode — an export inside an `if`
+  counts only when both arms make it, since the armed-only
+  `FILLER_SECRET_KEY` export would otherwise cover a dry run that inherits
+  the shell's key — and unless every name either list carries is a real
+  one: `unset` or `export` of a misspelt name clears or sets nothing.
 - `src/main.rs` — binary entry point: tracing setup, argument parsing, exit.
 - `src/math/` — the pure port of the pool contract's arithmetic: `fixed`
   (checked rounding), `reserve` (accrual and token conversions), `position`
@@ -882,11 +884,11 @@ make help                           # Docker Compose lifecycle
   armed one the filler's key besides, and `docs/deploy.md` §6 forbids
   `trace` on a bot holding a secret. That list is written by hand, and
   `the_testnet_runner_clears_or_sets_every_real_setting` (`src/config.rs`)
-  fails when a setting the bot reads is in neither it nor the exports, or
-  when it names one the bot does not read. Its last step before the
-  `exec` takes `flock -n` on `target/testnet/<database>.lock`, held on a
-  descriptor the `exec` hands the bot, so it is released only when the
-  bot exits: one run per database at a time, which is what stops a
+  fails when a setting the bot reads is in neither it nor exported in
+  every mode, or when either names one the bot does not read. Its last
+  step before the `exec` takes `flock -n` on
+  `target/testnet/<database>.lock`, held on a descriptor the `exec` hands
+  the bot, so it is released only when the bot exits: one run per database at a time, which is what stops a
   second `make testnet-run-armed` signing with the live run's key.
   `TESTNET_RUN_PORT` and `TESTNET_RUN_DATABASE`, together or not at all,
   move a dry run to its own port, database and `run-<database>.log` so the
@@ -1540,12 +1542,13 @@ Status above for what remains.
   modes export `SEED_URL=""` (next to the `POOLS_FILE` export)
   — never the default, which answers for mainnet's own analytics API and
   would seed mainnet accounts into a testnet pool.
-- `users_tracked` has two writers: `apply_tick` (`src/service.rs`),
-  which re-reads `Store::count_users` after any tick whose refresh
-  touched an account — only a refresh inserts or deletes a `users` row,
-  so a tick that refreshed nothing skips the read — and `full_scan`, on
-  `FULL_SCAN_LEDGERS`'s cadence. So the gauge trails the store by at most
-  a ledger. Before `apply_tick` wrote it, the full scan was its only
+- `users_tracked` is written by `regauge_users` (`src/service.rs`)
+  wherever a `users` row can have been inserted or deleted: after any
+  tick whose refresh touched an account (`apply_tick` — a tick that
+  refreshed nothing skips the read), after every seed (the startup one,
+  a gap's reseed and the full scan's retry), and by `full_scan` itself
+  on `FULL_SCAN_LEDGERS`'s cadence. So the gauge trails the store by at
+  most a ledger. Before these writers, the full scan was its only
   writer and it trailed by up to a whole scan period — about 100 minutes
   at testnet's ~5 s ledgers, which is what the stage 1 soak's own log
   shows. The "full scan" and "tracked borrower" log lines are still the

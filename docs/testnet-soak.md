@@ -213,8 +213,8 @@ every `FULL_SCAN_LEDGERS` period (1,200 ledgers, about 100 minutes at
 testnet's ~5 s ledgers), at a random phase. "Tracked borrower" lists only
 accounts below `SCAN_HF_THRESHOLD` (1.2), at most 20 per scan.
 `blend_liquidator_users_tracked{pool=...}` is not full-scan only: every
-tick whose refresh touched an account re-reads the store's count, so the
-gauge follows the store to within a ledger. In the stage 1 run recorded
+tick whose refresh touched an account, and every seed, re-reads the
+store's count, so the gauge follows the store to within a ledger. In the stage 1 run recorded
 below it was still written by the full scan alone, and this run's own log
 shows the gap that caused: the watched position was first decided ("skip
 … Healthy") at 01:54:52, after the full scan at 01:52:31 had reported
@@ -572,8 +572,9 @@ see "Testnet resets" above). Dry run, no key configured.
     not say which. The read fails closed rather than mixing two ledgers,
     and in this run the scan then waited for its next period — about 5
     minutes at the default `ORACLE_SCAN_LEDGERS` of 60. It no longer
-    does: a scan refused as `LedgerMoved` now runs again on the very next
-    tick, while any other failure still waits a period. None of the
+    does: a scan refused as `LedgerMoved` now gets one retry on the very
+    next tick, while a second move in a row, like any other failure, still
+    waits a period. None of the
     sandbox runs whose logs this container still holds failed a snapshot
     this way.
   - 1 `PollerStalled` at 02:50:55 ("no poller heartbeat for 60s, limit

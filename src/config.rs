@@ -2823,64 +2823,160 @@ supported_lot = ["*"]
         parse_pools(&read_file("pools.example.toml")).expect("pools.example.toml parses");
     }
 
+    /// What `scripts/testnet/run-bot.sh` does to the environment it hands
+    /// the binary, read from the script's text.
+    struct RunnerEnvironment {
+        /// Every name in its `unset \` block.
+        cleared: std::collections::BTreeSet<String>,
+        /// Every setting-shaped name `export`ed after that block, in any mode.
+        exported: std::collections::BTreeSet<String>,
+        /// The ones exported in every mode: at the script's top level, or in
+        /// both arms of an `if` that has an `else`.
+        every_mode: std::collections::BTreeSet<String>,
+    }
+
+    impl RunnerEnvironment {
+        /// Reads `script`. The `unset \` block must sit at the script's top
+        /// level, so that it runs in every mode, and nothing exported before
+        /// it survives it, so only what follows it is read for exports. The
+        /// script branches only through `if`/`else`/`fi` around its exports;
+        /// an `elif`, or an export inside a `case`, is a shape this reading
+        /// does not follow, so it panics rather than guess.
+        fn read(script: &str) -> Self {
+            use std::collections::BTreeSet;
+
+            let mut lines = script.lines().map(str::trim);
+            let mut depth = 0_usize;
+            loop {
+                let line = lines.next().expect("run-bot.sh has no `unset \\` block");
+                if line.starts_with("if ") {
+                    depth += 1;
+                } else if line == "fi" {
+                    depth -= 1;
+                } else if line == "unset \\" {
+                    assert_eq!(depth, 0, "run-bot.sh's `unset \\` block is inside an `if`");
+                    break;
+                }
+            }
+            // Its opening line and every continuation line after it, up to
+            // the first that does not end in `\`.
+            let mut cleared = BTreeSet::new();
+            for line in lines.by_ref() {
+                let continues = line.ends_with('\\');
+                cleared.extend(
+                    line.trim_end_matches('\\')
+                        .split_whitespace()
+                        .map(str::to_owned),
+                );
+                if !continues {
+                    break;
+                }
+            }
+
+            let mut exported = BTreeSet::new();
+            let mut every_mode = BTreeSet::new();
+            // One set per arm of each `if` still open: the names that arm
+            // has exported in every path through it so far.
+            let mut open: Vec<(Vec<BTreeSet<String>>, bool)> = Vec::new();
+            let mut in_case = 0_usize;
+            for line in lines {
+                if line.starts_with("if ") {
+                    open.push((vec![BTreeSet::new()], false));
+                } else if line == "else" {
+                    let (arms, has_else) = open.last_mut().expect("an `else` outside any `if`");
+                    arms.push(BTreeSet::new());
+                    *has_else = true;
+                } else if line == "fi" {
+                    let (arms, has_else) = open.pop().expect("a `fi` outside any `if`");
+                    // Made in every path through this `if` only when it has
+                    // an `else` and every arm made it.
+                    let made = if has_else {
+                        let mut arms = arms.into_iter();
+                        let first = arms.next().unwrap_or_default();
+                        arms.fold(first, |made, arm| {
+                            made.intersection(&arm).cloned().collect()
+                        })
+                    } else {
+                        BTreeSet::new()
+                    };
+                    match open.last_mut() {
+                        Some((arms, _)) => arms.last_mut().expect("an arm").extend(made),
+                        None => every_mode.extend(made),
+                    }
+                } else if line.starts_with("elif ") {
+                    panic!("run-bot.sh uses `elif`, which this reading does not follow");
+                } else if line.starts_with("case ") {
+                    in_case += 1;
+                } else if line == "esac" {
+                    in_case -= 1;
+                } else if let Some((name, _)) = line
+                    .strip_prefix("export ")
+                    .and_then(|rest| rest.split_once('='))
+                    .filter(|(name, _)| is_setting(name))
+                {
+                    assert_eq!(
+                        in_case, 0,
+                        "run-bot.sh exports {name} inside a `case`, which this reading does not \
+                         follow"
+                    );
+                    exported.insert(name.to_owned());
+                    match open.last_mut() {
+                        Some((arms, _)) => {
+                            arms.last_mut().expect("an arm").insert(name.to_owned());
+                        }
+                        None => {
+                            every_mode.insert(name.to_owned());
+                        }
+                    }
+                }
+            }
+            assert!(open.is_empty(), "run-bot.sh has an `if` with no `fi`");
+            Self {
+                cleared,
+                exported,
+                every_mode,
+            }
+        }
+    }
+
     /// `scripts/testnet/run-bot.sh` hands the binary an environment of its
     /// own making: every setting the bot reads is either in its `unset`
-    /// block or `export`ed after it, so an operator's shell — plausibly
-    /// exported for a mainnet deployment — can neither hand the testnet
-    /// bot a signing key nor retune it. A setting added to `src/config.rs`
-    /// and to neither list would reach the binary from that shell
-    /// unannounced, which is what this test is here to catch. And every
-    /// name the `unset` block lists must be a real setting: `unset` of a
-    /// misspelt name succeeds and clears nothing, so a typo there is a
-    /// setting silently let through.
+    /// block or `export`ed after it **in every mode**, so an operator's
+    /// shell — plausibly exported for a mainnet deployment — can neither
+    /// hand the testnet bot a signing key nor retune it, dry run or armed.
+    /// An export inside an `if` counts only when both of its arms make it:
+    /// `FILLER_SECRET_KEY` is exported in the armed arm alone, so were it
+    /// dropped from the `unset` block a dry run would inherit the shell's
+    /// key while a mode-blind check still passed. And every name either
+    /// list carries must be a real setting: `unset` of a misspelt name
+    /// clears nothing, and `export` of one sets nothing the bot reads.
     #[test]
     fn the_testnet_runner_clears_or_sets_every_real_setting() {
         use std::collections::BTreeSet;
 
-        let script = read_repo_file("scripts/testnet/run-bot.sh");
+        let runner = RunnerEnvironment::read(&read_repo_file("scripts/testnet/run-bot.sh"));
         let real = real_settings();
-
-        // The `unset \` block: its opening line and every continuation
-        // line after it, up to the first that does not end in `\`.
-        let mut lines = script.lines().map(str::trim);
         assert!(
-            lines.by_ref().any(|line| line == "unset \\"),
-            "run-bot.sh has no `unset \\` block"
+            !runner.cleared.is_empty(),
+            "the `unset` block names nothing"
         );
-        let mut cleared = BTreeSet::new();
-        for line in lines {
-            let continues = line.ends_with('\\');
-            cleared.extend(
-                line.trim_end_matches('\\')
-                    .split_whitespace()
-                    .map(str::to_owned),
-            );
-            if !continues {
-                break;
-            }
-        }
-        assert!(!cleared.is_empty(), "the `unset` block names nothing");
-        let misspelt: Vec<&String> = cleared.difference(&real).collect();
+
+        let misspelt: Vec<&String> = runner
+            .cleared
+            .union(&runner.exported)
+            .filter(|name| !real.contains(*name))
+            .collect();
         assert!(
             misspelt.is_empty(),
-            "run-bot.sh unsets what the bot never reads, which clears nothing: {misspelt:?}"
+            "run-bot.sh unsets or exports what the bot never reads, which clears or sets \
+             nothing: {misspelt:?}"
         );
-
-        // Every `export NAME=`, in either mode.
-        let exported: BTreeSet<String> = script
-            .lines()
-            .filter_map(|line| {
-                let (name, _) = line.trim().strip_prefix("export ")?.split_once('=')?;
-                is_setting(name).then(|| name.to_owned())
-            })
-            .collect();
-
-        let handled: BTreeSet<String> = cleared.union(&exported).cloned().collect();
+        let handled: BTreeSet<String> = runner.cleared.union(&runner.every_mode).cloned().collect();
         let inherited: Vec<&String> = real.difference(&handled).collect();
         assert!(
             inherited.is_empty(),
-            "run-bot.sh neither unsets nor exports {inherited:?}, so the operator's shell hands \
-             it to the testnet bot"
+            "run-bot.sh neither unsets nor exports in every mode {inherited:?}, so the \
+             operator's shell hands it to the testnet bot in at least one"
         );
     }
 }
