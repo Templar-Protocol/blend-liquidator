@@ -1900,15 +1900,34 @@ async fn auctioneer_tick(
                 )
             });
             match ctx.auctioneer.scan_oracle(pool, watch, tick).await {
-                Ok(flagged) => tracing::info!(pool, flagged, "oracle scan"),
+                Ok(flagged) => {
+                    tracing::info!(pool, flagged, "oracle scan");
+                    state.last_oracle_scan.insert(pool.clone(), tick.sequence);
+                }
                 Err(AuctioneerError::Store(error)) => return Err(LiquidatorError::Store(error)),
-                Err(error) => tracing::warn!(
-                    pool,
-                    %error,
-                    "the oracle scan failed; it runs again next period"
-                ),
+                // A race between reads, which the snapshot has already lost
+                // `SNAPSHOT_ATTEMPTS` times, not a fault: left unrecorded,
+                // so the next tick is due and the scan does not wait a
+                // whole period to see a move it would have caught.
+                Err(AuctioneerError::Chain(error @ ChainError::LedgerMoved { .. })) => {
+                    tracing::warn!(
+                        pool,
+                        %error,
+                        "the oracle scan's ledger moved; it runs again next tick"
+                    );
+                }
+                // Anything else waits a period: retried every ledger, an
+                // oracle or RPC that has stopped answering would cost a
+                // read per ledger per pool for as long as it stays down.
+                Err(error) => {
+                    tracing::warn!(
+                        pool,
+                        %error,
+                        "the oracle scan failed; it runs again next period"
+                    );
+                    state.last_oracle_scan.insert(pool.clone(), tick.sequence);
+                }
             }
-            state.last_oracle_scan.insert(pool.clone(), tick.sequence);
         }
 
         if scan_due(
@@ -5670,6 +5689,92 @@ mod tests {
                 "{account} was not flagged by a scan that stopped for shutdown"
             );
         }
+        Ok(())
+    }
+
+    /// An oracle scan the chain moved under is retried on the very next
+    /// tick, not a whole `ORACLE_SCAN_LEDGERS` later: `LedgerMoved` is a
+    /// race between reads, not a fault, and a price move the scan would
+    /// have caught must not wait a period for it. Any other failure still
+    /// waits one — retried every ledger, an oracle that has stopped
+    /// answering would cost a read per ledger per pool for as long as it
+    /// stays down.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_oracle_scan_the_ledger_moved_under_runs_again_next_tick(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let tick = harness::fixture_tick();
+        // Tick one's scan: every attempt `PoolReader::snapshot` makes is
+        // moved under, so the refusal reaches the auctioneer.
+        for _ in 0..crate::chain::pool::SNAPSHOT_ATTEMPTS {
+            harness::script_moved_snapshot(&rpc, tick.sequence);
+        }
+        // Tick two's: a whole snapshot, so the retry succeeds.
+        harness::script_snapshot(&rpc, &[]);
+        // Tick three's, a period later: refused outright.
+        rpc.expect_http("getLedgerEntries", 503);
+
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let auctioneer = Auctioneer::new(&client, &store, auctioneer_config(), None);
+        let (_flag, shutdown) = watch::channel(false);
+        let (instruments, _recording) = recording_instruments();
+        let cadence = AuctioneerCadence {
+            refresh_batch: 10,
+            oracle_scan_ledgers: 10,
+            oracle_phase: 0,
+            full_scan_ledgers: 0,
+            full_phase: 0,
+            scan_health_factor: 0,
+            price_delta_bps: 100,
+            startup_delay_ledgers: 0,
+        };
+        let pools = vec![harness::POOL.to_string()];
+        let ctx = AuctioneerContext {
+            store: &store,
+            pools: &pools,
+            auctioneer: &auctioneer,
+            cadence,
+            submission_queue: None,
+            shutdown: &shutdown,
+            instruments: &instruments,
+        };
+        let mut state = AuctioneerState::default();
+        let at = |sequence: u32| LedgerTick {
+            sequence,
+            close_time: tick.close_time,
+        };
+
+        auctioneer_tick(&ctx, tick, &mut state)
+            .await
+            .expect("tick one");
+        assert_eq!(
+            state.last_oracle_scan.get(harness::POOL),
+            None,
+            "a moved scan is not recorded as fired, so the next tick is due"
+        );
+
+        let second = tick.sequence + 1;
+        auctioneer_tick(&ctx, at(second), &mut state)
+            .await
+            .expect("tick two");
+        assert_eq!(
+            state.last_oracle_scan.get(harness::POOL),
+            Some(&second),
+            "the retry ran on the next tick and, succeeding, was recorded"
+        );
+
+        let third = second + 10;
+        auctioneer_tick(&ctx, at(third), &mut state)
+            .await
+            .expect("tick three");
+        assert_eq!(
+            state.last_oracle_scan.get(harness::POOL),
+            Some(&third),
+            "any other failure is recorded as fired, and waits a period"
+        );
+        assert_eq!(rpc.remaining(), 0, "every scripted read was made");
         Ok(())
     }
 

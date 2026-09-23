@@ -59,6 +59,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An oracle scan refused because the ledger moved between its reads
+  (`ChainError::LedgerMoved`, after the snapshot's own three attempts)
+  runs again on the next tick instead of waiting a whole
+  `ORACLE_SCAN_LEDGERS` period — about 5 minutes at the default of 60,
+  during which a price move the scan would have caught went unflagged.
+  The testnet soak saw three such refusals in about three hours on the
+  public RPC. Every other scan failure still waits a period, so an
+  oracle or RPC that has stopped answering is not re-read every ledger.
 - `scripts/sandbox/deploy.sh`'s `require_funded` re-requests friendbot
   funding every few seconds, on a widened 90s budget, while it polls
   Horizon for an account to exist. `up.sh`'s own health gate proves the

@@ -567,9 +567,12 @@ see "Testnet resets" above). Dry run, no key configured.
     rather than unlucky; a load-balanced public RPC whose `latestLedger` is
     not monotonic across calls is a possible further cause, and the logs do
     not say which. The read fails closed rather than mixing two ledgers,
-    and the scan runs again next period — about 5 minutes at the default
-    `ORACLE_SCAN_LEDGERS` of 60. None of the sandbox runs whose logs this
-    container still holds failed a snapshot this way.
+    and in this run the scan then waited for its next period — about 5
+    minutes at the default `ORACLE_SCAN_LEDGERS` of 60. It no longer
+    does: a scan refused as `LedgerMoved` now runs again on the very next
+    tick, while any other failure still waits a period. None of the
+    sandbox runs whose logs this container still holds failed a snapshot
+    this way.
   - 1 `PollerStalled` at 02:50:55 ("no poller heartbeat for 60s, limit
     55s"), with recovery logged five seconds later — the only stall in
     the run, in the same second as a transport error. The code's premise
