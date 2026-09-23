@@ -213,8 +213,10 @@ timeout and every decoded contract error, with no network and nothing
 mocked below the wire format.
 
 **The sandbox**, a throwaway Stellar network in Docker with Blend v2
-deployed on it and this binary run against it **armed** — the one place
-anything in this repository signs and sends a transaction. Five scenarios
+deployed on it and this binary run against it **armed** — one of the two
+places anything in this repository signs and sends a transaction; the
+other is the testnet soak's armed stage (`docs/testnet-soak.md`), on
+public testnet with friendbot's XLM. Five scenarios
 (`liquidation`, `check_config`, `dry_run`, `unwind_repay`,
 `restart_adopt` — see `tests/liquidation_sandbox.rs`'s module doc for what
 each proves):
