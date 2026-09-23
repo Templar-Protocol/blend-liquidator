@@ -64,17 +64,22 @@ default and bound beyond what is stated below.
 - **Exit codes**: `0` on graceful shutdown or a passing `check-config`;
   `2` on a configuration error — including a failed `check-config`, a
   command-line parse error, and a database that cannot be reached when
-  `loop` starts; `1` on any other fatal error while running; `130` on a
+  `loop` starts; `1` on any other fatal error while running; `101` when a
+  task panicked (below); `130` on a second `SIGINT`/`SIGTERM`,
+  deliberately immediate.
+- **A panic in any task shuts the bot down gracefully, then exits
+  `101`**, Rust's panic exit code. The release profile unwinds
+  (`panic = "unwind"`), and the run treats a task's panic as it treats a
+  task's error: every other task is told to shut down and allowed to
+  finish what it is doing — a transaction the submission queue has
+  already sent is resolved, not abandoned, unless the queue is itself
+  the task that panicked — and the notifier drains, before the panic
+  ends the process.
+  Treat `101` as a bug to report, never as a configuration to fix. A
+  death by signal is still possible (the platform's own kill, say), and
+  is not part of this contract.
+- **One exit skips draining notifications still in flight**: `130`, the
   second `SIGINT`/`SIGTERM`, deliberately immediate.
-- **A panic in any task aborts the process** (the image is a release
-  build, and the release profile sets `panic = "abort"`): no unwind and
-  no graceful shutdown. The process is killed by a signal rather than
-  exiting with one of the codes above, and which signal is not part of
-  this contract — it depends on the architecture and on whether the
-  binary runs as the container's PID 1 — so treat any death by signal as
-  a crash.
-- **Two exits skip draining notifications still in flight**: `130` and a
-  panic's abort.
 - **Logs go to stdout**, one line per event; `LOG_FORMAT=json` renders
   each as one JSON object per line instead of text. A command-line parse
   error and a panic's message go to stderr as plain text, whatever
