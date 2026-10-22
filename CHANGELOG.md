@@ -114,6 +114,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the variant with the URL still in it before the error is logged or, as
   `RpcFailing`, sent to the notification channel. `RPC_URL` must still carry no credential — it is
   an ordinary argument, and a debug print of the RPC client renders it.
+- `rustls-webpki` 0.103.15 → 0.103.16, which rejects any certificate path
+  holding one of the compromised eMudhra intermediate CA keys
+  (CVE-2026-111943, <https://emudhra.we-have-a-problem.com/>). Their
+  private keys can be derived from the public certificates, so anyone
+  could mint a certificate for the Soroban RPC, the analytics API or
+  Telegram. Every TLS path in the bot — reqwest and sqlx, both rustls with
+  native roots — verifies through `rustls-webpki`, so the check holds
+  whatever CA bundle the image carries.
 
 ## [0.1.0] - 2026-09-22
 
