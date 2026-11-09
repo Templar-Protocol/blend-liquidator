@@ -764,6 +764,7 @@ mod tests {
                 r_three: 0,
                 reactivity: 0,
                 supply_cap: i128::MAX,
+                min_position: 0,
                 enabled: true,
             },
             ReserveData {

@@ -1156,6 +1156,7 @@ mod tests {
                 r_three: 0,
                 reactivity: 0,
                 supply_cap: 9_999_999_999,
+                min_position: 0,
                 enabled: true,
             },
             ReserveData {
@@ -1271,6 +1272,7 @@ mod plan_tests {
                 r_three: 0,
                 reactivity: 0,
                 supply_cap: i128::MAX,
+                min_position: 0,
                 enabled: true,
             },
             ReserveData {

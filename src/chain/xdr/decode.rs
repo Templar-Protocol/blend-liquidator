@@ -173,6 +173,19 @@ fn i128_field(fields: &BTreeMap<String, &ScVal>, name: &'static str) -> Result<i
     }
 }
 
+/// An `i128` field a newer contract adds: `None` when the entry does not
+/// carry it, a shape error when it carries something else.
+fn optional_i128_field(
+    fields: &BTreeMap<String, &ScVal>,
+    name: &'static str,
+) -> Result<Option<i128>, XdrError> {
+    match fields.get(name).copied() {
+        None => Ok(None),
+        Some(ScVal::I128(parts)) => Ok(Some(as_i128(parts))),
+        Some(other) => Err(shape("i128", other)),
+    }
+}
+
 fn bool_field(fields: &BTreeMap<String, &ScVal>, name: &'static str) -> Result<bool, XdrError> {
     match field(fields, name)? {
         ScVal::Bool(value) => Ok(*value),
@@ -306,6 +319,7 @@ pub fn reserve_config_value(value: &ScVal) -> Result<ReserveConfig, XdrError> {
         r_three: u32_field(&fields, "r_three")?,
         reactivity: u32_field(&fields, "reactivity")?,
         supply_cap: i128_field(&fields, "supply_cap")?,
+        min_position: optional_i128_field(&fields, "min_position")?.unwrap_or(0),
         enabled: bool_field(&fields, "enabled")?,
     })
 }
@@ -462,6 +476,10 @@ mod tests {
         assert_eq!(config.r_three, 50_000_000);
         assert_eq!(config.reactivity, 50);
         assert_eq!(config.supply_cap, 100_000_000_000_000_000);
+        assert_eq!(
+            config.min_position, 0,
+            "the fixture's stock reserve predates the field"
+        );
         assert!(config.enabled);
 
         let data = reserve_data(&entry(text(&fixture, &["reserves", "0", "data_entry_xdr"])))
@@ -473,6 +491,53 @@ mod tests {
         assert_eq!(data.d_supply, 13_201_825_877_188);
         assert_eq!(data.backstop_credit, 31_426_481);
         assert_eq!(data.last_time, 1_788_533_688);
+    }
+
+    /// Precept `v0.1.1`'s `ReserveConfig` carries `min_position`
+    /// (`pool/src/storage.rs:71`), and the decoder reads it by name.
+    #[test]
+    fn a_precept_reserve_config_carries_its_min_position() {
+        use crate::chain::xdr::encode::{i128_val, map, symbol};
+        let field = |name: &str, value: ScVal| (symbol(name).expect("symbol"), value);
+        let value = map(vec![
+            field("index", ScVal::U32(1)),
+            field("decimals", ScVal::U32(7)),
+            field("c_factor", ScVal::U32(8_000_000)),
+            field("l_factor", ScVal::U32(0)),
+            field("util", ScVal::U32(0)),
+            field("max_util", ScVal::U32(9_500_000)),
+            field("r_base", ScVal::U32(1_000)),
+            field("r_one", ScVal::U32(0)),
+            field("r_two", ScVal::U32(0)),
+            field("r_three", ScVal::U32(0)),
+            field("reactivity", ScVal::U32(0)),
+            field("supply_cap", i128_val(i128::MAX)),
+            field("min_position", i128_val(500_000_000)),
+            field("enabled", ScVal::Bool(true)),
+        ])
+        .expect("a map");
+        let config = reserve_config_value(&value).expect("decodes");
+        assert_eq!(config.min_position, 500_000_000);
+
+        // A field of the wrong type is a shape error, never a zero.
+        let wrong = map(vec![
+            field("index", ScVal::U32(1)),
+            field("decimals", ScVal::U32(7)),
+            field("c_factor", ScVal::U32(8_000_000)),
+            field("l_factor", ScVal::U32(0)),
+            field("util", ScVal::U32(0)),
+            field("max_util", ScVal::U32(9_500_000)),
+            field("r_base", ScVal::U32(1_000)),
+            field("r_one", ScVal::U32(0)),
+            field("r_two", ScVal::U32(0)),
+            field("r_three", ScVal::U32(0)),
+            field("reactivity", ScVal::U32(0)),
+            field("supply_cap", i128_val(i128::MAX)),
+            field("min_position", ScVal::U32(5)),
+            field("enabled", ScVal::Bool(true)),
+        ])
+        .expect("a map");
+        assert!(reserve_config_value(&wrong).is_err());
     }
 
     #[test]

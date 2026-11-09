@@ -170,6 +170,7 @@ mod tests {
             r_three: 50_000_000,
             reactivity: 50,
             supply_cap: 100_000_000_000_000_000,
+            min_position: 0,
             enabled: true,
         };
         let data = ReserveData {
