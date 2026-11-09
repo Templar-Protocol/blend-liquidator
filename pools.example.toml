@@ -18,17 +18,20 @@ address = "CDOU4OEOBWACSNAH7T72IAR4JXJDNS4ZFVHT7TWILVKVBOR3DZT3VSK2"
 primary_asset = "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA" # XLM
 
 # The least of the primary asset to hold, in its own decimals as a decimal
-# string (XLM has 7: this is 1,000 XLM). In live mode, the filler holding
-# less than this in a configured pool is a startup warning, not a failure.
+# string (XLM has 7: this is 1,000 XLM). Setting it supplies nothing: the
+# bot only ever withdraws down to this floor, never tops up to it, and in
+# live mode the filler holding less than this in a configured pool is a
+# startup warning, not a failure.
 #
 # On a Precept pool, make it at least the primary reserve's own min_position
-# (50 XLM on this market): the contract refuses any collateral supply or
-# withdrawal that leaves a nonzero position below that. Zero is not safe
-# yet either: the planner does not model min_position, so a fill that has
-# to supply the primary supplies only its shortfall, which can land under
-# min_position and be refused (CLAUDE.md, "The fork's gotchas"). With the
-# floor at or above min_position, every supply lands on top of a position
-# already past it.
+# (50 XLM on this market), and supply that much of the primary as collateral
+# before arming: the contract refuses any collateral supply or withdrawal
+# that leaves a nonzero position below min_position, and the planner does
+# not model it yet, so a fill that has to supply the primary supplies only
+# its shortfall — which, onto a position under min_position (zero
+# included), can land under it and be refused (CLAUDE.md, "The fork's
+# gotchas"). With the position itself at or above min_position, every
+# supply lands on top of a position already past it.
 min_primary_collateral = "10000000000"
 
 # The health factor the filler keeps its own position above after a fill.
