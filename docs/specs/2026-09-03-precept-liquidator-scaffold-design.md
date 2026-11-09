@@ -1,11 +1,13 @@
-# blend-liquidator: repository scaffold
+# precept-liquidator: repository scaffold
 
 **Date:** 2026-09-03
 **Status:** approved in outline, pending spec review
+**Renamed 2026-11-09:** scaffolded as `blend-liquidator`; the repository now
+targets Precept, Templar's fork of Blend v2, and carries its name.
 
 ## What this is
 
-A new private repository, `Templar-Protocol/blend-liquidator`, scaffolded to the
+A new private repository, `Templar-Protocol/precept-liquidator`, scaffolded to the
 same standard as `Templar-Protocol/templar-liquidator` but carrying none of its
 business logic. The deliverable is a repository that is green on its first
 commit and ready to receive a liquidation bot for [Blend
@@ -110,7 +112,7 @@ Same shape as templar-liquidator, with the NEAR-specific weight removed.
   glibc-parity reason.
 - Features pinned to exact versions for the same reason: `github-cli`,
   `docker-in-docker` (≥2.x), `node` 22.
-- Named volumes `blend-liquidator-claude-code` and `blend-liquidator-gh-config`,
+- Named volumes `precept-liquidator-claude-code` and `precept-liquidator-gh-config`,
   distinct from templar-liquidator's so the two repositories do not share
   credential state. These hold credentials and live in Docker's volume store,
   outside anything `.gitignore` covers.
@@ -185,7 +187,7 @@ pin.
 ## The crate
 
 ```
-Cargo.toml          name = "blend-liquidator", version 0.1.0, GPL-3.0-only
+Cargo.toml          name = "precept-liquidator", version 0.1.0, GPL-3.0-only
                     empty [workspace] so no enclosing workspace is adopted
 src/liquidator.rs   lib root, crate-level docs
 src/main.rs         bin "liquidator"

@@ -1,5 +1,5 @@
-//! Liquidation bot for [Blend Protocol](https://blend.capital) lending pools
-//! on Stellar.
+//! Liquidation bot for [Precept](https://github.com/Templar-Protocol/precept)
+//! lending markets on Stellar — Templar's audited fork of Blend v2.
 //!
 //! **This bot is not non-custodial.** Like the venue it trades against, it is
 //! expected to run unsupervised — but unlike the venue it holds a signing key
@@ -50,7 +50,7 @@
 //! already fails loudly.
 //!
 //! The module layout follows the design spec at
-//! `docs/specs/2026-09-04-blend-liquidator-bot-design.md`.
+//! `docs/specs/2026-09-04-precept-liquidator-bot-design.md`.
 
 pub mod auctioneer;
 pub mod chain;

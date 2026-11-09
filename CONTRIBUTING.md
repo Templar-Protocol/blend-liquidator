@@ -33,13 +33,13 @@ every rebuild.
 
 Releases are tags (`vX.Y.Z`). Pushing one triggers
 [`.github/workflows/release.yml`](.github/workflows/release.yml), which builds
-and pushes `ghcr.io/templar-protocol/blend-liquidator:<tag>` and cuts a GitHub
+and pushes `ghcr.io/templar-protocol/precept-liquidator:<tag>` and cuts a GitHub
 Release.
 
 ```bash
 # 1. Bump the version and refresh the lock
 #    (edit Cargo.toml's `version`, then:)
-cargo update -p blend-liquidator
+cargo update -p precept-liquidator
 
 # 2. Move CHANGELOG.md's [Unreleased] content into a `## [X.Y.Z] - YYYY-MM-DD`
 #    section and update the README image pin to the new version

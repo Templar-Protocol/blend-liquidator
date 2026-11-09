@@ -1,6 +1,6 @@
 # Testnet soak
 
-The design spec's last step before mainnet (`docs/specs/2026-09-04-blend-liquidator-bot-design.md`
+The design spec's last step before mainnet (`docs/specs/2026-09-04-precept-liquidator-bot-design.md`
 §9): running the real binary against public Stellar testnet before it ever
 touches money. `docs/deploy.md` is the operator's path from an image to a
 running deployment and `docs/deployment-contract.md` is what this repository
@@ -179,12 +179,12 @@ live ones to see whether it is tracking.
 
 **Live:**
 
-- **`/metrics`** on port `18081`: `blend_liquidator_ledger_processed{pool=...}`
+- **`/metrics`** on port `18081`: `precept_liquidator_ledger_processed{pool=...}`
   (the last ledger the tracker fully applied — the cursor the poller
-  commits) and `blend_liquidator_ledger_head{pool=...}` (the chain head,
+  commits) and `precept_liquidator_ledger_head{pool=...}` (the chain head,
   recorded each pass the moment `getLatestLedger` answers), which should
   stay within a ledger or two of each other;
-  `blend_liquidator_poller_heartbeat_timestamp_seconds{pool=...}`, stamped
+  `precept_liquidator_poller_heartbeat_timestamp_seconds{pool=...}`, stamped
   every pass and every `POLL_INTERVAL_MS` (5 s here) within one, so it lags
   wall time by seconds while the poller is turning;
   `creations_total`/`fills_total` (an observe-stage pool can still produce
@@ -212,7 +212,7 @@ written by the tracker's full scan and nothing else (`full_scan` in
 every `FULL_SCAN_LEDGERS` period (1,200 ledgers, about 100 minutes at
 testnet's ~5 s ledgers), at a random phase. "Tracked borrower" lists only
 accounts below `SCAN_HF_THRESHOLD` (1.2), at most 20 per scan.
-`blend_liquidator_users_tracked{pool=...}` is not full-scan only: every
+`precept_liquidator_users_tracked{pool=...}` is not full-scan only: every
 tick whose refresh touched an account, and every seed, re-reads the
 store's count, so the gauge follows the store to within a ledger. In the stage 1 run recorded
 below it was still written by the full scan alone, and this run's own log

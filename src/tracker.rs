@@ -382,7 +382,7 @@ const SEED_PAGE_CAP: usize = 200;
 /// Pause between pages, to stay under the endpoint's anonymous rate limit.
 const SEED_PAGE_PAUSE: Duration = Duration::from_millis(200);
 
-/// The public Blend analytics API's positions endpoint, walked by cursor.
+/// The public Precept analytics API's positions endpoint, walked by cursor.
 ///
 /// Only `accountId` is read from each position: the API's own health
 /// factor is a third party's float, and every seeded account is re-valued
@@ -443,7 +443,7 @@ impl AnalyticsSeed {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
-            .user_agent(concat!("blend-liquidator/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("precept-liquidator/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self {
             http,
@@ -545,7 +545,7 @@ impl FileSeed {
 /// Where the tracker's initial user set comes from.
 #[derive(Debug, Clone)]
 pub enum SeedSource {
-    /// The public Blend analytics API.
+    /// The public Precept analytics API.
     Analytics(AnalyticsSeed),
     /// A static file.
     File(FileSeed),
@@ -597,7 +597,7 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "blend-liquidator-seed-test-{}-{id}.toml",
+            "precept-liquidator-seed-test-{}-{id}.toml",
             std::process::id()
         ));
         std::fs::write(&path, contents).expect("write temp seed file");
@@ -1364,7 +1364,7 @@ mod tests {
             let _ = std::fs::remove_file(&path);
         }
         // A path that does not exist is also a File error, not a panic.
-        let missing = std::env::temp_dir().join("blend-liquidator-seed-test-missing.toml");
+        let missing = std::env::temp_dir().join("precept-liquidator-seed-test-missing.toml");
         assert!(matches!(
             FileSeed::load(&missing).unwrap_err(),
             SeedError::File(_)

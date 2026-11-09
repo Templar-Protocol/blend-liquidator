@@ -25,7 +25,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Every metric name this module emits carries this prefix.
-pub const METRIC_PREFIX: &str = "blend_liquidator_";
+pub const METRIC_PREFIX: &str = "precept_liquidator_";
 
 /// Whether an attempted creation or fill went through. A closed set:
 /// [`Metrics::render`] emits all three `creations_total`/`fills_total`
@@ -768,22 +768,22 @@ mod tests {
         m.profit(13_350_000_000);
         m.reserved_inventory(&BTreeMap::from([("XLM".to_string(), 50_000_000_i128)]));
         let text = m.render();
-        assert!(text.contains("# TYPE blend_liquidator_ledger_head gauge\n"));
-        assert!(text.contains("blend_liquidator_ledger_head{pool=\"POOL\"} 105\n"));
-        assert!(text.contains("blend_liquidator_ledger_processed{pool=\"POOL\"} 100\n"));
-        assert!(text.contains("blend_liquidator_creations_total{result=\"attempted\"} 1\n"));
+        assert!(text.contains("# TYPE precept_liquidator_ledger_head gauge\n"));
+        assert!(text.contains("precept_liquidator_ledger_head{pool=\"POOL\"} 105\n"));
+        assert!(text.contains("precept_liquidator_ledger_processed{pool=\"POOL\"} 100\n"));
+        assert!(text.contains("precept_liquidator_creations_total{result=\"attempted\"} 1\n"));
         assert!(
-            text.contains("blend_liquidator_creations_total{result=\"failed\"} 0\n"),
+            text.contains("precept_liquidator_creations_total{result=\"failed\"} 0\n"),
             "closed sets render every member"
         );
-        assert!(text.contains("blend_liquidator_skips_total{reason=\"unsupported_assets\"} 0\n"));
-        assert!(text.contains("blend_liquidator_skips_total{reason=\"unfunded\"} 1\n"));
+        assert!(text.contains("precept_liquidator_skips_total{reason=\"unsupported_assets\"} 0\n"));
+        assert!(text.contains("precept_liquidator_skips_total{reason=\"unfunded\"} 1\n"));
         assert!(
-            text.contains("blend_liquidator_estimated_profit_total 13350000000\n"),
+            text.contains("precept_liquidator_estimated_profit_total 13350000000\n"),
             "the oracle's own units, whatever its decimals are: {text}"
         );
-        assert!(text.contains("blend_liquidator_estimated_loss_total 0\n"));
-        assert!(text.contains("blend_liquidator_reserved_inventory{asset=\"XLM\"} 50000000\n"));
+        assert!(text.contains("precept_liquidator_estimated_loss_total 0\n"));
+        assert!(text.contains("precept_liquidator_reserved_inventory{asset=\"XLM\"} 50000000\n"));
         assert!(
             !text.contains("last_successful_scan"),
             "absent until a scan succeeded"
@@ -812,7 +812,7 @@ mod tests {
         assert_eq!(status.processed, None);
         assert_eq!(status.heartbeat, Some(at));
         assert!(m.render().contains(
-            "blend_liquidator_poller_heartbeat_timestamp_seconds{pool=\"POOL\"} 1700000000\n"
+            "precept_liquidator_poller_heartbeat_timestamp_seconds{pool=\"POOL\"} 1700000000\n"
         ));
     }
 
@@ -838,7 +838,7 @@ mod tests {
         let text = m.render();
         assert!(
             text.contains(
-                "blend_liquidator_last_successful_scan_timestamp_seconds{pool=\"A\"} \
+                "precept_liquidator_last_successful_scan_timestamp_seconds{pool=\"A\"} \
                  1700000000\n"
             ),
             "{text}"
@@ -866,11 +866,11 @@ mod tests {
         m.profit(-250);
         let text = m.render();
         assert!(
-            text.contains("blend_liquidator_estimated_profit_total 1000\n"),
+            text.contains("precept_liquidator_estimated_profit_total 1000\n"),
             "the profit counter only ever rises: {text}"
         );
         assert!(
-            text.contains("blend_liquidator_estimated_loss_total 250\n"),
+            text.contains("precept_liquidator_estimated_loss_total 250\n"),
             "the loss is counted by magnitude, in its own counter: {text}"
         );
     }
@@ -883,7 +883,7 @@ mod tests {
         // Saturated, not wrapped: adding 1 past `i128::MAX` stays at
         // `i128::MAX`, so the rendered value is that total exactly.
         assert!(m.render().contains(&format!(
-            "blend_liquidator_estimated_profit_total {}\n",
+            "precept_liquidator_estimated_profit_total {}\n",
             i128::MAX
         )));
 
@@ -893,7 +893,7 @@ mod tests {
         loss.profit(i128::MIN);
         loss.profit(-1);
         assert!(loss.render().contains(&format!(
-            "blend_liquidator_estimated_loss_total {}\n",
+            "precept_liquidator_estimated_loss_total {}\n",
             i128::MAX
         )));
     }

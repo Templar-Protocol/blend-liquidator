@@ -1,4 +1,4 @@
-//! Ledger keys for the Blend v2 pool's storage.
+//! Ledger keys for the Precept pool's storage.
 //!
 //! Durability is part of the key: pool configuration, reserves and positions
 //! live in persistent storage, auctions in temporary storage. Reading an

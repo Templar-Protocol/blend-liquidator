@@ -28,7 +28,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/sandbox/lib.sh
 source "${script_dir}/lib.sh"
 
-: "${SANDBOX_CONTAINER:=blend-sandbox}"
+: "${SANDBOX_CONTAINER:=precept-sandbox}"
 : "${SANDBOX_PORT:=8000}"
 
 [ -n "${QUICKSTART_DIGEST}" ] || die "QUICKSTART_DIGEST is empty in versions.env — resolve the pin first (see that file's comment)"

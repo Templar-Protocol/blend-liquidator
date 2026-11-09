@@ -31,5 +31,9 @@ cargo run --example capture_fixture -- \
 The tool needs `curl` on the PATH. A refresh changes every literal the
 tests assert (rates, prices, position values), so refresh only when a
 contract upgrade changes a shape, and update the literals in the same
-change. Borrower addresses can be found with the public Blend analytics
-API: `GET https://api.blend.templarfi.org/v1/analytics/state/positions?healthFactorMax=100&poolId=<pool>&limit=5`.
+change. The analytics API this fixture's borrowers were found with,
+`api.blend.templarfi.org`, has been retired, and its Precept successor
+(`https://api.precept.templarfi.org/v1/analytics/state/positions?healthFactorMax=100&poolId=<pool>&limit=5`)
+lists Precept markets only; for a stock pool like this one,
+`examples/scan_borrowers.rs` finds accounts from the pool's own recent
+events instead.

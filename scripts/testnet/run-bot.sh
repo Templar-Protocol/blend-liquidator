@@ -271,7 +271,7 @@ export LOG_FORMAT=json
 # this repository keeps off argv. So a RUST_LOG naming `trace` is refused
 # outright in both modes. The armed bot always runs at this script's own
 # filter besides; a dry run keeps any other RUST_LOG an operator set.
-default_filter="info,blend_liquidator=debug"
+default_filter="info,precept_liquidator=debug"
 case "${RUST_LOG:-}" in
 *[Tt][Rr][Aa][Cc][Ee]*)
 	die "run-bot: RUST_LOG='${RUST_LOG}' names trace, and this run holds DATABASE_URL (and, armed, a signing key) — logging at trace is not audited for secrets (docs/deploy.md §6)"

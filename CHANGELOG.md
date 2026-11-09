@@ -59,6 +59,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: renamed from `blend-liquidator` to `precept-liquidator`**, to
+  match the protocol it targets: Precept, Templar's audited fork of Blend
+  v2, whose repository `Templar-Protocol/blend-contracts-v2` is now
+  `Templar-Protocol/precept`. The repository is now
+  `Templar-Protocol/precept-liquidator`, the crate `precept-liquidator`
+  (library `precept_liquidator`), the image
+  `ghcr.io/templar-protocol/precept-liquidator` and every metric's prefix
+  `precept_liquidator_` — a dashboard or alert written against
+  `blend_liquidator_*` needs the new names. The binary is still
+  `liquidator`. `RUST_LOG`'s default filter names `precept_liquidator`,
+  the compose project and its containers are `precept-liquidator`, the
+  sandbox's container is `precept-sandbox`, and the dev container's two
+  named volumes are `precept-liquidator-claude-code` and
+  `precept-liquidator-gh-config`. No image, tag or release was ever
+  published under the old name.
+- `SEED_URL` defaults to `https://api.precept.templarfi.org`, Precept's
+  public analytics API, which serves the same positions endpoint and shape.
+  The old default, `https://api.blend.templarfi.org`, has been retired and
+  no longer answers, so a bot left on it seeded nothing.
+- `pools.example.toml` follows Precept's XLM/USDC mainnet market, and
+  `seed.example.toml` names a Precept market's borrower.
 - A panic in any of the bot's tasks now shuts the bot down gracefully
   before it ends the process, rather than aborting it on the spot. The
   release profile unwinds (`panic = "unwind"`, where it had been
@@ -862,5 +883,5 @@ during development rather than a difference from an earlier release.
 - The Dockerfile's `HEALTHCHECK` comment, corrected: it predated `/livez`
   and never explained why the check isn't wired to it.
 
-[Unreleased]: https://github.com/Templar-Protocol/blend-liquidator/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/Templar-Protocol/blend-liquidator/releases/tag/v0.1.0
+[Unreleased]: https://github.com/Templar-Protocol/precept-liquidator/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Templar-Protocol/precept-liquidator/releases/tag/v0.1.0

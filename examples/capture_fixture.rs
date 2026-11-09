@@ -30,10 +30,10 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::process::Command;
 
-use blend_liquidator::chain::xdr::encode::{
+use precept_liquidator::chain::xdr::encode::{
     address, invoke_contract_op, simulation_envelope, stellar_asset, symbol, to_base64,
 };
-use blend_liquidator::chain::xdr::{decode, from_base64, keys};
+use precept_liquidator::chain::xdr::{decode, from_base64, keys};
 use serde_json::{json, Value};
 
 type Fallible<T> = Result<T, Box<dyn Error>>;

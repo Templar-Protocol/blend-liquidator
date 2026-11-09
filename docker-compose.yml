@@ -1,7 +1,12 @@
+# The project name, explicit so the Postgres volume's name
+# (precept-liquidator_postgres-data) does not follow whatever the checkout's
+# directory happens to be called.
+name: precept-liquidator
+
 services:
   postgres:
     image: postgres:17-alpine
-    container_name: blend-liquidator-db
+    container_name: precept-liquidator-db
 
     # The bot's durable state: cursors, tracked borrowers, open auctions.
     # Losing it costs a reseed and a replay, not correctness, but a restart
@@ -33,8 +38,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: blend-liquidator:latest
-    container_name: blend-liquidator
+    image: precept-liquidator:latest
+    container_name: precept-liquidator
 
     # Room for graceful shutdown. Docker's 10s default would routinely SIGKILL
     # a bot mid-flush; a liquidator must never be killed between the repay and
@@ -57,7 +62,7 @@ services:
       # so the bot would restart-loop against a perfectly healthy Postgres;
       # on the compose network it is reached by service name instead.
       - DATABASE_URL=postgres://${POSTGRES_USER:-liquidator}:${POSTGRES_PASSWORD:-liquidator}@postgres:5432/${POSTGRES_DB:-liquidator}
-      - RUST_LOG=${RUST_LOG:-info,blend_liquidator=debug}
+      - RUST_LOG=${RUST_LOG:-info,precept_liquidator=debug}
       - RUST_BACKTRACE=${RUST_BACKTRACE:-1}
 
     # No --dry-run flag and no DRY_RUN override here on purpose: this is the

@@ -9,10 +9,10 @@
 //! tasks have shut down and the notifier has drained: every build unwinds,
 //! and `Service::run` resumes the panic only after that drain.
 
-use blend_liquidator::config::{Args, LogFormat, RunMode};
-use blend_liquidator::service::Service;
-use blend_liquidator::LiquidatorError;
 use clap::Parser;
+use precept_liquidator::config::{Args, LogFormat, RunMode};
+use precept_liquidator::service::Service;
+use precept_liquidator::LiquidatorError;
 use tracing_subscriber::EnvFilter;
 
 /// A configuration problem, caught before the bot did anything with it.
@@ -27,7 +27,7 @@ async fn main() {
     // RUST_LOG wins when set; otherwise info for everything, debug for this
     // crate — the same posture the container image ships with.
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,blend_liquidator=debug"));
+        .unwrap_or_else(|_| EnvFilter::new("info,precept_liquidator=debug"));
 
     match args.log_format {
         LogFormat::Text => tracing_subscriber::fmt().with_env_filter(filter).init(),
@@ -43,7 +43,7 @@ async fn main() {
     tracing::info!(
         dry_run = args.dry_run,
         version = env!("CARGO_PKG_VERSION"),
-        "blend-liquidator starting"
+        "precept-liquidator starting"
     );
 
     if args.dry_run {

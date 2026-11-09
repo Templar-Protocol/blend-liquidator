@@ -1,7 +1,7 @@
 # Deployment contract
 
 This is the contract between this repository and whoever deploys it, per
-`docs/specs/2026-09-04-blend-liquidator-bot-design.md` §10: guarantees
+`docs/specs/2026-09-04-precept-liquidator-bot-design.md` §10: guarantees
 this repository makes about the image and the binary it runs, and
 requirements it places on the deployment around it. Nothing here is
 specific to any platform. See `docs/configuration.md` for every setting's
@@ -9,7 +9,7 @@ default and bound beyond what is stated below.
 
 ## What this repository guarantees
 
-- **Image.** Published to `ghcr.io/templar-protocol/blend-liquidator`
+- **Image.** Published to `ghcr.io/templar-protocol/precept-liquidator`
   only on a `v*` tag push. A release tags the image `{{version}}` (the
   leading `v` stripped); a non-prerelease also moves `{{major}}.{{minor}}`
   and `latest` to it, a prerelease (a tag with a `-` suffix) moves

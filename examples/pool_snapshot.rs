@@ -15,8 +15,8 @@
 
 use std::error::Error;
 
-use blend_liquidator::chain::pool::PoolReader;
-use blend_liquidator::chain::rpc::RpcClient;
+use precept_liquidator::chain::pool::PoolReader;
+use precept_liquidator::chain::rpc::RpcClient;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {

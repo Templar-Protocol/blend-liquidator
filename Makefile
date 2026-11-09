@@ -1,4 +1,4 @@
-# blend-liquidator
+# precept-liquidator
 
 .PHONY: help build build-clean start stop restart logs logs-tail clean shell ps stats check \
 	db-up db-down db-reset db-migrate sqlx-prepare \
@@ -7,7 +7,7 @@
 
 .DEFAULT_GOAL := help
 
-IMAGE := blend-liquidator
+IMAGE := precept-liquidator
 TAG := latest
 COMPOSE := docker compose
 ENV_FILE := .env

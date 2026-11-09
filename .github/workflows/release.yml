@@ -37,7 +37,7 @@ jobs:
           # repository's visibility, and nothing here sets it. While it is
           # private, pulling needs a token with `read:packages`
           # (docs/deploy.md, docs/deployment-contract.md).
-          images: ghcr.io/templar-protocol/blend-liquidator
+          images: ghcr.io/templar-protocol/precept-liquidator
           # `latest=auto` only moves :latest for a non-prerelease semver tag —
           # an unconditional raw tag would repoint :latest at a release
           # candidate. The {{major}}.{{minor}} tag is guarded for the same

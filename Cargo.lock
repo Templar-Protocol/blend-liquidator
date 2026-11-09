@@ -160,30 +160,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "blend-liquidator"
-version = "0.1.0"
-dependencies = [
- "axum",
- "clap",
- "ed25519-dalek",
- "ethnum",
- "rand",
- "reqwest",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "sqlx",
- "stellar-strkey",
- "stellar-xdr",
- "thiserror",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
- "wiremock",
-]
-
-[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1309,6 +1285,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d83eb9bc6d8e5cf568e7a1101d60ee05e81ed50ea106026f3d18deeb046d7661"
 dependencies = [
  "zerovec",
+]
+
+[[package]]
+name = "precept-liquidator"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "clap",
+ "ed25519-dalek",
+ "ethnum",
+ "rand",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "sqlx",
+ "stellar-strkey",
+ "stellar-xdr",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "wiremock",
 ]
 
 [[package]]

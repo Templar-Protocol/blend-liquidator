@@ -2079,7 +2079,7 @@ mod tests {
     /// the rendered text so a test asserts on what an operator's
     /// dashboard would actually scrape.
     fn series(metrics: &Metrics, name: &str, label: &str, value: &str) -> u64 {
-        let needle = format!("blend_liquidator_{name}{{{label}=\"{value}\"}} ");
+        let needle = format!("precept_liquidator_{name}{{{label}=\"{value}\"}} ");
         metrics
             .render()
             .lines()
@@ -2105,7 +2105,7 @@ mod tests {
             .render()
             .lines()
             .find_map(|line| {
-                line.strip_prefix("blend_liquidator_estimated_profit_total ")?
+                line.strip_prefix("precept_liquidator_estimated_profit_total ")?
                     .parse()
                     .ok()
             })
@@ -3595,7 +3595,7 @@ mod tests {
         );
         assert!(
             metrics.render().contains(&format!(
-                "blend_liquidator_auctions_open{{pool=\"{}\"}} 2\n",
+                "precept_liquidator_auctions_open{{pool=\"{}\"}} 2\n",
                 harness::POOL
             )),
             "the gauge is what the store holds open, not what survived the filter:\n{}",
@@ -4739,7 +4739,7 @@ mod tests {
         assert!(
             metrics
                 .render()
-                .contains("blend_liquidator_unwind_passes_total 1\n"),
+                .contains("precept_liquidator_unwind_passes_total 1\n"),
             "the unwind pass that followed it is counted once"
         );
         let confirmed = recorder.sent_of(NotificationKind::FillConfirmed);
@@ -5352,7 +5352,7 @@ mod tests {
 
         assert!(
             metrics.render().contains(&format!(
-                "blend_liquidator_reserved_inventory{{asset=\"{USDC}\"}} 4000000000\n"
+                "precept_liquidator_reserved_inventory{{asset=\"{USDC}\"}} 4000000000\n"
             )),
             "a reservation the tick ended with is what the gauge reports:\n{}",
             metrics.render()
@@ -5366,7 +5366,7 @@ mod tests {
 
         assert!(
             metrics.render().contains(&format!(
-                "blend_liquidator_reserved_inventory{{asset=\"{USDC}\"}} 0\n"
+                "precept_liquidator_reserved_inventory{{asset=\"{USDC}\"}} 0\n"
             )),
             "and a settled one is replaced rather than left at its last value:\n{}",
             metrics.render()
@@ -6207,7 +6207,7 @@ mod tests {
         assert!(
             metrics
                 .render()
-                .contains("blend_liquidator_unwind_passes_total 1\n"),
+                .contains("precept_liquidator_unwind_passes_total 1\n"),
             "one pass, counted once"
         );
         assert!(
@@ -6232,7 +6232,7 @@ mod tests {
         assert!(
             metrics
                 .render()
-                .contains("blend_liquidator_unwind_passes_total 1\n"),
+                .contains("precept_liquidator_unwind_passes_total 1\n"),
             "and a tick that made no pass counts none"
         );
         assert_eq!(rpc.remaining(), 0);

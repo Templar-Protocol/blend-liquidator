@@ -54,10 +54,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use blend_liquidator::chain::xdr::AuctionType;
-use blend_liquidator::chain::{PoolReader, RpcClient};
-use blend_liquidator::math::AuctionData;
-use blend_liquidator::store::{Store, TrackedAuction};
+use precept_liquidator::chain::xdr::AuctionType;
+use precept_liquidator::chain::{PoolReader, RpcClient};
+use precept_liquidator::math::AuctionData;
+use precept_liquidator::store::{Store, TrackedAuction};
 use sqlx::postgres::PgPool;
 
 /// The only network this tier will talk to. `scripts/sandbox/versions.env`
@@ -759,7 +759,7 @@ pub(crate) async fn spawn_bot(
         .env("PORT", HTTP_PORT.to_string())
         .env("HTTP_BIND_ADDR", "127.0.0.1")
         .env("LOG_FORMAT", "json")
-        .env("RUST_LOG", "info,blend_liquidator=debug")
+        .env("RUST_LOG", "info,precept_liquidator=debug")
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
@@ -882,7 +882,7 @@ pub(crate) async fn run_check_config(
         .env("SEED_URL", "")
         .env("RUN_MODE", "check-config")
         .env("LOG_FORMAT", "json")
-        .env("RUST_LOG", "info,blend_liquidator=debug")
+        .env("RUST_LOG", "info,precept_liquidator=debug")
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1601,9 +1601,9 @@ pub(crate) async fn wait_for_liability(
 /// the notifier accepted the entry and spawned its delivery, not that any
 /// particular channel confirmed it.
 ///
-/// [`NotificationKind::UnwindLeftovers`]: blend_liquidator::notifier::NotificationKind::UnwindLeftovers
+/// [`NotificationKind::UnwindLeftovers`]: precept_liquidator::notifier::NotificationKind::UnwindLeftovers
 pub(crate) const UNWIND_LEFTOVERS_METRIC: &str =
-    "blend_liquidator_notifications_total{kind=\"unwind_leftovers\",delivery=\"queued\"}";
+    "precept_liquidator_notifications_total{kind=\"unwind_leftovers\",delivery=\"queued\"}";
 
 /// Waits until [`UNWIND_LEFTOVERS_METRIC`] is at least `1` on `/metrics`,
 /// and answers what it read — the one signal in this scenario that nothing
@@ -1730,14 +1730,14 @@ pub(crate) fn assert_counter_at_least(bot: &Bot, metrics: &str, name: &str, mini
 pub(crate) fn print_nonzero_counters(metrics: &str) {
     println!("/metrics, the counters this run moved:");
     for line in metrics.lines() {
-        let Some(series) = line.strip_prefix("blend_liquidator_") else {
+        let Some(series) = line.strip_prefix("precept_liquidator_") else {
             continue;
         };
         if !series.contains("_total") {
             continue;
         }
         match series.rsplit_once(' ') {
-            Some((_, value)) if value != "0" => println!("  blend_liquidator_{series}"),
+            Some((_, value)) if value != "0" => println!("  precept_liquidator_{series}"),
             _ => {}
         }
     }
@@ -1758,16 +1758,16 @@ pub(crate) fn assert_metrics(bot: &Bot, metrics: &str) {
     assert_counter(
         bot,
         metrics,
-        "blend_liquidator_creations_total{result=\"succeeded\"}",
+        "precept_liquidator_creations_total{result=\"succeeded\"}",
         1,
     );
     assert_counter(
         bot,
         metrics,
-        "blend_liquidator_fills_total{result=\"succeeded\"}",
+        "precept_liquidator_fills_total{result=\"succeeded\"}",
         1,
     );
-    let passes = match series(metrics, "blend_liquidator_unwind_passes_total") {
+    let passes = match series(metrics, "precept_liquidator_unwind_passes_total") {
         Some(passes) if passes >= 1 => passes,
         Some(passes) => {
             let message = format!("unwind_passes_total is {passes}, expected at least 1");

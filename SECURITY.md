@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Report privately through [GitHub Security
-Advisories](https://github.com/Templar-Protocol/blend-liquidator/security/advisories/new).
+Advisories](https://github.com/Templar-Protocol/precept-liquidator/security/advisories/new).
 Do not open a public issue for a vulnerability.
 
 ## What this software is

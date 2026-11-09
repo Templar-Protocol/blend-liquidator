@@ -3626,7 +3626,7 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "blend-liquidator-service-seed-{}-{id}.toml",
+            "precept-liquidator-service-seed-{}-{id}.toml",
             std::process::id()
         ));
         std::fs::write(&path, contents).expect("write temp seed file");
@@ -4120,7 +4120,7 @@ mod tests {
                 .render()
                 .lines()
                 .any(|line| line.starts_with(&format!(
-                    "blend_liquidator_last_successful_scan_timestamp_seconds{{pool=\"{}\"}} ",
+                    "precept_liquidator_last_successful_scan_timestamp_seconds{{pool=\"{}\"}} ",
                     harness::POOL
                 ))),
             "and stamped itself as a scan that finished, for the pool it scanned: the scan \

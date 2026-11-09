@@ -1,11 +1,15 @@
-//! ScVal and ledger-entry codecs for the Blend v2 pool contract.
+//! ScVal and ledger-entry codecs for the Precept pool contract.
 //!
 //! Hand-written rather than generated from the contract spec so that every
 //! shape the bot depends on is visible here and pinned by a fixture test.
 //! A shape mismatch after a contract upgrade fails a test, not a fill.
 //!
-//! Ported from `blend-contracts-v2` tag `v2.0.0`: `pool/src/storage.rs`,
-//! `pool/src/events.rs` and `pool/src/contract.rs`. The next contract
+//! Ported from stock `blend-capital/blend-contracts-v2` tag `v2.0.0`:
+//! `pool/src/storage.rs`, `pool/src/events.rs` and `pool/src/contract.rs`.
+//! Precept is not byte-identical in all three: it adds events
+//! (`debt_setoff`, `collateral_orphaned`, `orphan_settled`) and, in `v0.1.1`,
+//! moves the user into topic 1 of `defaulted_debt` and `debt_setoff` — so
+//! the next upgrade diffs the fork's files, never only stock's. The next contract
 //! upgrade is a bounded diff against those three files.
 
 use crate::math::MathError;

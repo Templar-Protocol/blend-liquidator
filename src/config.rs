@@ -940,7 +940,7 @@ pub struct Args {
     #[arg(
         long,
         env = "SEED_URL",
-        default_value = "https://api.blend.templarfi.org"
+        default_value = "https://api.precept.templarfi.org"
     )]
     pub seed_url: String,
 
@@ -1871,7 +1871,7 @@ supported_lot = ["*"]
         assert_eq!(config.seed.health_factor_max, 100_000_000);
         assert_eq!(
             config.seed.url.as_deref(),
-            Some("https://api.blend.templarfi.org")
+            Some("https://api.precept.templarfi.org")
         );
 
         // Neither pools source, and both at once, are both errors.
