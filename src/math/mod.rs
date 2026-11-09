@@ -6,8 +6,10 @@
 //! this module performs I/O or panics: overflow and division by zero are
 //! `MathError`s.
 //!
-//! Ported from stock `blend-capital/blend-contracts-v2` tag `v2.0.0`, which
-//! Precept inherits byte for byte:
+//! Ported from stock `blend-capital/blend-contracts-v2` tag `v2.0.0`, whose
+//! arithmetic Precept keeps unchanged — though not every file whole: the
+//! fork's `auction.rs` also refuses every auction type but a user
+//! liquidation, and runs the default path on a full fill:
 //! `pool/src/pool/{reserve,interest,health_factor}.rs` and
 //! `pool/src/auctions/auction.rs`. The next contract upgrade is a bounded
 //! diff against those four files.

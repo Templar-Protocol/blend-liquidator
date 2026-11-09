@@ -11,8 +11,8 @@ says that this document does not contradict still stands.
 of the pre-release head `54afdae` below; the three ways `v0.1.1` differs from
 it that matter to the bot — two event topic layouts, a per-reserve
 `min_position`, and the default path's no-collateral gate — are listed in
-`docs/architecture.md` §6 until they are reconciled. §6's "the fork publishes
-no release" no longer holds.
+`docs/architecture.md` §6 until they are reconciled. The Verification basis
+below and §6 both say the fork publishes no release; neither holds any more.
 
 ## Source of truth
 
@@ -37,10 +37,14 @@ that prompted this document. Two trees were read side by side:
 
 Line references in this document are the fork's unless a row says "stock".
 
-**The fork is not deployable yet.** PR #3 is a draft whose own description
-opens with "SECURITY GATE OPEN: not ready for publication, release,
-deployment, activation, or handling funds." The repository has no releases and
-no tags. The branch head may be re-pushed; §7 records what that costs.
+**The fork was not deployable when this was written.** PR #3 was a draft
+whose own description opened with "SECURITY GATE OPEN: not ready for
+publication, release, deployment, activation, or handling funds." The
+repository had no releases and no tags, and the branch head could be
+re-pushed; §7 records what that costs. **That no longer holds (2026-11-09):**
+the fork is released (`v0.1.0`, `v0.1.1`) and live on mainnet, and `v0.1.1`
+differs from the `54afdae` read here in three ways the bot does not handle
+yet — see the note at the top of this document.
 
 ---
 

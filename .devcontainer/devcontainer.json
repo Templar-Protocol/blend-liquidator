@@ -56,17 +56,6 @@
   // keychain), which is why gh gets a volume rather than a fresh
   // `gh auth login` on every rebuild. `docker volume rm` both if you hand
   // this machine over.
-  //
-  // Both were named `blend-liquidator-*` before the repository was renamed,
-  // and a rename is a new, empty volume: the first rebuild after it starts
-  // logged out of both. To carry the logins over, copy each volume once, on
-  // the host, before rebuilding:
-  //   for v in claude-code gh-config; do
-  //     docker volume create "precept-liquidator-$v"
-  //     docker run --rm -v "blend-liquidator-$v:/from:ro" \
-  //       -v "precept-liquidator-$v:/to" alpine cp -a /from/. /to/
-  //   done
-  // then `docker volume rm` the two old ones once the new container works.
   "mounts": [
     "source=precept-liquidator-claude-code,target=/home/vscode/.claude,type=volume",
     "source=precept-liquidator-gh-config,target=/home/vscode/.config/gh,type=volume"

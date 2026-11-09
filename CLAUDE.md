@@ -5,9 +5,7 @@
 A liquidation bot for [Precept](https://github.com/Templar-Protocol/precept)
 lending markets on Stellar — Templar's audited fork of Blend v2. It is
 intended to repay the debt of underwater positions and receive their
-collateral at a discount, and it is open source for anyone to run: Precept's
-own documentation says Templar does not run liquidators, so nothing here
-should read as Templar operating this bot.
+collateral at a discount, and it is open source for anyone to run.
 
 **The source of truth for pool behaviour is `Templar-Protocol/precept`** —
 the ADR-0008 / ADR-0011 security fork, renamed from

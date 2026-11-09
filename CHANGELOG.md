@@ -72,9 +72,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the compose project and its containers are `precept-liquidator`, the
   sandbox's container is `precept-sandbox`, and the dev container's two
   named volumes are `precept-liquidator-claude-code` and
-  `precept-liquidator-gh-config` (`.devcontainer/devcontainer.json` says
-  how to carry a login over from the old ones). No image, tag or release
-  was ever published under the old name.
+  `precept-liquidator-gh-config`. No image, tag or release was ever
+  published under the old name.
 - `SEED_URL` defaults to `https://api.precept.templarfi.org`, Precept's
   public analytics API, which serves the same positions endpoint and shape.
   The old default, `https://api.blend.templarfi.org`, has been retired and

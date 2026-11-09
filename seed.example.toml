@@ -8,7 +8,14 @@
 # one extra chain read — it can never cause an incorrect submission.
 
 [accounts]
-# Precept - deJAAA/USDC, and one of its borrowers.
+# Precept - XLM/USDC, the market pools.example.toml configures. Nobody owes
+# anything there yet, so there is no borrower to name: list the accounts to
+# seed for it between the brackets.
+"CDOU4OEOBWACSNAH7T72IAR4JXJDNS4ZFVHT7TWILVKVBOR3DZT3VSK2" = []
+
+# Precept - deJAAA/USDC, and one of its borrowers. A pool the bot is not
+# configured to follow is ignored here, so this entry seeds nothing unless
+# the pools file names that market too.
 "CBH2ITLUBJ7H5A4ZZOWCUJ6LSXSDVN3LAMKVJ3JWIQ6TT5YCYVNA2LDH" = [
   "GAUD6X3PUFUCF2ZPEUVMZ5BW3SQZXOM36KUONBBHKJW763WPOAUY2TM5",
 ]

@@ -22,9 +22,9 @@ service that watches a configured set of [Blend Protocol](https://blend.capital)
 v2 lending pools on Stellar, creates user liquidation auctions for underwater
 borrowers, fills those auctions once they are profitable at the pool's own
 oracle prices and safe for the bot's own health factor, and unwinds what it
-takes over. It is a public, generic bot that any operator can run; Templar's
-own deployment lives in a separate private infrastructure repository and is
-covered by its own specification.
+takes over. It is a public, generic bot that any operator can run; a
+deployment of it was planned in a separate private infrastructure repository,
+to be covered by its own specification, which does not exist yet.
 
 Two reference implementations shaped this design and are the right things to
 read next to it:
@@ -63,7 +63,7 @@ pool WASM before mainnet.
 | Testing | Unit tests against contract-derived fixtures plus an ignored local Stellar sandbox integration test. |
 | Architecture | One process, a ledger poller as the clock, stage-per-module, two tasks sharing a store, one submission queue per key. |
 | Store | Postgres only, through `sqlx`; Cloud SQL in production, a `postgres:16` container in the generic compose file. |
-| Deployment | Two repositories: this one is public and generic; a private `precept-liquidator-infra` deploys it to its own GCP project as a single always-on Cloud Run service with Cloud SQL. This spec fixes only the contract between them. |
+| Deployment | Two repositories: this one is public and generic; a separate private infrastructure repository — planned as `precept-liquidator-infra`, and not yet created — would deploy it to its own GCP project as a single always-on Cloud Run service with Cloud SQL. This spec fixes only the contract between them. |
 | Implementer | The implementation plan will be executed by Claude Opus; phases are sized so each lands as one reviewable pull request. |
 
 ## 1. Scope and invariants
