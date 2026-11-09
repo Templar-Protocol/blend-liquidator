@@ -122,6 +122,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Telegram. Every TLS path in the bot — reqwest and sqlx, both rustls with
   native roots — verifies through `rustls-webpki`, so the check holds
   whatever CA bundle the image carries.
+- `ctutils` 0.4.2 → 0.4.8 (RUSTSEC-2026-0385), whose constant-time mask
+  generation and `u128` comparisons could compile to a branch on the
+  value. It reaches the bot through `digest`, under `sha2`,
+  `ed25519-dalek` and the `hmac` sqlx's Postgres authentication uses.
+- `tokio` 1.53.1 → 1.54.1 (RUSTSEC-2026-0386): `AsyncFd`'s safe
+  constructors accept a file descriptor they do not own, which can end in
+  a use-after-free in the I/O driver. Nothing in this crate constructs an
+  `AsyncFd`; the bump keeps the runtime every task runs on off a release
+  carrying an unsound advisory.
 
 ## [0.1.0] - 2026-09-22
 
