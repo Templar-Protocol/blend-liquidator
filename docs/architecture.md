@@ -10,8 +10,8 @@ operator's path to running it.
 
 ## 1. What the bot does
 
-`blend-liquidator` follows a configured set of Blend v2 lending pools on
-Stellar, decides which tracked borrowers are underwater, creates the
+`precept-liquidator` follows a configured set of Precept lending pools on
+Stellar — Precept being Templar's audited fork of Blend v2 — decides which tracked borrowers are underwater, creates the
 liquidation auction the pool's contract should accept, fills auctions —
 its own and anyone else's — that its configured assets support, and
 unwinds the position a fill leaves it holding back toward its wallet. It
@@ -138,9 +138,11 @@ contract's own logic:
 
 ## 6. The contract it targets
 
-The source of truth for pool behaviour is
-`Templar-Protocol/blend-contracts-v2`, the ADR-0008/ADR-0011 security
-fork — not the stock `blend-capital/blend-contracts-v2`. Most of the fork
+The source of truth for pool behaviour is Precept,
+[`Templar-Protocol/precept`](https://github.com/Templar-Protocol/precept)
+(the ADR-0008/ADR-0011 security fork, formerly named
+`Templar-Protocol/blend-contracts-v2`) — not the stock
+`blend-capital/blend-contracts-v2`. Most of the fork
 is byte-identical to stock,
 including all of this crate's arithmetic port. What differs, and what the
 bot does about each difference, is written down in
@@ -170,10 +172,28 @@ bot does about each difference, is written down in
   auctioneer and the filler treat it as one of the bot's own accounts
   rather than a borrower.
 
-**The fork is not deployed anywhere yet**: its pull request is a draft
-whose first line says it is not ready for deployment, and it publishes no
-release to pin. The bot still runs against stock Blend v2 pools as well,
-and two things follow from that:
+**Precept is released and live.** `v0.1.0` is the Guardian-audited
+release, `v0.1.1` its rebuild with small post-audit changes, and every
+active mainnet market runs `v0.1.1` wasm (`registry/mainnet.jsonl` in the
+Precept repository). The reconciliation above was made against the fork's
+pre-release head, `54afdae`, and `v0.1.1` differs from it in three ways
+the bot does not handle yet:
+
+- `defaulted_debt` and `debt_setoff` carry the user in topic 1 and the
+  asset in topic 2, where `54afdae` carried the asset alone — so
+  `chain::xdr::events` refuses both shapes it now sees, and the poller
+  skips each such event with a warning;
+- every reserve has a `min_position`: a `SupplyCollateral` or
+  `WithdrawCollateral` that leaves a nonzero collateral position below it
+  fails `1224 MinCollateralNotMet`, which neither `plan_fill` nor
+  `plan_unwind` models;
+- `check_and_handle_user_bad_debt` defaults a borrower holding no
+  collateral without pricing anything, where `math::setoff` values the
+  position first and so fails on an unpriced reserve the contract would
+  not have read.
+
+The bot still runs against stock Blend v2 pools as well, and three
+things follow from that:
 
 - `plan_fill`'s `b_rate`-haircut projection runs unconditionally, on stock
   pools too. A full fill on a stock pool moves the borrower's remaining
@@ -184,9 +204,10 @@ and two things follow from that:
   regardless of which wasm is actually deployed, and a stock pool emits
   `bad_debt` in ordinary operation — so on a stock pool this alert is
   expected noise, not evidence of a misconfiguration.
-- The sandbox integration tier (`scripts/sandbox/`) pins stock wasm by
-  release URL and SHA-256 (`scripts/sandbox/versions.env`) for exactly
-  this reason: there is nothing from the fork yet to pin.
+- The sandbox integration tier (`scripts/sandbox/`) still pins stock wasm
+  by release URL and SHA-256 (`scripts/sandbox/versions.env`): it predates
+  Precept's releases, and moving it onto Precept's own `v0.1.1` artefacts
+  is the next change to it.
 
 ## 7. The store
 

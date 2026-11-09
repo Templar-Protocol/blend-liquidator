@@ -1,11 +1,11 @@
 [package]
-name = "blend-liquidator"
+name = "precept-liquidator"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.97.0"
 license = "GPL-3.0-only"
-repository = "https://github.com/Templar-Protocol/blend-liquidator"
-description = "Liquidation bot for Blend Protocol lending pools on Stellar"
+repository = "https://github.com/Templar-Protocol/precept-liquidator"
+description = "Liquidation bot for Precept lending markets on Stellar"
 
 # Standalone crate: an empty workspace table stops Cargo from adopting any
 # enclosing workspace, wherever this repo happens to be checked out.

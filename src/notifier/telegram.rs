@@ -328,7 +328,7 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/bot123:abc/getMe"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"ok": true, "result": {"username": "blend_bot"}}),
+                serde_json::json!({"ok": true, "result": {"username": "precept_bot"}}),
             ))
             .expect(1)
             .mount(&server)
@@ -336,7 +336,7 @@ mod tests {
         let channel = TelegramChannel::new(Secret::new("123:abc"), "42".into())
             .expect("client")
             .with_base_url(server.uri());
-        assert_eq!(channel.verify().await.expect("verified"), "blend_bot");
+        assert_eq!(channel.verify().await.expect("verified"), "precept_bot");
 
         let broken = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))

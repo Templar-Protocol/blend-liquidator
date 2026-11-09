@@ -1,4 +1,4 @@
-//! Pure, chain-agnostic mathematics ported from the Blend v2 pool contract.
+//! Pure, chain-agnostic mathematics ported from the Precept pool contract.
 //!
 //! Every function here mirrors a contract function with the same rounding
 //! direction, because the bot's decisions are only as good as their
@@ -6,7 +6,8 @@
 //! this module performs I/O or panics: overflow and division by zero are
 //! `MathError`s.
 //!
-//! Ported from `blend-contracts-v2` tag `v2.0.0`:
+//! Ported from stock `blend-capital/blend-contracts-v2` tag `v2.0.0`, which
+//! Precept inherits byte for byte:
 //! `pool/src/pool/{reserve,interest,health_factor}.rs` and
 //! `pool/src/auctions/auction.rs`. The next contract upgrade is a bounded
 //! diff against those four files.

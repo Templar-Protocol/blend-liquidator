@@ -8,7 +8,7 @@
 //!
 //! `ledgers` defaults to 17280, about 24 hours at testnet's ~5 s ledger
 //! close. Pages `getEvents` from `latest - ledgers` to chain head the way
-//! [`blend_liquidator::ledger::LedgerPoller`] does — a start ledger for the
+//! [`precept_liquidator::ledger::LedgerPoller`] does — a start ledger for the
 //! first page, the returned cursor for every page after, stopping on a
 //! short page — and decodes every event through `chain::xdr::events`,
 //! collecting every account any variant names
@@ -33,9 +33,9 @@
 use std::collections::BTreeSet;
 use std::error::Error;
 
-use blend_liquidator::chain::rpc::{EventQuery, RpcClient};
-use blend_liquidator::chain::xdr::decode_pool_event;
-use blend_liquidator::chain::ChainError;
+use precept_liquidator::chain::rpc::{EventQuery, RpcClient};
+use precept_liquidator::chain::xdr::decode_pool_event;
+use precept_liquidator::chain::ChainError;
 
 /// About 24 hours at testnet's ~5 s ledger close.
 const DEFAULT_LEDGERS: u32 = 17_280;

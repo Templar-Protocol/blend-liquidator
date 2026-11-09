@@ -286,7 +286,7 @@ impl RpcClient {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
-            .user_agent(concat!("blend-liquidator/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("precept-liquidator/", env!("CARGO_PKG_VERSION")))
             .build()?;
         let api_key = api_key
             .map(|(name, value)| {

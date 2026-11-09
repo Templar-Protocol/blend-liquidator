@@ -4,21 +4,28 @@
 # contents inline as POOLS_TOML for an environment with no volume to mount
 # (see .env.example) — never both.
 #
-# This example follows one real mainnet pool with XLM as the primary asset:
-# the collateral the bot accumulates from fills and keeps a floor of.
+# This example follows one real Precept mainnet market, XLM/USDC, with XLM
+# as the primary asset: the collateral the bot accumulates from fills and
+# keeps a floor of. Precept's deployed markets and their addresses are
+# recorded in Templar-Protocol/precept's registry/mainnet.jsonl.
 
 [[pools]]
-# The pool contract.
-address = "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD"
+# The pool contract: Precept - XLM/USDC.
+address = "CDOU4OEOBWACSNAH7T72IAR4JXJDNS4ZFVHT7TWILVKVBOR3DZT3VSK2"
 
 # The asset the bot keeps as collateral in this pool. Startup validation
 # requires it to be a reserve with a positive collateral factor.
 primary_asset = "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA" # XLM
 
 # The least of the primary asset to hold, in its own decimals as a decimal
-# string (XLM has 7: this is 100,000 XLM). In live mode, the filler holding
+# string (XLM has 7: this is 1,000 XLM). In live mode, the filler holding
 # less than this in a configured pool is a startup warning, not a failure.
-min_primary_collateral = "1000000000000"
+#
+# On a Precept pool, make it zero or at least the primary reserve's own
+# min_position (50 XLM on this market): the contract refuses any collateral
+# supply or withdrawal that leaves a nonzero position below that, so a
+# floor between the two can never be reached.
+min_primary_collateral = "10000000000"
 
 # The health factor the filler keeps its own position above after a fill.
 # Decimal text, parsed into 7-decimal fixed point at startup.
@@ -67,19 +74,22 @@ force_fill = false
 fill_objective = "free-fill"
 
 # Assets the bot will pay as the auction's bid, or ["*"] for any reserve.
-# Every entry here must be a reserve of the pool.
-supported_bid = [
-  "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA", # XLM
-  "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75", # USDC
-]
+# Every entry here must be a reserve of the pool. On this market XLM has a
+# liability factor of zero and USDC a collateral factor of zero, so USDC is
+# the only asset anyone can borrow: every bid is USDC and every lot is XLM.
+supported_bid = ["CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75"] # USDC
 
 # Assets the bot will take as the auction's lot, or ["*"] for any reserve.
 supported_lot = ["*"]
 
 # Ordered profit rules; the first whose bid and lot lists both match a
 # candidate auction wins over default_profit_bps above. Optional, and may
-# be repeated.
-[[pools.profits]]
-profit_bps = 500
-supported_bid = ["CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75"] # USDC
-supported_lot = ["*"]
+# be repeated. On this market every bid is USDC, so a rule like this one
+# would match every auction and default_profit_bps would never apply; it is
+# left commented out to show the shape for a pool with more than one
+# borrowable asset.
+#
+# [[pools.profits]]
+# profit_bps = 500
+# supported_bid = ["CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75"] # USDC
+# supported_lot = ["*"]

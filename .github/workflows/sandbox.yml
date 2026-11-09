@@ -32,7 +32,7 @@ on:
 # one night's run finishing before the next starts, and no doubled runner
 # minutes from a manual dispatch landing on top of the schedule. A real
 # collision needs self-hosted runners sharing one machine: each job binds
-# host port 8000 and the container name `blend-sandbox`, and up.sh refuses
+# host port 8000 and the container name `precept-sandbox`, and up.sh refuses
 # to start while a container by that name exists, so two jobs there would
 # fail each other — and the group would keep two runs apart, but not the
 # matrix jobs inside one. Queued rather than cancelled: a cancelled run

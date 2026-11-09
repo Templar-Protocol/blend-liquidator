@@ -1,23 +1,30 @@
-# blend-liquidator
+# precept-liquidator
 
 ## What this is
 
-A liquidation bot for [Blend Protocol](https://blend.capital) lending pools on
-Stellar. It is intended to repay the debt of underwater positions and receive
-their collateral at a discount.
+A liquidation bot for [Precept](https://github.com/Templar-Protocol/precept)
+lending markets on Stellar — Templar's audited fork of Blend v2. It is
+intended to repay the debt of underwater positions and receive their
+collateral at a discount, and it is open source for anyone to run: Precept's
+own documentation says Templar does not run liquidators, so nothing here
+should read as Templar operating this bot.
 
-**The source of truth for pool behaviour is
-`Templar-Protocol/blend-contracts-v2`** — the ADR-0008 / ADR-0011 security
-fork — not `blend-capital/blend-contracts-v2`, which Phases 1 through 7 were
-built against. Most of the fork is byte-identical to stock, this crate's whole
+**The source of truth for pool behaviour is `Templar-Protocol/precept`** —
+the ADR-0008 / ADR-0011 security fork, renamed from
+`Templar-Protocol/blend-contracts-v2` (the old name redirects) — not
+`blend-capital/blend-contracts-v2`, which Phases 1 through 7 were built
+against. Most of the fork is byte-identical to stock, this crate's whole
 arithmetic port included, so the change is narrower than it sounds; what it
 does change, and what the bot still has to do about it, is
 `docs/specs/2026-09-20-adr-0008-fork-semantics.md`. Read that before touching
-anything contract-derived. The fork is **not deployed anywhere yet**: its pull
-request is a draft whose first line reads "SECURITY GATE OPEN: not ready for
-publication, release, deployment, activation, or handling funds", and it
-publishes no release, which is why the sandbox tier below still pins stock
-wasm.
+anything contract-derived. Precept is **released and live**: `v0.1.0` is the
+Guardian-audited release, `v0.1.1` its rebuild with small post-audit
+changes, and every active mainnet market runs `v0.1.1` wasm — the deployed
+addresses are in that repository's `registry/mainnet.jsonl`. That spec was
+written against the fork's pre-release head `54afdae`, and **`v0.1.1`
+differs from it in three ways the bot does not handle yet** (see "The
+fork's gotchas" below and `docs/architecture.md` §6). The sandbox tier
+below still pins stock wasm: it predates Precept's releases.
 
 **Status: Phase 9 complete.** Phase 1 landed the pure fixed-point math
 (`math`) and the ScVal/ledger-entry codecs (`chain::xdr`); Phase 2 landed
@@ -103,8 +110,8 @@ changelog section. The `v0.1.0` tag itself is the maintainer's to push:
 pushing it is what publishes the GHCR image and cuts the GitHub Release,
 not anything landed on this branch. Phase 9 also ran the testnet soak the
 design spec's §9 ends with (`scripts/testnet/`, `docs/testnet-soak.md`),
-against stock wasm on public Stellar testnet — the fork still is not
-deployed anywhere, so the soak targets what actually is: Blend's own
+against stock wasm on public Stellar testnet — the fork was not yet
+deployed anywhere then, so the soak targets what actually was: Blend's own
 testnet pool for stage 1 (observe) and this repository's own throwaway
 deployment for stage 2 (armed). Stage 1 has run the bot in dry run
 against a pool this repository does not control, seeded with the 15
@@ -837,7 +844,7 @@ make help                           # Docker Compose lifecycle
   than the matrix jobs inside one. On hosted runners every job of every
   run gets a fresh VM, so overlapping runs would not collide and the
   group buys ordering and runner minutes; a real collision — two jobs on
-  one machine fighting over host port 8000 and the `blend-sandbox`
+  one machine fighting over host port 8000 and the `precept-sandbox`
   container name `up.sh` refuses on — needs self-hosted runners sharing a
   machine, and even there the group keeps runs apart, not the matrix jobs
   inside one. It queues rather than cancels because a cancelled run never
@@ -928,7 +935,7 @@ make help                           # Docker Compose lifecycle
   covers only `--lib --bins`, never `examples/`.
 
 The module layout beyond this follows
-`docs/specs/2026-09-04-blend-liquidator-bot-design.md`; see
+`docs/specs/2026-09-04-precept-liquidator-bot-design.md`; see
 Status above for what remains.
 
 ## Conventions
@@ -1574,10 +1581,33 @@ Status above for what remains.
 
 ## The fork's gotchas
 
-Verified against `Templar-Protocol/blend-contracts-v2` PR #3 at head
-`54afdae`, side by side with stock at `v2.0.0`. The long form, with the
-reasoning and the work each one implies, is
-`docs/specs/2026-09-20-adr-0008-fork-semantics.md`; these are the traps.
+Verified against `Templar-Protocol/precept` (then named
+`blend-contracts-v2`) PR #3 at head `54afdae`, side by side with stock at
+`v2.0.0`. The long form, with the reasoning and the work each one implies,
+is `docs/specs/2026-09-20-adr-0008-fork-semantics.md`; these are the traps.
+
+**`v0.1.1`, the release every live market runs, differs from `54afdae` in
+three ways the bot does not handle yet** — none of them in this crate's
+arithmetic port:
+
+- **`defaulted_debt` and `debt_setoff` carry the user now**:
+  `["defaulted_debt", user, asset]` and `["debt_setoff", user, asset]`.
+  `chain::xdr::events` still requires the two-topic shape, so on a live
+  market every such event fails to decode and the poller skips it with a
+  warning.
+- **Every reserve has a `min_position`** (`ReserveConfig`, between
+  `supply_cap` and `enabled`): a `SupplyCollateral` or `WithdrawCollateral`
+  that leaves the user's collateral in that reserve above zero but below it
+  fails `1224 MinCollateralNotMet` — the same code as the pool-wide
+  `min_collateral`. The decoder looks fields up by name, so nothing fails
+  to parse, but neither `plan_fill`'s primary supply nor `plan_unwind`'s
+  partial withdrawals model it, and the executor's half-percent re-plan on
+  `1224` cannot cure it.
+- **The default path no longer prices a borrower with no collateral**
+  (Guardian L-01): `check_and_handle_user_bad_debt` defaults such a
+  position without reading the oracle, where `math::setoff::project_default`
+  and the auctioneer's bad-debt predicate value it first — and fail on an
+  unpriced reserve exactly where the contract succeeds.
 
 - **A 100% fill can cut the filler's own health factor, and the plan now
   accounts for it.** On the fork a full fill runs
@@ -1595,8 +1625,9 @@ reasoning and the work each one implies, is
   most important difference on this list; nothing else here can lose
   money, and it is no longer flying blind into it.
 - **Only three events are new**: `debt_setoff`, `collateral_orphaned` and
-  `orphan_settled`. `defaulted_debt` is **stock**, and this crate already
-  decodes it correctly — do not "add" it. The topic shapes differ and the
+  `orphan_settled`. `defaulted_debt` is **stock** at `54afdae`, and this
+  crate decodes that shape correctly — do not "add" it (but see `v0.1.1`'s
+  topic change above). The topic shapes differ and the
   borrower is not in a fixed position: `collateral_orphaned` carries the
   user in topic 1 and the asset in topic 2, while the other two carry no
   user at all, so a decoder that assumes "asset is always topic 1" mis-reads

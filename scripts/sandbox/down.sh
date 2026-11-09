@@ -19,7 +19,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/sandbox/lib.sh
 source "${script_dir}/lib.sh"
 
-: "${SANDBOX_CONTAINER:=blend-sandbox}"
+: "${SANDBOX_CONTAINER:=precept-sandbox}"
 
 if [ -n "$(docker ps -a --filter "name=^/${SANDBOX_CONTAINER}\$" --format '{{.Names}}')" ]; then
 	log "removing container ${SANDBOX_CONTAINER}"

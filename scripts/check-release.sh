@@ -56,11 +56,11 @@ fi
 # 3. Cargo.lock must have been regenerated after the bump. A stale lock means
 #    `cargo build --locked` (what the Dockerfile runs) fails inside the release
 #    build rather than here, wasting the tag.
-lock_version=$(awk '/^name = "blend-liquidator"$/ { found = 1; next } found && /^version = / { gsub(/[",]/, "", $3); print $3; exit }' Cargo.lock || true)
+lock_version=$(awk '/^name = "precept-liquidator"$/ { found = 1; next } found && /^version = / { gsub(/[",]/, "", $3); print $3; exit }' Cargo.lock || true)
 if [ -z "${lock_version}" ]; then
-	bad "could not read blend-liquidator version from Cargo.lock"
+	bad "could not read precept-liquidator version from Cargo.lock"
 elif [ "${lock_version}" != "${version}" ]; then
-	bad "Cargo.lock has blend-liquidator ${lock_version}, expected ${version} — run 'cargo update -p blend-liquidator' and commit the lock"
+	bad "Cargo.lock has precept-liquidator ${lock_version}, expected ${version} — run 'cargo update -p precept-liquidator' and commit the lock"
 else
 	note "Cargo.lock version = ${lock_version}"
 fi
@@ -92,9 +92,9 @@ case "${version}" in
 	note "prerelease: README image pin not required to match"
 	;;
 *)
-	readme_tag=$(grep -oE 'ghcr\.io/templar-protocol/blend-liquidator:[0-9A-Za-z.-]+' README.md | head -1 | cut -d: -f2 || true)
+	readme_tag=$(grep -oE 'ghcr\.io/templar-protocol/precept-liquidator:[0-9A-Za-z.-]+' README.md | head -1 | cut -d: -f2 || true)
 	if [ -z "${readme_tag}" ]; then
-		bad "could not find a ghcr.io/templar-protocol/blend-liquidator:<tag> reference in README.md"
+		bad "could not find a ghcr.io/templar-protocol/precept-liquidator:<tag> reference in README.md"
 	elif [ "${readme_tag}" != "${version}" ]; then
 		bad "README quickstart pins image tag ${readme_tag}, expected ${version} — update the docker run line in README.md"
 	else

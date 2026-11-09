@@ -1,4 +1,4 @@
-# blend-liquidator — standalone multi-stage Docker build.
+# precept-liquidator — standalone multi-stage Docker build.
 #
 # Single-crate repo (see the `[workspace]` note in Cargo.toml), so the build
 # context is the repo root and only this crate's own files are copied in.
@@ -74,7 +74,7 @@ COPY --chown=liquidator:liquidator .env.example ./.env.example
 
 USER liquidator
 
-ENV RUST_LOG=info,blend_liquidator=debug
+ENV RUST_LOG=info,precept_liquidator=debug
 ENV RUST_BACKTRACE=1
 
 # Liveness check: is the `liquidator` process still running. Deliberately NOT
@@ -90,10 +90,10 @@ ENV RUST_BACKTRACE=1
 HEALTHCHECK --interval=60s --timeout=10s --start-period=10s --retries=3 \
     CMD ["pgrep", "-x", "liquidator"]
 
-LABEL org.opencontainers.image.title="Blend Liquidator"
-LABEL org.opencontainers.image.description="Liquidation bot for Blend Protocol lending pools on Stellar"
+LABEL org.opencontainers.image.title="Precept Liquidator"
+LABEL org.opencontainers.image.description="Liquidation bot for Precept lending markets on Stellar"
 LABEL org.opencontainers.image.vendor="Templar Protocol"
 LABEL org.opencontainers.image.licenses="GPL-3.0-only"
-LABEL org.opencontainers.image.source="https://github.com/Templar-Protocol/blend-liquidator"
+LABEL org.opencontainers.image.source="https://github.com/Templar-Protocol/precept-liquidator"
 
 ENTRYPOINT ["/app/liquidator"]

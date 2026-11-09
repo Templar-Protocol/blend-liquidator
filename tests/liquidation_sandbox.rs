@@ -92,11 +92,11 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use blend_liquidator::chain::xdr::AuctionType;
-use blend_liquidator::chain::{PoolReader, RpcClient};
-use blend_liquidator::config::ChainConfig;
-use blend_liquidator::math::AuctionData;
-use blend_liquidator::store::Store;
+use precept_liquidator::chain::xdr::AuctionType;
+use precept_liquidator::chain::{PoolReader, RpcClient};
+use precept_liquidator::config::ChainConfig;
+use precept_liquidator::math::AuctionData;
+use precept_liquidator::store::Store;
 use sqlx::postgres::PgPool;
 
 use sandbox_harness::{
@@ -848,7 +848,7 @@ async fn dry_run_phase_a(ctx: &DryRunCtx<'_>) {
     assert_counter(
         &bot,
         &metrics,
-        "blend_liquidator_creations_total{result=\"succeeded\"}",
+        "precept_liquidator_creations_total{result=\"succeeded\"}",
         0,
     );
 
@@ -1015,7 +1015,7 @@ async fn dry_run_phase_c(ctx: &DryRunCtx<'_>, expected_entry: &AuctionData) {
     assert_counter(
         &bot,
         &metrics,
-        "blend_liquidator_fills_total{result=\"succeeded\"}",
+        "precept_liquidator_fills_total{result=\"succeeded\"}",
         0,
     );
 
@@ -1312,10 +1312,11 @@ async fn unwind_repay_run_two(ctx: &UnwindRepayCtx<'_>) {
     assert_counter(
         &bot,
         &metrics,
-        "blend_liquidator_fills_total{result=\"succeeded\"}",
+        "precept_liquidator_fills_total{result=\"succeeded\"}",
         0,
     );
-    let passes = assert_counter_at_least(&bot, &metrics, "blend_liquidator_unwind_passes_total", 1);
+    let passes =
+        assert_counter_at_least(&bot, &metrics, "precept_liquidator_unwind_passes_total", 1);
 
     terminate(&mut bot).await;
     println!(
@@ -1716,13 +1717,13 @@ async fn restart_adopt_bot_two(ctx: &RestartAdoptCtx<'_>, database_url: &str) {
     assert_counter(
         &bot,
         &metrics,
-        "blend_liquidator_creations_total{result=\"succeeded\"}",
+        "precept_liquidator_creations_total{result=\"succeeded\"}",
         0,
     );
     assert_counter(
         &bot,
         &metrics,
-        "blend_liquidator_fills_total{result=\"succeeded\"}",
+        "precept_liquidator_fills_total{result=\"succeeded\"}",
         1,
     );
 

@@ -22,7 +22,7 @@ use super::decode::{auction_value, PoolStatus};
 use super::{AuctionType, XdrError};
 use crate::math::AuctionData;
 
-/// A Blend v2 pool event the bot acts on.
+/// A pool event the bot acts on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PoolEvent {
     /// Uncollateralised supply.

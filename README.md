@@ -1,18 +1,23 @@
-# blend-liquidator
+# precept-liquidator
 
-[![CI](https://github.com/Templar-Protocol/blend-liquidator/actions/workflows/ci.yml/badge.svg)](https://github.com/Templar-Protocol/blend-liquidator/actions/workflows/ci.yml)
+[![CI](https://github.com/Templar-Protocol/precept-liquidator/actions/workflows/ci.yml/badge.svg)](https://github.com/Templar-Protocol/precept-liquidator/actions/workflows/ci.yml)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
-A liquidation bot for [Blend Protocol](https://blend.capital) lending pools on
-[Stellar](https://stellar.org).
+An open-source liquidation bot for [Precept](https://precept.templarfi.org)
+lending markets on [Stellar](https://stellar.org), which anyone can run.
+Precept is Templar's audited fork of Blend v2
+([`Templar-Protocol/precept`](https://github.com/Templar-Protocol/precept));
+its pools keep Blend's liquidation auctions and leave filling them to
+whoever is watching.
 
-> **Status: 0.1.0.** The bot follows every configured Blend v2 pool,
+> **Status: 0.1.0.** The bot follows every configured Precept pool,
 > creates the liquidation auction a tracked borrower's position calls
 > for, fills auctions — its own and anyone else's — that its pool
 > configuration supports, and unwinds the position a fill leaves it
-> holding back to its own wallet. It targets the ADR-0008 security fork
-> of the Blend contracts (`Templar-Protocol/blend-contracts-v2`) and
-> also runs against stock pools. Dry-run is the default: nothing is
+> holding back to its own wallet. Its contract reconciliation was made
+> against Precept's pre-release head (`54afdae`), not yet the `v0.1.1`
+> release live markets run; see `CLAUDE.md` for the differences still
+> open. Dry-run is the default: nothing is
 > created or filled on chain until `DRY_RUN=false` is set explicitly.
 > Armed, it is custodial — it holds a signing key and submits
 > transactions itself, which is the point of a liquidation bot (see
@@ -34,7 +39,8 @@ A liquidation bot for [Blend Protocol](https://blend.capital) lending pools on
   repository guarantees about the image and the binary, and what a
   deployment must provide around it.
 - [`docs/testnet-soak.md`](docs/testnet-soak.md) — the design spec's §9
-  soak: running the bot dry against Blend's own public-testnet pool, then
+  soak: running the bot dry against Blend's own public-testnet pool (no
+  Precept testnet market had borrowers or prices to observe), then
   armed against this repository's own throwaway deployment on the same
   network.
 
@@ -102,7 +108,7 @@ cp .env.example .env
 docker compose up
 ```
 
-This README tracks `ghcr.io/templar-protocol/blend-liquidator:0.1.0`. Each
+This README tracks `ghcr.io/templar-protocol/precept-liquidator:0.1.0`. Each
 image is published by pushing its `v<version>` tag (`v0.1.0` for this one),
 so a version is pullable only once its tag has been pushed and the release
 workflow has run. Whether the package is public is a GitHub package setting, not something
@@ -140,7 +146,7 @@ address.
   stopped — including the pools the seed has not reached yet. Only a
   poller that has genuinely stopped making progress fails this.
 - `/metrics` — Prometheus text exposition format, prefixed
-  `blend_liquidator_`: ledger head and processed per pool, events
+  `precept_liquidator_`: ledger head and processed per pool, events
   processed, users tracked and auctions open per pool, creation and fill
   attempts by result, skips by reason, estimated profit and estimated
   loss, reserved
@@ -201,8 +207,9 @@ Three tiers, and only the first two run on a pull request.
 
 **Unit tests**, inline in every module and run by `make check`. The pure
 arithmetic is pinned against `tests/fixtures/mainnet-fixed-v2.json`, one
-mainnet ledger's entries together with the contract's own answers at that
-ledger: accruing the stored reserves must reproduce `get_reserve` to the
+stock Blend v2 mainnet pool's ledger entries together with the contract's
+own answers at that ledger — Precept's arithmetic is Blend's, byte for
+byte, so the stock pool's answers attest it: accruing the stored reserves must reproduce `get_reserve` to the
 stroop, and decoding the stored positions must reproduce `get_positions`.
 The store's tests need a live Postgres and are not skipped without one
 (`make db-up` first) — `#[sqlx::test]` creates a database per test.
@@ -212,8 +219,8 @@ drive the *real* client through: the restore path, `TRY_AGAIN_LATER`, a
 timeout and every decoded contract error, with no network and nothing
 mocked below the wire format.
 
-**The sandbox**, a throwaway Stellar network in Docker with Blend v2
-deployed on it and this binary run against it **armed** — one of the two
+**The sandbox**, a throwaway Stellar network in Docker with stock Blend v2
+wasm deployed on it (Precept's own release wasm is not pinned yet) and this binary run against it **armed** — one of the two
 places anything in this repository signs and sends a transaction; the
 other is the testnet soak's armed stage (`docs/testnet-soak.md`), on
 public testnet with friendbot's XLM. Five scenarios

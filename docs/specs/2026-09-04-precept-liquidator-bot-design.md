@@ -1,14 +1,19 @@
-# blend-liquidator: bot design
+# precept-liquidator: bot design
 
 **Date:** 2026-09-04
 **Status:** design approved section by section in review; written spec pending
 review
-**Predecessor:** [2026-09-03 repository scaffold](2026-09-03-blend-liquidator-scaffold-design.md)
+**Predecessor:** [2026-09-03 repository scaffold](2026-09-03-precept-liquidator-scaffold-design.md)
 **Amended by:** [2026-09-20 ADR-0008 fork semantics](2026-09-20-adr-0008-fork-semantics.md),
 which moves the source of truth to `Templar-Protocol/blend-contracts-v2` and
 supersedes this document wherever the two disagree. Read it alongside this one:
 it is narrow, but it reaches §1's Blend invariants, §4's bad-debt decision,
 §5's fill ledger and health-bounded plan, and §12's phase list.
+**Renamed 2026-11-09:** the fork is now Precept, `Templar-Protocol/precept`
+(the old `blend-contracts-v2` name redirects there), and this repository,
+crate, image and metric prefix were renamed from `blend-liquidator` to
+`precept-liquidator` to match. Where this document says Blend, it means the
+protocol Precept forks; the design itself is unchanged.
 
 ## What this is
 
@@ -58,7 +63,7 @@ pool WASM before mainnet.
 | Testing | Unit tests against contract-derived fixtures plus an ignored local Stellar sandbox integration test. |
 | Architecture | One process, a ledger poller as the clock, stage-per-module, two tasks sharing a store, one submission queue per key. |
 | Store | Postgres only, through `sqlx`; Cloud SQL in production, a `postgres:16` container in the generic compose file. |
-| Deployment | Two repositories: this one is public and generic; a private `blend-liquidator-infra` deploys it to its own GCP project as a single always-on Cloud Run service with Cloud SQL. This spec fixes only the contract between them. |
+| Deployment | Two repositories: this one is public and generic; a private `precept-liquidator-infra` deploys it to its own GCP project as a single always-on Cloud Run service with Cloud SQL. This spec fixes only the contract between them. |
 | Implementer | The implementation plan will be executed by Claude Opus; phases are sized so each lands as one reviewable pull request. |
 
 ## 1. Scope and invariants
@@ -339,7 +344,7 @@ retained window, the tracker seeds the user set:
    Blend analytics API: `GET {SEED_URL}/v1/analytics/state/positions` with
    `healthFactorMax={SEED_HF_MAX}`, `poolId={pool}`, `limit=500`, following
    `nextCursor` until absent and reading `positions[].accountId`. The default
-   `SEED_URL` is `https://api.blend.templarfi.org`, which is keyless and free,
+   `SEED_URL` is `https://api.precept.templarfi.org`, which is keyless and free,
    so a third-party operator gets the same coverage. Pages are fetched with a
    small pause to stay under the anonymous rate limit. A failed seed is a
    warning and a notification, not a startup failure, and it is retried on
@@ -574,7 +579,7 @@ Environment variable or flag, flag winning, with clap's `env` derive.
 | `HIGH_FEE_PROFIT_THRESHOLD` | decimal, oracle units | 10 | |
 | `TX_POLL_LEDGERS` | u32 | 3 | |
 | `INVENTORY_REFRESH_SECS` | u64 | 30 | |
-| `SEED_URL` | URL | `https://api.blend.templarfi.org` | empty disables |
+| `SEED_URL` | URL | `https://api.precept.templarfi.org` | empty disables |
 | `SEED_HF_MAX` | decimal | 10 | |
 | `SEED_FILE` | path | unset | |
 | `STARTUP_DELAY_LEDGERS` | u32 | 0 | no submissions before this many ticks |
@@ -622,7 +627,7 @@ validation, prints the resolved (redacted) configuration, and exits 0 or 2.
 pool, user, auction type, ledger, and decoded error code as fields. Fills and
 creations are logged as dedicated events with every column the store records.
 
-**Metrics** are Prometheus text at `/metrics`, prefixed `blend_liquidator_`:
+**Metrics** are Prometheus text at `/metrics`, prefixed `precept_liquidator_`:
 ledger head and processed ledger gauges (lag is their difference), events
 processed, users tracked and auctions open per pool, creations and fills
 attempted, succeeded, and failed, skips by reason (`unsupported_assets`,
@@ -721,7 +726,7 @@ live run with small capital, is the last step before mainnet configuration.
 
 ## 10. Deployment contract
 
-What this repository guarantees to `blend-liquidator-infra` and to any other
+What this repository guarantees to `precept-liquidator-infra` and to any other
 operator:
 
 - A multi-stage, digest-pinned, non-root image published to GHCR on tags,

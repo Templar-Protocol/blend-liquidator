@@ -1,9 +1,18 @@
-# blend-liquidator on the ADR-0008 fork
+# precept-liquidator on the ADR-0008 fork
 
 **Status:** adopted direction. This document amends
-`docs/specs/2026-09-04-blend-liquidator-bot-design.md` (the bot design spec,
+`docs/specs/2026-09-04-precept-liquidator-bot-design.md` (the bot design spec,
 "the design spec" below) wherever the two disagree. Everything the design spec
 says that this document does not contradict still stands.
+
+**Since written (2026-11-09):** the fork repository was renamed to
+`Templar-Protocol/precept`, and has released `v0.1.0` (Guardian-audited) and
+`v0.1.1`, which every active mainnet market runs. This document's analysis is
+of the pre-release head `54afdae` below; the three ways `v0.1.1` differs from
+it that matter to the bot — two event topic layouts, a per-reserve
+`min_position`, and the default path's no-collateral gate — are listed in
+`docs/architecture.md` §6 until they are reconciled. §6's "the fork publishes
+no release" no longer holds.
 
 ## Source of truth
 

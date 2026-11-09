@@ -15,7 +15,7 @@ you do either.
 
 ## 1. Getting the image
 
-The image is published to `ghcr.io/templar-protocol/blend-liquidator`
+The image is published to `ghcr.io/templar-protocol/precept-liquidator`
 only on a `v*` tag push (`.github/workflows/release.yml`), tagged with
 the version the tag names — its leading `v` stripped, so the git tag
 `v0.1.0` publishes as image tag `0.1.0`, never `v0.1.0`
@@ -26,7 +26,7 @@ with the `read:packages` scope.
 
 ```bash
 echo "$GHCR_TOKEN" | docker login ghcr.io -u <github-username> --password-stdin
-docker pull ghcr.io/templar-protocol/blend-liquidator:<version>
+docker pull ghcr.io/templar-protocol/precept-liquidator:<version>
 ```
 
 Pin a specific version tag — never `:latest`. `:latest` moves to
@@ -96,7 +96,7 @@ docker run --rm --env-file check.env \
   -e RUN_MODE=check-config \
   -e POOLS_FILE=/config/pools.toml \
   -v "$PWD/pools.toml:/config/pools.toml:ro" \
-  ghcr.io/templar-protocol/blend-liquidator:<version>
+  ghcr.io/templar-protocol/precept-liquidator:<version>
 ```
 
 `check.env` is an environment file on a machine you control. Three
@@ -263,7 +263,7 @@ server on; `PORT` wins when both are set):
   holds, empty or not — safe to scrape before the bot has made a single
   decision.
 
-**Metrics**, all prefixed `blend_liquidator_`: per-pool ledger head and
+**Metrics**, all prefixed `precept_liquidator_`: per-pool ledger head and
 processed ledger and poller heartbeat, events processed, users tracked
 and auctions open; `creations_total`/`fills_total` by result
 (`attempted`/`succeeded`/`failed`); `skips_total` by reason;
@@ -284,9 +284,8 @@ notification at `High` severity on every `bad_debt` event — once per
 pool and account within `FAILURE_NOTIFICATION_COOLDOWN_HOURS` — because
 the fork it targets can never emit one. A stock pool emits one whenever a
 defaulted borrower's debt moves to the backstop — through the bot's own
-`bad_debt` call too — and stock pools are the only Blend v2 pools that
-exist today: the fork is deployed nowhere yet. On a stock pool the alert
-is expected; on a fork pool it means the wrong wasm is deployed.
+`bad_debt` call too. On a stock pool the alert is expected; on a Precept
+pool it means the wrong wasm is deployed.
 
 **The one thing never to do: run a deployment that holds a secret at
 `RUST_LOG=trace`.** That no secret reaches a log line holds at the

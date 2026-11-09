@@ -21,7 +21,7 @@
 //! holds no key and sends nothing, and it is why the command above names
 //! the RPC explicitly.
 //!
-//! `creations` and `fills` have no read method on [`blend_liquidator::store::Store`]
+//! `creations` and `fills` have no read method on [`precept_liquidator::store::Store`]
 //! — the bot only ever writes them — so this example reads both with
 //! runtime `sqlx::query_as`, never the compile-time `sqlx::query!`/
 //! `query_as!` macros: those are checked against the committed `.sqlx/`
@@ -33,9 +33,9 @@
 
 use std::error::Error;
 
-use blend_liquidator::chain::pool::PoolReader;
-use blend_liquidator::chain::rpc::RpcClient;
-use blend_liquidator::store::Store;
+use precept_liquidator::chain::pool::PoolReader;
+use precept_liquidator::chain::rpc::RpcClient;
+use precept_liquidator::store::Store;
 
 /// One `creations` row, read at runtime — see the module doc.
 #[derive(sqlx::FromRow)]

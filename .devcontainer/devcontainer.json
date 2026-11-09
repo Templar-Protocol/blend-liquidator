@@ -1,5 +1,5 @@
 {
-  "name": "blend-liquidator",
+  "name": "precept-liquidator",
   // Image is pinned by digest (not just a mutable major tag) so a container
   // rebuild can't silently pull a different image without a reviewed PR.
   // The tag is kept alongside the digest for readability; the digest is
@@ -56,9 +56,20 @@
   // keychain), which is why gh gets a volume rather than a fresh
   // `gh auth login` on every rebuild. `docker volume rm` both if you hand
   // this machine over.
+  //
+  // Both were named `blend-liquidator-*` before the repository was renamed,
+  // and a rename is a new, empty volume: the first rebuild after it starts
+  // logged out of both. To carry the logins over, copy each volume once, on
+  // the host, before rebuilding:
+  //   for v in claude-code gh-config; do
+  //     docker volume create "precept-liquidator-$v"
+  //     docker run --rm -v "blend-liquidator-$v:/from:ro" \
+  //       -v "precept-liquidator-$v:/to" alpine cp -a /from/. /to/
+  //   done
+  // then `docker volume rm` the two old ones once the new container works.
   "mounts": [
-    "source=blend-liquidator-claude-code,target=/home/vscode/.claude,type=volume",
-    "source=blend-liquidator-gh-config,target=/home/vscode/.config/gh,type=volume"
+    "source=precept-liquidator-claude-code,target=/home/vscode/.claude,type=volume",
+    "source=precept-liquidator-gh-config,target=/home/vscode/.config/gh,type=volume"
   ],
   // Toolchain, CI-parity tooling and the cargo cache warm-up. Kept in a script
   // rather than inlined here so each step can carry the reasoning for why it

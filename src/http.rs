@@ -576,7 +576,7 @@ mod tests {
             .expect("ascii content-type");
         assert!(content_type.starts_with("text/plain; version=0.0.4"));
         let body = response.text().await.expect("metrics body");
-        assert!(body.contains("# TYPE blend_liquidator_ledger_head gauge"));
+        assert!(body.contains("# TYPE precept_liquidator_ledger_head gauge"));
 
         let response = client
             .get(format!("{base}/nope"))
