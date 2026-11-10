@@ -176,21 +176,14 @@ bot does about each difference, is written down in
 release, `v0.1.1` its rebuild with small post-audit changes, and every
 active mainnet market runs `v0.1.1` wasm (`registry/mainnet.jsonl` in the
 Precept repository). The reconciliation above was made against the fork's
-pre-release head, `54afdae`, and `v0.1.1` differs from it in three ways
-the bot does not handle yet:
-
-- `defaulted_debt` and `debt_setoff` carry the user in topic 1 and the
-  asset in topic 2, where `54afdae` carried the asset alone — so
-  `chain::xdr::events` refuses both shapes it now sees, and the poller
-  skips each such event with a warning;
-- every reserve has a `min_position`: a `SupplyCollateral` or
-  `WithdrawCollateral` that leaves a nonzero collateral position below it
-  fails `1224 MinCollateralNotMet`, which neither `plan_fill` nor
-  `plan_unwind` models;
-- `check_and_handle_user_bad_debt` defaults a borrower holding no
-  collateral without pricing anything, where `math::setoff` values the
-  position first and so fails on an unpriced reserve the contract would
-  not have read.
+pre-release head, `54afdae`; the three ways `v0.1.1` differs from it are
+reconciled in `docs/specs/2026-11-09-precept-v0.1.1-reconciliation.md`:
+`defaulted_debt` and `debt_setoff` carry the user in topic 1 and decode
+with it, every reserve's `min_position` is modelled by `plan_fill`,
+`plan_unwind` and startup validation, and a borrower holding no collateral
+is defaulted and decided as bad debt without needing a price (Guardian
+L-01): the snapshot still reads the oracle, but a reserve it cannot price
+no longer blocks the decision.
 
 The bot still runs against stock Blend v2 pools as well, and three
 things follow from that:

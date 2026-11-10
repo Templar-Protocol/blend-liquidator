@@ -10,8 +10,8 @@ says that this document does not contradict still stands.
 `v0.1.1`, which every active mainnet market runs. This document's analysis is
 of the pre-release head `54afdae` below; the three ways `v0.1.1` differs from
 it that matter to the bot — two event topic layouts, a per-reserve
-`min_position`, and the default path's no-collateral gate — are listed in
-`docs/architecture.md` §6 until they are reconciled. The Verification basis
+`min_position`, and the default path's no-collateral gate — are reconciled
+in `2026-11-09-precept-v0.1.1-reconciliation.md`. The Verification basis
 below and §6 both say the fork publishes no release; neither holds any more.
 
 ## Source of truth
@@ -43,8 +43,9 @@ publication, release, deployment, activation, or handling funds." The
 repository had no releases and no tags, and the branch head could be
 re-pushed; §7 records what that costs. **That no longer holds (2026-11-09):**
 the fork is released (`v0.1.0`, `v0.1.1`) and live on mainnet, and `v0.1.1`
-differs from the `54afdae` read here in three ways the bot does not handle
-yet — see the note at the top of this document.
+differs from the `54afdae` read here in three ways, reconciled in
+`2026-11-09-precept-v0.1.1-reconciliation.md` — see the note at the top of
+this document.
 
 ---
 

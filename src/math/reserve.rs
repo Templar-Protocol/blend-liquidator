@@ -28,6 +28,11 @@ pub struct ReserveConfig {
     pub r_three: u32,
     pub reactivity: u32,
     pub supply_cap: i128,
+    /// The least underlying a nonzero collateral position in this reserve
+    /// may hold (Precept `v0.1.1`, `pool/src/storage.rs:71`). Zero on a
+    /// reserve whose entry does not carry the field — stock, and fork
+    /// builds before Guardian L-02 — which disables the rule.
+    pub min_position: i128,
     pub enabled: bool,
 }
 
@@ -104,6 +109,16 @@ impl Reserve {
     /// b-tokens to underlying, rounded down (the supplier gets the floor).
     pub fn to_asset_from_b_token(&self, b_tokens: i128) -> Result<i128, MathError> {
         mul_floor(b_tokens, self.data.b_rate, SCALAR_12)
+    }
+
+    /// Whether a collateral position of `b_tokens` passes Precept's
+    /// `require_min_position` (`pool/src/pool/actions.rs:418-423`): its
+    /// underlying, rounded down exactly as the contract values it, is zero
+    /// or at least `min_position`. The contract checks it after every
+    /// `SupplyCollateral` and `WithdrawCollateral` and refuses with `1224`.
+    pub fn meets_min_position(&self, b_tokens: i128) -> Result<bool, MathError> {
+        let position = self.to_asset_from_b_token(b_tokens)?;
+        Ok(position == 0 || position >= self.config.min_position)
     }
 
     /// d-tokens to effective liability: underlying divided by `l_factor`, up.
@@ -296,6 +311,7 @@ mod tests {
             r_three: 50_000_000,
             reactivity: 50,
             supply_cap: 100_000_000_000_000_000,
+            min_position: 0,
             enabled: true,
         }
     }
@@ -328,6 +344,30 @@ mod tests {
             last_time: 0,
         };
         Reserve::new("XLM".to_string(), config, data).expect("7 decimals fit")
+    }
+
+    /// Precept's `require_min_position`: a collateral position passes when
+    /// its underlying, rounded down as the contract rounds it, is zero or
+    /// at least `min_position`.
+    #[test]
+    fn a_position_meets_min_position_only_at_zero_or_at_least_it() {
+        let mut reserve = simple_reserve();
+        reserve.data.b_rate = SCALAR_12;
+        reserve.config.min_position = 500;
+        assert!(reserve.meets_min_position(0).expect("zero"));
+        assert!(!reserve.meets_min_position(499).expect("one under"));
+        assert!(reserve.meets_min_position(500).expect("exactly"));
+        assert!(reserve.meets_min_position(10_000).expect("over"));
+
+        // At b_rate 1.1 the contract floors: 454 b-tokens are 499.4 → 499,
+        // 455 are 500.5 → 500.
+        reserve.data.b_rate = 1_100_000_000_000;
+        assert!(!reserve.meets_min_position(454).expect("floors under"));
+        assert!(reserve.meets_min_position(455).expect("floors onto it"));
+
+        // Zero disables the rule.
+        reserve.config.min_position = 0;
+        assert!(reserve.meets_min_position(1).expect("disabled"));
     }
 
     #[test]
@@ -475,6 +515,7 @@ mod tests {
             r_three: 50_000_000,
             reactivity: 5,
             supply_cap: 100_000_000_000_000_000,
+            min_position: 0,
             enabled: true,
         };
         let ir_mod = 10_000_000; // SCALAR_7: a neutral 1.0 multiplier.
@@ -539,6 +580,7 @@ mod tests {
             r_three: 50_000_000,
             reactivity: 50,
             supply_cap: 100_000_000_000_000_000,
+            min_position: 0,
             enabled: true,
         };
         let ir_mod = 10_000_000; // SCALAR_7

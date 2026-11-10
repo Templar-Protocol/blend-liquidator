@@ -15,9 +15,9 @@ whoever is watching.
 > for, fills auctions — its own and anyone else's — that its pool
 > configuration supports, and unwinds the position a fill leaves it
 > holding back to its own wallet. Its contract reconciliation was made
-> against Precept's pre-release head (`54afdae`), not yet the `v0.1.1`
-> release live markets run; see `CLAUDE.md` for the differences still
-> open. Dry-run is the default: nothing is
+> against Precept's pre-release head (`54afdae`) and extended to the
+> `v0.1.1` release live markets run
+> (`docs/specs/2026-11-09-precept-v0.1.1-reconciliation.md`). Dry-run is the default: nothing is
 > created or filled on chain until `DRY_RUN=false` is set explicitly.
 > Armed, it is custodial — it holds a signing key and submits
 > transactions itself, which is the point of a liquidation bot (see

@@ -584,7 +584,7 @@ impl<'a> Auctioneer<'a> {
     /// The pool contract is a `Positions` holder on the fork this bot
     /// targets: a defaulting borrower's leftover collateral is confiscated
     /// into the pool's own address as ordinary supply
-    /// (`pool/src/pool/bad_debt.rs:98-109`). It holds no liabilities, so
+    /// (`pool/src/pool/bad_debt.rs:104-116`). It holds no liabilities, so
     /// there is nothing to liquidate, and the contract refuses
     /// `user == e.current_contract_address()` with 1211 in any case — but a
     /// seed source that lists the pool would otherwise cost a chain read
@@ -626,14 +626,39 @@ impl<'a> Auctioneer<'a> {
         {
             return Ok(Decision::Skip(SkipReason::AuctionOpen));
         }
+        // Guardian L-01 (Precept `pool/src/pool/bad_debt.rs:60-74`): the
+        // contract's default path reads no price for a borrower whose every
+        // collateral entry is zero, so neither does this decision. Without
+        // this check, a debt in a reserve the oracle cannot price would make
+        // the borrower undecidable here while `bad_debt(user)` succeeds.
+        if let Some(positions) = snapshot.positions.get(account) {
+            if !positions.liabilities.is_empty()
+                && !positions.collateral.values().any(|b_tokens| *b_tokens > 0)
+            {
+                // No price is needed, but every liability must still name a
+                // reserve the snapshot holds: one it does not is an incomplete
+                // view, and keeping it a per-borrower `MissingReserve` leaves
+                // the borrower undecided (its flag moved forward) rather than
+                // proposed for `bad_debt`.
+                for index in positions.liabilities.keys() {
+                    if !reserves.contains_key(index) {
+                        return Err(MathError::MissingReserve(*index).into());
+                    }
+                }
+                return Ok(Decision::BadDebt);
+            }
+        }
         let Some(data) = snapshot.position_data(account, valued_at)? else {
             return Ok(Decision::Skip(SkipReason::NoLiabilities));
         };
-        // The contract's own gate, read the same way it reads it:
-        // `check_and_handle_user_bad_debt` returns early unless the
-        // borrower has liabilities *and* `collateral_raw == 0`
-        // (`pool/src/pool/bad_debt.rs:56-58`). `collateral_base` is
-        // c-factor weighted, so a borrower holding a zero-factor reserve
+        // The priced half of the contract's own gate, read the same way it
+        // reads it: `check_and_handle_user_bad_debt` returns early unless
+        // the borrower has liabilities *and* `collateral_raw == 0`
+        // (`pool/src/pool/bad_debt.rs:60-74`). A borrower with liabilities
+        // who reaches this line holds a collateral entry above zero, since
+        // the check above has already settled every other case without a
+        // price. `collateral_base`
+        // is c-factor weighted, so a borrower holding a zero-factor reserve
         // has `collateral_base == 0` with collateral still there, and
         // proposing `bad_debt` for it costs a simulation and a flag for
         // an answer that is always 1200.
@@ -1688,6 +1713,96 @@ mod tests {
         Ok(())
     }
 
+    /// `script_snapshot_with_positions`, except that `unpriced`'s
+    /// `lastprice` answers `Void` — the oracle has no price for it, which
+    /// `chain::xdr::decode::price_data` reads as no price at all.
+    fn script_snapshot_with_positions_unpriced(
+        rpc: &ScriptedRpc,
+        account: &str,
+        collateral: &[(u32, i128)],
+        liabilities: &[(u32, i128)],
+        unpriced: &str,
+    ) {
+        let fixture = mainnet_fixed_v2();
+        let ledger = fixture["ledger"].as_u64().expect("ledger");
+        rpc.expect(
+            "getLedgerEntries",
+            json!({"latestLedger": ledger, "entries": [
+                entry(&keys::instance(POOL).expect("key"), text(&fixture, &["instance_entry_xdr"])),
+                entry(&keys::reserve_list(POOL).expect("key"), text(&fixture, &["res_list_entry_xdr"])),
+            ]}),
+        );
+        let mut entries = Vec::new();
+        for reserve in fixture["reserves"].as_array().expect("reserves") {
+            let asset = reserve["asset"].as_str().expect("asset");
+            entries.push(entry(
+                &keys::reserve_config(POOL, asset).expect("key"),
+                reserve["config_entry_xdr"].as_str().expect("config"),
+            ));
+            entries.push(entry(
+                &keys::reserve_data(POOL, asset).expect("key"),
+                reserve["data_entry_xdr"].as_str().expect("data"),
+            ));
+        }
+        entries.push(entry(
+            &keys::positions(POOL, account).expect("key"),
+            &positions_entry_xdr(account, collateral, liabilities),
+        ));
+        rpc.expect(
+            "getLedgerEntries",
+            json!({"latestLedger": ledger, "entries": entries}),
+        );
+        let ledger = u32::try_from(ledger).expect("ledger fits");
+        rpc.expect(
+            "simulateTransaction",
+            simulation(text(&fixture, &["oracle_decimals_return_xdr"]), ledger),
+        );
+        for reserve in fixture["reserves"].as_array().expect("reserves") {
+            let asset = reserve["asset"].as_str().expect("asset");
+            let return_xdr = if asset == unpriced {
+                to_base64(&ScVal::Void).expect("encodes")
+            } else {
+                reserve["lastprice_return_xdr"]
+                    .as_str()
+                    .expect("price")
+                    .to_string()
+            };
+            rpc.expect("simulateTransaction", simulation(&return_xdr, ledger));
+        }
+    }
+
+    /// Guardian L-01: the contract's default path reads no price for a
+    /// borrower holding no collateral, so a debt in a reserve the oracle
+    /// cannot price is still bad debt here too.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_unpriced_debt_with_no_collateral_is_still_bad_debt(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let account = synthetic_account(2);
+        let fixture = mainnet_fixed_v2();
+        let debt_asset = fixture["reserves"][1]["asset"]
+            .as_str()
+            .expect("asset")
+            .to_string();
+        script_snapshot_with_positions_unpriced(
+            &rpc,
+            &account,
+            &[],
+            &[(1, 10_000_000_000)],
+            &debt_asset,
+        );
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let auctioneer = Auctioneer::new(&client, &store, config(BTreeSet::new()), None);
+        let decisions = auctioneer
+            .decide(POOL, &[tracked_user(&account)], harness::fixture_tick())
+            .await
+            .expect("decide");
+        assert_eq!(decisions, vec![(account, Decision::BadDebt)]);
+        Ok(())
+    }
+
     /// None of the fixture's three reserves has `c_factor == 0` — they are
     /// `7_500_000` (index 0, XLM), `9_500_000` (index 1, USDC) and
     /// `9_500_000` (index 2) — so this exercises the fallback the task
@@ -1716,7 +1831,7 @@ mod tests {
 
     /// The contract gates its default path on `collateral_raw`, not on
     /// the c-factor-weighted `collateral_base`
-    /// (`pool/src/pool/bad_debt.rs:56-58` returns early unless the
+    /// (`pool/src/pool/bad_debt.rs:60-74` returns early unless the
     /// borrower has liabilities *and* `collateral_raw == 0`). A borrower
     /// holding a dust amount of `DUST_C_FACTOR_INDEX` therefore has
     /// `collateral_base == 0` (the weighted value floors away) and

@@ -7,14 +7,17 @@
 //! *modelled* event with an unexpected shape is an error, because that means
 //! a shape this bot depends on has changed.
 //!
-//! `DefaultedDebt`, `DebtSetoff` and `OrphanSettled` name no account
-//! (`PoolEvent::affected_accounts` answers none for them): a `b_rate` cut
-//! that lowers every borrower's position in that reserve flags nobody for
-//! a targeted re-read, and a `bad_debt(user)` call whose set-off clears the
-//! debt entirely from the borrower's own supply emits only `DebtSetoff` —
-//! no user-bearing event at all — so that borrower's row goes stale until
-//! the next full scan reaches it. A known bound of event-driven tracking,
-//! not a defect this module can close on its own.
+//! `OrphanSettled` names no account (`PoolEvent::affected_accounts` answers
+//! none for it), and neither do the two-topic `DefaultedDebt` and
+//! `DebtSetoff` that stock pools and pre-release fork builds emit. On
+//! Precept `v0.1.1` both carry the defaulted user in topic 1 — the
+//! borrower, or the backstop on the backstop path, which the tracker's
+//! re-read then finds with no liabilities — so the tracker
+//! re-reads that account in the tick that changed them, a `bad_debt(user)`
+//! whose set-off clears the debt from the borrower's own supply included.
+//! A `b_rate` cut still lowers every other position in that reserve without
+//! naming any of them: those rows catch up at the next full scan, a known
+//! bound of event-driven tracking.
 
 use stellar_xdr::ScVal;
 
@@ -107,15 +110,23 @@ pub enum PoolEvent {
         d_tokens: i128,
     },
     /// Debt destroyed and the reserve's `b_rate` cut so suppliers absorb
-    /// the loss. Verbatim from stock, but the fork emits it on two paths:
-    /// the backstop's, and the user path `check_and_handle_user_bad_debt`
-    /// runs inside a full liquidation fill — the event a modelled full
-    /// fill's projected haircut (`math::setoff`) causes.
-    DefaultedDebt { asset: String, d_tokens: i128 },
+    /// the loss. The fork emits it on two paths: the backstop's, and the
+    /// user path `check_and_handle_user_bad_debt` runs inside a full
+    /// liquidation fill — the event a modelled full fill's projected
+    /// haircut (`math::setoff`) causes. `user` is topic 1 on Precept
+    /// `v0.1.1`, `["defaulted_debt", user, asset]`, and `None` on the
+    /// two-topic stock shape.
+    DefaultedDebt {
+        user: Option<String>,
+        asset: String,
+        d_tokens: i128,
+    },
     /// The fork's set-off: before declaring a default it repays what it
-    /// can from the borrower's own supply in the debt reserve. Names no
-    /// account — the event carries only the asset.
+    /// can from the borrower's own supply in the debt reserve. `user` is
+    /// topic 1 on Precept `v0.1.1`, `["debt_setoff", user, asset]`, and
+    /// `None` on the two-topic shape of fork builds before it.
     DebtSetoff {
+        user: Option<String>,
         asset: String,
         b_tokens_burned: i128,
         d_tokens_repaid: i128,
@@ -159,10 +170,16 @@ impl PoolEvent {
             Self::NewAuction { user, .. }
             | Self::DeleteAuction { user, .. }
             | Self::CollateralOrphaned { user, .. }
-            | Self::BadDebt { user, .. } => vec![user],
+            | Self::BadDebt { user, .. }
+            | Self::DefaultedDebt {
+                user: Some(user), ..
+            }
+            | Self::DebtSetoff {
+                user: Some(user), ..
+            } => vec![user],
             Self::FillAuction { user, filler, .. } => vec![user, filler],
-            Self::DefaultedDebt { .. }
-            | Self::DebtSetoff { .. }
+            Self::DefaultedDebt { user: None, .. }
+            | Self::DebtSetoff { user: None, .. }
             | Self::OrphanSettled { .. }
             | Self::SetReserve { .. }
             | Self::SetStatus { .. } => Vec::new(),
@@ -229,6 +246,26 @@ fn require_topics(
             expected: message,
             got: format!("{} topics", topics.len()),
         })
+    }
+}
+
+/// `[name, user, asset]` (Precept `v0.1.1`) or `[name, asset]` (stock and
+/// fork builds before it): the user when the event names one, and the
+/// asset. Any other topic count is a shape error naming `message`.
+fn user_and_asset(
+    topics: &[ScVal],
+    message: &'static str,
+) -> Result<(Option<String>, String), XdrError> {
+    match topics.len() {
+        3 => Ok((
+            Some(as_address(topic(topics, 1)?)?),
+            as_address(topic(topics, 2)?)?,
+        )),
+        2 => Ok((None, as_address(topic(topics, 1)?)?)),
+        count => Err(XdrError::Shape {
+            expected: message,
+            got: format!("{count} topics"),
+        }),
     }
 }
 
@@ -391,17 +428,19 @@ fn decode_admin_event(
             }
         }
         "defaulted_debt" => {
-            require_topics(topics, 2, "defaulted_debt with 2 topics")?;
+            let (user, asset) = user_and_asset(topics, "defaulted_debt with 2 or 3 topics")?;
             PoolEvent::DefaultedDebt {
-                asset: as_address(topic(topics, 1)?)?,
+                user,
+                asset,
                 d_tokens: as_i128(value)?,
             }
         }
         "debt_setoff" => {
-            require_topics(topics, 2, "debt_setoff with 2 topics")?;
+            let (user, asset) = user_and_asset(topics, "debt_setoff with 2 or 3 topics")?;
             let items = data(value, 2)?;
             PoolEvent::DebtSetoff {
-                asset: as_address(topic(topics, 1)?)?,
+                user,
+                asset,
                 b_tokens_burned: as_i128(&items[0])?,
                 d_tokens_repaid: as_i128(&items[1])?,
             }
@@ -671,24 +710,105 @@ mod tests {
         );
     }
 
+    /// Precept `v0.1.1` (`pool/src/events.rs:179-197`): the borrower in
+    /// topic 1, the asset in topic 2.
     #[test]
-    fn decodes_a_constructed_debt_setoff() {
-        // Fork `PoolEvents::debt_setoff`: 2 topics, data `(b_tokens_burned,
-        // d_tokens_repaid)`.
+    fn a_v0_1_1_defaulted_debt_names_its_user() {
         let topics = vec![
+            symbol("defaulted_debt").expect("symbol"),
+            address(USER).expect("address"),
+            address(USDC).expect("address"),
+        ];
+        let event = decode_pool_event(&topics, &i128_val(9_999))
+            .expect("decodes")
+            .expect("modelled");
+        assert_eq!(
+            event,
+            PoolEvent::DefaultedDebt {
+                user: Some(USER.to_string()),
+                asset: USDC.to_string(),
+                d_tokens: 9_999,
+            }
+        );
+        assert_eq!(event.affected_accounts(), vec![USER]);
+    }
+
+    #[test]
+    fn a_v0_1_1_debt_setoff_names_its_user() {
+        let topics = vec![
+            symbol("debt_setoff").expect("symbol"),
+            address(USER).expect("address"),
+            address(USDC).expect("address"),
+        ];
+        let value =
+            crate::chain::xdr::encode::vec(vec![i128_val(1_200), i128_val(950)]).expect("data");
+        let event = decode_pool_event(&topics, &value)
+            .expect("decodes")
+            .expect("modelled");
+        assert_eq!(
+            event,
+            PoolEvent::DebtSetoff {
+                user: Some(USER.to_string()),
+                asset: USDC.to_string(),
+                b_tokens_burned: 1_200,
+                d_tokens_repaid: 950,
+            }
+        );
+        assert_eq!(event.affected_accounts(), vec![USER]);
+    }
+
+    /// The two-topic shape stock pools and pre-release fork builds emit
+    /// still decodes, naming nobody.
+    #[test]
+    fn the_two_topic_shapes_still_decode_with_no_user() {
+        let defaulted = vec![
+            symbol("defaulted_debt").expect("symbol"),
+            address(USDC).expect("address"),
+        ];
+        let event = decode_pool_event(&defaulted, &i128_val(7))
+            .expect("decodes")
+            .expect("modelled");
+        assert_eq!(
+            event,
+            PoolEvent::DefaultedDebt {
+                user: None,
+                asset: USDC.to_string(),
+                d_tokens: 7,
+            }
+        );
+        assert!(event.affected_accounts().is_empty());
+
+        let setoff = vec![
             symbol("debt_setoff").expect("symbol"),
             address(USDC).expect("address"),
         ];
         let value =
             crate::chain::xdr::encode::vec(vec![i128_val(1_200), i128_val(950)]).expect("data");
+        let event = decode_pool_event(&setoff, &value)
+            .expect("decodes")
+            .expect("modelled");
         assert_eq!(
-            decode_pool_event(&topics, &value).expect("decodes"),
-            Some(PoolEvent::DebtSetoff {
+            event,
+            PoolEvent::DebtSetoff {
+                user: None,
                 asset: USDC.to_string(),
                 b_tokens_burned: 1_200,
                 d_tokens_repaid: 950,
-            })
+            }
         );
+        assert!(event.affected_accounts().is_empty());
+    }
+
+    /// Any other topic count is a shape this bot does not know: an error.
+    #[test]
+    fn a_defaulted_debt_with_four_topics_is_an_error() {
+        let topics = vec![
+            symbol("defaulted_debt").expect("symbol"),
+            address(USER).expect("address"),
+            address(USDC).expect("address"),
+            address(XLM).expect("address"),
+        ];
+        assert!(decode_pool_event(&topics, &i128_val(1)).is_err());
     }
 
     #[test]
@@ -746,10 +866,15 @@ mod tests {
         assert!(decode_pool_event(&setoff, &i128_val(1)).is_err());
     }
 
-    /// Only `collateral_orphaned` names an account; the other two are
-    /// reserve-wide and name nobody, like `defaulted_debt`.
+    /// `orphan_settled` stays reserve-wide on `v0.1.1` and names nobody.
     #[test]
-    fn only_collateral_orphaned_names_an_account() {
+    fn orphan_settled_names_no_account() {
+        assert!(PoolEvent::OrphanSettled {
+            asset: XLM.to_string(),
+            b_tokens: 1,
+        }
+        .affected_accounts()
+        .is_empty());
         assert_eq!(
             PoolEvent::CollateralOrphaned {
                 user: USER.to_string(),
@@ -759,19 +884,6 @@ mod tests {
             .affected_accounts(),
             vec![USER]
         );
-        assert!(PoolEvent::DebtSetoff {
-            asset: USDC.to_string(),
-            b_tokens_burned: 1,
-            d_tokens_repaid: 1,
-        }
-        .affected_accounts()
-        .is_empty());
-        assert!(PoolEvent::OrphanSettled {
-            asset: XLM.to_string(),
-            b_tokens: 1,
-        }
-        .affected_accounts()
-        .is_empty());
     }
 
     #[test]

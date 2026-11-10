@@ -225,7 +225,12 @@ async fn validate(
             Some(_) => {}
         }
 
-        validate_primary_asset(&pool.address, &pool.primary_asset, &snapshot)?;
+        validate_primary_asset(
+            &pool.address,
+            &pool.primary_asset,
+            pool.min_primary_collateral,
+            &snapshot,
+        )?;
         validate_supported_assets(&pool.address, &pool.supported_bid, &snapshot)?;
         validate_supported_assets(&pool.address, &pool.supported_lot, &snapshot)?;
 
@@ -277,11 +282,15 @@ async fn validate(
 }
 
 /// The primary asset must be a reserve the pool can actually hold as
-/// collateral: listed, enabled, and with a positive collateral factor.
-/// Every failure names the asset, since that is what an operator fixes.
+/// collateral: listed, enabled, and with a positive collateral factor — and
+/// `min_primary_collateral` a floor the pool can hold it at: zero or at
+/// least the reserve's `min_position`, since Precept refuses every
+/// withdrawal that would leave a nonzero position under it. Every failure
+/// names the asset, since that is what an operator fixes.
 fn validate_primary_asset(
     pool: &str,
     asset: &str,
+    min_primary_collateral: i128,
     snapshot: &PoolSnapshot,
 ) -> Result<(), LiquidatorError> {
     let reserve = snapshot
@@ -301,6 +310,13 @@ fn validate_primary_asset(
     if reserve.config.c_factor == 0 {
         return Err(LiquidatorError::Config(format!(
             "pool {pool}: primary asset {asset} has no collateral factor"
+        )));
+    }
+    let min_position = reserve.config.min_position;
+    if min_primary_collateral > 0 && min_primary_collateral < min_position {
+        return Err(LiquidatorError::Config(format!(
+            "pool {pool}: min_primary_collateral {min_primary_collateral} is under primary \
+             asset {asset}'s min_position {min_position}; set it to 0 or at least {min_position}"
         )));
     }
     Ok(())
@@ -3059,6 +3075,7 @@ mod tests {
         asset: &'static str,
         enabled: bool,
         c_factor: u32,
+        min_position: i128,
         price: Option<i128>,
     }
 
@@ -3134,6 +3151,10 @@ mod tests {
             (symbol("index").unwrap(), ScVal::U32(index)),
             (symbol("l_factor").unwrap(), ScVal::U32(0)),
             (symbol("max_util").unwrap(), ScVal::U32(9_500_000)),
+            (
+                symbol("min_position").unwrap(),
+                i128_val(reserve.min_position),
+            ),
             (symbol("r_base").unwrap(), ScVal::U32(0)),
             (symbol("r_one").unwrap(), ScVal::U32(0)),
             (symbol("r_three").unwrap(), ScVal::U32(0)),
@@ -3273,6 +3294,7 @@ mod tests {
             asset: USDC,
             enabled: true,
             c_factor: 7_500_000,
+            min_position: 0,
             price: Some(10_000_000),
         }
     }
@@ -3471,6 +3493,49 @@ mod tests {
             message.contains(BACKSTOP_A) && message.contains(BACKSTOP_B),
             "the message should name both backstops: {message}"
         );
+        Ok(())
+    }
+
+    /// A floor strictly between zero and the primary reserve's
+    /// `min_position` can never be reached — Precept refuses every
+    /// withdrawal that would rest on it — so it is a configuration error;
+    /// zero and anything at or above it pass.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_primary_floor_under_min_position_is_refused(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let _store = Store::from_pool(db);
+        let reserve = SyntheticReserve {
+            min_position: 500_000_000,
+            ..usable_reserve()
+        };
+        for (floor, refused) in [
+            (1, true),
+            (499_999_999, true),
+            (0, false),
+            (500_000_000, false),
+        ] {
+            let rpc = ScriptedRpc::start().await;
+            script_pool(
+                &rpc,
+                POOL_A,
+                BACKSTOP_A,
+                PoolStatus::Active.code(),
+                &[reserve],
+                LEDGER,
+            );
+            let client = RpcClient::new(&rpc.url(), None).expect("client");
+            let pool = PoolConfig {
+                min_primary_collateral: floor,
+                ..pool_config(POOL_A, USDC, &["*"], &["*"])
+            };
+            let result = validate(&client, &[pool]).await;
+            if refused {
+                let error = result.expect_err("an unreachable floor").to_string();
+                assert!(error.contains("min_position"), "{error}");
+                assert!(error.contains("500000000"), "{error}");
+            } else {
+                assert!(result.is_ok(), "{floor}: {result:?}");
+            }
+        }
         Ok(())
     }
 

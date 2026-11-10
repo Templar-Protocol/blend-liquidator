@@ -37,6 +37,11 @@
 //! - **8.** Withdrawal amounts are found by formula and *verified by exact
 //!   projection*, backing off in bounded steps when the projection
 //!   disagrees. No amount reaches a plan unprojected.
+//! - **9.** No partial withdrawal leaves a position above zero and under
+//!   its reserve's `min_position` (Precept `v0.1.1`): partials are capped
+//!   to keep `to_b_token_up(min_position)` b-tokens, a position already
+//!   under it goes whole or not at all, and every withdrawal is verified
+//!   against [`Reserve::meets_min_position`] before it is planned.
 //!
 //! Values are in the pool oracle's units (`OraclePrices::scalar`), the units
 //! `PositionData` reports; amounts in an [`UnwindAction`] are underlying, in
@@ -371,7 +376,19 @@ fn withdraw_free(
     if excess <= 0 || dust(terms, excess)? {
         return Ok(());
     }
-    *positions = after_withdrawal(inputs, positions, primary, excess)?;
+    let next = after_withdrawal(inputs, positions, primary, excess)?;
+    // The excess stops at `min_primary_collateral`, which startup
+    // validation (`validate_primary_asset`) guarantees is zero or at least
+    // the reserve's `min_position` on every pool the bot runs, so the
+    // remainder is never left under it there. The check below stays as
+    // verification: every withdrawal in this module is verified rather
+    // than assumed. Should the remainder sit under it anyway, nothing is
+    // sent — a whole withdrawal is the only one the rule allows there, and
+    // step 2 does not plan that one.
+    if !reserve.meets_min_position(next.collateral.get(&primary).copied().unwrap_or(0))? {
+        return Ok(());
+    }
+    *positions = next;
     actions.push(UnwindAction::Withdraw {
         asset: reserve.asset.clone(),
         amount: excess,
@@ -534,8 +551,9 @@ fn withdraw_candidate(
 /// the price (`mul_ceil(base, reserve.scalar, price)`), underlying through
 /// the collateral factor (`div_ceil(effective, c_factor, SCALAR_7)`), and
 /// b-tokens through `b_rate` (`to_b_token_up`). What goes is the position
-/// less that, never taking the primary below `to_b_token_up`'s image of its
-/// own floor, converted back to the request's underlying with
+/// less that, never taking any asset below `to_b_token_up(min_position)` —
+/// and the primary below the larger of that and `to_b_token_up`'s image of
+/// its own floor — converted back to the request's underlying with
 /// `to_asset_from_b_token` — which rounds down, so the contract's
 /// `to_b_token_up(amount)` burns no more than the formula allowed.
 ///
@@ -598,11 +616,16 @@ fn partial(
         SCALAR_7,
     )?)?;
     let mut goes = held.checked_sub(stays).ok_or(MathError::Overflow)?;
+    // What stays of any partial: the reserve's `min_position` — Precept
+    // refuses a `WithdrawCollateral` that leaves a nonzero position under
+    // it — and, for the primary, its own floor, whichever is larger. Both
+    // in b-tokens rounded up, so the kept value is at least `min_position`.
     let is_primary = index == primary_index(terms, inputs)?;
+    let mut floor = reserve.to_b_token_up(reserve.config.min_position.max(0))?;
     if is_primary {
-        let floor = reserve.to_b_token_up(terms.min_primary_collateral.max(0))?;
-        goes = goes.min(held.checked_sub(floor).ok_or(MathError::Overflow)?);
+        floor = floor.max(reserve.to_b_token_up(terms.min_primary_collateral.max(0))?);
     }
+    goes = goes.min(held.checked_sub(floor).ok_or(MathError::Overflow)?);
     if goes <= 0 {
         return Ok(());
     }
@@ -637,11 +660,15 @@ fn take_withdrawal(
         return Ok(false);
     }
     let next = after_withdrawal(inputs, positions, index, amount)?;
+    let reserve = reserve_at(inputs, index)?;
+    if !reserve.meets_min_position(next.collateral.get(&index).copied().unwrap_or(0))? {
+        return Ok(false);
+    }
     if !bounds.accepts(&project(inputs, &next)?)? {
         return Ok(false);
     }
     actions.push(UnwindAction::Withdraw {
-        asset: reserve_at(inputs, index)?.asset.clone(),
+        asset: reserve.asset.clone(),
         amount,
     });
     *positions = next;
@@ -764,6 +791,7 @@ mod tests {
                 r_three: 0,
                 reactivity: 0,
                 supply_cap: i128::MAX,
+                min_position: 0,
                 enabled: true,
             },
             ReserveData {
@@ -1310,6 +1338,109 @@ mod tests {
             &BTreeMap::new(),
         );
         assert_eq!(unwound.actions, vec![withdraw_all(XLM)]);
+    }
+
+    /// `a_wallet_short_of_the_debt_withdraws_within_the_floor`, with a
+    /// 15,000 XLM `min_position`: the margin would let 73_052_631_560 go,
+    /// but that leaves 126_947_368_440 — under it — so the partial stops
+    /// at 2e11 − 1.5e11 = 5e10.
+    #[test]
+    fn a_partial_never_leaves_a_position_under_min_position() {
+        let mut pool = pool();
+        pool.reserves
+            .get_mut(&0)
+            .expect("the XLM reserve")
+            .config
+            .min_position = 150_000_000_000;
+        let held = positions(
+            &[(0, 200_000_000_000), (1, 5_000_000_000)],
+            &[(1, 10_000_000_000)],
+        );
+        let unwound = plan(&terms(), &pool, &held, &wallet(&[(USDC, 4_000_000_000)]));
+        assert_eq!(
+            unwound.actions,
+            vec![
+                repay(USDC, 4_000_000_000),
+                withdraw_all(USDC),
+                withdraw(XLM, 50_000_000_000),
+            ]
+        );
+    }
+
+    /// A position already under `min_position` — reachable, since a
+    /// fill's lot transfer is not checked — can only go whole. Here the
+    /// whole of it would break the margin, so it is not touched, and the
+    /// primary carries the withdrawal instead: the 1,200 of debt at a
+    /// factor of one, held to 1.5 plus the 50 bp margin, needs $1,809 of
+    /// effective collateral; the held $1,975 (XLM 20,000 × $0.10 × 0.75 =
+    /// $1,500, USDC 500 × $1 × 0.95 = $475) leaves $166 to go, all from the
+    /// XLM: 166 / 0.75 / 0.10 = 2,213.33… XLM rounded down.
+    #[test]
+    fn a_position_under_min_position_is_never_partially_withdrawn() {
+        let mut pool = pool();
+        pool.reserves
+            .get_mut(&1)
+            .expect("the USDC reserve")
+            .config
+            .min_position = 10_000_000_000;
+        // 500 USDC of collateral (under the 1,000 USDC minimum) and
+        // 20,000 XLM, against 1,200 of debt in the no-factor reserve.
+        let held = positions(
+            &[(0, 200_000_000_000), (1, 5_000_000_000)],
+            &[(2, 12_000_000_000)],
+        );
+        let unwound = plan(&terms(), &pool, &held, &BTreeMap::new());
+        assert_eq!(unwound.actions, vec![withdraw(XLM, 22_133_333_333)]);
+    }
+
+    /// With a zero floor the primary still goes whole: `WithdrawAll` leaves
+    /// nothing, which `min_position` allows.
+    #[test]
+    fn a_zero_floor_still_withdraws_the_primary_whole() {
+        let mut pool = pool();
+        pool.reserves
+            .get_mut(&0)
+            .expect("the XLM reserve")
+            .config
+            .min_position = 150_000_000_000;
+        let terms = UnwindTerms {
+            min_primary_collateral: 0,
+            ..terms()
+        };
+        let unwound = plan(
+            &terms,
+            &pool,
+            &positions(&[(0, 200_000_000_000)], &[]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(unwound.actions, vec![withdraw_all(XLM)]);
+    }
+
+    /// With no liabilities left, a `min_primary_collateral` between zero and
+    /// the primary's `min_position` — reachable here, though startup
+    /// validation refuses it in a running bot — plans no partial withdrawal
+    /// of the primary: the 5e9 floor would leave 5e9 of the 2e11 held, under
+    /// the 1.5e11 `min_position`, so the excess stays and only the USDC
+    /// goes whole.
+    #[test]
+    fn a_floor_under_min_position_leaves_the_primary_excess_in_step_two() {
+        let mut pool = pool();
+        pool.reserves
+            .get_mut(&0)
+            .expect("the XLM reserve")
+            .config
+            .min_position = 150_000_000_000;
+        let terms = UnwindTerms {
+            min_primary_collateral: 5_000_000_000,
+            ..terms()
+        };
+        let unwound = plan(
+            &terms,
+            &pool,
+            &positions(&[(0, 200_000_000_000), (1, 5_000_000_000)], &[]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(unwound.actions, vec![withdraw_all(USDC)]);
     }
 
     /// Nothing to do: no positions, or only the primary at its floor.
