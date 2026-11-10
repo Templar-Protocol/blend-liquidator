@@ -38,7 +38,10 @@ pub struct DefaultOutcome {
 ///
 /// The gate is the contract's, read the same way: the borrower must have
 /// liabilities and `collateral_raw == 0`
-/// (`pool/src/pool/bad_debt.rs:56-58`). Below it, per liability asset in
+/// (`pool/src/pool/bad_debt.rs:56-58`). A borrower with no collateral
+/// entry above zero is past the gate without any valuation at all, so no
+/// price is read for it (Guardian L-01, `pool/src/pool/bad_debt.rs:62-74`).
+/// Below the gate, per liability asset in
 /// reserve-index order:
 ///
 /// 1. **Set-off.** The borrower's own `supply` in that reserve repays
@@ -61,8 +64,8 @@ pub struct DefaultOutcome {
 /// # Errors
 ///
 /// `MathError::MissingReserve` when a liability names an index this pool
-/// has no reserve for, `MathError::MissingPrice` when the oracle snapshot
-/// cannot price one the gate must value, and `MathError::Overflow` or
+/// has no reserve for, `MathError::MissingPrice` when the borrower holds
+/// collateral the oracle snapshot cannot price, and `MathError::Overflow` or
 /// `DivisionByZero` from the conversions themselves. None is ever read as
 /// a zero: an incomplete view of the pool cannot be projected against.
 pub fn project_default(
@@ -77,8 +80,13 @@ pub fn project_default(
             defaulted: false,
         });
     }
-    let data = calculate_position_data(&reserves, prices, borrower)?;
-    if data.collateral_raw != 0 {
+    // Guardian L-01 (Precept `pool/src/pool/bad_debt.rs:62-74`): the
+    // contract values the borrower only when some collateral entry is above
+    // zero, so a borrower holding none defaults without the oracle being
+    // read at all.
+    let holds_collateral = borrower.collateral.values().any(|b_tokens| *b_tokens > 0);
+    if holds_collateral && calculate_position_data(&reserves, prices, borrower)?.collateral_raw != 0
+    {
         return Ok(DefaultOutcome {
             reserves,
             defaulted: false,
@@ -334,5 +342,33 @@ mod tests {
             project_default(&reserves, &prices(), &borrower),
             Err(MathError::MissingReserve(7))
         );
+    }
+
+    /// Precept `v0.1.1` (`pool/src/pool/bad_debt.rs:62-74`): a borrower
+    /// whose every collateral entry is zero defaults without the oracle
+    /// being read, so an unpriced debt reserve is no obstacle.
+    #[test]
+    fn a_borrower_with_no_collateral_defaults_without_a_price() {
+        let reserves = two_reserves(1_000_000, 500_000);
+        let only_b = OraclePrices::new(7, BTreeMap::from([(ASSET_B.to_string(), 20_000_000)]))
+            .expect("prices");
+        let borrower = positions(&[], &[(0, 100_000)], &[]);
+        let outcome = project_default(&reserves, &only_b, &borrower).expect("needs no price");
+        assert!(outcome.defaulted);
+        assert!(outcome.reserves[&0].data.b_rate < reserves[&0].data.b_rate);
+    }
+
+    /// Any collateral entry above zero still has to be valued, and an
+    /// unpriced one is an error, never a zero.
+    #[test]
+    fn a_borrower_with_collateral_is_still_valued() {
+        let reserves = two_reserves(1_000_000, 500_000);
+        let only_b = OraclePrices::new(7, BTreeMap::from([(ASSET_B.to_string(), 20_000_000)]))
+            .expect("prices");
+        let borrower = positions(&[(0, 1)], &[(1, 100)], &[]);
+        assert!(matches!(
+            project_default(&reserves, &only_b, &borrower),
+            Err(MathError::MissingPrice(_))
+        ));
     }
 }
