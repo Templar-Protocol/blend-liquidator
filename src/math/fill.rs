@@ -17,7 +17,7 @@ use super::auction::{
     bid_modifier, lot_modifier, scale_auction, AuctionData, ScaledAuction, RAMP_BLOCKS,
     RAMP_END_BLOCKS,
 };
-use super::fixed::{div_ceil, mul_ceil, mul_floor, MathError, SCALAR_7};
+use super::fixed::{div_ceil, mul_ceil, mul_floor, MathError, SCALAR_12, SCALAR_7};
 use super::position::{calculate_position_data, OraclePrices, PositionData, Positions};
 use super::reserve::Reserve;
 use super::setoff::project_default;
@@ -476,9 +476,16 @@ pub fn plan_fill(terms: &FillTerms, inputs: &FillInputs<'_>) -> Result<PlannedFi
             return settle(terms, inputs, ledger, percent, projection);
         }
         if terms.supply_allowed {
-            let wanted = supply
+            let shortfall = supply
                 .checked_add(supply_for(terms, inputs, &projection.data)?)
                 .ok_or(MathError::Overflow)?;
+            // Any supply at all must take the primary position to
+            // `min_position`, so a needed supply is raised to the top-up.
+            let wanted = if shortfall > 0 {
+                shortfall.max(projection.min_position_supply)
+            } else {
+                shortfall
+            };
             let (_, primary) = reserve_for(inputs, &terms.primary_asset)?;
             let room = supply_headroom(primary, wanted)?;
             let next = wanted.min(projection.primary_available).min(room);
@@ -490,7 +497,13 @@ pub fn plan_fill(terms: &FillTerms, inputs: &FillInputs<'_>) -> Result<PlannedFi
             // pool is full while suppressing the `UnfundedFill` notice
             // their empty wallet needed.
             capped |= wanted > room && room < projection.primary_available;
-            if next > supply {
+            if next < projection.min_position_supply {
+                // The contract refuses a supply that leaves the primary
+                // position above zero and under `min_position`, so one the
+                // wallet or the cap cannot take that far is no supply at
+                // all: the searches below run without one.
+                supply = 0;
+            } else if next > supply {
                 supply = next;
                 continue;
             }
@@ -531,6 +544,14 @@ struct Projection {
     /// The primary asset the wallet holds after the repays and before the
     /// supply, never negative: what caps the supply.
     primary_available: i128,
+    /// Whether the primary position passes `min_position` after this
+    /// projection's supply — always true when it supplies nothing, which
+    /// the contract does not check.
+    meets_min_position: bool,
+    /// The supply of the primary that would bring the position before any
+    /// supply to `min_position`: what a supply has to reach to be sent at
+    /// all.
+    min_position_supply: i128,
     /// `positions`, valued.
     data: PositionData,
 }
@@ -645,7 +666,10 @@ fn defaulted_reserves(
 ///    factor;
 /// 4. a `SupplyCollateral` of `supply` of the primary asset, clamped to
 ///    what the wallet holds after the repays, and only when that mints at
-///    least one b-token;
+///    least one b-token; a supply leaves the primary position at zero or
+///    at least the reserve's `min_position`, judged against the reserves
+///    the contract holds when the request runs
+///    (`Projection::meets_min_position`);
 ///
 /// and the result valued by `calculate_position_data`. Every amount
 /// `spend` records is first debited from a copy of the wallet that no
@@ -671,6 +695,14 @@ fn project(
 ) -> Result<Projection, MathError> {
     let ScaledAuction { to_fill, remaining } =
         scale_auction(inputs.auction, ledger, percent.get())?;
+    // `remaining` is `None` for exactly the fills the contract deletes the
+    // auction on, and those are the ones that run the borrower's default
+    // path. A partial fill runs none of it and is valued as read.
+    let reserves = if remaining.is_none() {
+        Cow::Owned(defaulted_reserves(inputs, &to_fill)?)
+    } else {
+        Cow::Borrowed(inputs.reserves)
+    };
     let mut positions = inputs.filler.clone();
     for (asset, b_tokens) in &to_fill.lot {
         let (index, _) = reserve_for(inputs, asset)?;
@@ -729,6 +761,11 @@ fn project(
         .unwrap_or(0)
         .max(0);
     let supply = supply.min(primary_available);
+    let primary = inputs.asset_index.get(&terms.primary_asset).copied();
+    let held_before = primary
+        .and_then(|index| positions.collateral.get(&index).copied())
+        .unwrap_or(0);
+    let mut supplied = false;
     if supply > 0 {
         let (index, reserve) = reserve_for(inputs, &terms.primary_asset)?;
         let b_tokens = reserve.to_b_token_down(supply)?;
@@ -738,6 +775,7 @@ fn project(
         // fill for as long as the dust sat in the wallet.
         if b_tokens > 0 {
             add_to(&mut positions.collateral, index, b_tokens)?;
+            supplied = true;
             add_to(&mut spend, terms.primary_asset.clone(), supply)?;
             actions.push(FillAction::SupplyCollateral {
                 asset: terms.primary_asset.clone(),
@@ -746,14 +784,14 @@ fn project(
         }
     }
 
-    // `remaining` is `None` for exactly the fills the contract deletes the
-    // auction on, and those are the ones that run the borrower's default
-    // path. A partial fill runs none of it and is valued as read.
-    let reserves = if remaining.is_none() {
-        Cow::Owned(defaulted_reserves(inputs, &to_fill)?)
-    } else {
-        Cow::Borrowed(inputs.reserves)
-    };
+    let (meets_min_position, min_position_supply) = check_min_position(
+        inputs,
+        &reserves,
+        primary,
+        &positions,
+        held_before,
+        supplied,
+    )?;
     let data = calculate_position_data(&reserves, inputs.prices, &positions)?;
     Ok(Projection {
         to_fill,
@@ -761,6 +799,8 @@ fn project(
         actions,
         spend,
         primary_available,
+        meets_min_position,
+        min_position_supply,
         data,
     })
 }
@@ -770,8 +810,12 @@ fn project(
 /// health factor at or above the floor with at least `min_collateral` of
 /// effective collateral — the contract's `InvalidHf` and
 /// `MinCollateralNotMet` checks, with the floor in place of the pool's
-/// minimum.
+/// minimum — and a supply of the primary that leaves the position at zero
+/// or at least `min_position`, the contract's `require_min_position`.
 fn healthy(terms: &FillTerms, projection: &Projection) -> Result<bool, MathError> {
+    if !projection.meets_min_position {
+        return Ok(false);
+    }
     if projection.positions.liabilities.is_empty() {
         return Ok(true);
     }
@@ -823,6 +867,62 @@ fn supply_for(
     )?
     .checked_add(SUPPLY_ROUNDING_ALLOWANCE)
     .ok_or(MathError::Overflow)
+}
+
+/// Precept's `require_min_position` for a projection's primary supply,
+/// answered as `(meets, top_up)`.
+///
+/// The contract runs it after a `SupplyCollateral`, on the reserve as it
+/// holds it then: after a full fill's default path, which is `reserves`.
+/// Valued there, with the b-tokens minted at the as-read rate — fewer than
+/// a cut rate mints — the position is never valued higher than the
+/// contract values it. A projection that supplied nothing always meets it.
+fn check_min_position(
+    inputs: &FillInputs<'_>,
+    reserves: &BTreeMap<u32, Reserve>,
+    primary: Option<u32>,
+    positions: &Positions,
+    held_before: i128,
+    supplied: bool,
+) -> Result<(bool, i128), MathError> {
+    let Some(index) = primary else {
+        return Ok((true, 0));
+    };
+    let read = inputs
+        .reserves
+        .get(&index)
+        .ok_or(MathError::MissingReserve(index))?;
+    let check = reserves
+        .get(&index)
+        .ok_or(MathError::MissingReserve(index))?;
+    let held = positions.collateral.get(&index).copied().unwrap_or(0);
+    Ok((
+        !supplied || check.meets_min_position(held)?,
+        min_position_top_up(check, read, held_before)?,
+    ))
+}
+
+/// The supply of the primary that brings a collateral position of `held`
+/// b-tokens to the reserve's `min_position`, or zero when it is already
+/// there or the reserve sets none.
+///
+/// Sized to pass exactly the check [`project`] applies: `check` is the
+/// primary's reserve as the projection values it (post-default for a full
+/// fill) and `read` its reserve as read, which mints the supply's
+/// b-tokens. The b-tokens that must be held are `check.to_b_token_up(
+/// min_position)` — whose value at `check`'s rate is at least
+/// `min_position` by that rounding — and the underlying that mints at
+/// least the missing ones at `read`'s rate is their value rounded up.
+fn min_position_top_up(check: &Reserve, read: &Reserve, held: i128) -> Result<i128, MathError> {
+    if check.config.min_position <= 0 {
+        return Ok(0);
+    }
+    let floor = check.to_b_token_up(check.config.min_position)?;
+    let needed = floor.checked_sub(held).ok_or(MathError::Overflow)?;
+    if needed <= 0 {
+        return Ok(0);
+    }
+    mul_ceil(needed, read.data.b_rate, SCALAR_12)
 }
 
 /// The largest underlying amount of `asset` that can be supplied without
@@ -2383,5 +2483,171 @@ mod plan_tests {
         assert_eq!(partial.percent, percent(50));
         assert_eq!(partial.fill_ledger, START + 267);
         assert_eq!(partial, unmodelled);
+    }
+
+    /// `pool()` with the XLM reserve's `min_position` set.
+    fn pool_with_min_position(min_position: i128) -> Pool {
+        let mut pool = pool();
+        pool.reserves
+            .get_mut(&0)
+            .expect("the XLM reserve")
+            .config
+            .min_position = min_position;
+        pool
+    }
+
+    /// The shortfall supply of `the_primary_asset_is_supplied_to_close_a_
+    /// shortfall` (44_385_964_922) would leave 1.1e11 + 44_385_964_922 XLM,
+    /// under a 2e11 `min_position`. The supply is raised to the top-up
+    /// instead: 2e11 − 1.1e11 = 9e10 at a rate of exactly one.
+    #[test]
+    fn a_shortfall_supply_is_raised_to_the_min_position() {
+        let pool = pool_with_min_position(200_000_000_000);
+        let wallet = BTreeMap::from([(XLM.to_string(), 1_000_000_000_000)]);
+        let draft = draft(plan(
+            &terms(),
+            &pool,
+            &Positions::default(),
+            &wallet,
+            &auction(),
+            START + 1,
+            percent(100),
+        ));
+        assert_eq!(draft.fill_ledger, START + 110);
+        let [FillAction::SupplyCollateral { asset, amount }] = draft.actions.as_slice() else {
+            panic!("expected one supply, got {:?}", draft.actions);
+        };
+        assert_eq!(asset.as_str(), XLM);
+        assert_eq!(*amount, 90_000_000_000);
+        assert!(draft.projected_health >= Some(11_000_000));
+    }
+
+    /// A wallet that cannot reach the top-up sends no supply at all — a
+    /// supply left under `min_position` is refused — and the plan waits for
+    /// a ledger whose lot carries the fill alone.
+    #[test]
+    fn a_top_up_the_wallet_cannot_reach_sends_no_supply() {
+        let pool = pool_with_min_position(300_000_000_000);
+        let wallet = BTreeMap::from([(XLM.to_string(), 50_000_000_000)]);
+        let draft = draft(plan(
+            &terms(),
+            &pool,
+            &Positions::default(),
+            &wallet,
+            &auction(),
+            START + 1,
+            percent(100),
+        ));
+        assert!(
+            !draft
+                .actions
+                .iter()
+                .any(|action| matches!(action, FillAction::SupplyCollateral { .. })),
+            "{:?}",
+            draft.actions
+        );
+        assert!(draft.fill_ledger > START + 110);
+    }
+
+    /// No ledger the plan may aim at carries the fill without a supply —
+    /// `force_fill` caps the search at 350 and the filler already owes
+    /// 2,000 USDC — and no supply the wallet holds reaches `min_position`:
+    /// the skip is `Unfunded`, the wallet being what is short.
+    #[test]
+    fn a_top_up_nothing_else_can_replace_is_unfunded() {
+        let pool = pool_with_min_position(1_000_000_000_000);
+        let terms = FillTerms {
+            force_fill: true,
+            ..terms()
+        };
+        let filler = Positions {
+            liabilities: BTreeMap::from([(1, 20_000_000_000)]),
+            ..Positions::default()
+        };
+        let wallet = BTreeMap::from([(XLM.to_string(), 300_000_000_000)]);
+        assert_eq!(
+            plan(
+                &terms,
+                &pool,
+                &filler,
+                &wallet,
+                &auction(),
+                START + 1,
+                percent(100)
+            ),
+            PlannedFill::Skip(FillSkip::Unfunded)
+        );
+    }
+
+    /// A plan that supplies nothing is not checked, as the contract does
+    /// not check a fill's own lot transfer: the 200%-margin fill of
+    /// `a_fill_the_lot_carries_alone_needs_nothing_from_the_wallet` is
+    /// unchanged under any `min_position`.
+    #[test]
+    fn a_plan_that_supplies_nothing_ignores_min_position() {
+        // Far past any position here, and far inside i128 for the top-up
+        // arithmetic every projection still runs.
+        let pool = pool_with_min_position(1_000_000_000_000_000_000);
+        let terms = FillTerms {
+            profit_bps: 20_000,
+            ..terms()
+        };
+        let draft = draft(plan(
+            &terms,
+            &pool,
+            &Positions::default(),
+            &BTreeMap::new(),
+            &auction(),
+            START + 1,
+            percent(100),
+        ));
+        assert_eq!(draft.fill_ledger, START + 267);
+        assert!(draft.actions.is_empty());
+    }
+
+    /// The borrower also owes 1,000 XLM outside the auction, which a full
+    /// fill's default path destroys against the XLM reserve's 1e12
+    /// b-tokens: a cut of ⌈1e10 × 1e12 / 1e12⌉ = 1e10, from 1.0 to 0.99.
+    /// The primary's `min_position` is then judged at 0.99: the as-read
+    /// top-up, 3e11 − 2e11 = 1e11, would leave ⌊3e11 × 0.99⌋ = 2.97e11 —
+    /// refused — so the plan supplies ⌈3e11 / 0.99⌉ − 2e11 =
+    /// 303_030_303_031 − 2e11 = 103_030_303_031, worth
+    /// ⌊303_030_303_031 × 0.99⌋ = 3e11. The 3.0 floor makes a supply
+    /// necessary at all: the lot alone is 1.485e10 effective after the cut
+    /// against 7e9 of bid, 2.12.
+    #[test]
+    fn a_full_fills_min_position_is_judged_after_the_default() {
+        let mut pool = pool_with_min_position(300_000_000_000);
+        let xlm = pool.reserves.get_mut(&0).expect("the XLM reserve");
+        xlm.data.b_supply = 1_000_000_000_000;
+        xlm.data.d_supply = 10_000_000_000;
+        let terms = FillTerms {
+            profit_bps: 20_000,
+            health_floor: 30_000_000,
+            ..terms()
+        };
+        let borrower = Positions {
+            collateral: BTreeMap::from([(0, 200_000_000_000)]),
+            liabilities: BTreeMap::from([(0, 10_000_000_000), (1, 10_000_000_000)]),
+            ..Positions::default()
+        };
+        let wallet = BTreeMap::from([(XLM.to_string(), 1_000_000_000_000)]);
+        let draft = draft(plan_against(
+            &terms,
+            &pool,
+            &Positions::default(),
+            &borrower,
+            &wallet,
+            &auction(),
+            START + 1,
+            percent(100),
+        ));
+        assert_eq!(draft.fill_ledger, START + 267);
+        let [FillAction::SupplyCollateral { asset, amount }] = draft.actions.as_slice() else {
+            panic!("expected one supply, got {:?}", draft.actions);
+        };
+        assert_eq!(asset.as_str(), XLM);
+        assert_eq!(*amount, 103_030_303_031);
+        assert!(draft.projected_health >= Some(30_000_000));
     }
 }
