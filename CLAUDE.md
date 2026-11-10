@@ -19,10 +19,11 @@ anything contract-derived. Precept is **released and live**: `v0.1.0` is the
 Guardian-audited release, `v0.1.1` its rebuild with small post-audit
 changes, and every active mainnet market runs `v0.1.1` wasm — the deployed
 addresses are in that repository's `registry/mainnet.jsonl`. That spec was
-written against the fork's pre-release head `54afdae`, and **`v0.1.1`
-differs from it in three ways the bot does not handle yet** (see "The
-fork's gotchas" below and `docs/architecture.md` §6). The sandbox tier
-below still pins stock wasm: it predates Precept's releases.
+written against the fork's pre-release head `54afdae`; the three ways
+`v0.1.1` differs from it are reconciled in
+`docs/specs/2026-11-09-precept-v0.1.1-reconciliation.md` (see "The fork's
+gotchas" below and `docs/architecture.md` §6). The sandbox tier below
+still pins stock wasm: it predates Precept's releases.
 
 **Status: Phase 9 complete.** Phase 1 landed the pure fixed-point math
 (`math`) and the ScVal/ledger-entry codecs (`chain::xdr`); Phase 2 landed
@@ -254,7 +255,10 @@ make help                           # Docker Compose lifecycle
   percent → later ledger when the projection is short, searching
   candidates exactly rather than estimating one a later round would only
   have to correct, answering `FillSkip::SupplyCapped` when the cap rather
-  than the wallet is what stopped it), `setoff` (the fork's default path,
+  than the wallet is what stopped it; a supply of the primary is raised to
+  the top-up that reaches the reserve's `min_position` or not sent, and
+  the check values the post-supply position against the post-default
+  reserves for a full fill), `setoff` (the fork's default path,
   ported: `project_default` answers what the contract's
   `check_and_handle_user_bad_debt` does to the pool's reserves — the
   borrower's own supply in the debt reserve sets off what it can first,
@@ -274,13 +278,15 @@ make help                           # Docker Compose lifecycle
   above the pool's own `min_collateral`, which binds step 3 wherever it is
   the larger of the two. `DUST_FLOOR_BPS` (100) is the smallest partial
   withdrawal of the primary worth sending, and every withdrawal is
-  verified by exact projection, backing off when it disagrees).
+  verified by exact projection, backing off when it disagrees; no partial
+  withdrawal leaves the primary under the reserve's `min_position`).
   Nothing here does I/O and nothing panics.
 - `src/chain/xdr/` — ScVal codecs for the pool: `encode` (values, operations,
   simulation envelopes), `keys` (ledger keys, durability included), `decode`
   (entries and view-call returns), `events` (pool events, including the
   fork's `debt_setoff`, `collateral_orphaned` and `orphan_settled`
-  alongside the stock `bad_debt` and `defaulted_debt`).
+  alongside the stock `bad_debt` and `defaulted_debt`;
+  `defaulted_debt`/`debt_setoff` with their `v0.1.1` user).
 - `src/chain/rpc.rs` — the Soroban JSON-RPC client: the eight methods the
   bot uses, their wire shapes, base64 XDR decoded at the boundary. Every
   result carries the ledger it was taken at.
@@ -1585,27 +1591,36 @@ Verified against `Templar-Protocol/precept` (then named
 is `docs/specs/2026-09-20-adr-0008-fork-semantics.md`; these are the traps.
 
 **`v0.1.1`, the release every live market runs, differs from `54afdae` in
-three ways the bot does not handle yet** — none of them in this crate's
-arithmetic port:
+three ways, all reconciled** (`docs/specs/2026-11-09-precept-v0.1.1-reconciliation.md`)
+— none of them in this crate's arithmetic port:
 
-- **`defaulted_debt` and `debt_setoff` carry the user now**:
-  `["defaulted_debt", user, asset]` and `["debt_setoff", user, asset]`.
-  `chain::xdr::events` still requires the two-topic shape, so on a live
-  market every such event fails to decode and the poller skips it with a
-  warning.
+- **`defaulted_debt` and `debt_setoff` carry the user**:
+  `["defaulted_debt", user, asset]` and `["debt_setoff", user, asset]` on
+  `v0.1.1`. `chain::xdr::events` decodes the three-topic shape with the
+  user, still accepts the two-topic shape (no user) that `54afdae` and
+  stock emit, and the tracker refreshes the named user like any other
+  account an event names.
 - **Every reserve has a `min_position`** (`ReserveConfig`, between
   `supply_cap` and `enabled`): a `SupplyCollateral` or `WithdrawCollateral`
   that leaves the user's collateral in that reserve above zero but below it
   fails `1224 MinCollateralNotMet` — the same code as the pool-wide
-  `min_collateral`. The decoder looks fields up by name, so nothing fails
-  to parse, but neither `plan_fill`'s primary supply nor `plan_unwind`'s
-  partial withdrawals model it, and the executor's half-percent re-plan on
-  `1224` cannot cure it.
+  `min_collateral`. `Reserve::meets_min_position` is the predicate.
+  `plan_fill` raises a needed supply of the primary to the top-up that
+  reaches `min_position`, rounding allowance included, or sends no supply
+  at all (the percent and ledger searches then run without one, and the
+  skip is `Unfunded` only when none lands); `plan_unwind` never leaves a
+  partial withdrawal under it; `validate_primary_asset` refuses a
+  `min_primary_collateral` strictly between zero and the primary reserve's
+  `min_position` at startup. The executor's half-percent re-plan on `1224`
+  stays as the backstop.
 - **The default path no longer prices a borrower with no collateral**
   (Guardian L-01): `check_and_handle_user_bad_debt` defaults such a
-  position without reading the oracle, where `math::setoff::project_default`
-  and the auctioneer's bad-debt predicate value it first — and fail on an
-  unpriced reserve exactly where the contract succeeds.
+  position without reading the oracle, and so do
+  `math::setoff::project_default` and `Auctioneer::decide_one`, for a
+  borrower with no collateral entry above zero. `decide_one` takes that
+  short-circuit only when every liability is in a reserve the snapshot
+  holds; an incomplete view stays undecided (`MissingReserve`), never bad
+  debt.
 
 - **A 100% fill can cut the filler's own health factor, and the plan now
   accounts for it.** On the fork a full fill runs
@@ -1624,11 +1639,12 @@ arithmetic port:
   money, and it is no longer flying blind into it.
 - **Only three events are new**: `debt_setoff`, `collateral_orphaned` and
   `orphan_settled`. `defaulted_debt` is **stock** at `54afdae`, and this
-  crate decodes that shape correctly — do not "add" it (but see `v0.1.1`'s
-  topic change above). The topic shapes differ and the
+  crate decodes that shape correctly — do not "add" it; `v0.1.1` only adds
+  the user to its topics (above). The topic shapes differ and the
   borrower is not in a fixed position: `collateral_orphaned` carries the
-  user in topic 1 and the asset in topic 2, while the other two carry no
-  user at all, so a decoder that assumes "asset is always topic 1" mis-reads
+  user in topic 1 and the asset in topic 2, `debt_setoff` carries none at
+  `54afdae` and the user in topic 1 on `v0.1.1`, and `orphan_settled`
+  carries none, so a decoder that assumes "asset is always topic 1" mis-reads
   it silently, both being addresses.
 - **A `bad_debt` event on a fork pool means stock wasm is deployed.** The
   event is still declared and has zero call sites, so a fork pool can

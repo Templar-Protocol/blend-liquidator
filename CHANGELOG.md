@@ -100,6 +100,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The bot is reconciled with Precept `v0.1.1`, the release every live
+  market runs. `defaulted_debt` and `debt_setoff` events, which `v0.1.1`
+  emits with the borrower in topic 1, decode again — every one used to be
+  skipped with a warning — and the tracker re-reads that borrower. Each
+  reserve's `min_position` is modelled: a fill's supply of the primary is
+  sized to reach it or not sent, an unwind's partial withdrawal never
+  leaves a position under it, and a `min_primary_collateral` strictly
+  between zero and it is a startup error. A borrower with no collateral is
+  bad debt without the oracle being read, as the contract now decides it
+  (Guardian L-01), so an unpriced debt reserve no longer leaves them
+  undecided.
 - An oracle scan refused because the ledger moved between its reads
   (`ChainError::LedgerMoved`, after the snapshot's own three attempts)
   gets one retry on the next tick instead of waiting a whole

@@ -23,15 +23,11 @@ primary_asset = "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA" # XLM
 # live mode the filler holding less than this in a configured pool is a
 # startup warning, not a failure.
 #
-# On a Precept pool, make it at least the primary reserve's own min_position
-# (50 XLM on this market), and supply that much of the primary as collateral
-# before arming: the contract refuses any collateral supply or withdrawal
-# that leaves a nonzero position below min_position, and the planner does
-# not model it yet, so a fill that has to supply the primary supplies only
-# its shortfall — which, onto a position under min_position (zero
-# included), can land under it and be refused (CLAUDE.md, "The fork's
-# gotchas"). With the position itself at or above min_position, every
-# supply lands on top of a position already past it.
+# On a Precept pool, make it zero or at least the primary reserve's own
+# min_position (50 XLM on this market): the contract refuses any collateral
+# supply or withdrawal that leaves a nonzero position below min_position, so
+# a value strictly between is refused at startup. The planner sizes any
+# supply of the primary to reach min_position.
 min_primary_collateral = "10000000000"
 
 # The health factor the filler keeps its own position above after a fill.
