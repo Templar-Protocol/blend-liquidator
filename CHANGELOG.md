@@ -97,6 +97,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   release candidate is never shown as the repository's latest release.
   The workflow's comment no longer claims the package is private because
   the repository is: its visibility is its own GHCR setting.
+- **Breaking: a `min_primary_collateral` strictly between zero and the
+  primary reserve's `min_position` is now a startup error**, in every
+  mode, naming both values. A configuration that started before can
+  refuse to start after upgrading; check each pool's
+  `min_primary_collateral` against its primary reserve's `min_position`
+  first and set it to zero or at least that minimum. No unwind could ever
+  rest at such a floor: the contract refuses every withdrawal that would
+  leave the position there.
 
 ### Fixed
 
@@ -105,12 +113,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   emits with the borrower in topic 1, decode again — every one used to be
   skipped with a warning — and the tracker re-reads that borrower. Each
   reserve's `min_position` is modelled: a fill's supply of the primary is
-  sized to reach it or not sent, an unwind's partial withdrawal never
-  leaves a position under it, and a `min_primary_collateral` strictly
-  between zero and it is a startup error. A borrower with no collateral is
-  bad debt without the oracle being read, as the contract now decides it
-  (Guardian L-01): the auctioneer decides such a borrower without
-  reading the oracle.
+  sized to reach it or not sent, and an unwind's partial withdrawal never
+  leaves a position under it (the startup check that goes with it is under
+  Changed). A borrower with no collateral is bad debt without needing a
+  price, as the contract now decides it (Guardian L-01): the auctioneer
+  decides such a borrower even when a reserve it owes in is unpriced. The
+  snapshot still reads the oracle, so an oracle that fails outright still
+  leaves the batch undecided.
 - An oracle scan refused because the ledger moved between its reads
   (`ChainError::LedgerMoved`, after the snapshot's own three attempts)
   gets one retry on the next tick instead of waiting a whole

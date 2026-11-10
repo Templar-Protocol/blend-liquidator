@@ -584,7 +584,7 @@ impl<'a> Auctioneer<'a> {
     /// The pool contract is a `Positions` holder on the fork this bot
     /// targets: a defaulting borrower's leftover collateral is confiscated
     /// into the pool's own address as ordinary supply
-    /// (`pool/src/pool/bad_debt.rs:98-109`). It holds no liabilities, so
+    /// (`pool/src/pool/bad_debt.rs:104-116`). It holds no liabilities, so
     /// there is nothing to liquidate, and the contract refuses
     /// `user == e.current_contract_address()` with 1211 in any case — but a
     /// seed source that lists the pool would otherwise cost a chain read

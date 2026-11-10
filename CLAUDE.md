@@ -1607,17 +1607,22 @@ three ways, all reconciled** (`docs/specs/2026-11-09-precept-v0.1.1-reconciliati
   `min_collateral`. `Reserve::meets_min_position` is the predicate.
   `plan_fill` raises a needed supply of the primary to the top-up that
   reaches `min_position`, rounding allowance included, or sends no supply
-  at all (the percent and ledger searches then run without one, and the
-  skip is `Unfunded` only when none lands); `plan_unwind` never leaves a
+  at all (the percent and ledger searches then run without one, and only
+  when none lands is the skip `Unfunded` — or `SupplyCapped`, when the
+  reserve's `supply_cap` rather than the wallet stopped the top-up);
+  `plan_unwind` never leaves a
   partial withdrawal under it; `validate_primary_asset` refuses a
   `min_primary_collateral` strictly between zero and the primary reserve's
   `min_position` at startup. The executor's half-percent re-plan on `1224`
   stays as the backstop.
 - **The default path no longer prices a borrower with no collateral**
   (Guardian L-01): `check_and_handle_user_bad_debt` defaults such a
-  position without reading the oracle, and so do
-  `math::setoff::project_default` and `Auctioneer::decide_one`, for a
-  borrower with no collateral entry above zero. `decide_one` takes that
+  position without reading the oracle, and
+  `math::setoff::project_default` and `Auctioneer::decide_one` decide it
+  without needing a price, for a borrower with no collateral entry above
+  zero. The auctioneer's snapshot still reads the oracle — an unpriced
+  reserve no longer blocks the decision, but an oracle that fails outright
+  still fails the batch. `decide_one` takes that
   short-circuit only when every liability is in a reserve the snapshot
   holds; an incomplete view stays undecided (`MissingReserve`), never bad
   debt.
@@ -1638,9 +1643,11 @@ three ways, all reconciled** (`docs/specs/2026-11-09-precept-v0.1.1-reconciliati
   most important difference on this list; nothing else here can lose
   money, and it is no longer flying blind into it.
 - **Only three events are new**: `debt_setoff`, `collateral_orphaned` and
-  `orphan_settled`. `defaulted_debt` is **stock** at `54afdae`, and this
-  crate decodes that shape correctly — do not "add" it; `v0.1.1` only adds
-  the user to its topics (above). The topic shapes differ and the
+  `orphan_settled`. `v0.1.1` adds no event, but it does change two topic
+  shapes, `defaulted_debt`'s and `debt_setoff`'s (above).
+  `defaulted_debt` is **stock** at `54afdae`, and this crate decodes that
+  shape correctly — do not "add" it; `v0.1.1` only adds the user to its
+  topics (above). The topic shapes differ and the
   borrower is not in a fixed position: `collateral_orphaned` carries the
   user in topic 1 and the asset in topic 2, `debt_setoff` carries none at
   `54afdae` and the user in topic 1 on `v0.1.1`, and `orphan_settled`

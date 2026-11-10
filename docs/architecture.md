@@ -181,8 +181,9 @@ reconciled in `docs/specs/2026-11-09-precept-v0.1.1-reconciliation.md`:
 `defaulted_debt` and `debt_setoff` carry the user in topic 1 and decode
 with it, every reserve's `min_position` is modelled by `plan_fill`,
 `plan_unwind` and startup validation, and a borrower holding no collateral
-is defaulted and decided as bad debt without the oracle being read
-(Guardian L-01).
+is defaulted and decided as bad debt without needing a price (Guardian
+L-01): the snapshot still reads the oracle, but a reserve it cannot price
+no longer blocks the decision.
 
 The bot still runs against stock Blend v2 pools as well, and three
 things follow from that:
