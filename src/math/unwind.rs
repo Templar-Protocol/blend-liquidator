@@ -377,10 +377,14 @@ fn withdraw_free(
         return Ok(());
     }
     let next = after_withdrawal(inputs, positions, primary, excess)?;
-    // The excess stops at `min_primary_collateral`, which need not be at
-    // or above the reserve's `min_position`: when the remainder would sit
-    // under it, nothing is sent — a whole withdrawal is the only one the
-    // rule allows there, and step 2 does not plan that one.
+    // The excess stops at `min_primary_collateral`, which startup
+    // validation (`validate_primary_asset`) guarantees is zero or at least
+    // the reserve's `min_position` on every pool the bot runs, so the
+    // remainder is never left under it there. The check below stays as
+    // verification: every withdrawal in this module is verified rather
+    // than assumed. Should the remainder sit under it anyway, nothing is
+    // sent — a whole withdrawal is the only one the rule allows there, and
+    // step 2 does not plan that one.
     if !reserve.meets_min_position(next.collateral.get(&primary).copied().unwrap_or(0))? {
         return Ok(());
     }
