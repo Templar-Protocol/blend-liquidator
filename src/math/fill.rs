@@ -327,7 +327,8 @@ pub enum FillSkip {
     /// The fill would take the filler past the pool's `max_positions`.
     TooManyPositions,
     /// More of the primary asset would have closed the shortfall, and the
-    /// wallet does not hold it.
+    /// wallet does not hold it — or a supply the wallet could not take as
+    /// far as the reserve's `min_position`, which the contract would refuse.
     Unfunded,
     /// More of the primary asset would have closed the shortfall and the
     /// pool's `supply_cap` has no room for it. Distinct from
@@ -382,10 +383,14 @@ const SUPPLY_ROUNDING_ALLOWANCE: i128 = 2;
 ///    the wallet holds after the repays. A projection that raises the
 ///    position count past `max_positions` is `TooManyPositions`. One with
 ///    no liabilities, or at or above the floor with at least
-///    `min_collateral`, is the plan.
+///    `min_collateral`, is the plan — and a projection whose primary
+///    supply leaves the position above zero and under the reserve's
+///    `min_position` is never healthy.
 /// 4. Short, in the spec's order: supply more of the primary for the
 ///    shortfall, when the pool permits it (remember when the wallet capped
-///    it); else the largest lower percent that projects healthy; else the
+///    it), raising any needed supply to the top-up that reaches
+///    `min_position` and sending no supply at all when the wallet or the
+///    cap cannot reach that top-up; else the largest lower percent that projects healthy; else the
 ///    first later ledger at which `max_percent` projects healthy (ruling
 ///    10). Candidates are searched exactly (ruling 11), and a candidate
 ///    the search finds is the plan: it is drafted from the very projection
@@ -876,7 +881,10 @@ fn supply_for(
 /// holds it then: after a full fill's default path, which is `reserves`.
 /// Valued there, with the b-tokens minted at the as-read rate — fewer than
 /// a cut rate mints — the position is never valued higher than the
-/// contract values it. A projection that supplied nothing always meets it.
+/// contract values it against the snapshot's state; the rate's accrual
+/// between the snapshot and the landing is what the top-up's
+/// `SUPPLY_ROUNDING_ALLOWANCE` covers. A projection that supplied nothing
+/// always meets it.
 fn check_min_position(
     inputs: &FillInputs<'_>,
     reserves: &BTreeMap<u32, Reserve>,
@@ -912,9 +920,15 @@ fn check_min_position(
 /// b-tokens. The b-tokens that must be held are `check.to_b_token_up(
 /// min_position)` — whose value at `check`'s rate is at least
 /// `min_position` by that rounding — and the underlying that mints at
-/// least the missing ones at `read`'s rate is their value rounded up.
+/// least the missing ones at `read`'s rate is their value rounded up,
+/// plus `SUPPLY_ROUNDING_ALLOWANCE` like every other supply: `b_rate`
+/// accrues between the snapshot and the transaction landing, so the
+/// contract mints a little fewer b-tokens than are counted here, and a
+/// top-up landing exactly on `min_position` could come out under it. A
+/// `check` reserve whose `b_rate` is zero values every position at zero,
+/// which `min_position` accepts, so it needs nothing.
 fn min_position_top_up(check: &Reserve, read: &Reserve, held: i128) -> Result<i128, MathError> {
-    if check.config.min_position <= 0 {
+    if check.config.min_position <= 0 || check.data.b_rate <= 0 {
         return Ok(0);
     }
     let floor = check.to_b_token_up(check.config.min_position)?;
@@ -922,7 +936,9 @@ fn min_position_top_up(check: &Reserve, read: &Reserve, held: i128) -> Result<i1
     if needed <= 0 {
         return Ok(0);
     }
-    mul_ceil(needed, read.data.b_rate, SCALAR_12)
+    mul_ceil(needed, read.data.b_rate, SCALAR_12)?
+        .checked_add(SUPPLY_ROUNDING_ALLOWANCE)
+        .ok_or(MathError::Overflow)
 }
 
 /// The largest underlying amount of `asset` that can be supplied without
@@ -2499,7 +2515,8 @@ mod plan_tests {
     /// The shortfall supply of `the_primary_asset_is_supplied_to_close_a_
     /// shortfall` (44_385_964_922) would leave 1.1e11 + 44_385_964_922 XLM,
     /// under a 2e11 `min_position`. The supply is raised to the top-up
-    /// instead: 2e11 − 1.1e11 = 9e10 at a rate of exactly one.
+    /// instead: 2e11 − 1.1e11 = 9e10 at a rate of exactly one, plus the
+    /// two-unit rounding allowance every supply carries.
     #[test]
     fn a_shortfall_supply_is_raised_to_the_min_position() {
         let pool = pool_with_min_position(200_000_000_000);
@@ -2518,7 +2535,7 @@ mod plan_tests {
             panic!("expected one supply, got {:?}", draft.actions);
         };
         assert_eq!(asset.as_str(), XLM);
-        assert_eq!(*amount, 90_000_000_000);
+        assert_eq!(*amount, 90_000_000_002);
         assert!(draft.projected_health >= Some(11_000_000));
     }
 
@@ -2546,7 +2563,7 @@ mod plan_tests {
             "{:?}",
             draft.actions
         );
-        assert!(draft.fill_ledger > START + 110);
+        assert_eq!(draft.fill_ledger, START + 155);
     }
 
     /// No ledger the plan may aim at carries the fill without a supply —
@@ -2612,7 +2629,8 @@ mod plan_tests {
     /// top-up, 3e11 − 2e11 = 1e11, would leave ⌊3e11 × 0.99⌋ = 2.97e11 —
     /// refused — so the plan supplies ⌈3e11 / 0.99⌉ − 2e11 =
     /// 303_030_303_031 − 2e11 = 103_030_303_031, worth
-    /// ⌊303_030_303_031 × 0.99⌋ = 3e11. The 3.0 floor makes a supply
+    /// ⌊303_030_303_031 × 0.99⌋ = 3e11, plus the two-unit rounding
+    /// allowance: 103_030_303_033. The 3.0 floor makes a supply
     /// necessary at all: the lot alone is 1.485e10 effective after the cut
     /// against 7e9 of bid, 2.12.
     #[test]
@@ -2647,7 +2665,50 @@ mod plan_tests {
             panic!("expected one supply, got {:?}", draft.actions);
         };
         assert_eq!(asset.as_str(), XLM);
-        assert_eq!(*amount, 103_030_303_031);
+        assert_eq!(*amount, 103_030_303_033);
         assert!(draft.projected_health >= Some(30_000_000));
+    }
+
+    /// The same plan as `a_shortfall_supply_is_raised_to_the_min_position`
+    /// at a 4e10 `min_position`, a 1e10 wallet and no gate would be a 22%
+    /// partial fill at START + 110 whose primary position, 2.42e10 of lot
+    /// plus the 1e10 supplied, is 3.42e10 — under 4e10, refused by the
+    /// contract. With the gate that candidate is not healthy, the percent
+    /// search finds nothing, and the ledger search finds START + 145: the
+    /// full lot there is 1.45e11 b-tokens, so a 1e10 supply leaves
+    /// 1.55e11 ≥ 4e10, and 1.55e11 × 0.075 clears the 11_578_947_369 of
+    /// effective collateral the floor asks for first at that ledger.
+    #[test]
+    fn a_partial_fill_under_min_position_is_not_healthy() {
+        let pool = pool_with_min_position(40_000_000_000);
+        let wallet = BTreeMap::from([(XLM.to_string(), 10_000_000_000)]);
+        let draft = draft(plan(
+            &terms(),
+            &pool,
+            &Positions::default(),
+            &wallet,
+            &auction(),
+            START + 1,
+            percent(100),
+        ));
+        assert_eq!(draft.fill_ledger, START + 145);
+        assert_eq!(draft.percent, percent(100));
+        let [FillAction::SupplyCollateral { asset, amount }] = draft.actions.as_slice() else {
+            panic!("expected one supply, got {:?}", draft.actions);
+        };
+        assert_eq!(asset.as_str(), XLM);
+        assert_eq!(*amount, 10_000_000_000);
+    }
+
+    /// A primary whose `b_rate` a default cut to zero values every position
+    /// at zero, which `min_position` accepts: no top-up, and no division by
+    /// the rate.
+    #[test]
+    fn a_zero_b_rate_needs_no_top_up() {
+        let mut reserve = reserve(XLM, 0, 7_500_000, 7_500_000);
+        reserve.config.min_position = 300_000_000_000;
+        reserve.data.b_rate = 0;
+        let read = self::reserve(XLM, 0, 7_500_000, 7_500_000);
+        assert_eq!(min_position_top_up(&reserve, &read, 0), Ok(0));
     }
 }
