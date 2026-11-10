@@ -1597,8 +1597,8 @@ three ways, all reconciled** (`docs/specs/2026-11-09-precept-v0.1.1-reconciliati
 - **`defaulted_debt` and `debt_setoff` carry the user**:
   `["defaulted_debt", user, asset]` and `["debt_setoff", user, asset]` on
   `v0.1.1`. `chain::xdr::events` decodes the three-topic shape with the
-  user, still accepts the two-topic shape (no user) that `54afdae` and
-  stock emit, and the tracker refreshes the named user like any other
+  user, still accepts the two-topic shape (no user) that is stock's
+  `defaulted_debt` and `54afdae`'s two events, and the tracker refreshes the named user like any other
   account an event names.
 - **Every reserve has a `min_position`** (`ReserveConfig`, between
   `supply_cap` and `enabled`): a `SupplyCollateral` or `WithdrawCollateral`

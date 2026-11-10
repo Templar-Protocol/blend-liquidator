@@ -401,8 +401,10 @@ async fn enqueue(
 }
 
 /// `Replan` for the two errors that mean the contract's own health check
-/// disagreed with the plan's projection — which a lower percent can fix —
-/// and `Refused` for every other refusal, including one that carried no
+/// disagreed with the plan's projection — which a lower percent can fix;
+/// a `1224` can also be a reserve's `min_position`, which the planner models
+/// but a lower percent does not reliably cure, so the one re-plan may be
+/// refused again — and `Refused` for every other refusal, including one that carried no
 /// code at all.
 fn refusal(contract_error: Option<u32>) -> ExecOutcome {
     match contract_error {
@@ -746,7 +748,9 @@ impl<'a> Executor<'a> {
 
     /// Step 2 for a fill: [`Executor::judge_operation`], read the way a
     /// fill reads it. `InvalidHf` and `MinCollateralNotMet` are the two
-    /// refusals a lower percent addresses, and they alone are not a
+    /// refusals a lower percent addresses (a `1224` can also be a reserve's
+    /// `min_position`, which a lower percent does not reliably cure, so the
+    /// one re-plan may be refused again), and they alone are not a
     /// warning: the fill is re-planned, not skipped.
     async fn judge(&self, plan: &FillPlan, armed: bool) -> Result<JudgedFill, ExecutorError> {
         let requests = fill_requests(&plan.user, &plan.draft)?;
@@ -1763,7 +1767,8 @@ mod tests {
 
         // 1205 is `InvalidHf`, 1224 `MinCollateralNotMet`: both say the
         // contract's own view of the filler's health disagreed with the
-        // plan's projection, which a lower percent can fix.
+        // plan's projection, which a lower percent can fix (a `1224` may
+        // also be a `min_position` the one re-plan does not cure).
         for code in [1_205_u32, 1_224] {
             script_simulate_prelude(&rpc, &signer, 10, 100);
             script_simulate_refused(&rpc, code, 100);

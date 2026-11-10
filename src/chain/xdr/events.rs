@@ -10,8 +10,10 @@
 //! `OrphanSettled` names no account (`PoolEvent::affected_accounts` answers
 //! none for it), and neither do the two-topic `DefaultedDebt` and
 //! `DebtSetoff` that stock pools and pre-release fork builds emit. On
-//! Precept `v0.1.1` both carry the borrower in topic 1, so the tracker
-//! re-reads that borrower in the tick that changed them, a `bad_debt(user)`
+//! Precept `v0.1.1` both carry the defaulted user in topic 1 — the
+//! borrower, or the backstop on the backstop path, which the tracker's
+//! re-read then finds with no liabilities — so the tracker
+//! re-reads that account in the tick that changed them, a `bad_debt(user)`
 //! whose set-off clears the debt from the borrower's own supply included.
 //! A `b_rate` cut still lowers every other position in that reserve without
 //! naming any of them: those rows catch up at the next full scan, a known

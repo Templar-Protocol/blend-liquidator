@@ -109,8 +109,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leaves a position under it, and a `min_primary_collateral` strictly
   between zero and it is a startup error. A borrower with no collateral is
   bad debt without the oracle being read, as the contract now decides it
-  (Guardian L-01), so an unpriced debt reserve no longer leaves them
-  undecided.
+  (Guardian L-01): the auctioneer decides such a borrower without
+  reading the oracle.
 - An oracle scan refused because the ledger moved between its reads
   (`ChainError::LedgerMoved`, after the snapshot's own three attempts)
   gets one retry on the next tick instead of waiting a whole

@@ -626,7 +626,7 @@ impl<'a> Auctioneer<'a> {
         {
             return Ok(Decision::Skip(SkipReason::AuctionOpen));
         }
-        // Guardian L-01 (Precept `pool/src/pool/bad_debt.rs:62-74`): the
+        // Guardian L-01 (Precept `pool/src/pool/bad_debt.rs:60-74`): the
         // contract's default path reads no price for a borrower whose every
         // collateral entry is zero, so neither does this decision. Without
         // this check, a debt in a reserve the oracle cannot price would make
@@ -636,9 +636,10 @@ impl<'a> Auctioneer<'a> {
                 && !positions.collateral.values().any(|b_tokens| *b_tokens > 0)
             {
                 // No price is needed, but every liability must still name a
-                // reserve the pool has: the contract cannot default a debt it
-                // cannot resolve, so that stays a math failure for this
-                // borrower rather than a decision.
+                // reserve the snapshot holds: one it does not is an incomplete
+                // view, and keeping it a per-borrower `MissingReserve` leaves
+                // the borrower undecided (its flag moved forward) rather than
+                // proposed for `bad_debt`.
                 for index in positions.liabilities.keys() {
                     if !reserves.contains_key(index) {
                         return Err(MathError::MissingReserve(*index).into());
@@ -653,7 +654,7 @@ impl<'a> Auctioneer<'a> {
         // The priced half of the contract's own gate, read the same way it
         // reads it: `check_and_handle_user_bad_debt` returns early unless
         // the borrower has liabilities *and* `collateral_raw == 0`
-        // (`pool/src/pool/bad_debt.rs:56-58`). A borrower with liabilities
+        // (`pool/src/pool/bad_debt.rs:60-74`). A borrower with liabilities
         // who reaches this line holds a collateral entry above zero, since
         // the check above has already settled every other case without a
         // price. `collateral_base`
@@ -1830,7 +1831,7 @@ mod tests {
 
     /// The contract gates its default path on `collateral_raw`, not on
     /// the c-factor-weighted `collateral_base`
-    /// (`pool/src/pool/bad_debt.rs:56-58` returns early unless the
+    /// (`pool/src/pool/bad_debt.rs:60-74` returns early unless the
     /// borrower has liabilities *and* `collateral_raw == 0`). A borrower
     /// holding a dust amount of `DUST_C_FACTOR_INDEX` therefore has
     /// `collateral_base == 0` (the weighted value floors away) and

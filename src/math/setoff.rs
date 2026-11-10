@@ -38,9 +38,9 @@ pub struct DefaultOutcome {
 ///
 /// The gate is the contract's, read the same way: the borrower must have
 /// liabilities and `collateral_raw == 0`
-/// (`pool/src/pool/bad_debt.rs:56-58`). A borrower with no collateral
+/// (`pool/src/pool/bad_debt.rs:60-74`). A borrower with no collateral
 /// entry above zero is past the gate without any valuation at all, so no
-/// price is read for it (Guardian L-01, `pool/src/pool/bad_debt.rs:62-74`).
+/// price is read for it (Guardian L-01, `pool/src/pool/bad_debt.rs:60-74`).
 /// Below the gate, per liability asset in
 /// reserve-index order:
 ///
@@ -80,7 +80,7 @@ pub fn project_default(
             defaulted: false,
         });
     }
-    // Guardian L-01 (Precept `pool/src/pool/bad_debt.rs:62-74`): the
+    // Guardian L-01 (Precept `pool/src/pool/bad_debt.rs:60-74`): the
     // contract values the borrower only when some collateral entry is above
     // zero, so a borrower holding none defaults without the oracle being
     // read at all.
@@ -344,7 +344,7 @@ mod tests {
         );
     }
 
-    /// Precept `v0.1.1` (`pool/src/pool/bad_debt.rs:62-74`): a borrower
+    /// Precept `v0.1.1` (`pool/src/pool/bad_debt.rs:60-74`): a borrower
     /// whose every collateral entry is zero defaults without the oracle
     /// being read, so an unpriced debt reserve is no obstacle.
     #[test]

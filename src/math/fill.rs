@@ -328,7 +328,9 @@ pub enum FillSkip {
     TooManyPositions,
     /// More of the primary asset would have closed the shortfall, and the
     /// wallet does not hold it — or a supply the wallet could not take as
-    /// far as the reserve's `min_position`, which the contract would refuse.
+    /// far as the reserve's `min_position`, which the contract would refuse
+    /// — except that [`FillSkip::SupplyCapped`] is answered instead when the
+    /// reserve's supply cap is what stopped it.
     Unfunded,
     /// More of the primary asset would have closed the shortfall and the
     /// pool's `supply_cap` has no room for it. Distinct from
@@ -354,7 +356,9 @@ pub enum PlannedFill {
 pub(crate) const REPAY_ALLOWANCE_BPS: i128 = 1;
 
 /// Units added to a supply for the b-token round trip's two floors; the
-/// next projection verifies the result either way.
+/// next projection verifies the result either way. The minted-b-token round
+/// trip can lose up to one b-token's worth (`b_rate / 1e12` of underlying),
+/// so two units cover it while `b_rate` is below 2.0.
 const SUPPLY_ROUNDING_ALLOWANCE: i128 = 2;
 
 /// Plans one fill (spec §5, "Health-bounded plan").
@@ -2593,6 +2597,44 @@ mod plan_tests {
                 percent(100)
             ),
             PlannedFill::Skip(FillSkip::Unfunded)
+        );
+    }
+
+    /// `a_top_up_nothing_else_can_replace_is_unfunded` with a reserve whose
+    /// `supply_cap` has room for 5e11 and a wallet holding 1e13: the
+    /// filler owes 2,000 USDC, `force_fill` caps the search at 350, and the
+    /// whole lot (2e11 XLM, full from the 200th ledger) leaves the position
+    /// under the 1e12 `min_position`, so the top-up is 1e12 − 2e11 = 8e11,
+    /// over the 5e11 the cap admits. The wallet could cover it; the cap cannot, so the
+    /// skip is `SupplyCapped`, not `Unfunded`.
+    #[test]
+    fn a_top_up_the_supply_cap_blocks_is_capped_not_unfunded() {
+        let mut pool = pool_with_min_position(1_000_000_000_000);
+        pool.reserves
+            .get_mut(&0)
+            .expect("the XLM reserve")
+            .config
+            .supply_cap = 500_000_000_000;
+        let terms = FillTerms {
+            force_fill: true,
+            ..terms()
+        };
+        let filler = Positions {
+            liabilities: BTreeMap::from([(1, 20_000_000_000)]),
+            ..Positions::default()
+        };
+        let wallet = BTreeMap::from([(XLM.to_string(), 10_000_000_000_000)]);
+        assert_eq!(
+            plan(
+                &terms,
+                &pool,
+                &filler,
+                &wallet,
+                &auction(),
+                START + 1,
+                percent(100)
+            ),
+            PlannedFill::Skip(FillSkip::SupplyCapped)
         );
     }
 
