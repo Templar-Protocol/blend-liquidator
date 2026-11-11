@@ -3,7 +3,7 @@
 # one lever that turns deploy.sh's healthy borrower into a liquidatable
 # one. PRICE is in the oracle's own units — 7 decimals, so the default
 # 750000 is $0.075 against deploy.sh's $0.10, a 25% drop that takes the
-# borrower's health factor from ~1.19 to ~0.89.
+# borrower's health factor from ~1.18 to ~0.88.
 #
 # USDC's price is re-sent unchanged alongside it because set_price_stable
 # takes the whole price vector positionally, in the `assets` order

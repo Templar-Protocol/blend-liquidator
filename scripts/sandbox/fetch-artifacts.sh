@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# fetch-artifacts.sh — downloads the five pinned Blend v2 wasm files into
-# target/sandbox/wasm/, verifying each against scripts/sandbox/versions.env,
-# and prints their sizes.
+# fetch-artifacts.sh — downloads the five pinned wasm files — Precept's
+# pool, backstop and factory, Blend's Comet and the SEP-40 mock oracle —
+# into target/sandbox/wasm/, verifying each against
+# scripts/sandbox/versions.env, and prints their sizes.
 #
 # Idempotent and offline-safe once every file is present and verified: a
 # second run finds each already_verified() and downloads nothing. A file

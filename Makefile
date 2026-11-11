@@ -81,10 +81,10 @@ check: ## Run everything CI runs (needs `make db-up` first)
 sandbox-up: ## Start the pinned local Stellar network in Docker
 	./scripts/sandbox/up.sh
 
-sandbox-fetch: ## Download and verify the pinned Blend v2 wasm artefacts
+sandbox-fetch: ## Download and verify the pinned Precept, Comet and mock-oracle wasm artefacts
 	./scripts/sandbox/fetch-artifacts.sh
 
-sandbox-deploy: ## Deploy Blend v2 on the local network for SANDBOX_SCENARIO (default liquidation)
+sandbox-deploy: ## Deploy Precept on the local network for SANDBOX_SCENARIO (default liquidation)
 	SANDBOX_SCENARIO=$(SANDBOX_SCENARIO) ./scripts/sandbox/deploy.sh
 
 # `--list` first, and exactly one match required, because libtest exits 0
