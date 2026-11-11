@@ -38,6 +38,12 @@
 //!   it (`AuctionInProgress`, 1212) rather than trying to create a second
 //!   one, and fills it — proving `Auctioneer::adopt`, otherwise
 //!   unreachable from this tier's own continuous runs.
+//! - [`free_fill_default`]: the crate's default fill timing against
+//!   Precept's default path — a 100% auction filled with `free-fill` at
+//!   `start + 400`, where the bid is gone, so Precept sets off the
+//!   borrower's plain supply and defaults the rest inside the fill,
+//!   emitting `debt_setoff` and `defaulted_debt` with the borrower in
+//!   their topics, and cuts USDC's `b_rate`.
 //!
 //! `mod sandbox_harness` (`tests/sandbox_harness/mod.rs`) is the machinery
 //! every scenario in this tier shares: the standalone-network gate, the
@@ -94,7 +100,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use precept_liquidator::chain::xdr::AuctionType;
+use precept_liquidator::chain::xdr::{AuctionType, PoolEvent};
 use precept_liquidator::chain::{PoolReader, RpcClient};
 use precept_liquidator::config::ChainConfig;
 use precept_liquidator::math::AuctionData;
@@ -102,17 +108,19 @@ use precept_liquidator::store::Store;
 use sqlx::postgres::PgPool;
 
 use sandbox_harness::{
-    assert_all_dry_run, assert_auction_unchanged, assert_counter, assert_counter_at_least,
-    assert_metrics, assert_no_auction, assert_no_rows, crash, create_run_database,
-    create_run_database_unmigrated, drop_run_database, fail, fail_check, fill_budget,
-    log_lines_containing, mint, note_run_database, pools_toml, pools_toml_with,
-    print_nonzero_counters, read_metrics, repo_root, require_standalone_rpc, required,
-    run_check_config, sandbox_env, spawn_bot, terminate, wait_for_adopted_auction,
-    wait_for_auction, wait_for_dry_run_row, wait_for_ledgers_past, wait_for_liability,
-    wait_for_ready, wait_for_tx_hash, wait_for_unwind, wait_for_unwind_leftovers, with_database,
-    Bot, BotConfig, PoolOptions, CREATIONS_FOR_ACCOUNT, CREATIONS_VIOLATING_DRY_RUN,
-    CREATION_TIMEOUT, CREATION_TX_HASH, DRY_RUN_CREATION_ROW, DRY_RUN_FILL_ROW,
-    FILLS_VIOLATING_DRY_RUN, FILL_TX_HASH, UNWIND_LEFTOVERS_METRIC,
+    applied_ledger, assert_all_dry_run, assert_auction_unchanged, assert_counter,
+    assert_counter_at_least, assert_kind_never_notified, assert_metrics, assert_no_auction,
+    assert_no_positions, assert_no_rows, crash, crash_at, create_run_database,
+    create_run_database_unmigrated, creation_percent, drop_run_database, fail, fail_check,
+    fill_budget, log_lines_containing, mint, note_run_database, pool_events_of, pools_toml,
+    pools_toml_with, print_nonzero_counters, read_metrics, repo_root, require_standalone_rpc,
+    required, reserve_b_rate, run_check_config, sandbox_env, spawn_bot, terminate,
+    wait_for_adopted_auction, wait_for_auction, wait_for_dry_run_row, wait_for_ledgers_past,
+    wait_for_liability, wait_for_ready, wait_for_tx_hash, wait_for_unwind,
+    wait_for_unwind_leftovers, wait_for_user_row_gone, with_database, Bot, BotConfig, PoolOptions,
+    CREATIONS_FOR_ACCOUNT, CREATIONS_VIOLATING_DRY_RUN, CREATION_TIMEOUT, CREATION_TX_HASH,
+    DRY_RUN_CREATION_ROW, DRY_RUN_FILL_ROW, EARLIEST_PROFITABLE_FILL, FILLS_VIOLATING_DRY_RUN,
+    FILL_TX_HASH, FREE_FILL, UNWIND_LEFTOVERS_METRIC,
 };
 
 /// The tier's standard scenario: an armed bot creates the auction, fills it
@@ -225,7 +233,7 @@ async fn liquidation() {
     // Measured, not assumed: the fill waits on the auction's ledger ramp,
     // so its budget is however long this sandbox takes to close that many
     // ledgers.
-    let budget = fill_budget(&mut bot, &rpc).await;
+    let budget = fill_budget(&mut bot, &rpc, &EARLIEST_PROFITABLE_FILL).await;
     let fill = wait_for_tx_hash(
         &mut bot,
         &store,
@@ -1000,7 +1008,7 @@ async fn dry_run_phase_c(ctx: &DryRunCtx<'_>, expected_entry: &AuctionData) {
 
     wait_for_ready(&mut bot, ctx.http).await;
 
-    let budget = fill_budget(&mut bot, ctx.rpc).await;
+    let budget = fill_budget(&mut bot, ctx.rpc, &EARLIEST_PROFITABLE_FILL).await;
     let (tx_hash, fill_ledger) = wait_for_dry_run_row(
         &mut bot,
         ctx.store,
@@ -1244,7 +1252,7 @@ async fn unwind_repay_run_one(ctx: &UnwindRepayCtx<'_>) -> Bot {
     .await;
     // Measured, not assumed, the same reason `liquidation` measures it: the
     // fill waits on the auction's own ledger ramp.
-    let budget = fill_budget(&mut bot, ctx.rpc).await;
+    let budget = fill_budget(&mut bot, ctx.rpc, &EARLIEST_PROFITABLE_FILL).await;
     let fill = wait_for_tx_hash(
         &mut bot,
         ctx.store,
@@ -1727,7 +1735,7 @@ async fn restart_adopt_bot_two(ctx: &RestartAdoptCtx<'_>, database_url: &str) {
         println!("bot #2, the adoption path: {line}");
     }
 
-    let budget = fill_budget(&mut bot, ctx.rpc).await;
+    let budget = fill_budget(&mut bot, ctx.rpc, &EARLIEST_PROFITABLE_FILL).await;
     let fill = wait_for_tx_hash(
         &mut bot,
         &store,
@@ -1890,4 +1898,215 @@ async fn restart_adopt() {
     // will read are databases worth not keeping.
     drop_run_database(&root, &maintenance_url, &database_one).await;
     drop_run_database(&root, &maintenance_url, &database_two).await;
+}
+
+/// `free_fill_default`'s crash: $0.05, at which the borrower's raw
+/// collateral ($250) is under its debt ($340), so no partial liquidation
+/// closes the excess and the auctioneer creates a 100% one.
+const FREE_FILL_CRASH_PRICE: i128 = 500_000;
+
+/// The crate's default fill timing, against Precept's default path: a 100%
+/// auction filled with `free-fill` at `start + 400`, where the bid is gone,
+/// so the fill takes the whole lot and none of the debt, and Precept
+/// defaults the borrower's leftover debt inside that same transaction —
+/// setting off its 40 USDC of plain supply first (`debt_setoff`), then
+/// defaulting the rest (`defaulted_debt`), both with the borrower in topic
+/// 1 as Precept `v0.1.1` emits them, and cutting USDC's `b_rate`. No other
+/// scenario uses `free-fill`, and none reaches the default path.
+///
+/// Ignored on purpose — it needs `scripts/sandbox/up.sh` and
+/// `SANDBOX_SCENARIO=free_fill_default scripts/sandbox/deploy.sh` to have
+/// run, and a Postgres at `DATABASE_URL`.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+#[ignore = "needs the local sandbox network: scripts/sandbox/up.sh && scripts/sandbox/deploy.sh"]
+async fn free_fill_default() {
+    let root = repo_root();
+    let env = sandbox_env(
+        &root.join("target/sandbox/sandbox.env"),
+        "free_fill_default",
+    );
+
+    let passphrase = required(&env, "SANDBOX_PASSPHRASE").to_string();
+    let pool = required(&env, "SANDBOX_POOL").to_string();
+    let xlm = required(&env, "SANDBOX_XLM").to_string();
+    let usdc = required(&env, "SANDBOX_USDC").to_string();
+    let borrower = required(&env, "SANDBOX_BORROWER").to_string();
+    let filler = required(&env, "SANDBOX_FILLER").to_string();
+    let rpc_url = required(&env, "SANDBOX_RPC_URL").to_string();
+
+    // Ordered as in `liquidation`: nothing below runs against an endpoint
+    // whose own answer has not been checked.
+    require_standalone_rpc(&rpc_url).await;
+
+    let Ok(maintenance_url) = std::env::var("DATABASE_URL") else {
+        panic!("DATABASE_URL is not set — the store tests need it too; see `make db-up`")
+    };
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or_default();
+    let database = format!("sandbox_{stamp}");
+    println!("creating the run's database {database}");
+    let database_url = create_run_database(&root, &maintenance_url, &database).await;
+    note_run_database(&database);
+
+    let sandbox_dir = root.join("target/sandbox");
+    let seed_path = sandbox_dir.join("seed.toml");
+    let seed = format!("[accounts]\n\"{pool}\" = [\"{borrower}\"]\n");
+    if let Err(error) = std::fs::write(&seed_path, seed) {
+        panic!("could not write {}: {error}", seed_path.display());
+    }
+
+    let pools = pools_toml_with(
+        &pool,
+        &xlm,
+        &[usdc.as_str()],
+        &PoolOptions {
+            fill_objective: "free-fill",
+            ..PoolOptions::default()
+        },
+    );
+    let mut bot = spawn_bot(
+        &root,
+        &env,
+        BotConfig {
+            dry_run: false,
+            filler_secret: Some(required(&env, "SANDBOX_FILLER_SECRET_KEY")),
+            pools,
+            database_url: database_url.clone(),
+            log_name: "bot.log",
+            extra_env: vec![("SEED_FILE", seed_path.display().to_string())],
+        },
+    )
+    .await;
+
+    let http = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => fail(&bot, &format!("could not build an HTTP client: {error}")),
+    };
+    let store = match Store::connect(&database_url, 4).await {
+        Ok(store) => store,
+        Err(error) => fail(&bot, &format!("could not connect to {database}: {error}")),
+    };
+    let chain = ChainConfig {
+        network_passphrase: passphrase,
+        rpc_url,
+        rpc_api_key: None,
+        base_fee: 5_000,
+        high_fee: 10_000,
+        tx_poll_ledgers: 30,
+    };
+    let rpc = match RpcClient::from_config(&chain) {
+        Ok(rpc) => rpc,
+        Err(error) => fail(&bot, &format!("could not build an RPC client: {error}")),
+    };
+
+    wait_for_ready(&mut bot, &http).await;
+
+    let b_rate_before = reserve_b_rate(&bot, &rpc, &pool, &usdc).await;
+    println!(
+        "crashing XLM's price to {FREE_FILL_CRASH_PRICE} at {:.1} s",
+        bot.elapsed()
+    );
+    crash_at(&bot, &root, FREE_FILL_CRASH_PRICE);
+
+    let creation = wait_for_tx_hash(
+        &mut bot,
+        &store,
+        CREATION_TX_HASH,
+        "the auctioneer to create the borrower's full liquidation auction",
+        CREATION_TIMEOUT,
+        &pool,
+        &borrower,
+    )
+    .await;
+    let percent = creation_percent(&bot, &store, &pool, &borrower).await;
+    if percent != 100 {
+        fail(
+            &bot,
+            &format!("the auction was created at {percent}%, not 100%"),
+        );
+    }
+    let created_in = applied_ledger(&bot, &rpc, &creation).await;
+
+    let budget = fill_budget(&mut bot, &rpc, &FREE_FILL).await;
+    let fill = wait_for_tx_hash(
+        &mut bot,
+        &store,
+        FILL_TX_HASH,
+        "the filler to take the whole lot at start + 400",
+        budget,
+        &pool,
+        &borrower,
+    )
+    .await;
+    let filled_in = applied_ledger(&bot, &rpc, &fill).await;
+    // An auction's `block` is its creation ledger + 1
+    // (`create_user_liq_auction_data`'s `e.ledger().sequence() + 1`).
+    let into_auction = filled_in.saturating_sub(created_in + 1);
+    if into_auction < 400 {
+        fail(
+            &bot,
+            &format!("the fill landed {into_auction} ledgers in, before the bid had gone"),
+        );
+    }
+
+    let events = pool_events_of(&bot, &rpc, &pool, filled_in, &fill).await;
+    let set_off = events.iter().any(|event| {
+        matches!(event,
+            PoolEvent::DebtSetoff { user: Some(user), asset, .. }
+                if *user == borrower && *asset == usdc)
+    });
+    let defaulted = events.iter().any(|event| {
+        matches!(event,
+            PoolEvent::DefaultedDebt { user: Some(user), asset, .. }
+                if *user == borrower && *asset == usdc)
+    });
+    if !(set_off && defaulted) {
+        fail(
+            &bot,
+            &format!(
+                "the fill's events lack a debt_setoff and a defaulted_debt naming the \
+                 borrower: {events:?}"
+            ),
+        );
+    }
+
+    wait_for_user_row_gone(&mut bot, &store, &pool, &borrower).await;
+    assert_no_positions(&bot, &rpc, &pool, &borrower).await;
+    let b_rate_after = reserve_b_rate(&bot, &rpc, &pool, &usdc).await;
+    if b_rate_after >= b_rate_before {
+        fail(
+            &bot,
+            &format!(
+                "USDC's b_rate went from {b_rate_before} to {b_rate_after}: nothing was defaulted"
+            ),
+        );
+    }
+
+    let undecoded = log_lines_containing(&bot, "an event this bot models did not decode");
+    if !undecoded.is_empty() {
+        fail(
+            &bot,
+            &format!("the bot skipped events it could not decode: {undecoded:?}"),
+        );
+    }
+
+    let collateral = wait_for_unwind(&mut bot, &rpc, &pool, &filler, &xlm).await;
+    let metrics = read_metrics(&bot, &http).await;
+    assert_metrics(&bot, &metrics);
+    assert_kind_never_notified(&bot, &metrics, "stock_wasm_detected");
+
+    terminate(&mut bot).await;
+    println!(
+        "done in {:.1} s: creation {creation} (100%), fill {fill} {into_auction} ledgers in, \
+         USDC b_rate {b_rate_before} → {b_rate_after}, {collateral} stroops of XLM collateral left",
+        bot.elapsed()
+    );
+    store.pool().close().await;
+    drop_run_database(&root, &maintenance_url, &database).await;
 }

@@ -28,8 +28,9 @@
 #
 # SANDBOX_SCENARIO picks which of this tier's scenarios (sandbox_scenarios,
 # below) this deploy is for, defaulting to liquidation. It changes exactly
-# one thing below: unwind_repay skips minting the filler's USDC in step 2,
-# so a fill's bid arrives with nothing to cover it. It is written into
+# two things below: unwind_repay skips minting the filler's USDC in step 2,
+# so a fill's bid arrives with nothing to cover it, and free_fill_default
+# adds the borrower's plain USDC supply in step 9. It is written into
 # sandbox.env in step 10, which is what lets a scenario's own test
 # (tests/sandbox_harness/mod.rs's sandbox_env) refuse a deploy meant for a
 # different one before it creates a database or spawns anything.
@@ -54,11 +55,11 @@ source "${script_dir}/lib.sh"
 : "${SANDBOX_PORT:=8000}"
 : "${SANDBOX_SCENARIO:=liquidation}"
 
-# The scenarios this deploy accepts. The same five names are written in
+# The scenarios this deploy accepts. The same six names are written in
 # four more places — the Makefile's SANDBOX_SCENARIOS default, SCENARIOS in
 # tests/sandbox_harness/mod.rs, the matrix in .github/workflows/sandbox.yml
 # and the #[ignore]d test fns in tests/liquidation_sandbox.rs — and
-# scripts/check-repo-invariants.sh fails unless all five name the same set.
+# scripts/check-repo-invariants.sh fails unless all five places name the same set.
 # No other script reads SANDBOX_SCENARIO: the Rust side's sandbox_env is
 # what compares a test against the SANDBOX_SCENARIO this writes into
 # sandbox.env.
@@ -69,7 +70,7 @@ source "${script_dir}/lib.sh"
 # env-file check below is: it touches no network, and an operator who
 # mistyped it deserves that answer immediately rather than after a network
 # has been verified.
-sandbox_scenarios=(liquidation check_config dry_run unwind_repay restart_adopt)
+sandbox_scenarios=(liquidation check_config dry_run unwind_repay restart_adopt free_fill_default)
 scenario_known=false
 for scenario in "${sandbox_scenarios[@]}"; do
 	if [ "${scenario}" = "${SANDBOX_SCENARIO}" ]; then
@@ -622,12 +623,35 @@ invoke "${SANDBOX_KEY_BORROWER}" "${POOL}" submit \
 	--from "${BORROWER}" --spender "${BORROWER}" --to "${BORROWER}" \
 	--requests "[{\"request_type\":2,\"address\":\"${XLM}\",\"amount\":\"${BORROWER_XLM_COLLATERAL}\"},{\"request_type\":4,\"address\":\"${USDC}\",\"amount\":\"${BORROWER_USDC_DEBT}\"}]" >/dev/null
 
+# free_fill_default is the one scenario whose borrower also supplies USDC,
+# as plain supply (0), never SupplyCollateral (2): on this market USDC
+# carries a zero collateral factor, but a collateral entry still has raw
+# value, and Precept's check_and_handle_user_bad_debt returns early for any
+# position with raw collateral (pool/src/pool/bad_debt.rs:64-74) — so the
+# default this scenario exists to prove would never run. Plain supply
+# leaves the health factor where it was, and is what the default path's
+# set-off draws on first. It is its own submit, after the borrow: the pool
+# moves a request's tokens in before it pays the borrow out, so in one
+# submit the borrower's wallet would still be empty when the supply's
+# transfer ran.
+if [ "${SANDBOX_SCENARIO}" = "free_fill_default" ]; then
+	log "free_fill_default: the borrower also supplies ${BORROWER_USDC_SUPPLY} stroops of USDC as plain supply"
+	invoke "${SANDBOX_KEY_BORROWER}" "${POOL}" submit \
+		--from "${BORROWER}" --spender "${BORROWER}" --to "${BORROWER}" \
+		--requests "[{\"request_type\":0,\"address\":\"${USDC}\",\"amount\":\"${BORROWER_USDC_SUPPLY}\"}]" >/dev/null
+fi
+
 positions=$(invoke_view "${SANDBOX_KEY_ADMIN}" "${POOL}" get_positions --address "${BORROWER}")
 collateral_count=$(json_field "${positions}" '.collateral | length' "step 9 borrower")
 liability_count=$(json_field "${positions}" '.liabilities | length' "step 9 borrower")
 if [ "${collateral_count}" != "1" ] || [ "${liability_count}" != "1" ]; then
 	die "step 9 borrower: expected one collateral and one liability, got ${collateral_count} and ${liability_count}: ${positions}"
 fi
+supply_count=$(json_field "${positions}" '.supply | length' "step 9 borrower")
+expected_supply=0
+[ "${SANDBOX_SCENARIO}" != "free_fill_default" ] || expected_supply=1
+[ "${supply_count}" = "${expected_supply}" ] \
+	|| die "step 9 borrower: expected ${expected_supply} plain supply position(s), got ${supply_count}: ${positions}"
 log "borrower positions: ${positions}"
 
 ########################################################################
