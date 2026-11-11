@@ -691,7 +691,8 @@ const AUCTION_ENTRY_TIMEOUT: Duration = Duration::from_mins(1);
 /// ledgers at all, and phase A's comes before any close rate has been
 /// measured. Three minutes is 20 ledgers at up to 9 s each — over three
 /// times the slowest close [`fill_budget`] accepts (its ten-minute cap
-/// over `FILL_LEDGERS` plus slack allows about 2.8 s a ledger), so a
+/// over `FILL_LEDGERS` plus slack allows 2.7 s a ledger, (600 − 60) / 200, for
+/// the earliest-profitable budget), so a
 /// sandbox slow enough to time out here would fail every fill wait anyway,
 /// and a timeout names the ledger wait it happened in rather than blaming
 /// the bot.
@@ -1917,6 +1918,9 @@ const FREE_FILL_CRASH_PRICE: i128 = 500_000;
 /// Ignored on purpose — it needs `scripts/sandbox/up.sh` and
 /// `SANDBOX_SCENARIO=free_fill_default scripts/sandbox/deploy.sh` to have
 /// run, and a Postgres at `DATABASE_URL`.
+// A straight line of named waits and chain assertions, each carrying its
+// own reason to fail closed, and together over clippy's line count.
+// Wiring, not logic.
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
 #[ignore = "needs the local sandbox network: scripts/sandbox/up.sh && scripts/sandbox/deploy.sh"]
@@ -2076,6 +2080,17 @@ async fn free_fill_default() {
         );
     }
 
+    // The borrower is left with no collateral, so there is none to orphan.
+    if events
+        .iter()
+        .any(|event| matches!(event, PoolEvent::CollateralOrphaned { .. }))
+    {
+        fail(
+            &bot,
+            &format!("the fill's events hold a collateral_orphaned: {events:?}"),
+        );
+    }
+
     wait_for_user_row_gone(&mut bot, &store, &pool, &borrower).await;
     assert_no_positions(&bot, &rpc, &pool, &borrower).await;
     let b_rate_after = reserve_b_rate(&bot, &rpc, &pool, &usdc).await;
@@ -2088,6 +2103,15 @@ async fn free_fill_default() {
         );
     }
 
+    let collateral = wait_for_unwind(&mut bot, &rpc, &pool, &filler, &xlm).await;
+    let metrics = read_metrics(&bot, &http).await;
+    assert_metrics(&bot, &metrics);
+    assert_kind_never_notified(
+        &bot,
+        &metrics,
+        precept_liquidator::notifier::NotificationKind::StockWasmDetected.as_str(),
+    );
+
     let undecoded = log_lines_containing(&bot, "an event this bot models did not decode");
     if !undecoded.is_empty() {
         fail(
@@ -2095,11 +2119,6 @@ async fn free_fill_default() {
             &format!("the bot skipped events it could not decode: {undecoded:?}"),
         );
     }
-
-    let collateral = wait_for_unwind(&mut bot, &rpc, &pool, &filler, &xlm).await;
-    let metrics = read_metrics(&bot, &http).await;
-    assert_metrics(&bot, &metrics);
-    assert_kind_never_notified(&bot, &metrics, "stock_wasm_detected");
 
     terminate(&mut bot).await;
     println!(

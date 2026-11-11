@@ -1051,7 +1051,7 @@ pub(crate) async fn wait_for_ready(bot: &mut Bot, http: &reqwest::Client) {
 /// with "the filler never filled", which is a true statement about the
 /// wrong thing. So the rate is measured, the budget derived, and a sandbox
 /// too slow to finish inside `budget.cap` is reported now rather
-/// than in ten minutes' time.
+/// than once that cap has run out.
 pub(crate) async fn fill_budget(bot: &mut Bot, rpc: &RpcClient, budget: &FillBudget) -> Duration {
     let first = match rpc.latest_ledger().await {
         Ok(ledger) => ledger.sequence,
@@ -2257,8 +2257,19 @@ pub(crate) async fn wait_for_user_row_gone(
 /// with a nonzero count. `Metrics::render` writes that family from what was
 /// observed — unlike the closed-enum families, a kind never notified has no
 /// series at all — so absence is the never-notified state, and a series that
-/// is present must read zero.
+/// is present must read zero. The family's `# TYPE` line is required first:
+/// it is always written, so its absence means the family was renamed and an
+/// absence of series would prove nothing.
 pub(crate) fn assert_kind_never_notified(bot: &Bot, metrics: &str, kind: &str) {
+    if !metrics
+        .lines()
+        .any(|line| line == "# TYPE precept_liquidator_notifications_total counter")
+    {
+        fail(
+            bot,
+            "/metrics does not declare precept_liquidator_notifications_total",
+        );
+    }
     let prefix = format!("precept_liquidator_notifications_total{{kind=\"{kind}\",");
     for line in metrics.lines().filter(|line| line.starts_with(&prefix)) {
         if line.rsplit(' ').next() != Some("0") {

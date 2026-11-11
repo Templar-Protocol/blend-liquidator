@@ -90,8 +90,8 @@ ship; neither tier deploys that stack (§5).
 
 Precept builds against `soroban-sdk =25.3.0`, so its wasm needs a network
 on protocol 25 or later. Public testnet answers protocol 30. The pinned
-quickstart image's standalone network has not been checked, and is the
-first thing the implementation verifies (§2.A).
+quickstart image's standalone network answers protocol 28 (checked
+2026-11-10), at or above 25.
 
 ## 2. Design
 
@@ -193,8 +193,9 @@ The five existing scenarios keep their purpose:
 - `liquidation`: crash, partial auction, `earliest-profitable` fill, unwind.
 - `unwind_repay`: the filler holds no USDC, so the fill leaves it a USDC
   liability, and on this market its health then needs a supply of its
-  primary, XLM — the first time `plan_fill`'s `min_position` top-up meets
-  real contract code. The repay branch after `mint.sh` is unchanged.
+  primary, XLM — a fill whose plan supplies the primary, under a reserve
+  with a `min_position`, against real contract code. The repay branch
+  after `mint.sh` is unchanged.
 - `dry_run`, `restart_adopt`: logic unchanged; numbers follow §2.C.
 - `check_config`: gains case (i), §2.E.
 

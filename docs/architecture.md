@@ -185,7 +185,7 @@ is defaulted and decided as bad debt without needing a price (Guardian
 L-01): the snapshot still reads the oracle, but a reserve it cannot price
 no longer blocks the decision.
 
-The bot still runs against stock Blend v2 pools as well, and three
+The bot still runs against stock Blend v2 pools as well, and two
 things follow from that:
 
 - `plan_fill`'s `b_rate`-haircut projection runs unconditionally, on stock
@@ -197,12 +197,13 @@ things follow from that:
   regardless of which wasm is actually deployed, and a stock pool emits
   `bad_debt` in ordinary operation — so on a stock pool this alert is
   expected noise, not evidence of a misconfiguration.
-- The sandbox integration tier (`scripts/sandbox/`) and the testnet soak's
-  armed stage (`scripts/testnet/`) deploy Precept's own `v0.1.1` release
-  wasm (pool, backstop and factory, pinned by release URL and SHA-256 in
-  `scripts/sandbox/versions.env`) in the live XLM/USDC market's shape. The
-  sandbox runs six scenarios, `free_fill_default` among them, which drives
-  Precept's set-off and default path against real contract code.
+
+The sandbox integration tier (`scripts/sandbox/`) and the testnet soak's
+armed stage (`scripts/testnet/`) deploy Precept's own `v0.1.1` release
+wasm (pool, backstop and factory, pinned by release URL and SHA-256 in
+`scripts/sandbox/versions.env`) in the live XLM/USDC market's shape. The
+sandbox runs six scenarios, `free_fill_default` among them, which drives
+Precept's set-off and default path against real contract code.
 
 ## 7. The store
 

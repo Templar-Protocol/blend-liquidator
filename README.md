@@ -229,7 +229,7 @@ public testnet with friendbot's XLM. Six scenarios
 each proves):
 
 ```bash
-make sandbox                                # all six, about 25 minutes
+make sandbox                                # all six, about 30 minutes
 SANDBOX_SCENARIO=liquidation make sandbox   # just one
 make sandbox-down                           # tear it down by hand (SANDBOX_KEEP=1 left it up)
 ```
@@ -261,7 +261,7 @@ runner. `liquidation`'s deploy leaves a borrower at a health factor of
 the bot then creates the borrower's liquidation auction, fills it and
 unwinds the position it took, asserted through the audit tables' own
 transaction hashes, the filler's on-chain position and `/metrics`. The
-other four prove `check-config`'s exit codes and warnings, a wrong
+other five prove `check-config`'s exit codes and warnings, a wrong
 `NETWORK_PASSPHRASE`'s included, without ever sending a transaction or
 migrating the database; that a dry-run bot holding a real signing key
 never sends a transaction, whether deciding to create an auction or to
@@ -270,7 +270,11 @@ rows; that the unwind's repay branch clears debt a
 fill's own repay could not cover, once the wallet is funded and a second
 bot restarts; and that a bot `SIGKILL`ed right after creating an auction
 is followed by a fresh instance that adopts and fills that same auction
-rather than trying to create a second one. What it catches is the world
+rather than trying to create a second one; and that `free_fill_default`'s
+`free-fill` at `start + 400` takes a 100% auction's whole lot with no bid
+while Precept defaults the borrower's leftover debt in the same
+transaction, setting off its USDC supply first and cutting the reserve's
+`b_rate`. What it catches is the world
 moving — a quickstart image, a pinned wasm, a contract that changed its
 mind — rather than a diff being wrong, which is what the pull-request
 gate is for.

@@ -147,7 +147,7 @@ cargo test --lib --bins             # unit tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 make sqlx-prepare                   # after changing a query in src/store.rs
-make sandbox                        # all six scenarios, ~25 min (Docker + stellar CLI); SANDBOX_SCENARIO=x for one
+make sandbox                        # all six scenarios, ~30 min (Docker + stellar CLI); SANDBOX_SCENARIO=x for one
 make testnet-deploy                 # stand Precept up on public Stellar testnet for the soak's armed stage
 make testnet-crash                  # move the testnet soak's oracle price (default $0.08)
 make testnet-run                    # run the bot against testnet in dry run (no key; nothing is ever submitted)
@@ -1491,16 +1491,16 @@ Status above for what remains.
   USDC, and, with the pool's 100 bps margin, a fill that landed at block
   185, where the lot it took was ~2,838.66 XLM worth ~$227.09 at the
   crashed price; `FILL_LEDGERS` is 200, that with room for a re-plan.
-  `free_fill_default` has its own budget (`FREE_FILL`, 410 ledgers, a
-  15-minute cap, against `EARLIEST_PROFITABLE_FILL`'s `FILL_LEDGERS` and
-  10-minute cap) because `free-fill` aims at `start + 400`. So
-  `fill_budget` samples the chain head (`RpcClient::latest_ledger`, the
+  So `fill_budget` samples the chain head (`RpcClient::latest_ledger`, the
   RPC's `getLatestLedger`) for five seconds immediately before the wait,
-  derives `FILL_LEDGERS × seconds per ledger` plus a minute, and fails *up
-  front*, naming the rate it measured, when that exceeds the ten-minute
+  derives the scenario's ledgers × seconds per ledger plus a minute, and
+  fails *up front*, naming the rate it measured, when that exceeds its
   cap. A constant written around "quickstart closes a ledger a second"
   becomes a flake the day it does not, and it fails as "the filler never
-  filled" — a true statement about the wrong thing.
+  filled" — a true statement about the wrong thing. The budget is per
+  scenario: `free_fill_default` has its own (`FREE_FILL`, 410 ledgers, a
+  15-minute cap, against `EARLIEST_PROFITABLE_FILL`'s `FILL_LEDGERS` and
+  10-minute cap) because `free-fill` aims at `start + 400`.
 - Each sandbox scenario creates its own databases per run on the
   `DATABASE_URL` server — `sandbox_<unix seconds>`, or `sandbox_<unix
   seconds>_1` and `_2` for `restart_adopt`'s two bots, the suffixes
@@ -1565,7 +1565,7 @@ Status above for what remains.
   every network but a brand-new standalone one carries it — so
   `scripts/sandbox/deploy.sh`'s own `stellar contract asset deploy
   --asset native` would fail there. `scripts/testnet/deploy.sh`'s
-  `native_asset_id` (`scripts/testnet/deploy.sh:190-198`) takes the id
+  `native_asset_id` (`scripts/testnet/deploy.sh:191-199`) takes the id
   instead from `stellar contract id asset --asset native`, which derives
   it purely from the network passphrase, no source account or
   transaction involved.
