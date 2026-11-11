@@ -152,8 +152,9 @@ market lists USDC at index 0; this tier keeps XLM at 0 and USDC at 1, the
 order every existing assertion and `sandbox.env` key already assumes. Index
 order carries no contract semantics, and the bot reads indices from chain.
 
-`reserve_metadata` takes every field above rather than four positional
-arguments, so neither reserve's row can silently inherit the other's.
+`reserve_metadata`'s four positional arguments give way to two literal
+`ReserveConfig` JSON objects, one per reserve, every field written out, so
+neither reserve's row can silently inherit the other's.
 
 ### C. Scenario numbers
 
