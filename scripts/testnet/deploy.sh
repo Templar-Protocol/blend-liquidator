@@ -547,9 +547,11 @@ log "pool is active (status ${status}): ${config}"
 # At $0.10/XLM the borrower's 5,000 XLM of collateral is worth $500, which
 # XLM's 0.8 collateral factor values at $400, against 340 USDC of debt that
 # USDC's 1.0 liability factor values at $340 — a health factor of ~1.18.
-# crash.sh's $0.075 takes the collateral to $300 and the health factor to
-# ~0.88. At 300 USDC the same crash would land on exactly 1.0, which is not
-# under LIQ_HF_THRESHOLD's 0.998.
+# crash.sh's $0.08 takes the collateral to $320 and the health factor to
+# ~0.94. At 300 USDC the same crash would leave it at ~1.07, nothing to
+# liquidate. Not deeper: on this market a liquidation restores 1.06 only at
+# (1.06 - HF) / 0.18 of the debt, so from ~0.88 it would need ~99%, which
+# Precept treats as a full liquidation; ~0.94 needs ~66%, a real partial.
 ########################################################################
 
 log "=== step 9: liquidity and the borrower ==="

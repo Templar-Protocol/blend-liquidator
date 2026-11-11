@@ -164,11 +164,17 @@ today it borrows 300:
 | | XLM price | Effective collateral | Effective debt | Health factor |
 |---|---:|---:|---:|---:|
 | deployed | $0.10 | 5,000 × 0.10 × 0.8 = $400 | 340 / 1.0 = $340 | ≈ 1.18 |
-| after `crash.sh` (default) | $0.075 | $300 | $340 | ≈ 0.88 |
+| after `crash.sh` (default) | $0.08 | $320 | $340 | ≈ 0.94 |
 
-So the scenario stays one 25% price move wide and `crash.sh`'s default of
-`750000` stands. At 300 USDC the same crash would reach exactly 1.0, which
-is not under `LIQ_HF_THRESHOLD`'s 0.998.
+So the scenario stays one price move wide, now 20%, and `crash.sh`'s default
+moves to `800000`. At 300 USDC the same crash would leave the health factor
+at ~1.07, nothing to liquidate.
+
+Not deeper: Precept treats more than 95% as a full liquidation, and on this
+market every $1 of debt removed costs 1.1 × 0.8 = $0.88 of effective
+collateral, so the percent that restores 1.06 is (1.06 − HF) / 0.18. From
+~0.88 that is ~99%, a full liquidation; from ~0.94 it is ~66%, a real
+partial.
 
 Everything downstream of those numbers is **measured, never assumed**,
 exactly as the existing fill-budget gotcha requires: the partial percent
@@ -285,7 +291,7 @@ otherwise get past silently, decoding `enabled`'s slot or `supply_cap`'s.
 `scripts/testnet/deploy.sh` makes the same changes as §2.A–C: Precept
 pins, take rate 0, the §2.B reserves, the 340 USDC borrower. Its upload
 preflight message names `soroban-sdk 25` and testnet's protocol 30.
-`crash.sh` keeps `750000` as its default. `run-bot.sh --armed` keeps
+`crash.sh`'s default is `800000`, as the sandbox's. `run-bot.sh --armed` keeps
 `fill_objective = "earliest-profitable"`, so an armed pass fits its hour.
 
 **Stage 2 is re-run** on the new deployment: any `target/testnet/testnet.env`

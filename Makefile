@@ -26,8 +26,8 @@ SANDBOX_SCENARIO ?= liquidation
 SANDBOX_SCENARIOS ?= liquidation check_config dry_run unwind_repay restart_adopt
 
 # testnet-crash's own oracle price, in the oracle's 7-decimal units. Empty
-# by default, which leaves crash.sh to use its own default (750000,
-# $0.075); PRICE=<n> overrides it.
+# by default, which leaves crash.sh to use its own default (800000,
+# $0.08); PRICE=<n> overrides it.
 PRICE ?=
 
 help: ## Show available commands
@@ -258,7 +258,7 @@ sandbox: ## fetch, then up → deploy → test → down for each of SANDBOX_SCEN
 testnet-deploy: ## Stand Precept up on testnet for the soak's armed stage (writes target/testnet/testnet.env; refuses if it already exists)
 	./scripts/testnet/deploy.sh
 
-testnet-crash: ## Move the testnet soak's oracle price (default $0.075; PRICE=<n> in the oracle's 7-decimal units for another)
+testnet-crash: ## Move the testnet soak's oracle price (default $0.08; PRICE=<n> in the oracle's 7-decimal units for another)
 	./scripts/testnet/crash.sh $(PRICE)
 
 testnet-run: ## Run the bot against testnet in dry run (the observe stage's own pool; no key, nothing ever submitted)
