@@ -255,7 +255,7 @@ sandbox: ## fetch, then up → deploy → test → down for each of SANDBOX_SCEN
 # tear down; testnet.env, once deploy.sh writes it, is what every other
 # target here reads.
 
-testnet-deploy: ## Stand Blend v2 up on testnet for the soak's armed stage (writes target/testnet/testnet.env; refuses if it already exists)
+testnet-deploy: ## Stand Precept up on testnet for the soak's armed stage (writes target/testnet/testnet.env; refuses if it already exists)
 	./scripts/testnet/deploy.sh
 
 testnet-crash: ## Move the testnet soak's oracle price (default $0.075; PRICE=<n> in the oracle's 7-decimal units for another)
