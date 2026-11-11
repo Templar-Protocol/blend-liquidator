@@ -20,10 +20,11 @@ decide against a pool it has never seen before, for as long as it takes to
 see it track borrowers, read their positions, and either leave them alone
 or plan something — over real testnet conditions, not a scripted scenario.
 
-**Stage 2, armed**, stands up a throwaway Blend v2 deployment of this
-repository's own — our own tokens, oracle, backstop and pool, on the public
+**Stage 2, armed**, stands up a throwaway Precept v0.1.1 deployment of
+this repository's own — our own tokens, oracle, backstop and pool, on the public
 network rather than a local container — with one borrower a single oracle
-price move away from being liquidatable, and runs the bot with
+price move away from being liquidatable (340 USDC borrowed against 5,000
+XLM, a 20% drop), and runs the bot with
 `DRY_RUN=false` against it. This is the only place outside the sandbox tier
 that this bot ever signs and sends a transaction with real consequences
 (testnet ones), and the only place that proves the whole pipeline — create,
@@ -142,6 +143,11 @@ does the same):
 DATABASE_URL=postgres://liquidator:liquidator@127.0.0.1:55432/testnet_soak sqlx database create
 DATABASE_URL=postgres://liquidator:liquidator@127.0.0.1:55432/testnet_armed sqlx database create
 ```
+
+A dev-container rebuild recreates Postgres, so the databases must be
+created again after one; an armed start against a missing database
+refuses at startup (`database: connecting to the database failed`),
+sending nothing. The 2026-11-11 run hit exactly this.
 
 The binary itself migrates each one at startup (`RUN_MODE=loop`, this
 tier's default, migrates under an advisory lock — see
@@ -342,13 +348,16 @@ make testnet-deploy
 ```
 
 Runs `scripts/testnet/deploy.sh`: `scripts/sandbox/deploy.sh`'s own ten
-steps against testnet rather than a local container — four funded
-identities, the mock oracle, Comet, the backstop and pool factory (address
-predicted before either exists, since each names the other), the pool
-itself with XLM and USDC reserves, backstop funding past the activation
-threshold, and one borrower supplying 5,000 XLM of collateral and borrowing
-300 USDC — worth $375 and ~$315.8 respectively at the deploy-time price,
-a health factor around 1.19, nothing to liquidate yet. Refuses to start if
+steps against testnet rather than a local container, on Precept v0.1.1
+wasm — four funded identities, the mock oracle, Comet, the backstop and
+pool factory (address predicted before either exists, since each names
+the other), the pool itself with a backstop take rate of 0 and XLM and
+USDC reserves in the live XLM/USDC market's shape, backstop funding past
+the activation threshold, and one borrower supplying 5,000 XLM of
+collateral and borrowing 340 USDC — $400 of effective collateral (XLM's
+c_factor is 0.8) against $340 of debt (USDC's l_factor is 1.0) at the
+deploy-time price of $0.10, a health factor around 1.18, nothing to
+liquidate yet. Refuses to start if
 `target/testnet/testnet.env` already exists (see "Testnet resets" below);
 otherwise writes it at the end, `mode 0600`, holding the deployed
 addresses and the filler's secret key. A transcript of every step lands in
@@ -360,12 +369,16 @@ addresses and the filler's secret key. A transcript of every step lands in
 make testnet-crash
 ```
 
-Runs `scripts/testnet/crash.sh` with its default price (`750000`, $0.075 —
+Runs `scripts/testnet/crash.sh` with its default price (`800000`, $0.08 —
 `PRICE=<n>` in the oracle's own 7-decimal units overrides it). Moves the
-XLM price down 25% from deploy's $0.10, taking the borrower's collateral
-value to $281.25 and its health factor to about 0.89 — now liquidatable.
-Safe to run before or after starting the bot; it touches nothing but the
-oracle and can be re-run at any time.
+XLM price down 20% from deploy's $0.10, taking the borrower's effective
+collateral to $320 and its health factor to about 0.94 — now
+liquidatable. Safe to run before or after starting the bot; it touches
+nothing but the oracle and can be re-run at any time.
+
+Precept refuses a price older than 24 hours (or dated in the future): a
+deployment older than a day needs `make testnet-crash` re-run, at the
+price it should hold, before anything in the pool is priced again.
 
 ### Run armed
 
@@ -523,6 +536,11 @@ once (status 130).
 
 ## Stage 1 results
 
+Run against stock Blend v2 on Blend's own testnet pool. Re-running stage 1
+against Precept needs a Precept testnet pool that is priced and has
+borrowers; the rehearsal pool (CDPHII5C…) is the candidate, and on
+2026-11-09 it had neither.
+
 Run of 2026-09-23, against Blend's testnet pool
 `CCEBVDYM32YNYCVNRXQKDFFPISJJCV557CDZEIRBEE4NCV4KHPQ44HGF` (an example;
 see "Testnet resets" above). Dry run, no key configured.
@@ -607,6 +625,74 @@ see "Testnet resets" above). Dry run, no key configured.
   `creations` or `fills` rows for the pool.
 
 ## Stage 2 results
+
+### 2026-11-11: Precept v0.1.1
+
+Run of 2026-11-11 on Precept v0.1.1 wasm, in the live XLM/USDC market's
+shape (addresses below are that run's; treat them as an example — see
+"Testnet resets" above). Two auction cycles: the first was delayed by a
+bot bug this run found, the second followed from the delay.
+
+- Pool `CBFC6M6NTGUOYEYQFUYVV676AMBPDVLI7XBKTYMY426S5T5SDVVOOROP`;
+  borrower `GDJ4MJ3JKP3HUDEDNBL3HQ456TER6AK6EXIUR4EUMMW3NBXS3B3RVPTO`
+  with 5,000 XLM of collateral and 340 USDC of debt after deploy;
+  `make testnet-crash` set XLM to 800000 ($0.08) at 04:51 UTC. The first
+  armed start refused at startup, sending nothing, because this dev
+  container's Postgres had been recreated and `testnet_armed` did not
+  exist; creating it (see "The database") fixed that.
+- **Bug found:** the testnet RPC runs stellar-rpc 30.0.0, whose
+  `getEvents` no longer sends `inSuccessfulContractCall`. From 04:55:37
+  every poll of a page holding an event failed with `rpc response shape:
+  getEvents: missing field`, the poller backed off, and at 04:55:55 the
+  bot reported `RpcFailing` (5 consecutive failures). No tick reached the
+  filler, so nothing was filled. The bot was stopped by `SIGTERM` at
+  05:28:50 (it drained cleanly) and restarted on the fixed binary
+  (commit 46674ff); it logged no poll failure afterwards.
+- **Cycle 1, creation**: `creations` row `#1`, percent 66, `dry_run =
+  false`, tx
+  `4604c50b843ca3a54a7372f8a18fe76b491976c7010f7d6e3239f6b05b8d52a3`.
+- **Cycle 1, fill**: `fills` row `#1`, `auction_type user_liquidation`,
+  percent 100, `fill_ledger` 5670261, bid empty, lot 3,085.5 XLM,
+  `est_profit` 2468400400, `dry_run = false`, tx
+  `b4dc229d9ba3519e1e60815384d5c2c23c9177d217559edba799d15ab3c3511b`.
+  It landed about 403 ledgers into the auction, past the ramp's end,
+  only because the poller was stuck until the fix; the bid was absent, so
+  the filler took the whole lot and none of the debt. Without the bug,
+  `earliest-profitable` would have aimed at about 185 ledgers in.
+- **Cycle 1, unwind**: one action, no remaining liabilities, tx
+  `3244aaee74e99f4514a4904bb09846782524767643e2389e8b1ece6362fe7bc0`.
+- **Cycle 2** followed from the late free fill, which left the borrower
+  all 340 USDC of debt and 34% of its collateral, deeply underwater.
+  `creations` row `#2`, percent 100, `dry_run = false`, tx
+  `d54280ab72cd685c56fa84485f7936809246def12e18a0944a5b557603f8b291`;
+  `fills` row `#2`, percent 100, `fill_ledger` 5670577, bid 149.6 USDC,
+  lot 1,914.5 XLM, `est_profit` 35599519, `dry_run = false`, tx
+  `3fe9e39f7d5c04d5c0520f868ee24e5b5d2106974991f1b4540d3fa908007f2e`,
+  about 312 ledgers in (`earliest-profitable`, the bid ramped down to
+  44%). Unwind: one action, no remaining liabilities, tx
+  `863bdb0f2a1a62d75c11e6c8af77e5df1714e82a8f39fe7c5a8069796ce91dfb`.
+- **Precept's default path, on testnet**: cycle 2's fill was a full fill
+  that left the borrower about 190 USDC of debt and no collateral, so
+  Precept defaulted it inside the same transaction. The RPC's events for
+  that ledger are `defaulted_debt` (three topics, the v0.1.1
+  `[name, user, asset]` shape), `fill_auction` and `repay`; the bot
+  decoded all of them (its log holds no "an event this bot models did
+  not decode" line for the run) and the borrower was left with no
+  positions.
+- **End state** (`examples/soak_report.rs`, ledger 5670645): 0 tracked
+  users, 0 open auctions, 2 creations, 2 fills. The filler holds 0
+  liabilities and primary collateral valued at 64000000 in the oracle's
+  own units — exactly 100 XLM at $0.08 and a 0.8 collateral factor,
+  which is this pool's `min_primary_collateral`.
+- **`/metrics`** of the restarted process (counters are per process, so
+  cycle 1's creation was counted by the first one):
+  `creations_total{result="succeeded"} 1`,
+  `fills_total{result="succeeded"} 2`, `unwind_passes_total 4`,
+  `estimated_profit_total 2503999919`, `auction_created` notifications
+  queued 1, `fill_confirmed` queued 1 and deduplicated 1. The bot was
+  stopped by `SIGTERM` at 06:01 and drained cleanly.
+
+### 2026-09-23: stock Blend v2
 
 Run of 2026-09-23 (addresses below are that run's; treat them as an
 example — see "Testnet resets" above):
