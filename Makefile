@@ -68,7 +68,7 @@ check: ## Run everything CI runs (needs `make db-up` first)
 
 # ── The sandbox integration tier ────────────────────
 #
-# A throwaway Stellar network in Docker, Blend v2 deployed on it, and the
+# A throwaway Stellar network in Docker, Precept deployed on it, and the
 # real binary run against it **armed**. Nothing here runs in CI's PR gate:
 # `make sandbox` takes minutes and starts containers, so it is a nightly
 # workflow (.github/workflows/sandbox.yml) and a thing you run by hand.

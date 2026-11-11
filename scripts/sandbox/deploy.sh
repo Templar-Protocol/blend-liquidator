@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # deploy.sh — stands Precept — Templar's audited Blend v2 fork, release
-# v0.1.1 — up on the sandbox's local
-# network and leaves one borrower a single price move away from being
-# liquidatable. Writes target/sandbox/sandbox.env (mode 0600), which is
-# the only thing the rest of the tier reads, and target/sandbox/sandbox.log,
-# a transcript of every step and every address it produced.
+# v0.1.1 — up on the sandbox's local network and leaves one borrower a
+# single price move away from being liquidatable. Writes
+# target/sandbox/sandbox.env (mode 0600), which is the only thing the rest
+# of the tier reads, and target/sandbox/sandbox.log, a transcript of every
+# step and every address it produced.
 #
 # Runs exactly once per `up.sh`: it refuses to start when sandbox.env
 # already exists, because a second run against the same network would
@@ -555,7 +555,8 @@ done
 # **Deviation from the brief.** The brief's step 8 ends with
 # `update_status` returning 0. It cannot: the pool's own
 # execute_update_pool_status panics with StatusNotAllowed (1204) whenever
-# the current status is 6, and verified against Precept v0.1.1's source (pool/src/pool/status.rs:43-48).
+# the current status is 6, and verified against Precept v0.1.1's source
+# (pool/src/pool/status.rs:43-48).
 # The contracts' own fixture leaves Setup with set_status(3) followed by
 # update_status(), which lands on 1 (Active); execute_set_pool_status(0)
 # reaches 0 (Admin Active) in one call while enforcing the identical

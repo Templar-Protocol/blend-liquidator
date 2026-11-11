@@ -197,10 +197,12 @@ things follow from that:
   regardless of which wasm is actually deployed, and a stock pool emits
   `bad_debt` in ordinary operation — so on a stock pool this alert is
   expected noise, not evidence of a misconfiguration.
-- The sandbox integration tier (`scripts/sandbox/`) still pins stock wasm
-  by release URL and SHA-256 (`scripts/sandbox/versions.env`): it predates
-  Precept's releases, and moving it onto Precept's own `v0.1.1` artefacts
-  is the next change to it.
+- The sandbox integration tier (`scripts/sandbox/`) and the testnet soak's
+  armed stage (`scripts/testnet/`) deploy Precept's own `v0.1.1` release
+  wasm (pool, backstop and factory, pinned by release URL and SHA-256 in
+  `scripts/sandbox/versions.env`) in the live XLM/USDC market's shape. The
+  sandbox runs six scenarios, `free_fill_default` among them, which drives
+  Precept's set-off and default path against real contract code.
 
 ## 7. The store
 

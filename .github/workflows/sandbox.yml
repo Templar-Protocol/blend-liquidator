@@ -1,7 +1,7 @@
 name: Sandbox
 
-# The sandbox integration tier: a throwaway Stellar network in Docker, Blend
-# v2 deployed on it, and the real binary run against it **armed** — the one
+# The sandbox integration tier: a throwaway Stellar network in Docker, Precept
+# deployed on it, and the real binary run against it **armed** — the one
 # place anything in this repository submits a transaction it signed.
 #
 # Nightly and on demand, never on `push` or `pull_request`. The tier has six
@@ -160,7 +160,7 @@ jobs:
       - name: Fetch the pinned contract artefacts
         run: ./scripts/sandbox/fetch-artifacts.sh
 
-      - name: Deploy Blend v2, leaving one borrower a price move from liquidation
+      - name: Deploy Precept, leaving one borrower a price move from liquidation
         env:
           SANDBOX_SCENARIO: ${{ matrix.scenario }}
         run: ./scripts/sandbox/deploy.sh

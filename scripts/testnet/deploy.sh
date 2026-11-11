@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# deploy.sh — stands Precept (release v0.1.1) up on Stellar testnet for the soak's armed
-# stage: our own tokens, mock oracle, backstop, factory and pool, with one
-# borrower a single price move from being liquidatable. Writes
-# target/testnet/testnet.env (mode 0600) and target/testnet/deploy.log, a
-# transcript of every step and every address it produced.
+# deploy.sh — stands Precept (release v0.1.1) up on Stellar testnet for the
+# soak's armed stage: our own tokens, mock oracle, backstop, factory and
+# pool, with one borrower a single price move from being liquidatable.
+# Writes target/testnet/testnet.env (mode 0600) and
+# target/testnet/deploy.log, a transcript of every step and every address
+# it produced.
 #
 # This is scripts/sandbox/deploy.sh's own ten steps, run against testnet
 # instead of a throwaway local network — read that file's comments for the
@@ -280,10 +281,11 @@ require_funded_testnet "${TESTNET_KEY_FILLER}" "${FILLER}"
 #
 # versions.env's five wasm files were built against soroban-sdk 25; testnet
 # runs protocol 30. Precept's own testnet deployments run these exact
-# contracts (registry/testnet.jsonl records pool wasm acf7a128…), so this is expected to succeed — but if protocol 30 refuses
-# them, every later step would fail for the same reason under a more
-# confusing name, so this is where that question gets answered, and where
-# this script stops if the answer is no. POOL_HASH is reused by step 5
+# contracts (registry/testnet.jsonl records pool wasm acf7a128…), so this is
+# expected to succeed — but if protocol 30 refuses them, every later step
+# would fail for the same reason under a more confusing name, so this is
+# where that question gets answered, and where this script stops if the
+# answer is no. POOL_HASH is reused by step 5
 # rather than uploaded a second time.
 ########################################################################
 
