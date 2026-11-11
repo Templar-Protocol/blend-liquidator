@@ -643,25 +643,57 @@ pub(crate) async fn drop_run_database(root: &Path, maintenance_url: &str, name: 
     maintenance.close().await;
 }
 
+/// What a scenario's `POOLS_TOML` may vary. [`Default`] is every
+/// scenario's own: [`MIN_PRIMARY_COLLATERAL`] and `earliest-profitable`,
+/// which [`FILL_LEDGERS`] is measured against — the crate's own default,
+/// `free-fill`, aims at `start + 400` instead, past that measured budget.
+pub(crate) struct PoolOptions {
+    /// `min_primary_collateral`, in stroops.
+    pub(crate) min_primary_collateral: i128,
+    /// `fill_objective`: `"earliest-profitable"` or `"free-fill"`.
+    pub(crate) fill_objective: &'static str,
+}
+
+impl Default for PoolOptions {
+    fn default() -> Self {
+        Self {
+            min_primary_collateral: MIN_PRIMARY_COLLATERAL,
+            fill_objective: "earliest-profitable",
+        }
+    }
+}
+
 /// The `POOLS_TOML` a bot follows: one pool, `bid` as `supported_bid`, any
-/// lot, the primary asset floor an unwind is asserted against.
+/// lot, the primary asset floor an unwind is asserted against, with
+/// [`PoolOptions::default`].
 pub(crate) fn pools_toml(pool: &str, xlm: &str, bid: &[&str]) -> String {
+    pools_toml_with(pool, xlm, bid, &PoolOptions::default())
+}
+
+/// [`pools_toml`] with `options` in place of the defaults.
+pub(crate) fn pools_toml_with(
+    pool: &str,
+    xlm: &str,
+    bid: &[&str],
+    options: &PoolOptions,
+) -> String {
     let supported_bid = bid
         .iter()
         .map(|asset| format!("\"{asset}\""))
         .collect::<Vec<_>>()
         .join(", ");
+    let PoolOptions {
+        min_primary_collateral,
+        fill_objective,
+    } = options;
     format!(
         "[[pools]]\n\
          address = \"{pool}\"\n\
          primary_asset = \"{xlm}\"\n\
-         min_primary_collateral = \"{MIN_PRIMARY_COLLATERAL}\"\n\
+         min_primary_collateral = \"{min_primary_collateral}\"\n\
          min_health_factor = 1.5\n\
          default_profit_bps = 100\n\
-         # earliest-profitable, not the crate's free-fill default: FILL_LEDGERS\n\
-         # is measured against the lot ramp's break-even ledger, and free-fill\n\
-         # would move the fill out to start + 400, past that measured budget.\n\
-         fill_objective = \"earliest-profitable\"\n\
+         fill_objective = \"{fill_objective}\"\n\
          supported_bid = [{supported_bid}]\n\
          supported_lot = [\"*\"]\n"
     )

@@ -16,10 +16,12 @@
 //!   borrower's liquidation auction after a price crash, fills it, and
 //!   unwinds the position it took.
 //! - [`check_config`]: `RUN_MODE=check-config` against the same deploy,
-//!   proving its eight cases' exit codes and messages — two of them with a
+//!   proving its nine cases' exit codes and messages — two of them with a
 //!   wrong `NETWORK_PASSPHRASE`, pinning what a keyed and a keyless
-//!   configuration each do with one — and that none of them sends a
-//!   transaction or migrates the database.
+//!   configuration each do with one, and one, (i), a primary floor under
+//!   the reserve's `min_position`, pinning that the decoder reads
+//!   `min_position` from a real `ReserveConfig` — and that none of them
+//!   sends a transaction or migrates the database.
 //! - [`dry_run`]: the tier's most important safety test. A dry-run bot
 //!   holding the real filler key never sends a transaction — not to create
 //!   a borrower's auction, and not to fill one an armed run of the same bot
@@ -103,13 +105,14 @@ use sandbox_harness::{
     assert_all_dry_run, assert_auction_unchanged, assert_counter, assert_counter_at_least,
     assert_metrics, assert_no_auction, assert_no_rows, crash, create_run_database,
     create_run_database_unmigrated, drop_run_database, fail, fail_check, fill_budget,
-    log_lines_containing, mint, note_run_database, pools_toml, print_nonzero_counters,
-    read_metrics, repo_root, require_standalone_rpc, required, run_check_config, sandbox_env,
-    spawn_bot, terminate, wait_for_adopted_auction, wait_for_auction, wait_for_dry_run_row,
-    wait_for_ledgers_past, wait_for_liability, wait_for_ready, wait_for_tx_hash, wait_for_unwind,
-    wait_for_unwind_leftovers, with_database, Bot, BotConfig, CREATIONS_FOR_ACCOUNT,
-    CREATIONS_VIOLATING_DRY_RUN, CREATION_TIMEOUT, CREATION_TX_HASH, DRY_RUN_CREATION_ROW,
-    DRY_RUN_FILL_ROW, FILLS_VIOLATING_DRY_RUN, FILL_TX_HASH, UNWIND_LEFTOVERS_METRIC,
+    log_lines_containing, mint, note_run_database, pools_toml, pools_toml_with,
+    print_nonzero_counters, read_metrics, repo_root, require_standalone_rpc, required,
+    run_check_config, sandbox_env, spawn_bot, terminate, wait_for_adopted_auction,
+    wait_for_auction, wait_for_dry_run_row, wait_for_ledgers_past, wait_for_liability,
+    wait_for_ready, wait_for_tx_hash, wait_for_unwind, wait_for_unwind_leftovers, with_database,
+    Bot, BotConfig, PoolOptions, CREATIONS_FOR_ACCOUNT, CREATIONS_VIOLATING_DRY_RUN,
+    CREATION_TIMEOUT, CREATION_TX_HASH, DRY_RUN_CREATION_ROW, DRY_RUN_FILL_ROW,
+    FILLS_VIOLATING_DRY_RUN, FILL_TX_HASH, UNWIND_LEFTOVERS_METRIC,
 };
 
 /// The tier's standard scenario: an armed bot creates the auction, fills it
@@ -311,14 +314,18 @@ struct CheckConfigCase<'a> {
 /// and (h), and nothing else ever is.
 const WRONG_PASSPHRASE: &str = "Test SDF Network ; September 2015";
 
-/// The eight cases [`check_config`] runs, (a) through (h) — wiring, not
+/// The nine cases [`check_config`] runs, (a) through (i) — wiring, not
 /// logic, kept out of that function so it reads as the chain and database
 /// checks around one loop. The comment on each case carries the reasoning
 /// `src/service.rs`, `src/config.rs` and `src/main.rs` give for that exact
 /// code and text.
+// The table is one literal per case, each carrying its own reasoning
+// comment, and runs past clippy's line count for that reason alone.
+#[allow(clippy::too_many_lines)]
 fn check_config_cases<'a>(
     default_pools: &'a str,
     blnd_pools: &'a str,
+    primary_under_min_position_pools: &'a str,
     filler_secret: &'a str,
     database_url: &'a str,
     absent_url: &'a str,
@@ -441,18 +448,37 @@ fn check_config_cases<'a>(
             expected_code: 0,
             expected_text: "no FILLER_SECRET_KEY",
         },
+        // (i) a `min_primary_collateral` of 10 XLM, above zero and under
+        // the XLM reserve's 50 XLM `min_position`: `validate_primary_asset`
+        // refuses it in every mode, because no unwind could ever rest on a
+        // floor Precept refuses to leave a position at. Its unit tests pin
+        // the rule; this case pins that the decoder reads `min_position`
+        // from a real `v0.1.1` `ReserveConfig`, at the field position
+        // between `supply_cap` and `enabled` — a field-order bug would read
+        // one of those instead and pass silently.
+        CheckConfigCase {
+            label: "i",
+            pools: primary_under_min_position_pools,
+            dry_run: true,
+            filler_secret: None,
+            extra_env: vec![],
+            database_url,
+            passphrase_override: None,
+            expected_code: 2,
+            expected_text: "min_position 500000000",
+        },
     ]
 }
 
 /// The `check_config` scenario: `RUN_MODE=check-config` against the
 /// standard deploy, proving the deploy-smoke-test contract spec §10
 /// promises — the right exit code and the right warning or error text for
-/// each of eight cases — and that none of them sends a transaction or
+/// each of nine cases — and that none of them sends a transaction or
 /// migrates the database it is pointed at. Cases (g) and (h) pin what a
 /// wrong `NETWORK_PASSPHRASE` does, since nothing checks it against the
 /// network: a configuration with a key fails, one without passes.
 ///
-/// Eight short-lived binary runs rather than one long-running [`Bot`]:
+/// Nine short-lived binary runs rather than one long-running [`Bot`]:
 /// `check-config` validates and exits on its own, so
 /// [`sandbox_harness::run_check_config`] is its own spawn-and-wait-for-exit
 /// rather than [`spawn_bot`]'s spawn-and-wait-for-`/healthz`, and every
@@ -543,6 +569,17 @@ async fn check_config() {
 
     let default_pools = pools_toml(&pool, &xlm, &[usdc.as_str()]);
     let blnd_pools = pools_toml(&pool, &xlm, &[blnd.as_str()]);
+    // Case (i)'s: a primary floor of 10 XLM, under the reserve's 50 XLM
+    // `min_position`.
+    let primary_under_min_position_pools = pools_toml_with(
+        &pool,
+        &xlm,
+        &[usdc.as_str()],
+        &PoolOptions {
+            min_primary_collateral: 100_000_000,
+            ..PoolOptions::default()
+        },
+    );
     let started = Instant::now();
 
     // Table-driven: each case is `run_check_config`'s own arguments plus
@@ -552,6 +589,7 @@ async fn check_config() {
     let cases = check_config_cases(
         &default_pools,
         &blnd_pools,
+        &primary_under_min_position_pools,
         filler_secret.as_str(),
         &database_url,
         &absent_url,
