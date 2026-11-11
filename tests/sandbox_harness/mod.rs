@@ -104,9 +104,9 @@ pub(crate) const CREATION_TIMEOUT: Duration = Duration::from_secs(90);
 /// lot covers the bid plus the configured margin is `200 × bid_value /
 /// lot_value_at_full`. The figures are a real run's (Precept v0.1.1, the
 /// live XLM/USDC market's reserves): the auctioneer created that scenario's
-/// auction at 66%, a bid of 224.4 USDC against a full lot of ~2,838.66 XLM
-/// worth ~$227.09 at the crashed price, and with the pool's 100 bps margin
-/// the fill landed at block 185. Both sides
+/// auction at 66%, with a bid of 224.4 USDC, and with the pool's 100 bps
+/// margin the fill landed at block 185, where the lot it took was ~2,838.66
+/// XLM worth ~$227.09 at the crashed price. Both sides
 /// scale with the percent, so the break-even block is near-invariant across
 /// the band the percent walk lands in. Nothing shortens it: `force_fill`
 /// caps the target at 350 ledgers, which is later, not sooner, and this is
