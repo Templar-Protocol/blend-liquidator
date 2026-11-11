@@ -102,18 +102,19 @@ pub(crate) const CREATION_TIMEOUT: Duration = Duration::from_secs(90);
 /// counts: the lot ramps linearly to full over the auction's first 200
 /// ledgers while the bid stays whole, so the earliest ledger at which the
 /// lot covers the bid plus the configured margin is `200 × bid_value /
-/// lot_value_at_full`. The figures are a real run's, not an illustration:
-/// the auctioneer created that scenario's auction at 69%, a bid of 207 USDC
-/// against a full lot of ~3,139 XLM worth ~$235 at the crashed price, and
-/// with the pool's 100 bps margin the fill landed at block 178. Both sides
+/// lot_value_at_full`. The figures are a real run's (Precept v0.1.1, the
+/// live XLM/USDC market's reserves): the auctioneer created that scenario's
+/// auction at 98%, a bid of 340 USDC against a full lot of ~4,600 XLM worth
+/// ~$345 at the crashed price, and with the pool's 100 bps margin the fill
+/// landed at block 185. Both sides
 /// scale with the percent, so the break-even block is near-invariant across
 /// the band the percent walk lands in. Nothing shortens it: `force_fill`
 /// caps the target at 350 ledgers, which is later, not sooner, and this is
 /// the earliest-profitable break-even specifically — [`pools_toml`] pins
 /// `fill_objective` to `earliest-profitable` for exactly that reason, since
 /// the crate's own default, `free-fill`, aims at `start + 400` instead,
-/// well outside this budget. 190 is 178 with room for a re-plan.
-const FILL_LEDGERS: u32 = 190;
+/// well outside this budget. 200 is 185 with room for a re-plan.
+const FILL_LEDGERS: u32 = 200;
 
 /// What [`FILL_LEDGERS`] worth of measured close time is padded by, for the
 /// bot's own cadences either side of the fill itself.
