@@ -120,6 +120,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The event poller accepts stellar-rpc 30's getEvents, which no longer sends inSuccessfulContractCall: every page holding an event used to fail to decode, so the poller backed off forever and the bot stopped following the pool from its first event.
 - The bot is reconciled with Precept `v0.1.1`, the release every live
   market runs. `defaulted_debt` and `debt_setoff` events, which `v0.1.1`
   emits with the borrower in topic 1, decode again — every one used to be

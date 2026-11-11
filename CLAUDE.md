@@ -1121,6 +1121,14 @@ Status above for what remains.
   Dependabot ignores it for that reason, and `scripts/check-repo-invariants.sh`
   fails unless `Cargo.lock` holds exactly one. Two means a `stellar-xdr` bump
   moved its copy: bump this one in the same PR.
+- stellar-rpc 30 omits `inSuccessfulContractCall` from `getEvents` events
+  (testnet's 30.0.0, checked 2026-11-11). `RawEvent` defaults it to `true`:
+  since Protocol 23 a failed call emits no contract events, so absent means
+  a successful call, and the consumers that filter on it still work for an
+  RPC that sends it. The sandbox's quickstart RPC (protocol 28) still sends
+  the field, so only a newer RPC, testnet's, exercises the absent case. A
+  new required field in any RPC wire struct must be checked against the
+  newest stellar-rpc, not only the sandbox's.
 - `getLedgerEntries` omits absent keys rather than returning nulls, so a
   lookup must go by key, never by position, and "the RPC returned fewer
   entries than keys" is the normal shape of "some of these do not exist".
