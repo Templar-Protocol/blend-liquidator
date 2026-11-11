@@ -148,7 +148,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 make sqlx-prepare                   # after changing a query in src/store.rs
 make sandbox                        # all six scenarios, ~25 min (Docker + stellar CLI); SANDBOX_SCENARIO=x for one
-make testnet-deploy                 # stand Blend v2 up on public Stellar testnet for the soak's armed stage
+make testnet-deploy                 # stand Precept up on public Stellar testnet for the soak's armed stage
 make testnet-crash                  # move the testnet soak's oracle price (default $0.08)
 make testnet-run                    # run the bot against testnet in dry run (no key; nothing is ever submitted)
 make testnet-run-armed              # run the bot against testnet ARMED — the only target that runs the bot armed on testnet
