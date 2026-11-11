@@ -658,11 +658,12 @@ bot bug this run found, the second followed from the delay.
   It landed about 403 ledgers into the auction, past the ramp's end,
   only because the poller was stuck until the fix; the bid was absent, so
   the filler took the whole lot and none of the debt. Without the bug,
-  `earliest-profitable` would have aimed at about 185 ledgers in.
+  `earliest-profitable` would have aimed at about 184 ledgers in.
 - **Cycle 1, unwind**: one action, no remaining liabilities, tx
   `3244aaee74e99f4514a4904bb09846782524767643e2389e8b1ece6362fe7bc0`.
 - **Cycle 2** followed from the late free fill, which left the borrower
-  all 340 USDC of debt and 34% of its collateral, deeply underwater.
+  all 340 USDC of debt and about 38% of its collateral (1,914.5 of 5,000
+  XLM), deeply underwater.
   `creations` row `#2`, percent 100, `dry_run = false`, tx
   `d54280ab72cd685c56fa84485f7936809246def12e18a0944a5b557603f8b291`;
   `fills` row `#2`, percent 100, `fill_ledger` 5670577, bid 149.6 USDC,

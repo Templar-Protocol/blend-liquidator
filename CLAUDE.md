@@ -1497,7 +1497,7 @@ Status above for what remains.
   first 200 ledgers while the bid stays whole, so for this scenario — the
   numbers are a real run's: an auction created at 66%, a bid of 224.4
   USDC, and, with the pool's 100 bps margin, a fill that landed at block
-  185, where the lot it took was ~2,838.66 XLM worth ~$227.09 at the
+  184, where the lot it took was ~2,838.66 XLM worth ~$227.09 at the
   crashed price; `FILL_LEDGERS` is 200, that with room for a re-plan.
   So `fill_budget` samples the chain head (`RpcClient::latest_ledger`, the
   RPC's `getLatestLedger`) for five seconds immediately before the wait,

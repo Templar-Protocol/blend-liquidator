@@ -107,15 +107,19 @@ pub(crate) const CREATION_TIMEOUT: Duration = Duration::from_secs(90);
 /// lot_value_at_full`. The figures are a real run's (Precept v0.1.1, the
 /// live XLM/USDC market's reserves): the auctioneer created that scenario's
 /// auction at 66%, with a bid of 224.4 USDC, and with the pool's 100 bps
-/// margin the fill landed at block 185, where the lot it took was ~2,838.66
-/// XLM worth ~$227.09 at the crashed price. Both sides
+/// margin the fill landed at block 184, where the lot it took was ~2,838.66
+/// XLM worth ~$227.09 at the crashed price — 0.92 of the same position's
+/// full lot of 3,085.5 XLM, the lot modifier at 184 ledgers. (Counted from
+/// the auction's start, the ledger its creation landed in plus one; the
+/// creation row's own ledger is the one the bot read before submitting, a
+/// ledger or two earlier, so subtracting that overstates by one.) Both sides
 /// scale with the percent, so the break-even block is near-invariant across
 /// the band the percent walk lands in. Nothing shortens it: `force_fill`
 /// caps the target at 350 ledgers, which is later, not sooner, and this is
 /// the earliest-profitable break-even specifically — [`pools_toml`] pins
 /// `fill_objective` to `earliest-profitable` for exactly that reason, since
 /// the crate's own default, `free-fill`, aims at `start + 400` instead,
-/// well outside this budget. 200 is 185 with room for a re-plan.
+/// well outside this budget. 200 is 184 with room for a re-plan.
 const FILL_LEDGERS: u32 = 200;
 
 /// What [`FILL_LEDGERS`] worth of measured close time is padded by, for the
@@ -2133,9 +2137,24 @@ pub(crate) async fn applied_ledger(bot: &Bot, rpc: &RpcClient, tx_hash: &str) ->
     }
 }
 
+/// The page size [`pool_events_of`] reads `getEvents` in.
+const EVENT_PAGE_LIMIT: u32 = 200;
+
+/// The most pages [`pool_events_of`] follows before failing. A read that has
+/// not reached past its ledger by then is reported as incomplete, never
+/// treated as the whole ledger.
+const EVENT_PAGES_MAX: usize = 10;
+
 /// Every pool event `tx_hash` emitted in `ledger`, decoded. An event the
 /// decoder refuses fails the run: this scenario exists to prove every one
 /// of them decodes.
+///
+/// `getEvents` answers in ledger order, a page at a time, so the read
+/// follows the cursor until a page is short (the RPC holds nothing more) or
+/// already holds a later ledger's event. A full page that does neither is
+/// read past rather than trusted: stopping there would drop the target
+/// ledger's later events and report a missing `defaulted_debt` that the
+/// chain did emit.
 pub(crate) async fn pool_events_of(
     bot: &Bot,
     rpc: &RpcClient,
@@ -2151,30 +2170,53 @@ pub(crate) async fn pool_events_of(
         ),
     };
     let contract_ids = [pool];
-    let query = EventQuery {
-        start_ledger: Some(ledger),
-        cursor: None,
-        contract_ids: &contract_ids,
-        limit: 200,
-    };
-    let page = match rpc.events(&query).await {
-        Ok(page) => page,
-        Err(error) => fail(
-            bot,
-            &format!("could not read ledger {ledger}'s events: {error}"),
-        ),
-    };
+    let page_limit = usize::try_from(EVENT_PAGE_LIMIT).unwrap_or(usize::MAX);
+    let mut cursor: Option<String> = None;
     let mut decoded = Vec::new();
-    for event in page.events.iter().filter(|event| {
-        event.ledger == ledger && event.in_successful_contract_call && event.tx_hash == hash
-    }) {
-        match decode_pool_event(&event.topics, &event.value) {
-            Ok(Some(pool_event)) => decoded.push(pool_event),
-            Ok(None) => {}
-            Err(error) => fail(bot, &format!("event {} did not decode: {error}", event.id)),
+    for _ in 0..EVENT_PAGES_MAX {
+        let query = EventQuery {
+            start_ledger: if cursor.is_none() { Some(ledger) } else { None },
+            cursor: cursor.as_deref(),
+            contract_ids: &contract_ids,
+            limit: EVENT_PAGE_LIMIT,
+        };
+        let page = match rpc.events(&query).await {
+            Ok(page) => page,
+            Err(error) => fail(
+                bot,
+                &format!("could not read ledger {ledger}'s events: {error}"),
+            ),
+        };
+        for event in page.events.iter().filter(|event| {
+            event.ledger == ledger && event.in_successful_contract_call && event.tx_hash == hash
+        }) {
+            match decode_pool_event(&event.topics, &event.value) {
+                Ok(Some(pool_event)) => decoded.push(pool_event),
+                Ok(None) => {}
+                Err(error) => fail(bot, &format!("event {} did not decode: {error}", event.id)),
+            }
+        }
+        if page.events.len() < page_limit || page.events.iter().any(|event| event.ledger > ledger) {
+            return decoded;
+        }
+        match page.cursor {
+            Some(next) => cursor = Some(next),
+            None => fail(
+                bot,
+                &format!(
+                    "ledger {ledger}'s events filled a {EVENT_PAGE_LIMIT}-event page with no \
+                     cursor to read on from — the read is incomplete"
+                ),
+            ),
         }
     }
-    decoded
+    fail(
+        bot,
+        &format!(
+            "ledger {ledger}'s events did not end within {EVENT_PAGES_MAX} pages of \
+             {EVENT_PAGE_LIMIT} — the read is incomplete"
+        ),
+    )
 }
 
 /// `asset`'s reserve `b_rate` in `pool`, as stored (not accrued).

@@ -501,6 +501,10 @@ that it is the bot's own margin — but not both readings in one crate.
 ## 6. Sandbox and fixtures
 
 > **2026-11-10:** resolved by [the sandbox and testnet tiers on Precept wasm](2026-11-10-precept-sandbox-and-testnet.md), which took route 2 (Precept's own v0.1.1 release; its factory is not byte-identical to stock, so route 1 was not open).
+> Both tiers now deploy Precept v0.1.1. The rest of this section is the
+> original decision record of 2026-09-20, kept as written: its present
+> tense — stock pins, no fork release — describes the state at that date,
+> not the sandbox's current one.
 
 **The sandbox stays on stock pins for now, and this is not a deferral that can
 be quietly forgotten.** `scripts/sandbox/versions.env` pins five wasm by URL
