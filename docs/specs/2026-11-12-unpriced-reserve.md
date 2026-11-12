@@ -191,11 +191,33 @@ Test-first, each new branch's test confirmed to fail without it.
   which a reserve was unpriced, if `src/ledger.rs`'s existing tracker-ack
   tests can drive it. Otherwise the service test's `Ok` is the contract,
   since the poller's commit-on-ack is already tested.
-- **No sandbox scenario.** The script3 mock SEP-40 oracle the sandbox uses
-  is expected to be unable to answer `None` for an asset it was configured
-  with, so a sandbox run would not take the real path. The implementation's
-  first step confirms this from the mock's interface. If it can answer
-  `None`, add a scenario.
+- **A seventh sandbox scenario, `unpriced_reserve`.** The script3 mock
+  SEP-40 oracle can answer `None` for an asset it was configured with
+  (`script3/sep-40-oracle` `v1.2.0`, `mock-sep-40/src/mock_sep_40.rs`):
+  `set_price(prices, timestamp)` stores `prices` positionally under
+  `timestamp` and makes it the latest, so `set_price([xlm], now)` leaves
+  USDC, index 1, with no price at the latest timestamp, and
+  `lastprice(USDC)` answers `None` — the real path, against the real pool
+  and RPC. `set_price_stable([xlm, usdc])` (`crash.sh`) restores both.
+
+  A new `scripts/sandbox/unprice.sh` makes that call. It is gated and
+  pinned like `crash.sh`, signed by the admin, and stamped with the latest
+  ledger's close time. The scenario runs a **dry-run bot with no key**
+  (nothing here needs to sign), with `USER_REFRESH_LEDGERS=3` so the stale
+  pass re-reads the seeded borrower within a few ledgers, with no chain
+  action. It asserts, in order:
+  1. the borrower is tracked with a health factor;
+  2. after `unprice.sh`, `unvalued_users{pool}` reads 1 and the row's health
+     factor is NULL;
+  3. `ledger_processed{pool}` keeps advancing while USDC is unpriced —
+     the cursor is not held, which is the whole fix;
+  4. `notifications_total{kind="reserve_unpriced",…}` counts exactly one
+     queued delivery;
+  5. after `crash.sh 1000000` restores both prices at $0.10, the gauge
+     reads 0 and the row's health factor is back.
+
+  The name joins the five places scenario names are written, which
+  `scripts/check-repo-invariants.sh` holds equal.
 
 ## 3. Documentation
 
