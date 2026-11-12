@@ -21,7 +21,7 @@ use crate::chain::rpc::RpcClient;
 use crate::chain::xdr::PoolEvent;
 use crate::chain::ChainError;
 use crate::ledger::LedgerTick;
-use crate::math::{mul_floor, MathError, SCALAR_7};
+use crate::math::{mul_floor, MathError, Positions, Reserve, SCALAR_7};
 use crate::store::{Store, StoreError, TrackedAuction, TrackedUser};
 
 /// A failure applying chain state to the store.
@@ -39,16 +39,22 @@ pub enum TrackerError {
 }
 
 /// What one refresh did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RefreshOutcome {
-    /// Accounts written or updated.
+    /// Accounts written or updated, unvalued ones included.
     pub tracked: usize,
     /// Accounts removed because they no longer owe anything.
     pub removed: usize,
+    /// Of `tracked`, the accounts written with a NULL health factor
+    /// because a reserve they hold has no oracle price.
+    pub unvalued: usize,
+    /// The distinct assets whose missing price stopped at least one
+    /// valuation.
+    pub unpriced: BTreeSet<String>,
 }
 
 /// What one seed did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SeedOutcome {
     /// The refresh that valued every account the sources named.
     pub refresh: RefreshOutcome,
@@ -72,6 +78,29 @@ impl SeedOutcome {
     pub fn is_complete(&self) -> bool {
         self.failed_sources == 0 && !self.stopped_early
     }
+}
+
+/// What valuing one owing account answered.
+enum Valuation {
+    /// Valued (or nothing owed): the normalised health factor, if any.
+    Valued(Option<i128>),
+    /// A reserve the account holds has no oracle price.
+    Unpriced(String),
+}
+
+/// The first reserve `positions` holds a nonzero balance in that `reserves`
+/// does not hold. Valuation reads collateral before liabilities and stops at
+/// its first error, so a missing price can stand in front of a missing
+/// reserve; deferring on the price then would hide an incomplete view, which
+/// must fail the batch, behind an operating state, which need not.
+fn unknown_reserve(positions: &Positions, reserves: &BTreeMap<u32, Reserve>) -> Option<u32> {
+    positions
+        .collateral
+        .iter()
+        .chain(&positions.liabilities)
+        .filter(|(_, amount)| **amount != 0)
+        .map(|(index, _)| *index)
+        .find(|index| !reserves.contains_key(index))
 }
 
 /// Applies events and refreshes users for one store.
@@ -203,6 +232,18 @@ impl<'a> Tracker<'a> {
     /// rightly refuses the other direction, and clamping here keeps that
     /// refusal from turning "the chain moved" into a failed refresh.
     ///
+    /// An account holding a reserve the oracle has no price for is not an
+    /// error: only `MathError::MissingPrice` is deferred, per account. Its
+    /// row is written with its exact positions and a NULL health factor, a
+    /// recheck is flagged at `tick.sequence`, and the asset is reported in
+    /// [`RefreshOutcome::unpriced`]. The positions are the ledger's effect
+    /// and are stored exactly, so acknowledging the tick (which commits the
+    /// events cursor) still means "applied"; the valuation is not an
+    /// effect of the ledger, and its deferral is durable because the row
+    /// itself is unvalued and flagged. Failing the refresh instead would
+    /// decline the tick and stall the pool's cursor behind one unpriced
+    /// reserve.
+    ///
     /// The row records `snapshot.ledger`, the ledger the positions were
     /// actually read at, not the tick: that is what the stale-refresh pass
     /// then measures staleness against.
@@ -230,21 +271,43 @@ impl<'a> Tracker<'a> {
         for account in accounts {
             let positions = snapshot.positions.get(account);
             let owes = positions.is_some_and(|positions| !positions.liabilities.is_empty());
-            let health = if owes {
-                snapshot
-                    .position_data(account, valued_at)?
-                    .and_then(|data| data.health_factor().transpose())
-                    .transpose()?
+            let valuation = if owes {
+                match snapshot.position_data(account, valued_at) {
+                    Ok(data) => Valuation::Valued(
+                        data.and_then(|data| data.health_factor().transpose())
+                            .transpose()?,
+                    ),
+                    // A reserve this account holds has no oracle price: a
+                    // feed tripped or gone stale, which Precept's adapter
+                    // answers as no price rather than a failure. The
+                    // positions are still exact; only the valuation waits.
+                    // Every other error is an incomplete view or a bug and
+                    // still fails the batch — a reserve the snapshot lacks
+                    // included, even where a missing price was met first.
+                    Err(ChainError::Math(MathError::MissingPrice(asset))) => {
+                        if let Some(index) =
+                            positions.and_then(|held| unknown_reserve(held, &snapshot.reserves))
+                        {
+                            return Err(ChainError::Math(MathError::MissingReserve(index)).into());
+                        }
+                        Valuation::Unpriced(asset)
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             } else {
-                None
+                Valuation::Valued(None)
             };
-            match (positions, health) {
-                (Some(positions), Some(health)) => {
+            match (positions, valuation) {
+                (Some(positions), Valuation::Valued(Some(health))) => {
                     self.store
                         .upsert_user(&TrackedUser {
                             pool: pool.to_string(),
                             account: account.clone(),
-                            health_factor: mul_floor(health, SCALAR_7, snapshot.prices.scalar())?,
+                            health_factor: Some(mul_floor(
+                                health,
+                                SCALAR_7,
+                                snapshot.prices.scalar(),
+                            )?),
                             collateral: positions.collateral.clone(),
                             liabilities: positions.liabilities.clone(),
                             updated_ledger: snapshot.ledger,
@@ -253,6 +316,30 @@ impl<'a> Tracker<'a> {
                         .await?;
                     outcome.tracked += 1;
                 }
+                (Some(positions), Valuation::Unpriced(asset)) => {
+                    self.store
+                        .upsert_user(&TrackedUser {
+                            pool: pool.to_string(),
+                            account: account.clone(),
+                            health_factor: None,
+                            collateral: positions.collateral.clone(),
+                            liabilities: positions.liabilities.clone(),
+                            updated_ledger: snapshot.ledger,
+                            recheck_ledger: None,
+                        })
+                        .await?;
+                    // Durable, not in memory: a kill between this tick and
+                    // the price returning loses nothing, because the row
+                    // itself says it is unvalued and is flagged.
+                    self.store
+                        .flag_recheck(pool, account, tick.sequence)
+                        .await?;
+                    outcome.tracked += 1;
+                    outcome.unvalued += 1;
+                    outcome.unpriced.insert(asset);
+                }
+                // `(None, Unpriced)` cannot occur: `owes` requires
+                // positions, so it falls to the delete with the rest.
                 _ => {
                     if self.store.delete_user(pool, account).await? {
                         outcome.removed += 1;
@@ -264,8 +351,9 @@ impl<'a> Tracker<'a> {
     }
 
     /// Refreshes up to `batch` users whose row was written before
-    /// `updated_before`, oldest first, so a long-idle borrower's accrued
-    /// interest is never missed.
+    /// `updated_before`, plus any unvalued (NULL health factor) row whatever
+    /// its ledger, oldest first, so a long-idle borrower's accrued interest
+    /// is never missed.
     ///
     /// `updated_before` is an **absolute ledger**, not a span: a caller
     /// working from a knob like `USER_REFRESH_LEDGERS` subtracts it from
@@ -276,7 +364,7 @@ impl<'a> Tracker<'a> {
     /// **No production caller.** `service::apply_tick` inlines the same two
     /// steps rather than calling this, because that call site also needs
     /// the account list to flag for the auctioneer and [`RefreshOutcome`]
-    /// reports only counts. This stays as the tested statement of what the
+    /// carries no account list. This stays as the tested statement of what the
     /// pass is; changing one and not the other is how they drift.
     pub async fn refresh_stale(
         &self,
@@ -333,6 +421,18 @@ impl<'a> Tracker<'a> {
             let result = self.refresh(pool, chunk, tick).await?;
             outcome.refresh.tracked += result.tracked;
             outcome.refresh.removed += result.removed;
+            outcome.refresh.unvalued += result.unvalued;
+            outcome.refresh.unpriced.extend(result.unpriced);
+        }
+        // Never a notification: nothing before the run's tasks may notify,
+        // and the first tick's stale pass re-reads these rows and does.
+        for asset in &outcome.refresh.unpriced {
+            tracing::warn!(
+                pool,
+                asset,
+                seed_unvalued = outcome.refresh.unvalued,
+                "seeded borrowers hold a reserve the oracle has no price for; they are tracked unvalued until it returns"
+            );
         }
         Ok(outcome)
     }
@@ -563,7 +663,7 @@ impl SeedSource {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use serde_json::json;
     use stellar_xdr::{ContractDataDurability, ContractDataEntry, ExtensionPoint, LedgerEntryData};
@@ -587,6 +687,127 @@ mod tests {
     const USDC: &str = "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75";
     const REPAID: &str = "GCC4A2FN5BIXW6I57LKMP4XK7WVNZJWDCD5JZGGQKAI45PNTPC5NU6U4";
     const NEVER_TRACKED: &str = "GAX2VVWVHU5YQY5J3NJBXKHI3FFKZN54BE6GRJCWSIKSBZTQWJJNJMPC";
+
+    /// The fixture's reserve asset at `index`.
+    fn reserve_asset(index: usize) -> String {
+        crate::fixture::mainnet_fixed_v2()["reserves"][index]["asset"]
+            .as_str()
+            .expect("asset")
+            .to_string()
+    }
+
+    /// One borrower holds a reserve the oracle cannot price. The refresh
+    /// still succeeds, so the tick can be acknowledged. That borrower is
+    /// written with its exact positions, a NULL health factor and a recheck
+    /// flag; the borrower whose reserves are all priced is valued as ever.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_unpriced_reserve_defers_only_its_holders_valuation(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let unpriced = reserve_asset(2);
+        let priced_holder =
+            harness::positions_entry_xdr(USER_ONE, &[(0, 10_000_000_000)], &[(1, 100_000_000)]);
+        let unpriced_holder =
+            harness::positions_entry_xdr(USER_TWO, &[(2, 10_000_000_000)], &[(1, 100_000_000)]);
+        harness::script_snapshot_positions_unpriced(
+            &rpc,
+            &[(USER_ONE, priced_holder), (USER_TWO, unpriced_holder)],
+            &unpriced,
+        );
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let tracker = Tracker::new(&client, &store);
+        let tick = harness::fixture_tick();
+
+        let outcome = tracker
+            .refresh(POOL, &[USER_ONE.to_string(), USER_TWO.to_string()], tick)
+            .await
+            .expect("an unpriced reserve no longer fails the refresh");
+
+        assert_eq!(outcome.tracked, 2);
+        assert_eq!(outcome.removed, 0);
+        assert_eq!(outcome.unvalued, 1);
+        assert_eq!(outcome.unpriced, BTreeSet::from([unpriced.clone()]));
+
+        let valued = store
+            .user(POOL, USER_ONE)
+            .await
+            .expect("read")
+            .expect("row");
+        assert!(valued.health_factor.is_some(), "{valued:?}");
+        let unvalued = store
+            .user(POOL, USER_TWO)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(unvalued.health_factor, None);
+        assert_eq!(unvalued.collateral, BTreeMap::from([(2, 10_000_000_000)]));
+        assert_eq!(unvalued.liabilities, BTreeMap::from([(1, 100_000_000)]));
+        assert_eq!(unvalued.recheck_ledger, Some(tick.sequence));
+        Ok(())
+    }
+
+    /// Only a missing price is deferred. A position in a reserve the
+    /// snapshot does not hold is an incomplete view, and still fails the
+    /// whole batch, so the tick is declined and the range re-read.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_missing_reserve_still_fails_the_refresh(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let phantom =
+            harness::positions_entry_xdr(USER_ONE, &[(9, 10_000_000_000)], &[(1, 100_000_000)]);
+        harness::script_snapshot_positions(&rpc, &[(USER_ONE, phantom)]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let tracker = Tracker::new(&client, &store);
+
+        let error = tracker
+            .refresh(POOL, &[USER_ONE.to_string()], harness::fixture_tick())
+            .await
+            .expect_err("a reserve the snapshot lacks is not an unpriced one");
+        assert!(
+            matches!(
+                error,
+                TrackerError::Chain(ChainError::Math(MathError::MissingReserve(9)))
+            ),
+            "{error:?}"
+        );
+        assert!(store.user(POOL, USER_ONE).await.expect("read").is_none());
+        Ok(())
+    }
+
+    /// A missing price met first does not hide a missing reserve behind it.
+    /// Valuation reads the unpriced collateral before it reaches the
+    /// liability in a reserve the snapshot lacks, so the error it answers is
+    /// the price; the batch still fails on the reserve, and nothing is
+    /// written.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_missing_reserve_behind_a_missing_price_still_fails_the_refresh(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let unpriced = reserve_asset(2);
+        let both =
+            harness::positions_entry_xdr(USER_ONE, &[(2, 10_000_000_000)], &[(9, 100_000_000)]);
+        harness::script_snapshot_positions_unpriced(&rpc, &[(USER_ONE, both)], &unpriced);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let tracker = Tracker::new(&client, &store);
+
+        let error = tracker
+            .refresh(POOL, &[USER_ONE.to_string()], harness::fixture_tick())
+            .await
+            .expect_err("a reserve the snapshot lacks fails the batch, priced or not");
+        assert!(
+            matches!(
+                error,
+                TrackerError::Chain(ChainError::Math(MathError::MissingReserve(9)))
+            ),
+            "{error:?}"
+        );
+        assert!(store.user(POOL, USER_ONE).await.expect("read").is_none());
+        Ok(())
+    }
 
     /// Writes `contents` to a fresh temporary file and returns its path, for
     /// the seed-file tests: a real path `FileSeed::load` reads, rather than
@@ -612,7 +833,7 @@ mod tests {
         TrackedUser {
             pool: POOL.to_string(),
             account: account.to_string(),
-            health_factor: 20_000_000,
+            health_factor: Some(20_000_000),
             collateral,
             liabilities,
             updated_ledger,
@@ -673,7 +894,8 @@ mod tests {
             outcome,
             RefreshOutcome {
                 tracked: 2,
-                removed: 0
+                removed: 0,
+                ..RefreshOutcome::default()
             }
         );
 
@@ -683,7 +905,7 @@ mod tests {
                 .await
                 .expect("read")
                 .unwrap_or_else(|| panic!("{account} should be tracked"));
-            assert_eq!(row.health_factor, golden);
+            assert_eq!(row.health_factor, Some(golden));
             assert_eq!(row.pool, POOL);
             // The snapshot is the fixture's own ledger, which is also this
             // tick's, so this pins both: the row records the ledger it was
@@ -808,7 +1030,8 @@ mod tests {
             outcome,
             RefreshOutcome {
                 tracked: 0,
-                removed: 1
+                removed: 1,
+                ..RefreshOutcome::default()
             },
             "only REPAID had a row to remove"
         );
@@ -1458,7 +1681,8 @@ mod tests {
             outcome.refresh,
             RefreshOutcome {
                 tracked: 2,
-                removed: 0
+                removed: 0,
+                ..RefreshOutcome::default()
             },
             "USER_ONE and USER_TWO are each refreshed exactly once, deduplicated \
              across the analytics source and the file source"

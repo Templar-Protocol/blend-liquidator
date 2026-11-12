@@ -97,6 +97,13 @@ pub enum NotificationKind {
     /// the supplier haircut, orphan custody, the fill's own health
     /// projection — is void. An alarm, never something to act on.
     StockWasmDetected,
+    /// A reserve the oracle has no price for — a feed tripped or gone
+    /// stale, which Precept's oracle adapter answers as no price. The
+    /// borrowers holding it are tracked unvalued: the contract refuses
+    /// priced actions on them until it returns, and the bot keeps
+    /// following the pool meanwhile. `account` carries the asset, so a
+    /// second asset in the same pool is not deduplicated by the first.
+    ReserveUnpriced,
 }
 
 impl NotificationKind {
@@ -116,6 +123,7 @@ impl NotificationKind {
             Self::EventGap => "event_gap",
             Self::UnfundedFill => "unfunded_fill",
             Self::StockWasmDetected => "stock_wasm_detected",
+            Self::ReserveUnpriced => "reserve_unpriced",
         }
     }
 }
@@ -137,8 +145,8 @@ pub struct Notification {
     /// pool's repeating failure never silences another's.
     pub pool: String,
     /// The borrower this notification is about, when it is about one —
-    /// `PollerStalled`, `RpcFailing` and `EventGap` are pool-wide and carry
-    /// `None`.
+    /// or, for `ReserveUnpriced`, the asset. `PollerStalled`, `RpcFailing`
+    /// and `EventGap` are pool-wide and carry `None`.
     pub account: Option<String>,
     /// Human-readable detail. Never a secret: every [`NotificationChannel`]
     /// this bot ever hands one to may log or forward it verbatim.

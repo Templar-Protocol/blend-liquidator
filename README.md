@@ -223,13 +223,13 @@ mocked below the wire format.
 v0.1.1 release wasm deployed on it and this binary run against it **armed** — one of the two
 places anything in this repository signs and sends a transaction; the
 other is the testnet soak's armed stage (`docs/testnet-soak.md`), on
-public testnet with friendbot's XLM. Six scenarios
+public testnet with friendbot's XLM. Seven scenarios
 (`liquidation`, `check_config`, `dry_run`, `unwind_repay`,
-`restart_adopt`, `free_fill_default` — see `tests/liquidation_sandbox.rs`'s module doc for what
+`restart_adopt`, `free_fill_default`, `unpriced_reserve` — see `tests/liquidation_sandbox.rs`'s module doc for what
 each proves):
 
 ```bash
-make sandbox                                # all six, about 30 minutes
+make sandbox                                # all seven, about 30 minutes
 SANDBOX_SCENARIO=liquidation make sandbox   # just one
 make sandbox-down                           # tear it down by hand (SANDBOX_KEEP=1 left it up)
 ```
@@ -253,7 +253,7 @@ belong to a network that is gone the moment it is torn down; the bot's
 copy of the filler's key lives in `target/sandbox/sandbox.env` at mode
 `0600`, and the teardown deletes it.
 
-The same six runs are the nightly `Sandbox` workflow (`schedule` and
+The same seven runs are the nightly `Sandbox` workflow (`schedule` and
 `workflow_dispatch` only — never a pull request, so it is deliberately
 outside the `CI Summary` gate), one matrix job per scenario on its own
 runner. `liquidation`'s deploy leaves a borrower at a health factor of
@@ -261,7 +261,7 @@ runner. `liquidation`'s deploy leaves a borrower at a health factor of
 the bot then creates the borrower's liquidation auction, fills it and
 unwinds the position it took, asserted through the audit tables' own
 transaction hashes, the filler's on-chain position and `/metrics`. The
-other five prove `check-config`'s exit codes and warnings, a wrong
+other six prove `check-config`'s exit codes and warnings, a wrong
 `NETWORK_PASSPHRASE`'s included, without ever sending a transaction or
 migrating the database; that a dry-run bot holding a real signing key
 never sends a transaction, whether deciding to create an auction or to
@@ -274,7 +274,9 @@ rather than trying to create a second one; and that `free_fill_default`'s
 `free-fill` at `start + 400` takes a 100% auction's whole lot with no bid
 while Precept defaults the borrower's leftover debt in the same
 transaction, setting off its USDC supply first and cutting the reserve's
-`b_rate`. What it catches is the world
+`b_rate`; and that `unpriced_reserve`'s oracle, answering no price for
+USDC, leaves the borrower recorded unvalued while the events cursor keeps
+moving and exactly one `reserve_unpriced` alarm is raised. What it catches is the world
 moving — a quickstart image, a pinned wasm, a contract that changed its
 mind — rather than a diff being wrong, which is what the pull-request
 gate is for.
@@ -287,7 +289,7 @@ gate is for.
 | `src/config.rs` | CLI and environment configuration |
 | `src/main.rs` | Binary entry point |
 | `scripts/` | Repo-invariant and release preflight checks, review tooling, the sandbox tier |
-| `tests/` | Fixtures, and the sandbox tier's six scenario tests |
+| `tests/` | Fixtures, and the sandbox tier's seven scenario tests |
 | `docs/` | Guides and reference (see Documentation above) and design specs |
 
 ## Licence

@@ -4,9 +4,9 @@ name: Sandbox
 # deployed on it, and the real binary run against it **armed** — the one
 # place anything in this repository submits a transaction it signed.
 #
-# Nightly and on demand, never on `push` or `pull_request`. The tier has six
+# Nightly and on demand, never on `push` or `pull_request`. The tier has seven
 # scenarios (liquidation, check_config, dry_run, unwind_repay, restart_adopt,
-# free_fill_default; see tests/liquidation_sandbox.rs's module doc for what
+# free_fill_default, unpriced_reserve; see tests/liquidation_sandbox.rs's module doc for what
 # each proves), and
 # the job below runs every one of them as its own matrix entry, each on its
 # own runner: its own network stood up, its own eight contracts deployed, and
@@ -27,7 +27,7 @@ on:
 
 # This group serialises whole *workflow runs*, not the matrix jobs within
 # one: GitHub schedules every job in the matrix below on its own runner, so
-# six scenarios run at once without contending for anything. On hosted
+# seven scenarios run at once without contending for anything. On hosted
 # runners a second run's jobs get fresh VMs exactly as these do, so two
 # overlapping runs would not collide either; what the group buys there is
 # one night's run finishing before the next starts, and no doubled runner
@@ -64,12 +64,12 @@ jobs:
       # the others: every scenario deploys its own network and asserts only
       # on that, so each result stands on its own, and one failing (dry_run
       # finding a transaction from a key a dry-run bot held, say) says
-      # nothing about the other four. `make sandbox` locally stops at the
+      # nothing about the other six. `make sandbox` locally stops at the
       # first failure instead, for a developer who wants that failure's
       # state left to inspect.
       fail-fast: false
       matrix:
-        scenario: [liquidation, check_config, dry_run, unwind_repay, restart_adopt, free_fill_default]
+        scenario: [liquidation, check_config, dry_run, unwind_repay, restart_adopt, free_fill_default, unpriced_reserve]
     services:
       postgres:
         image: postgres:17-alpine

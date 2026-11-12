@@ -58,7 +58,7 @@ use precept_liquidator::chain::rpc::{EventQuery, TransactionStatus};
 use precept_liquidator::chain::xdr::{decode_pool_event, AuctionType, PoolEvent};
 use precept_liquidator::chain::{PoolReader, RpcClient, TxHash};
 use precept_liquidator::math::AuctionData;
-use precept_liquidator::store::{Store, TrackedAuction};
+use precept_liquidator::store::{events_cursor, Store, TrackedAuction};
 use sqlx::postgres::PgPool;
 
 /// The only network this tier will talk to. `scripts/sandbox/versions.env`
@@ -68,22 +68,23 @@ use sqlx::postgres::PgPool;
 /// `sandbox.env` was produced.
 const STANDALONE_PASSPHRASE: &str = "Standalone Network ; February 2017";
 
-/// The tier's six scenarios, in the order the Makefile's `sandbox` target
-/// loops over them. The same six names are written in
+/// The tier's seven scenarios, in the order the Makefile's `sandbox` target
+/// loops over them. The same seven names are written in
 /// `scripts/sandbox/deploy.sh`'s accepted list, the Makefile's
 /// `SANDBOX_SCENARIOS`, `.github/workflows/sandbox.yml`'s matrix and the
 /// `#[ignore]`d test fns in `tests/liquidation_sandbox.rs`. None is derived
 /// from another — a shell script, a Makefile, a workflow and a Rust test
-/// share no build step that could — so a seventh scenario is added to all
+/// share no build step that could — so a new scenario is added to all
 /// five by hand, and `scripts/check-repo-invariants.sh` fails unless they
 /// name the same set.
-pub(crate) const SCENARIOS: [&str; 6] = [
+pub(crate) const SCENARIOS: [&str; 7] = [
     "liquidation",
     "check_config",
     "dry_run",
     "unwind_repay",
     "restart_adopt",
     "free_fill_default",
+    "unpriced_reserve",
 ];
 
 /// How long a bot has to bind its HTTP port and report ready. Readiness
@@ -377,7 +378,7 @@ pub(crate) fn fail_check(output: &str, message: &str) -> ! {
 ///
 /// Every wait in this tier is one of these, so a hung run names what it was
 /// waiting for rather than timing out anonymously.
-struct Wait {
+pub(crate) struct Wait {
     what: &'static str,
     deadline: Instant,
     budget: Duration,
@@ -385,7 +386,7 @@ struct Wait {
 }
 
 impl Wait {
-    fn new(what: &'static str, budget: Duration) -> Self {
+    pub(crate) fn new(what: &'static str, budget: Duration) -> Self {
         println!("waiting for {what} ({} s budget)", budget.as_secs());
         let now = Instant::now();
         Self {
@@ -402,7 +403,7 @@ impl Wait {
     /// satisfy any of these conditions: waiting out the whole budget on a
     /// dead process turns a startup failure into a timeout, and the log tail
     /// that explains it arrives minutes later.
-    async fn tick(&mut self, bot: &mut Bot) -> bool {
+    pub(crate) async fn tick(&mut self, bot: &mut Bot) -> bool {
         if let Some(status) = bot.exited() {
             fail(
                 bot,
@@ -427,7 +428,7 @@ impl Wait {
     }
 
     /// The message a timeout panics with.
-    fn timed_out(&self) -> String {
+    pub(crate) fn timed_out(&self) -> String {
         format!(
             "timed out after {} s waiting for {}",
             self.budget.as_secs(),
@@ -1739,7 +1740,7 @@ pub(crate) async fn read_metrics(bot: &Bot, http: &reqwest::Client) -> String {
 
 /// One `NAME{labels} value` line's value, or `None` when the series is
 /// absent.
-fn series(metrics: &str, name: &str) -> Option<i64> {
+pub(crate) fn series(metrics: &str, name: &str) -> Option<i64> {
     metrics.lines().find_map(|line| {
         let rest = line.strip_prefix(name)?;
         let rest = rest.strip_prefix(' ')?;
@@ -2020,6 +2021,101 @@ pub(crate) fn crash(bot: &Bot, root: &Path) {
 /// liquidation can answer.
 pub(crate) fn crash_at(bot: &Bot, root: &Path, price: i128) {
     run_crash(bot, root, &[price.to_string()]);
+}
+
+/// Runs `scripts/sandbox/unprice.sh`, which leaves the oracle with no price
+/// for USDC — what Precept's adapter answers for a tripped or stale feed.
+/// `crash_at(bot, root, 1_000_000)` restores both prices.
+pub(crate) fn unprice(bot: &Bot, root: &Path) {
+    let script = root.join("scripts/sandbox/unprice.sh");
+    match Command::new(&script).current_dir(root).output() {
+        Ok(output) if output.status.success() => println!("unprice.sh: USDC has no price"),
+        Ok(output) => {
+            let message = format!(
+                "unprice.sh failed ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            fail(bot, &message);
+        }
+        Err(error) => fail(bot, &format!("could not run {}: {error}", script.display())),
+    }
+}
+
+/// Waits for `/metrics` to render `name` (a full series, labels included)
+/// at exactly `expected`.
+pub(crate) async fn wait_for_series(
+    bot: &mut Bot,
+    http: &reqwest::Client,
+    name: &str,
+    expected: i64,
+    what: &'static str,
+    budget: Duration,
+) {
+    let mut wait = Wait::new(what, budget);
+    loop {
+        if let Ok(text) = try_read_metrics(http).await {
+            if series(&text, name) == Some(expected) {
+                return;
+            }
+        }
+        if !wait.tick(bot).await {
+            let message = wait.timed_out();
+            fail(bot, &message);
+        }
+    }
+}
+
+/// [`wait_for_series`], true once the series reads `expected` or more: a
+/// gauge that advances can step past an exact value.
+pub(crate) async fn wait_for_series_at_least(
+    bot: &mut Bot,
+    http: &reqwest::Client,
+    name: &str,
+    expected: i64,
+    what: &'static str,
+    budget: Duration,
+) {
+    let mut wait = Wait::new(what, budget);
+    loop {
+        if let Ok(text) = try_read_metrics(http).await {
+            if series(&text, name).is_some_and(|value| value >= expected) {
+                return;
+            }
+        }
+        if !wait.tick(bot).await {
+            let message = wait.timed_out();
+            fail(bot, &message);
+        }
+    }
+}
+
+/// `account`'s stored health factor in `pool`: `None` when there is no
+/// row, `Some(None)` when the row is unvalued.
+pub(crate) async fn stored_health(
+    bot: &Bot,
+    store: &Store,
+    pool: &str,
+    account: &str,
+) -> Option<Option<i128>> {
+    match store.user(pool, account).await {
+        Ok(row) => row.map(|row| row.health_factor),
+        Err(error) => fail(bot, &format!("could not read {account}'s row: {error}")),
+    }
+}
+
+/// The ledger of `pool`'s committed events cursor, `None` before the
+/// poller's first commit. This, not `ledger_processed`, is what proves a
+/// ledger committed: the gauge is set as the tracker sends its
+/// acknowledgement, and the poller writes the cursor only once it has it.
+pub(crate) async fn stored_cursor(bot: &Bot, store: &Store, pool: &str) -> Option<u32> {
+    match store.cursor(&events_cursor(pool)).await {
+        Ok(cursor) => cursor.map(|cursor| cursor.ledger),
+        Err(error) => fail(
+            bot,
+            &format!("could not read {pool}'s events cursor: {error}"),
+        ),
+    }
 }
 
 fn run_crash(bot: &Bot, root: &Path, args: &[String]) {

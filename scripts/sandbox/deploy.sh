@@ -55,7 +55,7 @@ source "${script_dir}/lib.sh"
 : "${SANDBOX_PORT:=8000}"
 : "${SANDBOX_SCENARIO:=liquidation}"
 
-# The scenarios this deploy accepts. The same six names are written in
+# The scenarios this deploy accepts. The same seven names are written in
 # four more places — the Makefile's SANDBOX_SCENARIOS default, SCENARIOS in
 # tests/sandbox_harness/mod.rs, the matrix in .github/workflows/sandbox.yml
 # and the #[ignore]d test fns in tests/liquidation_sandbox.rs — and
@@ -70,7 +70,7 @@ source "${script_dir}/lib.sh"
 # env-file check below is: it touches no network, and an operator who
 # mistyped it deserves that answer immediately rather than after a network
 # has been verified.
-sandbox_scenarios=(liquidation check_config dry_run unwind_repay restart_adopt free_fill_default)
+sandbox_scenarios=(liquidation check_config dry_run unwind_repay restart_adopt free_fill_default unpriced_reserve)
 scenario_known=false
 for scenario in "${sandbox_scenarios[@]}"; do
 	if [ "${scenario}" = "${SANDBOX_SCENARIO}" ]; then

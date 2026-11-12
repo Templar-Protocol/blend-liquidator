@@ -9,17 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `NotificationKind::ReserveUnpriced` (High, one per pool and asset per cooldown), the `notifications_total{kind="reserve_unpriced"}` series, and the `unvalued_users{pool}` gauge.
+- A seventh sandbox scenario, `unpriced_reserve`.
 - Four more sandbox scenarios alongside the original `liquidation` run —
   `check_config`, `dry_run`, `unwind_repay` and `restart_adopt` (see
   `tests/liquidation_sandbox.rs`'s module doc for what each proves) —
   sharing a new `tests/sandbox_harness/mod.rs` harness that factors out
   the standalone-network gate, the spawned bot, the per-run database(s)
   and every named wait. `deploy.sh` takes `SANDBOX_SCENARIO` to pick
-  which of the six it deploys for (`liquidation` by default), and a new
+  which of the seven it deploys for (`liquidation` by default), and a new
   `scripts/sandbox/mint.sh` mints the filler more USDC on a running
   network — `unwind_repay`'s way of funding a wallet its own deploy left
   empty. `.github/workflows/sandbox.yml`'s nightly run now matrices over
-  all six scenarios, one job per scenario on its own runner,
+  all seven scenarios, one job per scenario on its own runner,
   `fail-fast: false`. `make sandbox-test` refuses a `SANDBOX_SCENARIO`
   that does not name exactly one test fn, rather than passing having run
   none, and `scripts/check-repo-invariants.sh` fails unless the five
@@ -66,6 +68,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Migration `0004` makes `users.health_factor` nullable. It applies itself at startup. Do not roll back to an earlier binary afterwards: `Store::migrate` runs the embedded migrator without `ignore_missing`, so a binary that does not know `0004` refuses to start against a store that has applied it (`VersionMissing`), before it follows anything. Its `check-config`, which does not migrate, would still pass.
 - The sandbox and testnet tiers deploy Precept's own v0.1.1 release wasm
   (pool, backstop, factory), in the live XLM/USDC market's reserve
   configuration — XLM collateral-only, USDC borrow-only, each with
@@ -120,6 +123,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A reserve the oracle cannot price no longer holds a pool's events cursor: the tracker stores its holders' positions with an unvalued (NULL) health factor and a recheck flag, acknowledges the tick, and keeps re-reading them in its stale pass, `REFRESH_BATCH` rows a tick and oldest first, until the price returns. Before, one such holder stopped the pool's cursor for every borrower until the price came back.
 - The event poller accepts stellar-rpc 30's getEvents, which no longer sends inSuccessfulContractCall: every page holding an event used to fail to decode, so the poller backed off forever and the bot stopped following the pool from its first event.
 - The bot is reconciled with Precept `v0.1.1`, the release every live
   market runs. `defaulted_debt` and `debt_setoff` events, which `v0.1.1`

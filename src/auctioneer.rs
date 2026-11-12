@@ -1337,7 +1337,7 @@ mod tests {
         TrackedUser {
             pool: POOL.to_string(),
             account: account.to_string(),
-            health_factor: 0,
+            health_factor: Some(0),
             collateral: BTreeMap::new(),
             liabilities: BTreeMap::new(),
             updated_ledger: 0,
@@ -3402,7 +3402,7 @@ mod tests {
             .upsert_user(&TrackedUser {
                 pool: POOL.to_string(),
                 account: liability_holder.clone(),
-                health_factor: 0,
+                health_factor: Some(0),
                 collateral: BTreeMap::new(),
                 liabilities: BTreeMap::from([(index, 1_000_000_000)]),
                 updated_ledger: 0,
@@ -3414,7 +3414,7 @@ mod tests {
             .upsert_user(&TrackedUser {
                 pool: POOL.to_string(),
                 account: collateral_holder.clone(),
-                health_factor: 0,
+                health_factor: Some(0),
                 collateral: BTreeMap::from([(index, 1_000_000_000)]),
                 liabilities: BTreeMap::new(),
                 updated_ledger: 0,
@@ -3564,7 +3564,7 @@ mod tests {
                 .upsert_user(&TrackedUser {
                     pool: POOL.to_string(),
                     account: account.clone(),
-                    health_factor: 0,
+                    health_factor: Some(0),
                     collateral: BTreeMap::new(),
                     liabilities: BTreeMap::from([(index, 1_000_000_000)]),
                     updated_ledger: 0,

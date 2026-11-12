@@ -323,6 +323,28 @@ pub(crate) fn script_snapshot_positions_at(
     ledger: u32,
     positions: &[(&str, String)],
 ) {
+    script_snapshot_positions_inner(rpc, ledger, positions, None);
+}
+
+/// [`script_snapshot_positions`], except that `unpriced`'s `lastprice`
+/// answers `Void` — the oracle has no price for it, which
+/// `chain::xdr::decode::price_data` reads as no price at all.
+pub(crate) fn script_snapshot_positions_unpriced(
+    rpc: &ScriptedRpc,
+    positions: &[(&str, String)],
+    unpriced: &str,
+) {
+    let ledger =
+        u32::try_from(mainnet_fixed_v2()["ledger"].as_u64().expect("ledger")).expect("ledger fits");
+    script_snapshot_positions_inner(rpc, ledger, positions, Some(unpriced));
+}
+
+fn script_snapshot_positions_inner(
+    rpc: &ScriptedRpc,
+    ledger: u32,
+    positions: &[(&str, String)],
+    unpriced: Option<&str>,
+) {
     let fixture = mainnet_fixed_v2();
     rpc.expect(
         "getLedgerEntries",
@@ -358,13 +380,15 @@ pub(crate) fn script_snapshot_positions_at(
         simulation(text(&fixture, &["oracle_decimals_return_xdr"]), ledger),
     );
     for reserve in fixture["reserves"].as_array().expect("reserves") {
-        rpc.expect(
-            "simulateTransaction",
-            simulation(
-                reserve["lastprice_return_xdr"].as_str().expect("price"),
-                ledger,
-            ),
-        );
+        let price = if unpriced == reserve["asset"].as_str() {
+            to_base64(&ScVal::Void).expect("encodes")
+        } else {
+            reserve["lastprice_return_xdr"]
+                .as_str()
+                .expect("price")
+                .to_string()
+        };
+        rpc.expect("simulateTransaction", simulation(&price, ledger));
     }
 }
 
