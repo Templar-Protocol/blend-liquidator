@@ -93,6 +93,10 @@
 //! and `a_dry_run_that_needs_a_restore_is_refused` (`src/executor.rs`) are
 //! what cover it, each against a scripted RPC that answers with an
 //! archived footprint.
+//! - [`unpriced_reserve`]: a reserve the oracle has no price for no
+//!   longer holds the pool's events cursor — the tracker records the
+//!   borrower unvalued, the cursor keeps moving, one `ReserveUnpriced`
+//!   alarm is raised, and the valuation returns with the price.
 
 mod sandbox_harness;
 
@@ -114,10 +118,11 @@ use sandbox_harness::{
     create_run_database_unmigrated, creation_percent, drop_run_database, fail, fail_check,
     fill_budget, log_lines_containing, mint, note_run_database, pool_events_of, pools_toml,
     pools_toml_with, print_nonzero_counters, read_metrics, repo_root, require_standalone_rpc,
-    required, reserve_b_rate, run_check_config, sandbox_env, spawn_bot, terminate,
-    wait_for_adopted_auction, wait_for_auction, wait_for_dry_run_row, wait_for_ledgers_past,
-    wait_for_liability, wait_for_ready, wait_for_tx_hash, wait_for_unwind,
-    wait_for_unwind_leftovers, wait_for_user_row_gone, with_database, Bot, BotConfig, PoolOptions,
+    required, reserve_b_rate, run_check_config, sandbox_env, series, spawn_bot, stored_health,
+    terminate, unprice, wait_for_adopted_auction, wait_for_auction, wait_for_dry_run_row,
+    wait_for_ledgers_past, wait_for_liability, wait_for_ready, wait_for_series,
+    wait_for_series_at_least, wait_for_tx_hash, wait_for_unwind, wait_for_unwind_leftovers,
+    wait_for_user_row_gone, with_database, Bot, BotConfig, PoolOptions, Wait,
     CREATIONS_FOR_ACCOUNT, CREATIONS_VIOLATING_DRY_RUN, CREATION_TIMEOUT, CREATION_TX_HASH,
     DRY_RUN_CREATION_ROW, DRY_RUN_FILL_ROW, EARLIEST_PROFITABLE_FILL, FILLS_VIOLATING_DRY_RUN,
     FILL_TX_HASH, FREE_FILL, UNWIND_LEFTOVERS_METRIC,
@@ -2126,6 +2131,161 @@ async fn free_fill_default() {
          USDC b_rate {b_rate_before} → {b_rate_after}, {collateral} stroops of XLM collateral left",
         bot.elapsed()
     );
+    store.pool().close().await;
+    drop_run_database(&root, &maintenance_url, &database).await;
+}
+
+/// The `unpriced_reserve` scenario: a reserve the oracle has no price for
+/// no longer holds the pool's events cursor. `unprice.sh` leaves USDC with
+/// no price; the tracker records the seeded borrower as unvalued (a NULL
+/// health factor, counted by `unvalued_users`) rather than failing the
+/// tick, the cursor keeps advancing, exactly one `ReserveUnpriced` alarm is
+/// raised, and restoring the price values the borrower again.
+///
+/// It runs dry with no key because nothing here submits: the claim is about
+/// the tracker and the cursor, and a keyless bot cannot sign anything.
+///
+/// Ignored on purpose — it needs `scripts/sandbox/up.sh` and
+/// `SANDBOX_SCENARIO=unpriced_reserve scripts/sandbox/deploy.sh` to have
+/// run, and a Postgres at `DATABASE_URL`.
+// A straight line of named waits and assertions, each carrying its own
+// reason to fail closed, and together over clippy's line count.
+// Wiring, not logic.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+#[ignore = "needs the local sandbox network: scripts/sandbox/up.sh && scripts/sandbox/deploy.sh"]
+async fn unpriced_reserve() {
+    let root = repo_root();
+    let env = sandbox_env(&root.join("target/sandbox/sandbox.env"), "unpriced_reserve");
+
+    let pool = required(&env, "SANDBOX_POOL").to_string();
+    let xlm = required(&env, "SANDBOX_XLM").to_string();
+    let usdc = required(&env, "SANDBOX_USDC").to_string();
+    let borrower = required(&env, "SANDBOX_BORROWER").to_string();
+    let rpc_url = required(&env, "SANDBOX_RPC_URL").to_string();
+
+    require_standalone_rpc(&rpc_url).await;
+
+    let Ok(maintenance_url) = std::env::var("DATABASE_URL") else {
+        panic!("DATABASE_URL is not set — the store tests need it too; see `make db-up`")
+    };
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or_default();
+    let database = format!("sandbox_{stamp}");
+    println!("creating the run's database {database}");
+    let database_url = create_run_database(&root, &maintenance_url, &database).await;
+    note_run_database(&database);
+
+    let sandbox_dir = root.join("target/sandbox");
+    let seed_path = sandbox_dir.join("seed.toml");
+    let seed = format!("[accounts]\n\"{pool}\" = [\"{borrower}\"]\n");
+    if let Err(error) = std::fs::write(&seed_path, seed) {
+        panic!("could not write {}: {error}", seed_path.display());
+    }
+
+    let pools = pools_toml(&pool, &xlm, &[usdc.as_str()]);
+    let mut bot = spawn_bot(
+        &root,
+        &env,
+        BotConfig {
+            dry_run: true,
+            filler_secret: None,
+            pools,
+            database_url: database_url.clone(),
+            log_name: "bot.log",
+            extra_env: vec![
+                ("SEED_FILE", seed_path.display().to_string()),
+                ("USER_REFRESH_LEDGERS", "3".to_string()),
+            ],
+        },
+    )
+    .await;
+
+    let http = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => fail(&bot, &format!("could not build an HTTP client: {error}")),
+    };
+    let store = match Store::connect(&database_url, 4).await {
+        Ok(store) => store,
+        Err(error) => fail(&bot, &format!("could not connect to {database}: {error}")),
+    };
+
+    wait_for_ready(&mut bot, &http).await;
+
+    // 1. The seeded borrower is tracked, valued.
+    let mut wait = Wait::new(
+        "the seeded borrower to be tracked with a health factor",
+        Duration::from_mins(1),
+    );
+    while !matches!(
+        stored_health(&bot, &store, &pool, &borrower).await,
+        Some(Some(_))
+    ) {
+        if !wait.tick(&mut bot).await {
+            let message = wait.timed_out();
+            fail(&bot, &message);
+        }
+    }
+    // 2. Take USDC's price away.
+    unprice(&bot, &root);
+    let unvalued_series = format!("precept_liquidator_unvalued_users{{pool=\"{pool}\"}}");
+    wait_for_series(
+        &mut bot,
+        &http,
+        &unvalued_series,
+        1,
+        "the tracker to record the borrower as unvalued",
+        Duration::from_mins(1),
+    )
+    .await;
+    if stored_health(&bot, &store, &pool, &borrower).await != Some(None) {
+        fail(&bot, "the borrower's row is not unvalued");
+    }
+    // 3. The cursor keeps moving while USDC is unpriced — the whole fix.
+    let processed_series = format!("precept_liquidator_ledger_processed{{pool=\"{pool}\"}}");
+    let Some(processed) = series(&read_metrics(&bot, &http).await, &processed_series) else {
+        fail(&bot, "/metrics has no ledger_processed series for the pool")
+    };
+    wait_for_series_at_least(
+        &mut bot,
+        &http,
+        &processed_series,
+        processed + 10,
+        "the cursor to advance ten ledgers with USDC unpriced",
+        Duration::from_mins(1),
+    )
+    .await;
+    // 4. Exactly one alarm.
+    let metrics = read_metrics(&bot, &http).await;
+    assert_counter(
+        &bot,
+        &metrics,
+        "precept_liquidator_notifications_total{kind=\"reserve_unpriced\",delivery=\"queued\"}",
+        1,
+    );
+    // 5. The price returns, and so does the valuation.
+    crash_at(&bot, &root, 1_000_000);
+    wait_for_series(
+        &mut bot,
+        &http,
+        &unvalued_series,
+        0,
+        "the tracker to value the borrower again",
+        Duration::from_mins(1),
+    )
+    .await;
+    if !matches!(
+        stored_health(&bot, &store, &pool, &borrower).await,
+        Some(Some(_))
+    ) {
+        fail(&bot, "the borrower's health factor did not come back");
+    }
+    terminate(&mut bot).await;
     store.pool().close().await;
     drop_run_database(&root, &maintenance_url, &database).await;
 }

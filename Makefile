@@ -15,7 +15,7 @@ ENV_FILE := .env
 DATABASE_URL ?= postgres://liquidator:liquidator@127.0.0.1:55432/liquidator
 export DATABASE_URL
 
-# The sandbox tier's six scenarios. The same six names are written in
+# The sandbox tier's seven scenarios. The same seven names are written in
 # scripts/sandbox/deploy.sh, tests/sandbox_harness/mod.rs's SCENARIOS,
 # .github/workflows/sandbox.yml's matrix and tests/liquidation_sandbox.rs's
 # #[ignore]d test fns, and scripts/check-repo-invariants.sh fails unless
@@ -23,7 +23,7 @@ export DATABASE_URL
 # `sandbox-deploy` and `sandbox-test` act on; SANDBOX_SCENARIOS is what
 # `sandbox` loops over when no single SANDBOX_SCENARIO is given.
 SANDBOX_SCENARIO ?= liquidation
-SANDBOX_SCENARIOS ?= liquidation check_config dry_run unwind_repay restart_adopt free_fill_default
+SANDBOX_SCENARIOS ?= liquidation check_config dry_run unwind_repay restart_adopt free_fill_default unpriced_reserve
 
 # testnet-crash's own oracle price, in the oracle's 7-decimal units. Empty
 # by default, which leaves crash.sh to use its own default (800000,
@@ -173,7 +173,7 @@ sandbox-down: ## Tear the sandbox down and drop the databases failed runs kept
 # deploy.sh re-verifies them itself regardless.
 #
 # SANDBOX_SCENARIOS is the list each of its own network, database and log
-# file is made for, defaulting to all six this tier has; SANDBOX_SCENARIO=x
+# file is made for, defaulting to all seven this tier has; SANDBOX_SCENARIO=x
 # runs the one x instead. The loop stops at the first scenario that fails
 # and names it, because a developer running this by hand wants that
 # failure's state: its kept database and its logs, sandbox.log above all,
@@ -210,7 +210,7 @@ sandbox-down: ## Tear the sandbox down and drop the databases failed runs kept
 # container still holding port 8000 and databases still on the server —
 # precisely what the next run refuses on, and reporting success would hide
 # it until then.
-sandbox: ## fetch, then up → deploy → test → down for each of SANDBOX_SCENARIOS (default all six; SANDBOX_SCENARIO=x runs just x; SANDBOX_KEEP=1, with one scenario selected, leaves its sandbox up)
+sandbox: ## fetch, then up → deploy → test → down for each of SANDBOX_SCENARIOS (default all seven; SANDBOX_SCENARIO=x runs just x; SANDBOX_KEEP=1, with one scenario selected, leaves its sandbox up)
 	@scenarios="$${SANDBOX_SCENARIO:-$(SANDBOX_SCENARIOS)}"; \
 	set -- $$scenarios; \
 	if [ "$$#" -eq 0 ]; then \
