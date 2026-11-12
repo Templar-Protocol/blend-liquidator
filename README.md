@@ -10,7 +10,7 @@ Precept is Templar's audited fork of Blend v2
 its pools keep Blend's liquidation auctions and leave filling them to
 whoever is watching.
 
-> **Status: 0.1.0.** The bot follows every configured Precept pool,
+> **Status: 0.2.0.** The bot follows every configured Precept pool,
 > creates the liquidation auction a tracked borrower's position calls
 > for, fills auctions — its own and anyone else's — that its pool
 > configuration supports, and unwinds the position a fill leaves it
@@ -108,8 +108,8 @@ cp .env.example .env
 docker compose up
 ```
 
-This README tracks `ghcr.io/templar-protocol/precept-liquidator:0.1.0`. Each
-image is published by pushing its `v<version>` tag (`v0.1.0` for this one),
+This README tracks `ghcr.io/templar-protocol/precept-liquidator:0.2.0`. Each
+image is published by pushing its `v<version>` tag (`v0.2.0` for this one),
 so a version is pullable only once its tag has been pushed and the release
 workflow has run. Whether the package is public is a GitHub package setting, not something
 this repository controls; while it is private, pulling it needs a token

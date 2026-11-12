@@ -105,10 +105,11 @@ contract address — a `Positions` holder on the fork, since confiscated
 collateral lands there as ordinary supply — as a borrower to liquidate.
 Phase 9 landed the documentation set — `docs/configuration.md`,
 `docs/deploy.md`, `docs/deployment-contract.md` and `docs/architecture.md`
-— the deployment contract, and a `check-release.sh`-green `0.1.0`
-changelog section. The `v0.1.0` tag itself is the maintainer's to push:
-pushing it is what publishes the GHCR image and cuts the GitHub Release,
-not anything landed on this branch. Phase 9 also ran the testnet soak the
+— the deployment contract, and a `0.1.0` changelog section that was cut
+but never tagged. The first published release is `0.2.0`, and its
+`v0.2.0` tag is the maintainer's to push: pushing it is what publishes
+the GHCR image and cuts the GitHub Release, not anything landed on a
+branch. Phase 9 also ran the testnet soak the
 design spec's §9 ends with (`scripts/testnet/`, `docs/testnet-soak.md`),
 against stock wasm on public Stellar testnet — the fork was not yet
 deployed anywhere then, so the soak targets what actually was: Blend's own
