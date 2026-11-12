@@ -97,7 +97,14 @@ signing key owns.
   (`src/ledger.rs`). Committing on send instead would let a kill
   drop whatever was still queued while the store claimed those ledgers
   done — and nothing re-reads the ledgers behind a cursor, so the loss
-  would be silent.
+  would be silent. What a tick's effect *is* is bounded: its events'
+  bookkeeping and the exact on-chain positions of the accounts they name.
+  A health factor is a valuation of those, not part of the effect, so a
+  reserve the oracle has no price for does not stop the acknowledgement —
+  the tracker stores that account's positions with a NULL (unvalued) health
+  factor and a durable recheck flag, raises `NotificationKind::ReserveUnpriced`
+  once per pool and asset, gauges `unvalued_users{pool}`, and re-values the
+  account every tick until the price returns.
 - **Nothing is sent for a key while an earlier transaction's outcome on it
   is unknown.** A Soroban transaction is built against its source
   account's sequence number at prepare time, so two in-flight
@@ -202,8 +209,10 @@ The sandbox integration tier (`scripts/sandbox/`) and the testnet soak's
 armed stage (`scripts/testnet/`) deploy Precept's own `v0.1.1` release
 wasm (pool, backstop and factory, pinned by release URL and SHA-256 in
 `scripts/sandbox/versions.env`) in the live XLM/USDC market's shape. The
-sandbox runs six scenarios, `free_fill_default` among them, which drives
-Precept's set-off and default path against real contract code.
+sandbox runs seven scenarios, `free_fill_default` among them, which drives
+Precept's set-off and default path against real contract code, and
+`unpriced_reserve`, which leaves a reserve with no oracle price and shows
+the events cursor still moving.
 
 ## 7. The store
 

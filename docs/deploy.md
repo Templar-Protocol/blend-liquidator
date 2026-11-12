@@ -268,7 +268,9 @@ processed ledger and poller heartbeat, events processed, users tracked
 and auctions open; `creations_total`/`fills_total` by result
 (`attempted`/`succeeded`/`failed`); `skips_total` by reason;
 `estimated_profit_total`/`estimated_loss_total` in the pool oracle's own
-units; `reserved_inventory` per asset; unwind passes; and notification
+units; `reserved_inventory` per asset; `unvalued_users` per pool (the
+borrowers held without a health factor because a reserve they hold has no
+oracle price); unwind passes; and notification
 delivery counts by kind. `docs/configuration.md` §8 has the HTTP
 variables that turn this on; the metric families themselves are defined
 in `src/metrics.rs`.
@@ -286,6 +288,17 @@ the fork it targets can never emit one. A stock pool emits one whenever a
 defaulted borrower's debt moves to the backstop — through the bot's own
 `bad_debt` call too. On a stock pool the alert is expected; on a Precept
 pool it means the wrong wasm is deployed.
+
+**`reserve_unpriced` means the oracle has stopped pricing a reserve.** The
+bot raises `ReserveUnpriced` at `High` severity once per pool and asset
+within `FAILURE_NOTIFICATION_COOLDOWN_HOURS`, and `unvalued_users{pool}`
+above zero says how many borrowers are waiting on it. It is a tripped or
+stale feed, not a fault in the bot: the bot keeps following the pool, stores
+those borrowers without a health factor, and re-values them every ledger
+until the price returns, so no restart or reseed is needed. Act on the
+oracle — the feed, its heartbeat, whatever tripped it — not on the bot. Until
+it is priced, the contract refuses every priced action on that reserve, so no
+liquidation can be created or filled against its holders either.
 
 **The one thing never to do: run a deployment that holds a secret at
 `RUST_LOG=trace`.** That no secret reaches a log line holds at the

@@ -27,7 +27,7 @@ on:
 
 # This group serialises whole *workflow runs*, not the matrix jobs within
 # one: GitHub schedules every job in the matrix below on its own runner, so
-# six scenarios run at once without contending for anything. On hosted
+# seven scenarios run at once without contending for anything. On hosted
 # runners a second run's jobs get fresh VMs exactly as these do, so two
 # overlapping runs would not collide either; what the group buys there is
 # one night's run finishing before the next starts, and no doubled runner
@@ -64,7 +64,7 @@ jobs:
       # the others: every scenario deploys its own network and asserts only
       # on that, so each result stands on its own, and one failing (dry_run
       # finding a transaction from a key a dry-run bot held, say) says
-      # nothing about the other four. `make sandbox` locally stops at the
+      # nothing about the other six. `make sandbox` locally stops at the
       # first failure instead, for a developer who wants that failure's
       # state left to inspect.
       fail-fast: false

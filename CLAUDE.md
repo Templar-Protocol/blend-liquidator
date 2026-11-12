@@ -131,7 +131,9 @@ through 7 built still stands: the fork's differences are additions to
 this crate's arithmetic port, not corrections to it. Since Phase 9 both
 test tiers moved onto Precept's v0.1.1 release, deployed as the live
 XLM/USDC market, and the sandbox gained a sixth scenario,
-`free_fill_default`. The repository scaffolding is complete and enforced.
+`free_fill_default`. Since then a reserve the oracle has no price for no
+longer holds a pool's events cursor (`docs/specs/2026-11-12-unpriced-reserve.md`),
+proved by a seventh scenario, `unpriced_reserve`. The repository scaffolding is complete and enforced.
 
 **This bot is NOT non-custodial.** It is designed to hold a signing key and
 submit transactions itself — that is the point of a liquidation bot. Treat
@@ -147,7 +149,7 @@ cargo test --lib --bins             # unit tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 make sqlx-prepare                   # after changing a query in src/store.rs
-make sandbox                        # all six scenarios, ~30 min (Docker + stellar CLI); SANDBOX_SCENARIO=x for one
+make sandbox                        # all seven scenarios, ~30 min (Docker + stellar CLI); SANDBOX_SCENARIO=x for one
 make testnet-deploy                 # stand Precept up on public Stellar testnet for the soak's armed stage
 make testnet-crash                  # move the testnet soak's oracle price (default $0.08)
 make testnet-run                    # run the bot against testnet in dry run (no key; nothing is ever submitted)
@@ -315,7 +317,11 @@ make help                           # Docker Compose lifecycle
   something) and open auctions (`auctions`), migrated by the embedded
   `migrations/` and read and written through compile-time-checked
   `sqlx::query!`. `i128` amounts and health factors cross the Postgres
-  boundary as decimal text, never as a bound number.
+  boundary as decimal text, never as a bound number. `users.health_factor`
+  is nullable and `TrackedUser.health_factor` an `Option<i128>`: `None` is
+  an unvalued borrower. `users_stale` returns NULL rows along with the
+  old ones, so the stale pass re-values them, and `count_unvalued` is the
+  `unvalued_users` gauge's source.
 - `src/ledger.rs` — the clock: one `LedgerPoller` per pool, reading events
   since a stored cursor, sending each decoded event and then the ledger's
   tick, and advancing the cursor only once the tracker has answered that
@@ -344,7 +350,14 @@ make help                           # Docker Compose lifecycle
   `Tracker::refresh` re-reads named accounts from chain in one snapshot,
   values them at the later of the tick's close time and the newest reserve
   entry the snapshot holds, and upserts or deletes their `users` row at the
-  ledger the snapshot was read at; `Tracker::refresh_stale` takes an
+  ledger the snapshot was read at. `refresh` defers only
+  `ChainError::Math(MathError::MissingPrice)` — a reserve the oracle has
+  no price for: it writes the account's exact positions with a NULL health
+  factor and `flag_recheck`s it at the tick's sequence, and `RefreshOutcome`
+  reports `unvalued` (a count) and `unpriced` (the assets) for the caller;
+  any other `Chain` or `Math` error still fails the batch. The seed
+  aggregates them, logs one `WARN` per asset and never notifies.
+  `Tracker::refresh_stale` takes an
   *absolute* ledger cutoff, not a span; `Tracker::seed` collects accounts
   from every configured `SeedSource` — the public analytics API
   (`AnalyticsSeed`) or a static file (`FileSeed`) — deduplicates them,
@@ -429,11 +442,15 @@ make help                           # Docker Compose lifecycle
   leave before the process does. `pub mod telegram` is `TelegramChannel`,
   the second `NotificationChannel`. `NotificationKind` already lists every
   kind spec §7 names, so the semaphore, `drain()` and the Telegram channel
-  add no new variant; Phase 8 added the one this crate's own fork
+  add no new variant; Phase 8 added the first beyond it, which this crate's own fork
   reconciliation needed, `StockWasmDetected` — raised, `Severity::High`,
   the moment `src/service.rs`'s event handler sees a `bad_debt` event,
   since the fork's contract can never emit one and one on chain means the
-  wrong wasm is deployed. Must be used from inside a tokio runtime:
+  wrong wasm is deployed. The second is `ReserveUnpriced` (`reserve_unpriced`,
+  `Severity::High`): `account` carries the *asset*, so the dedup key
+  `(pool, asset, kind)` is one alarm per pool and asset per cooldown, raised
+  by `apply_tick` once per distinct unpriced asset after it re-gauges and
+  never by the seed. Must be used from inside a tokio runtime:
   `notify` spawns.
 - `src/notifier/telegram.rs` — `TelegramChannel`: `sendMessage` for
   delivery, `getMe` (`verify`) to prove the configured credentials work
@@ -468,7 +485,8 @@ make help                           # Docker Compose lifecycle
   than lowering the profit one, since a Prometheus counter that decreases
   is read as a reset. No I/O, no float and nothing panics; a poisoned
   lock is recovered rather than propagated, the same call `notifier`'s
-  makes.
+  makes. `unvalued_users{pool}` is the gauge of `users` rows holding a NULL
+  health factor, set beside `users_tracked` by `regauge_users`.
 - `src/http.rs` — the `/healthz`, `/livez` and `/metrics` server, built
   from `HttpState` and served only when `crate::config::HttpConfig` is
   configured (`PORT` or `HTTP_PORT`). `readiness` (`/healthz`) needs every
@@ -648,7 +666,8 @@ make help                           # Docker Compose lifecycle
   Rust's panic code, and a panic wins over any error the same run
   reported. The tracker loop treats
   a `TrackerError::Store` as fatal and a `Chain` or `Math` one as transient
-  — it declines the tick, and the same range is read again. Both entry
+  — it declines the tick, and the same range is read again; a missing
+  price is no longer one of them, since the refresh defers it. Both entry
   points share `validate` and `validate_filler`: the filler's account must
   exist on the network and hold at least `XLM_FEE_RESERVE` of the native
   asset — armed, either failure is a startup *error*; in dry-run each is a
@@ -694,7 +713,9 @@ make help                           # Docker Compose lifecycle
   evidence that a transaction was named, and a row with `dry_run = false`
   and no attached hash is an armed attempt that was never submitted, or
   was submitted with its outcome unrecorded — the signing account's
-  sequence number tells the two apart, not the row. A new migration, never
+  sequence number tells the two apart, not the row; `0004` makes
+  `users.health_factor` nullable, NULL meaning the account's positions are
+  stored but a reserve it holds had no oracle price when they were read. A new migration, never
   an amendment, once one is applied anywhere. The
   `sqlx::query!` macros in `src/store.rs` are checked against it at compile
   time; see the query-macro gotcha below.
@@ -703,7 +724,7 @@ make help                           # Docker Compose lifecycle
 - `examples/capture_fixture.rs` — refreshes `tests/fixtures/` from a live
   RPC through `curl`. See that directory's README.
 - `tests/liquidation_sandbox.rs` and `tests/sandbox_harness/mod.rs` — the
-  sandbox tier's six scenario tests, and the one place outside the
+  sandbox tier's seven scenario tests, and the one place outside the
   testnet soak's armed stage (`scripts/testnet/run-bot.sh --armed`) where
   the bot is run with `DRY_RUN=false` and a signing key. `tests/sandbox_harness/mod.rs`
   is the machinery every scenario shares — the standalone-network gate,
@@ -757,7 +778,13 @@ make help                           # Docker Compose lifecycle
   so Precept sets off the borrower's 40 USDC plain supply and defaults
   the rest inside the fill — `debt_setoff` and `defaulted_debt` with the
   borrower in their topics, USDC's `b_rate` cut — and the filler unwinds
-  to its 100 XLM floor. Every scenario is `#[ignore]`d,
+  to its 100 XLM floor. `unpriced_reserve` is dry-run with no key and
+  `USER_REFRESH_LEDGERS=3`: `scripts/sandbox/unprice.sh` leaves USDC
+  unpriced, and the test asserts the borrower's row goes unvalued (NULL
+  health factor), `unvalued_users` reads 1, the cursor advances 10 or more
+  ledgers meanwhile, and exactly one `reserve_unpriced` notification is
+  queued; then `crash.sh 1000000` restores both prices and the gauge reads
+  0. Every scenario is `#[ignore]`d,
   so `cargo test` never starts a container, and each refuses to run at
   all unless `target/sandbox/sandbox.env` exists, names the standalone
   network and was deployed for that scenario. `spawn_bot` and
@@ -771,7 +798,7 @@ make help                           # Docker Compose lifecycle
   before it panics.
 - `scripts/sandbox/` — the tier's scripts, all `set -euo pipefail`. Every
   one that drives the sandbox itself — `fetch-artifacts.sh`, `up.sh`,
-  `deploy.sh`, `crash.sh`, `mint.sh`, `down.sh` and
+  `deploy.sh`, `crash.sh`, `unprice.sh`, `mint.sh`, `down.sh` and
   `test-network-pinning.sh` — sources `lib.sh`, and through it
   `versions.env`; `test-cargo-jobs.sh` and `test-cargo-config.sh` source
   neither, because what they test is `scripts/cargo-jobs*.sh`, which
@@ -807,7 +834,7 @@ make help                           # Docker Compose lifecycle
   reaches `down.sh` on that path and the next run refuses on it;
   `deploy.sh` stands Precept up in ten steps and writes
   `target/sandbox/sandbox.env`, keyed by `SANDBOX_SCENARIO` (one of the
-  tier's six names, `liquidation` by default): it changes two things,
+  tier's seven names, `liquidation` by default): it changes two things,
   step 2's mint, which `unwind_repay` alone skips, leaving the filler's
   wallet with no USDC to repay a fill's bid, and step 9's extra submit,
   which `free_fill_default` alone makes, the borrower's 40 USDC plain
@@ -818,7 +845,10 @@ make help                           # Docker Compose lifecycle
   90 s budget, while it polls Horizon for an account to exist, because
   `up.sh`'s health gate can go green before friendbot behind it is ready
   and `stellar keys generate --fund` exits `0` either way; `crash.sh`
-  moves the oracle's XLM price; `mint.sh AMOUNT` mints the filler more
+  moves the oracle's XLM price; `unprice.sh` leaves USDC with no price at
+  all through the mock oracle's `set_price([xlm], closeTime)` — what
+  Precept's adapter answers for a tripped or stale feed — and `crash.sh`
+  restores both; `mint.sh AMOUNT` mints the filler more
   USDC, signed by the issuer — `unwind_repay`'s way of funding the wallet
   its own deploy left empty, once the debt it means to prove is already
   outstanding; `down.sh` removes the container and `sandbox.env`.
@@ -851,7 +881,7 @@ make help                           # Docker Compose lifecycle
   `pull_request`, and deliberately outside `ci.yml`'s `ci-summary` needs
   list: that gate reads a skipped job as a failure, which is right for a
   workflow where nothing is conditional and wrong for one that has no
-  pull-request run to skip. `strategy.matrix.scenario` runs all six
+  pull-request run to skip. `strategy.matrix.scenario` runs all seven
   scenarios, `fail-fast: false`, each its own job on its own runner,
   because each result stands on its own (`make sandbox` locally stops at
   the first failure instead, for a developer who wants that failure's
@@ -860,7 +890,7 @@ make help                           # Docker Compose lifecycle
   test step's script reads it as `"${SANDBOX_SCENARIO}"` (`make
   sandbox-test SANDBOX_SCENARIO="${SANDBOX_SCENARIO}"`), never a `${{ }}`
   spliced into the shell; the uploaded log artifact is named
-  `sandbox-logs-${{ matrix.scenario }}` so six jobs' logs do not collide.
+  `sandbox-logs-${{ matrix.scenario }}` so seven jobs' logs do not collide.
   The workflow-level `concurrency` group of `sandbox`, with
   `cancel-in-progress: false`, serialises whole *workflow runs* rather
   than the matrix jobs inside one. On hosted runners every job of every
@@ -987,7 +1017,13 @@ Status above for what remains.
   shrunk with a smaller channel: everything still queued would be a ledger
   the store claims to have applied, a kill would drop it, and nothing would
   ever re-read it — `seed_pools_needing_it` reseeds only an empty store or a
-  missing cursor. The failure is loud and the loss is silent. A dropped
+  missing cursor. The failure is loud and the loss is silent. A ledger's
+  effect is its events' bookkeeping and the on-chain positions of the
+  accounts they name, both stored exactly; a health factor is a valuation
+  of them, not an effect — when a reserve's missing price stops one, the
+  tracker stores the row with a NULL health factor and a recheck flag, which
+  is durable, and acknowledges the tick
+  (`docs/specs/2026-11-12-unpriced-reserve.md` §1.B). A dropped
   acknowledgement therefore means "not applied": do not commit, and let the
   poller's backoff slow the re-read.
 
@@ -1182,6 +1218,11 @@ Status above for what remains.
   deletes it the moment its liabilities empty — so `count(*)` on `users` is
   the number of positions that could be liquidated, not the number of
   accounts ever seen.
+- A NULL `users.health_factor` means unvalued — a reserve the account holds
+  had no oracle price when it was last read — never zero. The full scan's
+  `health_factor < threshold` skips it by design; its recheck flag, raised by
+  the refresh, is what brings it to the auctioneer, and the stale pass
+  re-values it every tick until the price returns.
 - The migration in `migrations/` was amended twice during Phase 3, so a
   stale local database (one migrated before those amendments) fails loudly
   on a checksum mismatch rather than applying quietly. `make db-reset &&
@@ -1769,7 +1810,7 @@ three ways, all reconciled** (`docs/specs/2026-11-09-precept-v0.1.1-reconciliati
   the build-job cap (`cargo-jobs.sh`, `cargo-jobs-config.sh`) and the
   sandbox tier (`sandbox/`).
 - `tests/` — the fixtures the math is pinned against;
-  `liquidation_sandbox.rs`, the sandbox tier's six `#[ignore]`d scenario
+  `liquidation_sandbox.rs`, the sandbox tier's seven `#[ignore]`d scenario
   tests; and `sandbox_harness/mod.rs`, the harness they share.
 - `docs/` — `configuration.md` (every setting, its default and bound),
   `deploy.md` (the operator's guide from pulling the image to running it
