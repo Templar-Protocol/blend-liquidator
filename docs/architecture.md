@@ -103,8 +103,9 @@ signing key owns.
   reserve the oracle has no price for does not stop the acknowledgement —
   the tracker stores that account's positions with a NULL (unvalued) health
   factor and a durable recheck flag, raises `NotificationKind::ReserveUnpriced`
-  once per pool and asset, gauges `unvalued_users{pool}`, and re-values the
-  account every tick until the price returns.
+  once per pool and asset, gauges `unvalued_users{pool}`, and re-reads the
+  account in its stale pass — `REFRESH_BATCH` rows a tick, oldest first —
+  until the price returns.
 - **Nothing is sent for a key while an earlier transaction's outcome on it
   is unknown.** A Soroban transaction is built against its source
   account's sequence number at prepare time, so two in-flight

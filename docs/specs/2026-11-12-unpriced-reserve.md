@@ -96,8 +96,10 @@ decision made on a stale one is a decision the chain would not honour.
   the rows it returned, which are never NULL.
 - **`users_stale` also selects `health_factor IS NULL` rows**, whatever
   their `updated_ledger`, oldest first, under the same batch limit. That is
-  what re-values a row within a ledger of its price returning, rather than
-  a whole `USER_REFRESH_LEDGERS` span later. The stale pass runs inside the
+  what re-values a row within a ledger of its price returning, while the
+  pool's unvalued and stale rows fit in one batch (within as many ticks as
+  the backlog takes when they do not), rather than a whole
+  `USER_REFRESH_LEDGERS` span later. The stale pass runs inside the
   tick, so on a pool with unvalued rows it costs one more snapshot read per
   tick, bounded by the refresh batch.
 - **A new `Store::count_unvalued(pool)`.**
@@ -209,8 +211,9 @@ Test-first, each new branch's test confirmed to fail without it.
   1. the borrower is tracked with a health factor;
   2. after `unprice.sh`, `unvalued_users{pool}` reads 1 and the row's health
      factor is NULL;
-  3. `ledger_processed{pool}` keeps advancing while USDC is unpriced —
-     the cursor is not held, which is the whole fix;
+  3. `ledger_processed{pool}` and the stored events cursor both keep
+     advancing while USDC is unpriced — the cursor is not held, which is
+     the whole fix;
   4. `notifications_total{kind="reserve_unpriced",…}` counts exactly one
      queued delivery;
   5. after `crash.sh 1000000` restores both prices at $0.10, the gauge

@@ -123,7 +123,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- A reserve the oracle cannot price no longer holds a pool's events cursor: the tracker stores its holders' positions with an unvalued (NULL) health factor and a recheck flag, acknowledges the tick, and re-values them every tick until the price returns. Before, one such holder stopped the pool's cursor for every borrower until the price came back.
+- A reserve the oracle cannot price no longer holds a pool's events cursor: the tracker stores its holders' positions with an unvalued (NULL) health factor and a recheck flag, acknowledges the tick, and keeps re-reading them in its stale pass, `REFRESH_BATCH` rows a tick and oldest first, until the price returns. Before, one such holder stopped the pool's cursor for every borrower until the price came back.
 - The event poller accepts stellar-rpc 30's getEvents, which no longer sends inSuccessfulContractCall: every page holding an event used to fail to decode, so the poller backed off forever and the bot stopped following the pool from its first event.
 - The bot is reconciled with Precept `v0.1.1`, the release every live
   market runs. `defaulted_debt` and `debt_setoff` events, which `v0.1.1`

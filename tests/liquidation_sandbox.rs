@@ -118,12 +118,12 @@ use sandbox_harness::{
     create_run_database_unmigrated, creation_percent, drop_run_database, fail, fail_check,
     fill_budget, log_lines_containing, mint, note_run_database, pool_events_of, pools_toml,
     pools_toml_with, print_nonzero_counters, read_metrics, repo_root, require_standalone_rpc,
-    required, reserve_b_rate, run_check_config, sandbox_env, series, spawn_bot, stored_health,
-    terminate, unprice, wait_for_adopted_auction, wait_for_auction, wait_for_dry_run_row,
-    wait_for_ledgers_past, wait_for_liability, wait_for_ready, wait_for_series,
-    wait_for_series_at_least, wait_for_tx_hash, wait_for_unwind, wait_for_unwind_leftovers,
-    wait_for_user_row_gone, with_database, Bot, BotConfig, PoolOptions, Wait,
-    CREATIONS_FOR_ACCOUNT, CREATIONS_VIOLATING_DRY_RUN, CREATION_TIMEOUT, CREATION_TX_HASH,
+    required, reserve_b_rate, run_check_config, sandbox_env, series, spawn_bot, stored_cursor,
+    stored_health, terminate, unprice, wait_for_adopted_auction, wait_for_auction,
+    wait_for_dry_run_row, wait_for_ledgers_past, wait_for_liability, wait_for_ready,
+    wait_for_series, wait_for_series_at_least, wait_for_tx_hash, wait_for_unwind,
+    wait_for_unwind_leftovers, wait_for_user_row_gone, with_database, Bot, BotConfig, PoolOptions,
+    Wait, CREATIONS_FOR_ACCOUNT, CREATIONS_VIOLATING_DRY_RUN, CREATION_TIMEOUT, CREATION_TX_HASH,
     DRY_RUN_CREATION_ROW, DRY_RUN_FILL_ROW, EARLIEST_PROFITABLE_FILL, FILLS_VIOLATING_DRY_RUN,
     FILL_TX_HASH, FREE_FILL, UNWIND_LEFTOVERS_METRIC,
 };
@@ -2247,19 +2247,37 @@ async fn unpriced_reserve() {
         fail(&bot, "the borrower's row is not unvalued");
     }
     // 3. The cursor keeps moving while USDC is unpriced — the whole fix.
+    // Both the acknowledgement (`ledger_processed`) and the commit it lets
+    // the poller make (the stored cursor) must advance.
     let processed_series = format!("precept_liquidator_ledger_processed{{pool=\"{pool}\"}}");
     let Some(processed) = series(&read_metrics(&bot, &http).await, &processed_series) else {
         fail(&bot, "/metrics has no ledger_processed series for the pool")
+    };
+    let Some(committed) = stored_cursor(&bot, &store, &pool).await else {
+        fail(&bot, "the pool has no committed events cursor")
     };
     wait_for_series_at_least(
         &mut bot,
         &http,
         &processed_series,
         processed + 10,
-        "the cursor to advance ten ledgers with USDC unpriced",
+        "the tracker to acknowledge ten ledgers with USDC unpriced",
         Duration::from_mins(1),
     )
     .await;
+    let mut wait = Wait::new(
+        "the stored events cursor to advance ten ledgers with USDC unpriced",
+        Duration::from_mins(1),
+    );
+    while stored_cursor(&bot, &store, &pool)
+        .await
+        .is_none_or(|ledger| ledger < committed + 10)
+    {
+        if !wait.tick(&mut bot).await {
+            let message = wait.timed_out();
+            fail(&bot, &message);
+        }
+    }
     // 4. Exactly one alarm.
     let metrics = read_metrics(&bot, &http).await;
     assert_counter(

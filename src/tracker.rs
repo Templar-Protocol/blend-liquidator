@@ -21,7 +21,7 @@ use crate::chain::rpc::RpcClient;
 use crate::chain::xdr::PoolEvent;
 use crate::chain::ChainError;
 use crate::ledger::LedgerTick;
-use crate::math::{mul_floor, MathError, SCALAR_7};
+use crate::math::{mul_floor, MathError, Positions, Reserve, SCALAR_7};
 use crate::store::{Store, StoreError, TrackedAuction, TrackedUser};
 
 /// A failure applying chain state to the store.
@@ -86,6 +86,21 @@ enum Valuation {
     Valued(Option<i128>),
     /// A reserve the account holds has no oracle price.
     Unpriced(String),
+}
+
+/// The first reserve `positions` holds a nonzero balance in that `reserves`
+/// does not hold. Valuation reads collateral before liabilities and stops at
+/// its first error, so a missing price can stand in front of a missing
+/// reserve; deferring on the price then would hide an incomplete view, which
+/// must fail the batch, behind an operating state, which need not.
+fn unknown_reserve(positions: &Positions, reserves: &BTreeMap<u32, Reserve>) -> Option<u32> {
+    positions
+        .collateral
+        .iter()
+        .chain(&positions.liabilities)
+        .filter(|(_, amount)| **amount != 0)
+        .map(|(index, _)| *index)
+        .find(|index| !reserves.contains_key(index))
 }
 
 /// Applies events and refreshes users for one store.
@@ -267,8 +282,14 @@ impl<'a> Tracker<'a> {
                     // answers as no price rather than a failure. The
                     // positions are still exact; only the valuation waits.
                     // Every other error is an incomplete view or a bug and
-                    // still fails the batch.
+                    // still fails the batch — a reserve the snapshot lacks
+                    // included, even where a missing price was met first.
                     Err(ChainError::Math(MathError::MissingPrice(asset))) => {
+                        if let Some(index) =
+                            positions.and_then(|held| unknown_reserve(held, &snapshot.reserves))
+                        {
+                            return Err(ChainError::Math(MathError::MissingReserve(index)).into());
+                        }
                         Valuation::Unpriced(asset)
                     }
                     Err(error) => return Err(error.into()),
@@ -744,6 +765,39 @@ mod tests {
             .refresh(POOL, &[USER_ONE.to_string()], harness::fixture_tick())
             .await
             .expect_err("a reserve the snapshot lacks is not an unpriced one");
+        assert!(
+            matches!(
+                error,
+                TrackerError::Chain(ChainError::Math(MathError::MissingReserve(9)))
+            ),
+            "{error:?}"
+        );
+        assert!(store.user(POOL, USER_ONE).await.expect("read").is_none());
+        Ok(())
+    }
+
+    /// A missing price met first does not hide a missing reserve behind it.
+    /// Valuation reads the unpriced collateral before it reaches the
+    /// liability in a reserve the snapshot lacks, so the error it answers is
+    /// the price; the batch still fails on the reserve, and nothing is
+    /// written.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_missing_reserve_behind_a_missing_price_still_fails_the_refresh(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let unpriced = reserve_asset(2);
+        let both =
+            harness::positions_entry_xdr(USER_ONE, &[(2, 10_000_000_000)], &[(9, 100_000_000)]);
+        harness::script_snapshot_positions_unpriced(&rpc, &[(USER_ONE, both)], &unpriced);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let tracker = Tracker::new(&client, &store);
+
+        let error = tracker
+            .refresh(POOL, &[USER_ONE.to_string()], harness::fixture_tick())
+            .await
+            .expect_err("a reserve the snapshot lacks fails the batch, priced or not");
         assert!(
             matches!(
                 error,

@@ -294,8 +294,13 @@ bot raises `ReserveUnpriced` at `High` severity once per pool and asset
 within `FAILURE_NOTIFICATION_COOLDOWN_HOURS`, and `unvalued_users{pool}`
 above zero says how many borrowers are waiting on it. It is a tripped or
 stale feed, not a fault in the bot: the bot keeps following the pool, stores
-those borrowers without a health factor, and re-values them every ledger
-until the price returns, so no restart or reseed is needed. Act on the
+those borrowers without a health factor, and keeps re-reading them in its
+stale pass until the price returns, so no restart or reseed is needed. That
+pass takes `REFRESH_BATCH` rows a tick, oldest first, unvalued and stale
+alike, so once the price is back `unvalued_users` falls to zero within a tick
+only while those rows fit in one batch; with more of them, or a backlog of
+stale rows ahead of them, it takes as many ticks as working through them
+does. Act on the
 oracle — the feed, its heartbeat, whatever tripped it — not on the bot. Until
 it is priced, the contract refuses every priced action on that reserve, so no
 liquidation can be created or filled against its holders either. A borrower

@@ -781,8 +781,10 @@ make help                           # Docker Compose lifecycle
   to its 100 XLM floor. `unpriced_reserve` is dry-run with no key and
   `USER_REFRESH_LEDGERS=3`: `scripts/sandbox/unprice.sh` leaves USDC
   unpriced, and the test asserts the borrower's row goes unvalued (NULL
-  health factor), `unvalued_users` reads 1, the cursor advances 10 or more
-  ledgers meanwhile, and exactly one `reserve_unpriced` notification is
+  health factor), `unvalued_users` reads 1, both `ledger_processed` and the
+  stored events cursor advance 10 or more ledgers meanwhile — the gauge is
+  set as the acknowledgement is sent and only the stored cursor proves the
+  poller committed — and exactly one `reserve_unpriced` notification is
   queued; then `crash.sh 1000000` restores both prices and the gauge reads
   0. Every scenario is `#[ignore]`d,
   so `cargo test` never starts a container, and each refuses to run at
@@ -1222,7 +1224,13 @@ Status above for what remains.
   had no oracle price when it was last read — never zero. The full scan's
   `health_factor < threshold` skips it by design; its recheck flag, raised by
   the refresh, is what brings it to the auctioneer, and the stale pass
-  re-values it every tick until the price returns.
+  keeps re-reading it until the price returns — `REFRESH_BATCH` rows a
+  tick, oldest first, unvalued and stale alike, so every tick only while
+  they all fit in one batch. A re-read that is still unpriced moves the
+  row's `updated_ledger` to the newest in the pool, which sends it behind
+  every other candidate; sorting unvalued rows first instead would starve
+  the stale valued rows, the borrowers not holding the unpriced asset, for
+  the whole outage.
 - The migration in `migrations/` was amended twice during Phase 3, so a
   stale local database (one migrated before those amendments) fails loudly
   on a checksum mismatch rather than applying quietly. `make db-reset &&

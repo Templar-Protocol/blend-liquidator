@@ -58,7 +58,7 @@ use precept_liquidator::chain::rpc::{EventQuery, TransactionStatus};
 use precept_liquidator::chain::xdr::{decode_pool_event, AuctionType, PoolEvent};
 use precept_liquidator::chain::{PoolReader, RpcClient, TxHash};
 use precept_liquidator::math::AuctionData;
-use precept_liquidator::store::{Store, TrackedAuction};
+use precept_liquidator::store::{events_cursor, Store, TrackedAuction};
 use sqlx::postgres::PgPool;
 
 /// The only network this tier will talk to. `scripts/sandbox/versions.env`
@@ -2101,6 +2101,20 @@ pub(crate) async fn stored_health(
     match store.user(pool, account).await {
         Ok(row) => row.map(|row| row.health_factor),
         Err(error) => fail(bot, &format!("could not read {account}'s row: {error}")),
+    }
+}
+
+/// The ledger of `pool`'s committed events cursor, `None` before the
+/// poller's first commit. This, not `ledger_processed`, is what proves a
+/// ledger committed: the gauge is set as the tracker sends its
+/// acknowledgement, and the poller writes the cursor only once it has it.
+pub(crate) async fn stored_cursor(bot: &Bot, store: &Store, pool: &str) -> Option<u32> {
+    match store.cursor(&events_cursor(pool)).await {
+        Ok(cursor) => cursor.map(|cursor| cursor.ledger),
+        Err(error) => fail(
+            bot,
+            &format!("could not read {pool}'s events cursor: {error}"),
+        ),
     }
 }
 

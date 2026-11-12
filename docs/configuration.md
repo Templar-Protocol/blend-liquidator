@@ -177,7 +177,7 @@ which waits for the ledger the bid is gone) or `earliest-profitable`
 | Variable | Default | Constraint |
 |---|---|---|
 | `POLL_INTERVAL_MS` | `1000` | How often the poller asks the RPC for chain head, in milliseconds. At least 100, at most 60000. |
-| `USER_REFRESH_LEDGERS` | `241920` | A tracked user whose row is older than this many ledgers is refreshed, so accrued interest is never missed. Unvalued rows (no health factor, because the oracle has no price for one of their reserves) are re-read every tick regardless of this setting, and count against `REFRESH_BATCH`. |
+| `USER_REFRESH_LEDGERS` | `241920` | A tracked user whose row is older than this many ledgers is refreshed, so accrued interest is never missed. Unvalued rows (no health factor, because the oracle has no price for one of their reserves) are due on every tick regardless of this setting. They share `REFRESH_BATCH` with the stale rows, oldest first, so each is re-read every tick only while they all fit in one batch. |
 | `REFRESH_BATCH` | `20` | A rate, not a cap: how many stale users the tracker refreshes per tick, how many flagged borrowers the auctioneer decides and acts on per pool per tick, and the full scan's page size. At least 1, at most 1000. Never bounds the oracle scan, which flags every borrower a price move went against regardless of batch size. |
 | `FULL_SCAN_LEDGERS` | `1200` | How often the full scan reports the least healthy borrowers, in ledgers. At least 1. |
 | `SCAN_HF_THRESHOLD` | `1.2` | The health factor the full scan reports below (strictly). Must sit strictly above `LIQ_HF_THRESHOLD` (see below). |

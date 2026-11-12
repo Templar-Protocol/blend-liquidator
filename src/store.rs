@@ -1361,9 +1361,9 @@ mod tests {
         Ok(())
     }
 
-    /// The stale pass re-reads an unvalued row on every tick, whatever its
-    /// `updated_ledger`, so a returning price is picked up within a ledger;
-    /// the batch limit still holds.
+    /// The stale pass selects an unvalued row on every tick, whatever its
+    /// `updated_ledger`, oldest first alongside the stale ones; the batch
+    /// limit still holds.
     #[sqlx::test(migrations = "./migrations")]
     async fn users_stale_returns_unvalued_rows_whatever_their_ledger(
         db: sqlx::PgPool,
