@@ -7,25 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-12
+
+The first published release. `0.1.0` below was cut but never tagged, so
+no image or GitHub Release exists for it, and this release ships
+everything listed there as well. It targets Precept, Templar's audited
+fork of Blend v2, at `v0.1.1`, the release every live market runs
+(Precept `v0.1.2` changes no pool, backstop or factory wasm). Dry-run is
+the default.
+
 ### Added
 
-- `NotificationKind::ReserveUnpriced` (High, one per pool and asset per cooldown), the `notifications_total{kind="reserve_unpriced"}` series, and the `unvalued_users{pool}` gauge.
-- A seventh sandbox scenario, `unpriced_reserve`.
-- Four more sandbox scenarios alongside the original `liquidation` run —
-  `check_config`, `dry_run`, `unwind_repay` and `restart_adopt` (see
-  `tests/liquidation_sandbox.rs`'s module doc for what each proves) —
-  sharing a new `tests/sandbox_harness/mod.rs` harness that factors out
-  the standalone-network gate, the spawned bot, the per-run database(s)
-  and every named wait. `deploy.sh` takes `SANDBOX_SCENARIO` to pick
-  which of the seven it deploys for (`liquidation` by default), and a new
-  `scripts/sandbox/mint.sh` mints the filler more USDC on a running
-  network — `unwind_repay`'s way of funding a wallet its own deploy left
-  empty. `.github/workflows/sandbox.yml`'s nightly run now matrices over
-  all seven scenarios, one job per scenario on its own runner,
-  `fail-fast: false`. `make sandbox-test` refuses a `SANDBOX_SCENARIO`
-  that does not name exactly one test fn, rather than passing having run
-  none, and `scripts/check-repo-invariants.sh` fails unless the five
-  places that name the scenarios agree.
+- `NotificationKind::ReserveUnpriced` (High, one per pool and asset per
+  cooldown), the `notifications_total{kind="reserve_unpriced"}` series,
+  and the `unvalued_users{pool}` gauge.
 - The testnet soak tier: `scripts/testnet/{lib.sh,deploy.sh,crash.sh,
   run-bot.sh}` and the Makefile's `testnet-deploy`, `testnet-crash`,
   `testnet-run` and `testnet-run-armed` targets stand the same
@@ -58,22 +53,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pool's tracked-user count, open auctions, and every `creations`/`fills`
   row with its `dry_run` and `tx_hash`. `docs/testnet-soak.md` is the
   runbook for both stages.
+- Four more sandbox scenarios alongside the original `liquidation` run —
+  `check_config`, `dry_run`, `unwind_repay` and `restart_adopt` (see
+  `tests/liquidation_sandbox.rs`'s module doc for what each proves) —
+  sharing a new `tests/sandbox_harness/mod.rs` harness that factors out
+  the standalone-network gate, the spawned bot, the per-run database(s)
+  and every named wait. `deploy.sh` takes `SANDBOX_SCENARIO` to pick
+  which of the seven it deploys for (`liquidation` by default), and a new
+  `scripts/sandbox/mint.sh` mints the filler more USDC on a running
+  network — `unwind_repay`'s way of funding a wallet its own deploy left
+  empty. `.github/workflows/sandbox.yml`'s nightly run now matrices over
+  all seven scenarios, one job per scenario on its own runner,
+  `fail-fast: false`. `make sandbox-test` refuses a `SANDBOX_SCENARIO`
+  that does not name exactly one test fn, rather than passing having run
+  none, and `scripts/check-repo-invariants.sh` fails unless the five
+  places that name the scenarios agree.
 - A sixth sandbox scenario, `free_fill_default`: a 100% auction filled with
   the default free-fill objective at start + 400, proving Precept's set-off
   and default path (`debt_setoff`, `defaulted_debt`) against real contract
   code.
+- A seventh sandbox scenario, `unpriced_reserve`: the oracle stops
+  pricing USDC, and the pool's events cursor keeps advancing while the
+  borrower holding it is tracked unvalued, then valued again once the
+  price returns.
 - A ninth `check_config` case, (i): a `min_primary_collateral` under the
   primary reserve's `min_position` is refused, proving `min_position`
   decodes from a real `ReserveConfig`.
 
 ### Changed
 
-- Migration `0004` makes `users.health_factor` nullable. It applies itself at startup. Do not roll back to an earlier binary afterwards: `Store::migrate` runs the embedded migrator without `ignore_missing`, so a binary that does not know `0004` refuses to start against a store that has applied it (`VersionMissing`), before it follows anything. Its `check-config`, which does not migrate, would still pass.
-- The sandbox and testnet tiers deploy Precept's own v0.1.1 release wasm
-  (pool, backstop, factory), in the live XLM/USDC market's reserve
-  configuration — XLM collateral-only, USDC borrow-only, each with
-  Precept's `min_position` — instead of stock Blend v2. `crash.sh`'s
-  default is $0.08 in both tiers.
 - **Breaking: renamed from `blend-liquidator` to `precept-liquidator`**, to
   match the protocol it targets: Precept, Templar's audited fork of Blend
   v2, whose repository `Templar-Protocol/blend-contracts-v2` is now
@@ -89,6 +97,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   named volumes are `precept-liquidator-claude-code` and
   `precept-liquidator-gh-config`. No image, tag or release was ever
   published under the old name.
+- **Breaking: a `min_primary_collateral` strictly between zero and the
+  primary reserve's `min_position` is now a startup error**, in every
+  mode, naming both values. A configuration that started before can
+  refuse to start after upgrading; check each pool's
+  `min_primary_collateral` against its primary reserve's `min_position`
+  first and set it to zero or at least that minimum. No unwind could ever
+  rest at such a floor: the contract refuses every withdrawal that would
+  leave the position there.
+- Migration `0004` makes `users.health_factor` nullable. It applies
+  itself at startup. Do not roll back to an earlier binary afterwards:
+  `Store::migrate` runs the embedded migrator without `ignore_missing`,
+  so a binary that does not know `0004` refuses to start against a store
+  that has applied it (`VersionMissing`), before it follows anything.
+  Its `check-config`, which does not migrate, would still pass.
 - `SEED_URL` defaults to `https://api.precept.templarfi.org`, Precept's
   public analytics API, which serves the same positions endpoint and shape.
   The old default, `https://api.blend.templarfi.org`, has been retired and
@@ -112,19 +134,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   release candidate is never shown as the repository's latest release.
   The workflow's comment no longer claims the package is private because
   the repository is: its visibility is its own GHCR setting.
-- **Breaking: a `min_primary_collateral` strictly between zero and the
-  primary reserve's `min_position` is now a startup error**, in every
-  mode, naming both values. A configuration that started before can
-  refuse to start after upgrading; check each pool's
-  `min_primary_collateral` against its primary reserve's `min_position`
-  first and set it to zero or at least that minimum. No unwind could ever
-  rest at such a floor: the contract refuses every withdrawal that would
-  leave the position there.
+- The sandbox and testnet tiers deploy Precept's own v0.1.1 release wasm
+  (pool, backstop, factory), in the live XLM/USDC market's reserve
+  configuration — XLM collateral-only, USDC borrow-only, each with
+  Precept's `min_position` — instead of stock Blend v2. `crash.sh`'s
+  default is $0.08 in both tiers.
 
 ### Fixed
 
-- A reserve the oracle cannot price no longer holds a pool's events cursor: the tracker stores its holders' positions with an unvalued (NULL) health factor and a recheck flag, acknowledges the tick, and keeps re-reading them in its stale pass, `REFRESH_BATCH` rows a tick and oldest first, until the price returns. Before, one such holder stopped the pool's cursor for every borrower until the price came back.
-- The event poller accepts stellar-rpc 30's getEvents, which no longer sends inSuccessfulContractCall: every page holding an event used to fail to decode, so the poller backed off forever and the bot stopped following the pool from its first event.
 - The bot is reconciled with Precept `v0.1.1`, the release every live
   market runs. `defaulted_debt` and `debt_setoff` events, which `v0.1.1`
   emits with the borrower in topic 1, decode again — every one used to be
@@ -137,6 +154,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decides such a borrower even when a reserve it owes in is unpriced. The
   snapshot still reads the oracle, so an oracle that fails outright still
   leaves the batch undecided.
+- A reserve the oracle cannot price no longer holds a pool's events
+  cursor: the tracker stores its holders' positions with an unvalued
+  (NULL) health factor and a recheck flag, acknowledges the tick, and
+  keeps re-reading them in its stale pass, `REFRESH_BATCH` rows a tick
+  and oldest first, until the price returns. Before, one such holder
+  stopped the pool's cursor for every borrower until the price came
+  back.
+- The event poller accepts stellar-rpc 30's `getEvents`, which no longer
+  sends `inSuccessfulContractCall`: every page holding an event used to
+  fail to decode, so the poller backed off forever and the bot stopped
+  following the pool from its first event.
 - An oracle scan refused because the ledger moved between its reads
   (`ChainError::LedgerMoved`, after the snapshot's own three attempts)
   gets one retry on the next tick instead of waiting a whole
@@ -165,13 +193,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 
 - An RPC call that fails at the transport level (DNS, TLS, a timeout, a
-  refused connection) no longer renders the RPC URL. `ChainError::Transport`
-  holds a `TransportError`, whose field is private and whose one
-  constructor — which `ChainError`'s `From<reqwest::Error>` goes through —
-  strips the URL with `reqwest::Error::without_url()`, so nothing can build
-  the variant with the URL still in it before the error is logged or, as
-  `RpcFailing`, sent to the notification channel. `RPC_URL` must still carry no credential — it is
-  an ordinary argument, and a debug print of the RPC client renders it.
+  refused connection) no longer renders the RPC URL.
+  `ChainError::Transport` holds a `TransportError`, whose field is
+  private and whose one constructor — which `ChainError`'s
+  `From<reqwest::Error>` goes through — strips the URL with
+  `reqwest::Error::without_url()`, so nothing can build the variant with
+  the URL still in it before the error is logged or, as `RpcFailing`,
+  sent to the notification channel. `RPC_URL` must still carry no
+  credential — it is an ordinary argument, and a debug print of the RPC
+  client renders it.
 - `rustls-webpki` 0.103.15 → 0.103.16, which rejects any certificate path
   holding one of the compromised eMudhra intermediate CA keys
   (CVE-2026-111943, <https://emudhra.we-have-a-problem.com/>). Their
@@ -192,7 +222,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.0] - 2026-09-22
 
-The first release: a Blend v2 liquidation bot targeting the ADR-0008
+Cut but never tagged: no image or GitHub Release was ever published
+for this version, and everything below first shipped in 0.2.0.
+
+The first release cut: a Blend v2 liquidation bot targeting the ADR-0008
 security fork of the Blend contracts (`Templar-Protocol/blend-contracts-v2`)
 and also running against stock pools, dry-run by default. This being the
 first release, the `Changed` entries below record how behaviour settled
@@ -920,5 +953,6 @@ during development rather than a difference from an earlier release.
 - The Dockerfile's `HEALTHCHECK` comment, corrected: it predated `/livez`
   and never explained why the check isn't wired to it.
 
-[Unreleased]: https://github.com/Templar-Protocol/precept-liquidator/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/Templar-Protocol/precept-liquidator/releases/tag/v0.1.0
+[Unreleased]: https://github.com/Templar-Protocol/precept-liquidator/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Templar-Protocol/precept-liquidator/releases/tag/v0.2.0
+[0.1.0]: https://github.com/Templar-Protocol/precept-liquidator/tree/dc55a966781931a505476987edc798c96e7e3189

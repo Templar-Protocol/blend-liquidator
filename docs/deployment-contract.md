@@ -128,6 +128,6 @@ default and bound beyond what is stated below.
 
 ## Versioning
 
-This is the `0.1.0` contract. A change to any guarantee above is a
+This is the `0.2.0` contract. A change to any guarantee above is a
 breaking change to this contract and must be called out in
 `CHANGELOG.md`.

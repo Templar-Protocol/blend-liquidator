@@ -18,7 +18,7 @@ you do either.
 The image is published to `ghcr.io/templar-protocol/precept-liquidator`
 only on a `v*` tag push (`.github/workflows/release.yml`), tagged with
 the version the tag names — its leading `v` stripped, so the git tag
-`v0.1.0` publishes as image tag `0.1.0`, never `v0.1.0`
+`v0.2.0` publishes as image tag `0.2.0`, never `v0.2.0`
 (`docs/deployment-contract.md`, "What this repository guarantees").
 Whether the package is public is a GitHub package setting, not something
 this repository controls; while it is private, pulling it needs a token
