@@ -228,6 +228,9 @@ it); `Tracker::seed` (`src/tracker.rs`) then pulls the account list
 from every configured seed source and refreshes each from chain. Losing
 this half costs one reseed pass per affected pool, not correctness.
 
+`migrations/0004` makes `users.health_factor` nullable, so a borrower the
+oracle cannot price is stored unvalued rather than holding the cursor.
+
 **The audit tables** — `creations` (`migrations/0002_creations_and_recheck.sql`)
 and `fills` (`migrations/0003_fills.sql`) — are the bot's own record of
 what it decided and attempted, dry-run rows included: every auctioneer

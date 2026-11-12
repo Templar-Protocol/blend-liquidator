@@ -610,9 +610,8 @@ async fn seed_pools_needing_it(
             // fatal because the bot would be trading on state it cannot
             // write, while a chain or math failure costs coverage of this
             // pool and is retried. Propagating the latter would let a
-            // single unpriced reserve — which `validate` deliberately
-            // records as a warning that does not stop the bot — keep the
-            // bot from ever starting.
+            // failure that repeats on every attempt — an oracle whose
+            // `lastprice` traps, say — keep the bot from ever starting.
             Err(error @ TrackerError::Store(_)) => return Err(error.into()),
             Err(error) => {
                 tracing::warn!(pool = pool.address, %error, "seeding this pool failed; it will be retried");
@@ -1069,7 +1068,8 @@ async fn apply_tick(
     let updated_before = tick.sequence.saturating_sub(cadence.user_refresh_ledgers);
     // Inlines what `Tracker::refresh_stale` does — read the stale rows,
     // then refresh them — because this call site also needs the account
-    // list to flag, and `RefreshOutcome` reports only counts.
+    // list to flag, and `RefreshOutcome` carries counts and the unpriced
+    // asset set but no account list.
     let stale_rows = tracker
         .store()
         .users_stale(pool, updated_before, i64::from(cadence.refresh_batch))
@@ -1082,11 +1082,11 @@ async fn apply_tick(
             .flag_recheck(pool, account, tick.sequence)
             .await?;
     }
-    // Only a refresh or a seed inserts or deletes a `users` row, so a tick
-    // that refreshed nothing cannot have moved the count and pays for no
-    // read.
-    // When it is skipped no refresh ran, so both `unpriced` sets are empty
-    // and nothing below reads the count.
+    // Only a refresh or a seed inserts, deletes, or changes whether a
+    // `users` row is valued, so a tick that refreshed nothing cannot have
+    // moved the counts and pays for no read. When it is skipped no refresh
+    // ran, so both `unpriced` sets are empty and nothing below reads the
+    // count.
     let mut unvalued = 0;
     if !accounts.is_empty() || !stale_accounts.is_empty() {
         (_, unvalued) = regauge_users(tracker.store(), instruments, pool).await?;
@@ -1119,9 +1119,9 @@ async fn apply_tick(
         // least-healthy report nor a best-effort reseed retry is one of
         // them. Declining the tick over one would stall the pool's cursor
         // for good when the failure is deterministic rather than transient
-        // — a borrower the seed names who holds a reserve the oracle does
-        // not price is exactly that, and `validate` deliberately lets the
-        // bot follow such a pool. A store failure still propagates: it is
+        // — a position naming a reserve the snapshot lacks
+        // (`MissingReserve`), or an oracle whose `lastprice` traps, is
+        // exactly that. A store failure still propagates: it is
         // the one class that means the bot cannot trust what it reads.
         if let Err(error) = full_scan(
             tracker,
@@ -4321,7 +4321,21 @@ mod tests {
         let (_flag, shutdown) = watch::channel(false);
         let (tick_tx, _tick_rx) = tick_watch();
         let mut state = LoopState::default();
-        let (instruments, recording) = recording_instruments();
+        // The delivery counter is what tells tick 2's deduplicated notify
+        // from no notify at all, so this notifier reports into the run's
+        // metrics.
+        let recording = Arc::new(harness::RecordingChannel::new(false));
+        let metrics = Arc::new(Metrics::new());
+        let instruments = Instruments {
+            metrics: Arc::clone(&metrics),
+            notifier: Arc::new(
+                Notifier::new(
+                    Box::new(Arc::clone(&recording)),
+                    std::time::Duration::from_hours(1),
+                )
+                .with_metrics(Arc::clone(&metrics)),
+            ),
+        };
         let gauge = format!(
             "precept_liquidator_unvalued_users{{pool=\"{}\"}}",
             harness::POOL
@@ -4360,6 +4374,11 @@ mod tests {
         assert_eq!(sent[0].account.as_deref(), Some(unpriced.as_str()));
         assert!(sent[0].message.contains(&unpriced), "{}", sent[0].message);
         assert!(
+            sent[0].message.contains(": 1 tracked borrower(s)"),
+            "{}",
+            sent[0].message
+        );
+        assert!(
             instruments
                 .metrics
                 .render()
@@ -4379,6 +4398,14 @@ mod tests {
         assert!(applied.await.is_ok());
         assert!(instruments.notifier.drain(DRAIN_BUDGET).await);
         assert_eq!(recording.sent_count(), 1, "the second is deduplicated");
+        assert!(
+            instruments.metrics.render().contains(
+                "precept_liquidator_notifications_total{kind=\"reserve_unpriced\",\
+                 delivery=\"deduplicated\"} 1\n"
+            ),
+            "{}",
+            instruments.metrics.render()
+        );
 
         let (message, applied) = tick_message(
             harness::POOL,
@@ -4846,9 +4873,9 @@ mod tests {
     /// A full scan that fails does not fail the tick, and the period is
     /// recorded anyway. The acknowledgement means this ledger's effects are
     /// in the store, and a best-effort reseed retry is not one of them —
-    /// so a scan that fails the same way every time (a borrower the seed
-    /// names holding a reserve the oracle does not price, which `validate`
-    /// deliberately permits) would otherwise stall this pool's cursor for
+    /// so a scan that fails the same way every time (a position naming a
+    /// reserve the snapshot lacks, or an oracle whose `lastprice` traps)
+    /// would otherwise stall this pool's cursor for
     /// good, because the redelivered tick would find the scan still due.
     #[sqlx::test(migrations = "./migrations")]
     async fn a_failing_full_scan_neither_fails_the_tick_nor_repeats_forever(

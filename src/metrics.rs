@@ -781,6 +781,9 @@ impl Metrics {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::time::Duration;
+
     #[test]
     fn unvalued_users_renders_per_pool_once_recorded() {
         let m = Metrics::new();
@@ -795,9 +798,6 @@ mod tests {
             "{text}"
         );
     }
-
-    use super::*;
-    use std::time::Duration;
 
     #[test]
     fn render_carries_the_prefix_the_types_and_every_closed_label() {

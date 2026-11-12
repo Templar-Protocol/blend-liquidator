@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `NotificationKind::ReserveUnpriced` (High, one per pool and asset per cooldown) and the `unvalued_users{pool}` gauge.
+- `NotificationKind::ReserveUnpriced` (High, one per pool and asset per cooldown) the `notifications_total{kind="reserve_unpriced"}` series, and the `unvalued_users{pool}` gauge.
 - A seventh sandbox scenario, `unpriced_reserve`.
 - Four more sandbox scenarios alongside the original `liquidation` run —
   `check_config`, `dry_run`, `unwind_repay` and `restart_adopt` (see
@@ -68,7 +68,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Migration `0004` makes `users.health_factor` nullable. It applies itself at startup; a binary built before it cannot read a store holding a NULL health factor.
+- Migration `0004` makes `users.health_factor` nullable. It applies itself at startup. Do not roll back to an earlier binary afterwards: `Store::migrate` runs the embedded migrator without `ignore_missing`, so a binary that does not know `0004` refuses to start against a store that has applied it (`VersionMissing`), before it follows anything. Its `check-config`, which does not migrate, would still pass.
 - The sandbox and testnet tiers deploy Precept's own v0.1.1 release wasm
   (pool, backstop, factory), in the live XLM/USDC market's reserve
   configuration — XLM collateral-only, USDC borrow-only, each with

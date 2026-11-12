@@ -298,7 +298,10 @@ those borrowers without a health factor, and re-values them every ledger
 until the price returns, so no restart or reseed is needed. Act on the
 oracle — the feed, its heartbeat, whatever tripped it — not on the bot. Until
 it is priced, the contract refuses every priced action on that reserve, so no
-liquidation can be created or filled against its holders either.
+liquidation can be created or filled against its holders either. A borrower
+is valued collateral first and stops at the first asset with no price, so the
+alarm names that first asset; if several feeds are down at once, such as both
+of XLM/USDC's, later assets alarm only once the earlier ones return.
 
 **The one thing never to do: run a deployment that holds a secret at
 `RUST_LOG=trace`.** That no secret reaches a log line holds at the

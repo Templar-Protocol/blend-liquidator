@@ -330,8 +330,9 @@ impl<'a> Tracker<'a> {
     }
 
     /// Refreshes up to `batch` users whose row was written before
-    /// `updated_before`, oldest first, so a long-idle borrower's accrued
-    /// interest is never missed.
+    /// `updated_before`, plus any unvalued (NULL health factor) row whatever
+    /// its ledger, oldest first, so a long-idle borrower's accrued interest
+    /// is never missed.
     ///
     /// `updated_before` is an **absolute ledger**, not a span: a caller
     /// working from a knob like `USER_REFRESH_LEDGERS` subtracts it from
@@ -342,7 +343,7 @@ impl<'a> Tracker<'a> {
     /// **No production caller.** `service::apply_tick` inlines the same two
     /// steps rather than calling this, because that call site also needs
     /// the account list to flag for the auctioneer and [`RefreshOutcome`]
-    /// reports only counts. This stays as the tested statement of what the
+    /// carries no account list. This stays as the tested statement of what the
     /// pass is; changing one and not the other is how they drift.
     pub async fn refresh_stale(
         &self,
@@ -408,7 +409,7 @@ impl<'a> Tracker<'a> {
             tracing::warn!(
                 pool,
                 asset,
-                unvalued = outcome.refresh.unvalued,
+                seed_unvalued = outcome.refresh.unvalued,
                 "seeded borrowers hold a reserve the oracle has no price for; they are tracked unvalued until it returns"
             );
         }

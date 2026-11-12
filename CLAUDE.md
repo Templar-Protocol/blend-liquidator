@@ -442,8 +442,8 @@ make help                           # Docker Compose lifecycle
   leave before the process does. `pub mod telegram` is `TelegramChannel`,
   the second `NotificationChannel`. `NotificationKind` already lists every
   kind spec §7 names, so the semaphore, `drain()` and the Telegram channel
-  add no new variant; Phase 8 added the first beyond it, which this crate's own fork
-  reconciliation needed, `StockWasmDetected` — raised, `Severity::High`,
+  add no new variant; Phase 8 added the first beyond it, `StockWasmDetected`,
+  which this crate's own fork reconciliation needed — raised, `Severity::High`,
   the moment `src/service.rs`'s event handler sees a `bad_debt` event,
   since the fork's contract can never emit one and one on chain means the
   wrong wasm is deployed. The second is `ReserveUnpriced` (`reserve_unpriced`,
@@ -1648,7 +1648,10 @@ Status above for what remains.
   writer and it trailed by up to a whole scan period — about 100 minutes
   at testnet's ~5 s ledgers, which is what the stage 1 soak's own log
   shows. The "full scan" and "tracked borrower" log lines are still the
-  full scan's alone. `examples/soak_report.rs` reads the store directly
+  full scan's alone. `regauge_users` sets `unvalued_users` beside
+  `users_tracked` from the same writers, trailing the store by at most a
+  ledger the same way, and returns `(tracked, unvalued)`, which
+  `full_scan` uses. `examples/soak_report.rs` reads the store directly
   regardless: it is a process of its own, with no bot's `/metrics` to
   read.
 - Testnet's ledgers close about every 5 seconds, not the sandbox's ~1

@@ -74,7 +74,7 @@ const STANDALONE_PASSPHRASE: &str = "Standalone Network ; February 2017";
 /// `SANDBOX_SCENARIOS`, `.github/workflows/sandbox.yml`'s matrix and the
 /// `#[ignore]`d test fns in `tests/liquidation_sandbox.rs`. None is derived
 /// from another — a shell script, a Makefile, a workflow and a Rust test
-/// share no build step that could — so a seventh scenario is added to all
+/// share no build step that could — so a new scenario is added to all
 /// five by hand, and `scripts/check-repo-invariants.sh` fails unless they
 /// name the same set.
 pub(crate) const SCENARIOS: [&str; 7] = [
