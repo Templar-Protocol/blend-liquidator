@@ -121,6 +121,12 @@ fn decimal(text: Option<&str>, column: &'static str) -> Result<i128, StoreError>
     })
 }
 
+/// [`decimal`] for a nullable column: NULL is `None`, anything else must
+/// parse.
+fn optional_decimal(text: Option<&str>, column: &'static str) -> Result<Option<i128>, StoreError> {
+    text.map(|text| decimal(Some(text), column)).transpose()
+}
+
 /// A reserve-index-to-amount map as `jsonb`: keys are the index in decimal,
 /// values the amount as a decimal string, because an `i128` amount exceeds
 /// what a JSON number holds exactly.
@@ -279,8 +285,11 @@ pub struct TrackedUser {
     /// The borrower.
     pub account: String,
     /// Health factor normalised to 7 decimals (`hf * 10^7 / oracle_scalar`),
-    /// so pools whose oracles differ in decimals order alike.
-    pub health_factor: i128,
+    /// so pools whose oracles differ in decimals order alike, or `None` when
+    /// the account could not be valued at `updated_ledger` because a reserve
+    /// it holds had no oracle price — never zero; the full scan skips such a
+    /// row and its recheck flag covers it.
+    pub health_factor: Option<i128>,
     /// Reserve index to b-token amount.
     pub collateral: BTreeMap<u32, i128>,
     /// Reserve index to d-token amount.
@@ -349,7 +358,7 @@ impl Store {
                    updated_ledger = EXCLUDED.updated_ledger",
             user.pool,
             user.account,
-            user.health_factor.to_string(),
+            user.health_factor.map(|health| health.to_string()),
             index_amounts_to_json(&user.collateral),
             index_amounts_to_json(&user.liabilities),
             i64::from(user.updated_ledger),
@@ -387,7 +396,7 @@ impl Store {
             Ok(TrackedUser {
                 pool: row.pool,
                 account: row.account,
-                health_factor: decimal(row.health_factor.as_deref(), "health_factor")?,
+                health_factor: optional_decimal(row.health_factor.as_deref(), "health_factor")?,
                 collateral: index_amounts_from_json(&row.collateral, "collateral")?,
                 liabilities: index_amounts_from_json(&row.liabilities, "liabilities")?,
                 updated_ledger: ledger(row.updated_ledger, "updated_ledger")?,
@@ -448,7 +457,7 @@ impl Store {
                 Ok(TrackedUser {
                     pool: row.pool,
                     account: row.account,
-                    health_factor: decimal(row.health_factor.as_deref(), "health_factor")?,
+                    health_factor: optional_decimal(row.health_factor.as_deref(), "health_factor")?,
                     collateral: index_amounts_from_json(&row.collateral, "collateral")?,
                     liabilities: index_amounts_from_json(&row.liabilities, "liabilities")?,
                     updated_ledger: ledger(row.updated_ledger, "updated_ledger")?,
@@ -467,7 +476,9 @@ impl Store {
     ///
     /// `updated_before` is an absolute ledger, compared against the row's
     /// own `updated_ledger`. A caller holding a span of ledgers subtracts
-    /// it from the current one first.
+    /// it from the current one first. Unvalued rows (NULL health factor) are
+    /// returned whatever their ledger, so the stale pass re-values them every
+    /// tick, within the same `limit`.
     pub async fn users_stale(
         &self,
         pool: &str,
@@ -478,8 +489,8 @@ impl Store {
             "SELECT pool, account, health_factor::text AS health_factor, collateral,
                     liabilities, updated_ledger, recheck_ledger
              FROM users
-             WHERE pool = $1 AND updated_ledger < $2
-             ORDER BY updated_ledger ASC
+             WHERE pool = $1 AND (updated_ledger < $2 OR health_factor IS NULL)
+             ORDER BY updated_ledger ASC, account ASC
              LIMIT $3",
             pool,
             i64::from(updated_before),
@@ -492,7 +503,7 @@ impl Store {
                 Ok(TrackedUser {
                     pool: row.pool,
                     account: row.account,
-                    health_factor: decimal(row.health_factor.as_deref(), "health_factor")?,
+                    health_factor: optional_decimal(row.health_factor.as_deref(), "health_factor")?,
                     collateral: index_amounts_from_json(&row.collateral, "collateral")?,
                     liabilities: index_amounts_from_json(&row.liabilities, "liabilities")?,
                     updated_ledger: ledger(row.updated_ledger, "updated_ledger")?,
@@ -509,6 +520,19 @@ impl Store {
     pub async fn count_users(&self, pool: &str) -> Result<i64, StoreError> {
         let row = sqlx::query!(
             "SELECT count(*) AS \"count!\" FROM users WHERE pool = $1",
+            pool
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.count)
+    }
+
+    /// How many of `pool`'s tracked borrowers are unvalued — their health
+    /// factor is NULL because a reserve they hold had no oracle price when
+    /// they were last read.
+    pub async fn count_unvalued(&self, pool: &str) -> Result<i64, StoreError> {
+        let row = sqlx::query!(
+            "SELECT count(*) AS \"count!\" FROM users WHERE pool = $1 AND health_factor IS NULL",
             pool
         )
         .fetch_one(&self.pool)
@@ -568,7 +592,7 @@ impl Store {
                 Ok(TrackedUser {
                     pool: row.pool,
                     account: row.account,
-                    health_factor: decimal(row.health_factor.as_deref(), "health_factor")?,
+                    health_factor: optional_decimal(row.health_factor.as_deref(), "health_factor")?,
                     collateral: index_amounts_from_json(&row.collateral, "collateral")?,
                     liabilities: index_amounts_from_json(&row.liabilities, "liabilities")?,
                     updated_ledger: ledger(row.updated_ledger, "updated_ledger")?,
@@ -1281,12 +1305,103 @@ mod tests {
         TrackedUser {
             pool: POOL.to_string(),
             account: account.to_string(),
-            health_factor,
+            health_factor: Some(health_factor),
             collateral,
             liabilities,
             updated_ledger,
             recheck_ledger: None,
         }
+    }
+
+    fn tracked(pool: &str, account: &str, updated_ledger: u32) -> TrackedUser {
+        let mut row = user(account, 10_000_000, updated_ledger);
+        row.pool = pool.to_string();
+        row.collateral = BTreeMap::from([(0_u32, 10_000_000_000_i128)]);
+        row.liabilities = BTreeMap::from([(1_u32, 1_000_000_000_i128)]);
+        row
+    }
+
+    /// A NULL health factor means "could not be valued at `updated_ledger`",
+    /// never zero, and survives a write and a read as `None`.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_unvalued_health_factor_round_trips_as_none(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let mut user = tracked("POOL", "UNVALUED", 7);
+        user.health_factor = None;
+        store.upsert_user(&user).await.expect("upsert");
+        let row = store
+            .user("POOL", "UNVALUED")
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.health_factor, None);
+        assert_eq!(row.collateral, user.collateral);
+        assert_eq!(row.liabilities, user.liabilities);
+        Ok(())
+    }
+
+    /// The full scan's query never selects an unvalued row: `NULL < x` is
+    /// not true in SQL, and the recheck flag covers that row instead.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn users_below_health_skips_an_unvalued_row(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let mut valued = tracked("POOL", "VALUED", 7);
+        valued.health_factor = Some(9_000_000);
+        let mut unvalued = tracked("POOL", "UNVALUED", 7);
+        unvalued.health_factor = None;
+        store.upsert_user(&valued).await.expect("upsert");
+        store.upsert_user(&unvalued).await.expect("upsert");
+        let rows = store
+            .users_below_health("POOL", 15_000_000, 10, None)
+            .await
+            .expect("query");
+        let accounts: Vec<&str> = rows.iter().map(|row| row.account.as_str()).collect();
+        assert_eq!(accounts, vec!["VALUED"]);
+        Ok(())
+    }
+
+    /// The stale pass re-reads an unvalued row on every tick, whatever its
+    /// `updated_ledger`, so a returning price is picked up within a ledger;
+    /// the batch limit still holds.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn users_stale_returns_unvalued_rows_whatever_their_ledger(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let mut fresh_unvalued = tracked("POOL", "FRESH_UNVALUED", 100);
+        fresh_unvalued.health_factor = None;
+        let mut fresh_valued = tracked("POOL", "FRESH_VALUED", 100);
+        fresh_valued.health_factor = Some(12_000_000);
+        let mut old_valued = tracked("POOL", "OLD_VALUED", 5);
+        old_valued.health_factor = Some(12_000_000);
+        for user in [&fresh_unvalued, &fresh_valued, &old_valued] {
+            store.upsert_user(user).await.expect("upsert");
+        }
+        let rows = store.users_stale("POOL", 50, 10).await.expect("query");
+        let mut accounts: Vec<&str> = rows.iter().map(|row| row.account.as_str()).collect();
+        accounts.sort_unstable();
+        assert_eq!(accounts, vec!["FRESH_UNVALUED", "OLD_VALUED"]);
+        let limited = store.users_stale("POOL", 50, 1).await.expect("query");
+        assert_eq!(limited.len(), 1);
+        Ok(())
+    }
+
+    /// `count_unvalued` counts only the asked pool's NULL rows.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn count_unvalued_counts_only_this_pools_null_rows(db: sqlx::PgPool) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let mut a = tracked("POOL", "A", 7);
+        a.health_factor = None;
+        let mut b = tracked("POOL", "B", 7);
+        b.health_factor = Some(9_000_000);
+        let mut c = tracked("OTHER", "C", 7);
+        c.health_factor = None;
+        for user in [&a, &b, &c] {
+            store.upsert_user(user).await.expect("upsert");
+        }
+        assert_eq!(store.count_unvalued("POOL").await.expect("count"), 1);
+        assert_eq!(store.count_unvalued("OTHER").await.expect("count"), 1);
+        Ok(())
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -1302,7 +1417,7 @@ mod tests {
         );
         assert_eq!(store.count_users(POOL).await.expect("count"), 1);
 
-        tracked.health_factor = 9_500_000;
+        tracked.health_factor = Some(9_500_000);
         tracked.updated_ledger = 64_291_400;
         tracked.liabilities.insert(2_u32, 7_i128);
         store.upsert_user(&tracked).await.expect("update");
@@ -1577,7 +1692,7 @@ mod tests {
                 .upsert_user(&TrackedUser {
                     pool: POOL.to_string(),
                     account: account.to_string(),
-                    health_factor: health,
+                    health_factor: Some(health),
                     collateral: BTreeMap::new(),
                     liabilities: BTreeMap::from([(0, 1)]),
                     updated_ledger: 10,
@@ -1603,7 +1718,10 @@ mod tests {
                 break;
             }
             if let Some(last) = page.last() {
-                after = Some((last.health_factor, last.account.clone()));
+                let Some(health) = last.health_factor else {
+                    break;
+                };
+                after = Some((health, last.account.clone()));
             }
             seen.extend(page.into_iter().map(|user| user.account));
         }
@@ -1627,7 +1745,7 @@ mod tests {
             .upsert_user(&TrackedUser {
                 pool: POOL.to_string(),
                 account: USER.to_string(),
-                health_factor: 9_000_000,
+                health_factor: Some(9_000_000),
                 collateral: BTreeMap::new(),
                 liabilities: BTreeMap::from([(0, 1)]),
                 updated_ledger: 10,
@@ -1694,7 +1812,7 @@ mod tests {
             .upsert_user(&TrackedUser {
                 pool: POOL.to_string(),
                 account: USER.to_string(),
-                health_factor: 9_000_000,
+                health_factor: Some(9_000_000),
                 collateral: BTreeMap::new(),
                 liabilities: BTreeMap::from([(0, 1)]),
                 updated_ledger: 10,
@@ -1763,7 +1881,7 @@ mod tests {
             .upsert_user(&TrackedUser {
                 pool: POOL.to_string(),
                 account: USER.to_string(),
-                health_factor: 9_000_000,
+                health_factor: Some(9_000_000),
                 collateral: BTreeMap::new(),
                 liabilities: BTreeMap::from([(0, 1)]),
                 updated_ledger: 10,
@@ -1804,7 +1922,7 @@ mod tests {
         let user = TrackedUser {
             pool: POOL.to_string(),
             account: USER.to_string(),
-            health_factor: 9_000_000,
+            health_factor: Some(9_000_000),
             collateral: BTreeMap::new(),
             liabilities: BTreeMap::from([(0, 1)]),
             updated_ledger: 10,
@@ -1849,7 +1967,7 @@ mod tests {
             .upsert_user(&TrackedUser {
                 pool: POOL.to_string(),
                 account: HOLDS_COLLATERAL.to_string(),
-                health_factor: 10_000_000,
+                health_factor: Some(10_000_000),
                 collateral: BTreeMap::from([(3, 1_000_000)]),
                 liabilities: BTreeMap::new(),
                 updated_ledger: 10,
@@ -1862,7 +1980,7 @@ mod tests {
             .upsert_user(&TrackedUser {
                 pool: POOL.to_string(),
                 account: HOLDS_LIABILITY.to_string(),
-                health_factor: 10_000_000,
+                health_factor: Some(10_000_000),
                 collateral: BTreeMap::new(),
                 liabilities: BTreeMap::from([(3, 1_000_000)]),
                 updated_ledger: 10,
@@ -1876,7 +1994,7 @@ mod tests {
             .upsert_user(&TrackedUser {
                 pool: POOL.to_string(),
                 account: OTHER_RESERVE.to_string(),
-                health_factor: 10_000_000,
+                health_factor: Some(10_000_000),
                 collateral: BTreeMap::from([(9, 1)]),
                 liabilities: BTreeMap::from([(9, 1)]),
                 updated_ledger: 10,

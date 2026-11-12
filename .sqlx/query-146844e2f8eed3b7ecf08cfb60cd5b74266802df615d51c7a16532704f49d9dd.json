@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT pool, account, health_factor::text AS health_factor, collateral,\n                    liabilities, updated_ledger, recheck_ledger\n             FROM users\n             WHERE pool = $1 AND updated_ledger < $2\n             ORDER BY updated_ledger ASC\n             LIMIT $3",
+  "query": "SELECT pool, account, health_factor::text AS health_factor, collateral,\n                    liabilities, updated_ledger, recheck_ledger\n             FROM users\n             WHERE pool = $1 AND (updated_ledger < $2 OR health_factor IS NULL)\n             ORDER BY updated_ledger ASC, account ASC\n             LIMIT $3",
   "describe": {
     "columns": [
       {
@@ -93,5 +93,5 @@
       true
     ]
   },
-  "hash": "9d1cfc24069ab0794324e902c1b637d6ee1daa8322fca8823bba96f92bb84558"
+  "hash": "146844e2f8eed3b7ecf08cfb60cd5b74266802df615d51c7a16532704f49d9dd"
 }

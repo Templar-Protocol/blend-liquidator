@@ -244,7 +244,11 @@ impl<'a> Tracker<'a> {
                         .upsert_user(&TrackedUser {
                             pool: pool.to_string(),
                             account: account.clone(),
-                            health_factor: mul_floor(health, SCALAR_7, snapshot.prices.scalar())?,
+                            health_factor: Some(mul_floor(
+                                health,
+                                SCALAR_7,
+                                snapshot.prices.scalar(),
+                            )?),
                             collateral: positions.collateral.clone(),
                             liabilities: positions.liabilities.clone(),
                             updated_ledger: snapshot.ledger,
@@ -612,7 +616,7 @@ mod tests {
         TrackedUser {
             pool: POOL.to_string(),
             account: account.to_string(),
-            health_factor: 20_000_000,
+            health_factor: Some(20_000_000),
             collateral,
             liabilities,
             updated_ledger,
@@ -683,7 +687,7 @@ mod tests {
                 .await
                 .expect("read")
                 .unwrap_or_else(|| panic!("{account} should be tracked"));
-            assert_eq!(row.health_factor, golden);
+            assert_eq!(row.health_factor, Some(golden));
             assert_eq!(row.pool, POOL);
             // The snapshot is the fixture's own ledger, which is also this
             // tick's, so this pins both: the row records the ledger it was

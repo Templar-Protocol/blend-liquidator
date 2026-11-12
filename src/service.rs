@@ -1156,7 +1156,7 @@ async fn full_scan(
         tracing::info!(
             pool,
             account = user.account,
-            health_factor = user.health_factor,
+            health_factor = ?user.health_factor,
             "tracked borrower"
         );
     }
@@ -1420,7 +1420,13 @@ async fn full_scan_and_flag(
         let Some(last) = page.last() else {
             break;
         };
-        after = Some((last.health_factor, last.account.clone()));
+        // `users_below_health` never returns an unvalued row (`NULL <
+        // threshold` is not true), so every row it gave carries a health
+        // factor; one that did not would end the walk rather than restart it.
+        let Some(health) = last.health_factor else {
+            break;
+        };
+        after = Some((health, last.account.clone()));
         for user in &page {
             store.flag_recheck(pool, &user.account, ledger).await?;
         }
@@ -3776,7 +3782,7 @@ mod tests {
         TrackedUser {
             pool: harness::POOL.to_string(),
             account: account.to_string(),
-            health_factor: 20_000_000,
+            health_factor: Some(20_000_000),
             collateral,
             liabilities,
             updated_ledger,
@@ -4614,7 +4620,7 @@ mod tests {
             .upsert_user(&TrackedUser {
                 pool: POOL_B.to_string(),
                 account: harness::USER_TWO.to_string(),
-                health_factor: 20_000_000,
+                health_factor: Some(20_000_000),
                 collateral: BTreeMap::new(),
                 liabilities: BTreeMap::from([(0, 1)]),
                 updated_ledger: tick.sequence,
@@ -5899,7 +5905,7 @@ mod tests {
                 .upsert_user(&TrackedUser {
                     pool: harness::POOL.to_string(),
                     account: account.to_string(),
-                    health_factor: health,
+                    health_factor: Some(health),
                     collateral: BTreeMap::new(),
                     liabilities: BTreeMap::from([(0, 1)]),
                     updated_ledger: 10,
@@ -5913,7 +5919,7 @@ mod tests {
             .upsert_user(&TrackedUser {
                 pool: harness::POOL.to_string(),
                 account: "HEALTHY".to_string(),
-                health_factor: 20_000_000,
+                health_factor: Some(20_000_000),
                 collateral: BTreeMap::new(),
                 liabilities: BTreeMap::from([(0, 1)]),
                 updated_ledger: 10,
