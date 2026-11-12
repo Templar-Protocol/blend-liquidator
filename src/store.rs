@@ -471,8 +471,9 @@ impl Store {
     }
 
     /// The pool's borrowers whose row was written before `updated_before`,
-    /// and every unvalued (NULL health factor) row, oldest first: the refresh pass walks these so a long-idle
-    /// borrower's accrued interest is not missed.
+    /// and every unvalued (NULL health factor) row, oldest first: the
+    /// refresh pass walks these so a long-idle borrower's accrued interest
+    /// is not missed.
     ///
     /// `updated_before` is an absolute ledger, compared against the row's
     /// own `updated_ledger`. A caller holding a span of ledgers subtracts

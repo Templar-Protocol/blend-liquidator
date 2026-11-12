@@ -4875,8 +4875,8 @@ mod tests {
     /// in the store, and a best-effort reseed retry is not one of them —
     /// so a scan that fails the same way every time (a position naming a
     /// reserve the snapshot lacks, or an oracle whose `lastprice` traps)
-    /// would otherwise stall this pool's cursor for
-    /// good, because the redelivered tick would find the scan still due.
+    /// would otherwise stall this pool's cursor for good, because the
+    /// redelivered tick would find the scan still due.
     #[sqlx::test(migrations = "./migrations")]
     async fn a_failing_full_scan_neither_fails_the_tick_nor_repeats_forever(
         db: sqlx::PgPool,
