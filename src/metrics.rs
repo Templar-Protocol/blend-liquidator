@@ -186,6 +186,7 @@ struct PoolRecord {
     heartbeat: Option<(Instant, SystemTime)>,
     events_processed: Option<u64>,
     users_tracked: Option<i64>,
+    unvalued_users: Option<i64>,
     auctions_open: Option<usize>,
     seed_accounts_loaded: Option<usize>,
     last_successful_scan: Option<SystemTime>,
@@ -350,6 +351,16 @@ impl Metrics {
             .entry(pool.to_string())
             .or_default()
             .users_tracked = Some(count);
+    }
+
+    /// Records how many of this pool's tracked borrowers are unvalued (a
+    /// reserve they hold has no oracle price).
+    pub fn unvalued_users(&self, pool: &str, count: i64) {
+        lock(&self.inner)
+            .pools
+            .entry(pool.to_string())
+            .or_default()
+            .unvalued_users = Some(count);
     }
 
     /// Records this pool's current open-auction count.
@@ -568,6 +579,22 @@ impl Metrics {
 
         header(
             &mut out,
+            "unvalued_users",
+            "Tracked borrowers whose position could not be valued because a reserve they hold has no oracle price.",
+            "gauge",
+        );
+        for (pool, record) in &inner.pools {
+            if let Some(count) = record.unvalued_users {
+                let _ = writeln!(
+                    out,
+                    "{METRIC_PREFIX}unvalued_users{{pool=\"{}\"}} {count}",
+                    escape_label(pool)
+                );
+            }
+        }
+
+        header(
+            &mut out,
             "auctions_open",
             "Open auctions currently tracked in a pool.",
             "gauge",
@@ -754,6 +781,21 @@ impl Metrics {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unvalued_users_renders_per_pool_once_recorded() {
+        let m = Metrics::new();
+        m.unvalued_users("A", 2);
+        let text = m.render();
+        assert!(
+            text.contains("# TYPE precept_liquidator_unvalued_users gauge\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("precept_liquidator_unvalued_users{pool=\"A\"} 2\n"),
+            "{text}"
+        );
+    }
+
     use super::*;
     use std::time::Duration;
 

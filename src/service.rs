@@ -1001,7 +1001,8 @@ async fn handle_message(
     Ok(())
 }
 
-/// Sets `users_tracked{pool}` from the store's count as it stands now.
+/// Sets `users_tracked{pool}` and `unvalued_users{pool}` from the store's
+/// counts as they stand now, and returns them as `(tracked, unvalued)`.
 ///
 /// Called wherever a `users` row can have been inserted or deleted — after
 /// a tick's refresh and after every seed, the startup, gap and retried ones
@@ -1012,10 +1013,12 @@ async fn regauge_users(
     store: &Store,
     instruments: &Instruments,
     pool: &str,
-) -> Result<(), StoreError> {
-    let user_count = store.count_users(pool).await?;
-    instruments.metrics.users_tracked(pool, user_count);
-    Ok(())
+) -> Result<(i64, i64), StoreError> {
+    let tracked = store.count_users(pool).await?;
+    let unvalued = store.count_unvalued(pool).await?;
+    instruments.metrics.users_tracked(pool, tracked);
+    instruments.metrics.unvalued_users(pool, unvalued);
+    Ok((tracked, unvalued))
 }
 
 /// A tick's whole effect: refresh the accounts this ledger's events named,
@@ -1029,6 +1032,10 @@ async fn regauge_users(
 /// tick, and only a store error, which means the bot cannot trust what it
 /// reads at all, still propagates.
 ///
+/// A reserve the oracle has no price for does not fail the tick: the
+/// refresh defers that valuation durably (spec §1.B), and this raises one
+/// `ReserveUnpriced` per distinct unpriced asset instead.
+///
 /// `subject` is the pool, the accounts its events named, and the tick.
 async fn apply_tick(
     tracker: &Tracker<'_>,
@@ -1040,7 +1047,7 @@ async fn apply_tick(
     subject: (&str, &[String], LedgerTick),
 ) -> Result<(), TrackerError> {
     let (pool, accounts, tick) = subject;
-    tracker.refresh(pool, accounts, tick).await?;
+    let named = tracker.refresh(pool, accounts, tick).await?;
     // Flags every account this ledger's events named, for the auctioneer
     // task to pick up on its own cadence. This is the durable replacement
     // for `pending` as the auctioneer's input: `pending` itself stays
@@ -1068,7 +1075,7 @@ async fn apply_tick(
         .users_stale(pool, updated_before, i64::from(cadence.refresh_batch))
         .await?;
     let stale_accounts: Vec<String> = stale_rows.into_iter().map(|user| user.account).collect();
-    tracker.refresh(pool, &stale_accounts, tick).await?;
+    let swept = tracker.refresh(pool, &stale_accounts, tick).await?;
     for account in &stale_accounts {
         tracker
             .store()
@@ -1078,8 +1085,28 @@ async fn apply_tick(
     // Only a refresh or a seed inserts or deletes a `users` row, so a tick
     // that refreshed nothing cannot have moved the count and pays for no
     // read.
+    // When it is skipped no refresh ran, so both `unpriced` sets are empty
+    // and nothing below reads the count.
+    let mut unvalued = 0;
     if !accounts.is_empty() || !stale_accounts.is_empty() {
-        regauge_users(tracker.store(), instruments, pool).await?;
+        (_, unvalued) = regauge_users(tracker.store(), instruments, pool).await?;
+    }
+    // One notification per distinct asset across both passes: the same
+    // asset seen twice in a tick is one alarm, and the notifier's cooldown
+    // keeps later ticks quiet. Raised after the re-gauge so the count in
+    // the message is the store's current one.
+    for asset in named.unpriced.union(&swept.unpriced) {
+        instruments.notifier.notify(Notification {
+            kind: NotificationKind::ReserveUnpriced,
+            severity: Severity::High,
+            pool: pool.to_string(),
+            account: Some(asset.clone()),
+            message: format!(
+                "the oracle has no price for {asset}: {unvalued} tracked borrower(s) in this \
+                 pool cannot be valued until it returns; the contract refuses priced actions \
+                 on them meanwhile, and the bot keeps following the pool"
+            ),
+        });
     }
     if scan_due(
         tick.sequence,
@@ -1144,8 +1171,7 @@ async fn full_scan(
             None,
         )
         .await?;
-    let user_count = store.count_users(pool).await?;
-    instruments.metrics.users_tracked(pool, user_count);
+    let (user_count, _) = regauge_users(store, instruments, pool).await?;
     tracing::info!(
         pool,
         user_count,
@@ -4252,6 +4278,133 @@ mod tests {
         );
         assert_eq!(sent[0].pool, harness::POOL);
         assert_eq!(sent[0].account.as_deref(), Some(harness::USER_ONE));
+        Ok(())
+    }
+
+    /// A reserve the oracle cannot price no longer holds the pool's cursor:
+    /// the tick is acknowledged, one `ReserveUnpriced` is raised however
+    /// many passes see the same asset unpriced, the gauge counts the
+    /// unvalued borrower, and the price's return values it again.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_unpriced_reserve_acknowledges_the_tick_and_alarms_once(
+        db: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        let store = Store::from_pool(db);
+        let rpc = ScriptedRpc::start().await;
+        let unpriced = text(&mainnet_fixed_v2(), &["reserves", "2", "asset"]).to_string();
+        let holder = || {
+            harness::positions_entry_xdr(
+                harness::USER_TWO,
+                &[(2, 10_000_000_000)],
+                &[(1, 100_000_000)],
+            )
+        };
+        // Ledger 1: the named refresh writes the NULL row, and the same
+        // tick's stale pass selects it and reads again.
+        for _ in 0..2 {
+            harness::script_snapshot_positions_unpriced(
+                &rpc,
+                &[(harness::USER_TWO, holder())],
+                &unpriced,
+            );
+        }
+        // Ledger 2: no events; the stale pass re-reads the NULL row.
+        harness::script_snapshot_positions_unpriced(
+            &rpc,
+            &[(harness::USER_TWO, holder())],
+            &unpriced,
+        );
+        // Ledger 3: the price is back.
+        harness::script_snapshot_positions(&rpc, &[(harness::USER_TWO, holder())]);
+        let client = RpcClient::new(&rpc.url(), None).expect("client");
+        let tracker = Tracker::new(&client, &store);
+        let (_flag, shutdown) = watch::channel(false);
+        let (tick_tx, _tick_rx) = tick_watch();
+        let mut state = LoopState::default();
+        let (instruments, recording) = recording_instruments();
+        let gauge = format!(
+            "precept_liquidator_unvalued_users{{pool=\"{}\"}}",
+            harness::POOL
+        );
+        let base = harness::fixture_tick();
+
+        macro_rules! send {
+            ($message:expr) => {
+                handle_message(
+                    &tracker,
+                    &[],
+                    quiet_cadence(),
+                    &mut state,
+                    &shutdown,
+                    &instruments,
+                    &tick_tx,
+                    $message,
+                )
+            };
+        }
+
+        send!(borrow(harness::POOL, harness::USER_TWO))
+            .await
+            .expect("the event is applied");
+        let (message, applied) = tick_message(harness::POOL, base);
+        send!(message)
+            .await
+            .expect("an unpriced reserve is not a failure");
+        assert!(applied.await.is_ok(), "the tick is acknowledged");
+        assert!(instruments.notifier.drain(DRAIN_BUDGET).await);
+        let sent = recording.sent();
+        assert_eq!(sent.len(), 1, "exactly one alarm: {sent:?}");
+        assert_eq!(sent[0].kind, NotificationKind::ReserveUnpriced);
+        assert_eq!(sent[0].severity, Severity::High);
+        assert_eq!(sent[0].pool, harness::POOL);
+        assert_eq!(sent[0].account.as_deref(), Some(unpriced.as_str()));
+        assert!(sent[0].message.contains(&unpriced), "{}", sent[0].message);
+        assert!(
+            instruments
+                .metrics
+                .render()
+                .contains(&format!("{gauge} 1\n")),
+            "{}",
+            instruments.metrics.render()
+        );
+
+        let (message, applied) = tick_message(
+            harness::POOL,
+            LedgerTick {
+                sequence: base.sequence + 1,
+                close_time: base.close_time + 5,
+            },
+        );
+        send!(message).await.expect("tick 2");
+        assert!(applied.await.is_ok());
+        assert!(instruments.notifier.drain(DRAIN_BUDGET).await);
+        assert_eq!(recording.sent_count(), 1, "the second is deduplicated");
+
+        let (message, applied) = tick_message(
+            harness::POOL,
+            LedgerTick {
+                sequence: base.sequence + 2,
+                close_time: base.close_time + 10,
+            },
+        );
+        send!(message).await.expect("tick 3");
+        assert!(applied.await.is_ok());
+        assert!(instruments.notifier.drain(DRAIN_BUDGET).await);
+        let row = store
+            .user(harness::POOL, harness::USER_TWO)
+            .await
+            .expect("read")
+            .expect("row");
+        assert!(row.health_factor.is_some(), "{row:?}");
+        assert!(
+            instruments
+                .metrics
+                .render()
+                .contains(&format!("{gauge} 0\n")),
+            "{}",
+            instruments.metrics.render()
+        );
+        assert_eq!(recording.sent_count(), 1, "recovery raises nothing");
         Ok(())
     }
 
