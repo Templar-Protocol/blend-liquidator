@@ -369,6 +369,18 @@ sandbox_register_role() {
 	log "${role} is ${contract}"
 }
 
+# The applied run of a transaction can use more instructions than its
+# simulation measured, so every sending invoke carries this much slack. A
+# plain supply simulated at 1,805,663 instructions was refused
+# ResourceLimitExceeded at the CLI's default 4% padding (a limit of
+# 1,877,889) and again at +100,000 (1,905,663), so the applied run needed
+# more than 5.5% over its simulation; an earlier run of the same call
+# passed, so the overrun varies. 1,000,000 passes. It is a ceiling, not a
+# spend: the network charges 25 stroops per 10,000 instructions, about
+# 2,500 stroops per invoke at most, on a network that exists for the run
+# or on testnet.
+SANDBOX_INSTRUCTION_LEEWAY=1000000
+
 # invoke KEY CONTRACT FN ARGS… — `stellar contract invoke … --send=yes`,
 # logging the function name and CONTRACT's registered role but **never**
 # the arguments, and dying (naming the function, the role and the key) on
@@ -380,7 +392,8 @@ sandbox_register_role() {
 # says the call writes, which turns a call this script means as a
 # state change into a silent no-op the moment a contract's behaviour
 # shifts. Every invoke() here is meant to land on chain; use
-# invoke_view() for the ones that are not.
+# invoke_view() for the ones that are not. It also passes
+# --instruction-leeway SANDBOX_INSTRUCTION_LEEWAY.
 invoke() {
 	local key=$1 contract=$2 fn=$3 role
 	shift 3
@@ -388,7 +401,8 @@ invoke() {
 	role="${SANDBOX_ROLES[${contract}]:-unregistered contract}"
 	log "invoke ${fn} on ${role} as ${key}"
 	stellar contract invoke "${sandbox_network_args[@]}" --source-account "${key}" \
-		--id "${contract}" --send=yes -- "${fn}" "$@" \
+		--id "${contract}" --send=yes \
+		--instruction-leeway "${SANDBOX_INSTRUCTION_LEEWAY}" -- "${fn}" "$@" \
 		|| die "invoke ${fn} on ${role} (${contract}) as ${key} failed"
 }
 

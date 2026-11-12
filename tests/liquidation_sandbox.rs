@@ -16,10 +16,12 @@
 //!   borrower's liquidation auction after a price crash, fills it, and
 //!   unwinds the position it took.
 //! - [`check_config`]: `RUN_MODE=check-config` against the same deploy,
-//!   proving its eight cases' exit codes and messages — two of them with a
+//!   proving its nine cases' exit codes and messages — two of them with a
 //!   wrong `NETWORK_PASSPHRASE`, pinning what a keyed and a keyless
-//!   configuration each do with one — and that none of them sends a
-//!   transaction or migrates the database.
+//!   configuration each do with one, and one, (i), a primary floor under
+//!   the reserve's `min_position`, pinning that the decoder reads
+//!   `min_position` from a real `ReserveConfig` — and that none of them
+//!   sends a transaction or migrates the database.
 //! - [`dry_run`]: the tier's most important safety test. A dry-run bot
 //!   holding the real filler key never sends a transaction — not to create
 //!   a borrower's auction, and not to fill one an armed run of the same bot
@@ -36,6 +38,12 @@
 //!   it (`AuctionInProgress`, 1212) rather than trying to create a second
 //!   one, and fills it — proving `Auctioneer::adopt`, otherwise
 //!   unreachable from this tier's own continuous runs.
+//! - [`free_fill_default`]: the crate's default fill timing against
+//!   Precept's default path — a 100% auction filled with `free-fill` at
+//!   `start + 400`, where the bid is gone, so Precept sets off the
+//!   borrower's plain supply and defaults the rest inside the fill,
+//!   emitting `debt_setoff` and `defaulted_debt` with the borrower in
+//!   their topics, and cuts USDC's `b_rate`.
 //!
 //! `mod sandbox_harness` (`tests/sandbox_harness/mod.rs`) is the machinery
 //! every scenario in this tier shares: the standalone-network gate, the
@@ -92,7 +100,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use precept_liquidator::chain::xdr::AuctionType;
+use precept_liquidator::chain::xdr::{AuctionType, PoolEvent};
 use precept_liquidator::chain::{PoolReader, RpcClient};
 use precept_liquidator::config::ChainConfig;
 use precept_liquidator::math::AuctionData;
@@ -100,16 +108,19 @@ use precept_liquidator::store::Store;
 use sqlx::postgres::PgPool;
 
 use sandbox_harness::{
-    assert_all_dry_run, assert_auction_unchanged, assert_counter, assert_counter_at_least,
-    assert_metrics, assert_no_auction, assert_no_rows, crash, create_run_database,
-    create_run_database_unmigrated, drop_run_database, fail, fail_check, fill_budget,
-    log_lines_containing, mint, note_run_database, pools_toml, print_nonzero_counters,
-    read_metrics, repo_root, require_standalone_rpc, required, run_check_config, sandbox_env,
-    spawn_bot, terminate, wait_for_adopted_auction, wait_for_auction, wait_for_dry_run_row,
-    wait_for_ledgers_past, wait_for_liability, wait_for_ready, wait_for_tx_hash, wait_for_unwind,
-    wait_for_unwind_leftovers, with_database, Bot, BotConfig, CREATIONS_FOR_ACCOUNT,
-    CREATIONS_VIOLATING_DRY_RUN, CREATION_TIMEOUT, CREATION_TX_HASH, DRY_RUN_CREATION_ROW,
-    DRY_RUN_FILL_ROW, FILLS_VIOLATING_DRY_RUN, FILL_TX_HASH, UNWIND_LEFTOVERS_METRIC,
+    applied_ledger, assert_all_dry_run, assert_auction_unchanged, assert_counter,
+    assert_counter_at_least, assert_kind_never_notified, assert_metrics, assert_no_auction,
+    assert_no_positions, assert_no_rows, crash, crash_at, create_run_database,
+    create_run_database_unmigrated, creation_percent, drop_run_database, fail, fail_check,
+    fill_budget, log_lines_containing, mint, note_run_database, pool_events_of, pools_toml,
+    pools_toml_with, print_nonzero_counters, read_metrics, repo_root, require_standalone_rpc,
+    required, reserve_b_rate, run_check_config, sandbox_env, spawn_bot, terminate,
+    wait_for_adopted_auction, wait_for_auction, wait_for_dry_run_row, wait_for_ledgers_past,
+    wait_for_liability, wait_for_ready, wait_for_tx_hash, wait_for_unwind,
+    wait_for_unwind_leftovers, wait_for_user_row_gone, with_database, Bot, BotConfig, PoolOptions,
+    CREATIONS_FOR_ACCOUNT, CREATIONS_VIOLATING_DRY_RUN, CREATION_TIMEOUT, CREATION_TX_HASH,
+    DRY_RUN_CREATION_ROW, DRY_RUN_FILL_ROW, EARLIEST_PROFITABLE_FILL, FILLS_VIOLATING_DRY_RUN,
+    FILL_TX_HASH, FREE_FILL, UNWIND_LEFTOVERS_METRIC,
 };
 
 /// The tier's standard scenario: an armed bot creates the auction, fills it
@@ -222,7 +233,7 @@ async fn liquidation() {
     // Measured, not assumed: the fill waits on the auction's ledger ramp,
     // so its budget is however long this sandbox takes to close that many
     // ledgers.
-    let budget = fill_budget(&mut bot, &rpc).await;
+    let budget = fill_budget(&mut bot, &rpc, &EARLIEST_PROFITABLE_FILL).await;
     let fill = wait_for_tx_hash(
         &mut bot,
         &store,
@@ -311,14 +322,18 @@ struct CheckConfigCase<'a> {
 /// and (h), and nothing else ever is.
 const WRONG_PASSPHRASE: &str = "Test SDF Network ; September 2015";
 
-/// The eight cases [`check_config`] runs, (a) through (h) — wiring, not
+/// The nine cases [`check_config`] runs, (a) through (i) — wiring, not
 /// logic, kept out of that function so it reads as the chain and database
 /// checks around one loop. The comment on each case carries the reasoning
 /// `src/service.rs`, `src/config.rs` and `src/main.rs` give for that exact
 /// code and text.
+// The table is one literal per case, each carrying its own reasoning
+// comment, and runs past clippy's line count for that reason alone.
+#[allow(clippy::too_many_lines)]
 fn check_config_cases<'a>(
     default_pools: &'a str,
     blnd_pools: &'a str,
+    primary_under_min_position_pools: &'a str,
     filler_secret: &'a str,
     database_url: &'a str,
     absent_url: &'a str,
@@ -441,18 +456,37 @@ fn check_config_cases<'a>(
             expected_code: 0,
             expected_text: "no FILLER_SECRET_KEY",
         },
+        // (i) a `min_primary_collateral` of 10 XLM, above zero and under
+        // the XLM reserve's 50 XLM `min_position`: `validate_primary_asset`
+        // refuses it in every mode, because no unwind could ever rest on a
+        // floor Precept refuses to leave a position at. Its unit tests pin
+        // the rule; this case pins that the decoder reads `min_position`
+        // from a real `v0.1.1` `ReserveConfig`, at the field position
+        // between `supply_cap` and `enabled` — a field-order bug would read
+        // one of those instead and pass silently.
+        CheckConfigCase {
+            label: "i",
+            pools: primary_under_min_position_pools,
+            dry_run: true,
+            filler_secret: None,
+            extra_env: vec![],
+            database_url,
+            passphrase_override: None,
+            expected_code: 2,
+            expected_text: "min_position 500000000",
+        },
     ]
 }
 
 /// The `check_config` scenario: `RUN_MODE=check-config` against the
 /// standard deploy, proving the deploy-smoke-test contract spec §10
 /// promises — the right exit code and the right warning or error text for
-/// each of eight cases — and that none of them sends a transaction or
+/// each of nine cases — and that none of them sends a transaction or
 /// migrates the database it is pointed at. Cases (g) and (h) pin what a
 /// wrong `NETWORK_PASSPHRASE` does, since nothing checks it against the
 /// network: a configuration with a key fails, one without passes.
 ///
-/// Eight short-lived binary runs rather than one long-running [`Bot`]:
+/// Nine short-lived binary runs rather than one long-running [`Bot`]:
 /// `check-config` validates and exits on its own, so
 /// [`sandbox_harness::run_check_config`] is its own spawn-and-wait-for-exit
 /// rather than [`spawn_bot`]'s spawn-and-wait-for-`/healthz`, and every
@@ -543,6 +577,17 @@ async fn check_config() {
 
     let default_pools = pools_toml(&pool, &xlm, &[usdc.as_str()]);
     let blnd_pools = pools_toml(&pool, &xlm, &[blnd.as_str()]);
+    // Case (i)'s: a primary floor of 10 XLM, under the reserve's 50 XLM
+    // `min_position`.
+    let primary_under_min_position_pools = pools_toml_with(
+        &pool,
+        &xlm,
+        &[usdc.as_str()],
+        &PoolOptions {
+            min_primary_collateral: 100_000_000,
+            ..PoolOptions::default()
+        },
+    );
     let started = Instant::now();
 
     // Table-driven: each case is `run_check_config`'s own arguments plus
@@ -552,6 +597,7 @@ async fn check_config() {
     let cases = check_config_cases(
         &default_pools,
         &blnd_pools,
+        &primary_under_min_position_pools,
         filler_secret.as_str(),
         &database_url,
         &absent_url,
@@ -645,7 +691,8 @@ const AUCTION_ENTRY_TIMEOUT: Duration = Duration::from_mins(1);
 /// ledgers at all, and phase A's comes before any close rate has been
 /// measured. Three minutes is 20 ledgers at up to 9 s each — over three
 /// times the slowest close [`fill_budget`] accepts (its ten-minute cap
-/// over `FILL_LEDGERS` plus slack allows about 2.8 s a ledger), so a
+/// over `FILL_LEDGERS` plus slack allows 2.7 s a ledger, (600 − 60) / 200, for
+/// the earliest-profitable budget), so a
 /// sandbox slow enough to time out here would fail every fill wait anyway,
 /// and a timeout names the ledger wait it happened in rather than blaming
 /// the bot.
@@ -962,7 +1009,7 @@ async fn dry_run_phase_c(ctx: &DryRunCtx<'_>, expected_entry: &AuctionData) {
 
     wait_for_ready(&mut bot, ctx.http).await;
 
-    let budget = fill_budget(&mut bot, ctx.rpc).await;
+    let budget = fill_budget(&mut bot, ctx.rpc, &EARLIEST_PROFITABLE_FILL).await;
     let (tx_hash, fill_ledger) = wait_for_dry_run_row(
         &mut bot,
         ctx.store,
@@ -1206,7 +1253,7 @@ async fn unwind_repay_run_one(ctx: &UnwindRepayCtx<'_>) -> Bot {
     .await;
     // Measured, not assumed, the same reason `liquidation` measures it: the
     // fill waits on the auction's own ledger ramp.
-    let budget = fill_budget(&mut bot, ctx.rpc).await;
+    let budget = fill_budget(&mut bot, ctx.rpc, &EARLIEST_PROFITABLE_FILL).await;
     let fill = wait_for_tx_hash(
         &mut bot,
         ctx.store,
@@ -1689,7 +1736,7 @@ async fn restart_adopt_bot_two(ctx: &RestartAdoptCtx<'_>, database_url: &str) {
         println!("bot #2, the adoption path: {line}");
     }
 
-    let budget = fill_budget(&mut bot, ctx.rpc).await;
+    let budget = fill_budget(&mut bot, ctx.rpc, &EARLIEST_PROFITABLE_FILL).await;
     let fill = wait_for_tx_hash(
         &mut bot,
         &store,
@@ -1852,4 +1899,233 @@ async fn restart_adopt() {
     // will read are databases worth not keeping.
     drop_run_database(&root, &maintenance_url, &database_one).await;
     drop_run_database(&root, &maintenance_url, &database_two).await;
+}
+
+/// `free_fill_default`'s crash: $0.05, at which the borrower's raw
+/// collateral ($250) is under its debt ($340), so no partial liquidation
+/// closes the excess and the auctioneer creates a 100% one.
+const FREE_FILL_CRASH_PRICE: i128 = 500_000;
+
+/// The crate's default fill timing, against Precept's default path: a 100%
+/// auction filled with `free-fill` at `start + 400`, where the bid is gone,
+/// so the fill takes the whole lot and none of the debt, and Precept
+/// defaults the borrower's leftover debt inside that same transaction —
+/// setting off its 40 USDC of plain supply first (`debt_setoff`), then
+/// defaulting the rest (`defaulted_debt`), both with the borrower in topic
+/// 1 as Precept `v0.1.1` emits them, and cutting USDC's `b_rate`. No other
+/// scenario uses `free-fill`, and none reaches the default path.
+///
+/// Ignored on purpose — it needs `scripts/sandbox/up.sh` and
+/// `SANDBOX_SCENARIO=free_fill_default scripts/sandbox/deploy.sh` to have
+/// run, and a Postgres at `DATABASE_URL`.
+// A straight line of named waits and chain assertions, each carrying its
+// own reason to fail closed, and together over clippy's line count.
+// Wiring, not logic.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+#[ignore = "needs the local sandbox network: scripts/sandbox/up.sh && scripts/sandbox/deploy.sh"]
+async fn free_fill_default() {
+    let root = repo_root();
+    let env = sandbox_env(
+        &root.join("target/sandbox/sandbox.env"),
+        "free_fill_default",
+    );
+
+    let passphrase = required(&env, "SANDBOX_PASSPHRASE").to_string();
+    let pool = required(&env, "SANDBOX_POOL").to_string();
+    let xlm = required(&env, "SANDBOX_XLM").to_string();
+    let usdc = required(&env, "SANDBOX_USDC").to_string();
+    let borrower = required(&env, "SANDBOX_BORROWER").to_string();
+    let filler = required(&env, "SANDBOX_FILLER").to_string();
+    let rpc_url = required(&env, "SANDBOX_RPC_URL").to_string();
+
+    // Ordered as in `liquidation`: nothing below runs against an endpoint
+    // whose own answer has not been checked.
+    require_standalone_rpc(&rpc_url).await;
+
+    let Ok(maintenance_url) = std::env::var("DATABASE_URL") else {
+        panic!("DATABASE_URL is not set — the store tests need it too; see `make db-up`")
+    };
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or_default();
+    let database = format!("sandbox_{stamp}");
+    println!("creating the run's database {database}");
+    let database_url = create_run_database(&root, &maintenance_url, &database).await;
+    note_run_database(&database);
+
+    let sandbox_dir = root.join("target/sandbox");
+    let seed_path = sandbox_dir.join("seed.toml");
+    let seed = format!("[accounts]\n\"{pool}\" = [\"{borrower}\"]\n");
+    if let Err(error) = std::fs::write(&seed_path, seed) {
+        panic!("could not write {}: {error}", seed_path.display());
+    }
+
+    let pools = pools_toml_with(
+        &pool,
+        &xlm,
+        &[usdc.as_str()],
+        &PoolOptions {
+            fill_objective: "free-fill",
+            ..PoolOptions::default()
+        },
+    );
+    let mut bot = spawn_bot(
+        &root,
+        &env,
+        BotConfig {
+            dry_run: false,
+            filler_secret: Some(required(&env, "SANDBOX_FILLER_SECRET_KEY")),
+            pools,
+            database_url: database_url.clone(),
+            log_name: "bot.log",
+            extra_env: vec![("SEED_FILE", seed_path.display().to_string())],
+        },
+    )
+    .await;
+
+    let http = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => fail(&bot, &format!("could not build an HTTP client: {error}")),
+    };
+    let store = match Store::connect(&database_url, 4).await {
+        Ok(store) => store,
+        Err(error) => fail(&bot, &format!("could not connect to {database}: {error}")),
+    };
+    let chain = ChainConfig {
+        network_passphrase: passphrase,
+        rpc_url,
+        rpc_api_key: None,
+        base_fee: 5_000,
+        high_fee: 10_000,
+        tx_poll_ledgers: 30,
+    };
+    let rpc = match RpcClient::from_config(&chain) {
+        Ok(rpc) => rpc,
+        Err(error) => fail(&bot, &format!("could not build an RPC client: {error}")),
+    };
+
+    wait_for_ready(&mut bot, &http).await;
+
+    let b_rate_before = reserve_b_rate(&bot, &rpc, &pool, &usdc).await;
+    println!(
+        "crashing XLM's price to {FREE_FILL_CRASH_PRICE} at {:.1} s",
+        bot.elapsed()
+    );
+    crash_at(&bot, &root, FREE_FILL_CRASH_PRICE);
+
+    let creation = wait_for_tx_hash(
+        &mut bot,
+        &store,
+        CREATION_TX_HASH,
+        "the auctioneer to create the borrower's full liquidation auction",
+        CREATION_TIMEOUT,
+        &pool,
+        &borrower,
+    )
+    .await;
+    let percent = creation_percent(&bot, &store, &pool, &borrower).await;
+    if percent != 100 {
+        fail(
+            &bot,
+            &format!("the auction was created at {percent}%, not 100%"),
+        );
+    }
+    let created_in = applied_ledger(&bot, &rpc, &creation).await;
+
+    let budget = fill_budget(&mut bot, &rpc, &FREE_FILL).await;
+    let fill = wait_for_tx_hash(
+        &mut bot,
+        &store,
+        FILL_TX_HASH,
+        "the filler to take the whole lot at start + 400",
+        budget,
+        &pool,
+        &borrower,
+    )
+    .await;
+    let filled_in = applied_ledger(&bot, &rpc, &fill).await;
+    // An auction's `block` is its creation ledger + 1
+    // (`create_user_liq_auction_data`'s `e.ledger().sequence() + 1`).
+    let into_auction = filled_in.saturating_sub(created_in + 1);
+    if into_auction < 400 {
+        fail(
+            &bot,
+            &format!("the fill landed {into_auction} ledgers in, before the bid had gone"),
+        );
+    }
+
+    let events = pool_events_of(&bot, &rpc, &pool, filled_in, &fill).await;
+    let set_off = events.iter().any(|event| {
+        matches!(event,
+            PoolEvent::DebtSetoff { user: Some(user), asset, .. }
+                if *user == borrower && *asset == usdc)
+    });
+    let defaulted = events.iter().any(|event| {
+        matches!(event,
+            PoolEvent::DefaultedDebt { user: Some(user), asset, .. }
+                if *user == borrower && *asset == usdc)
+    });
+    if !(set_off && defaulted) {
+        fail(
+            &bot,
+            &format!(
+                "the fill's events lack a debt_setoff and a defaulted_debt naming the \
+                 borrower: {events:?}"
+            ),
+        );
+    }
+
+    // The borrower is left with no collateral, so there is none to orphan.
+    if events
+        .iter()
+        .any(|event| matches!(event, PoolEvent::CollateralOrphaned { .. }))
+    {
+        fail(
+            &bot,
+            &format!("the fill's events hold a collateral_orphaned: {events:?}"),
+        );
+    }
+
+    wait_for_user_row_gone(&mut bot, &store, &pool, &borrower).await;
+    assert_no_positions(&bot, &rpc, &pool, &borrower).await;
+    let b_rate_after = reserve_b_rate(&bot, &rpc, &pool, &usdc).await;
+    if b_rate_after >= b_rate_before {
+        fail(
+            &bot,
+            &format!(
+                "USDC's b_rate went from {b_rate_before} to {b_rate_after}: nothing was defaulted"
+            ),
+        );
+    }
+
+    let collateral = wait_for_unwind(&mut bot, &rpc, &pool, &filler, &xlm).await;
+    let metrics = read_metrics(&bot, &http).await;
+    assert_metrics(&bot, &metrics);
+    assert_kind_never_notified(
+        &bot,
+        &metrics,
+        precept_liquidator::notifier::NotificationKind::StockWasmDetected.as_str(),
+    );
+
+    let undecoded = log_lines_containing(&bot, "an event this bot models did not decode");
+    if !undecoded.is_empty() {
+        fail(
+            &bot,
+            &format!("the bot skipped events it could not decode: {undecoded:?}"),
+        );
+    }
+
+    terminate(&mut bot).await;
+    println!(
+        "done in {:.1} s: creation {creation} (100%), fill {fill} {into_auction} ledgers in, \
+         USDC b_rate {b_rate_before} → {b_rate_after}, {collateral} stroops of XLM collateral left",
+        bot.elapsed()
+    );
+    store.pool().close().await;
+    drop_run_database(&root, &maintenance_url, &database).await;
 }

@@ -239,9 +239,19 @@ struct RawEvent {
     id: String,
     tx_hash: String,
     contract_id: String,
+    /// Absent from stellar-rpc 30's `getEvents` (checked 2026-11-11 against
+    /// testnet's 30.0.0). Since Protocol 23 (CAP-0067) a failed call emits
+    /// no contract events, so absent means the event came from a successful
+    /// call.
+    #[serde(default = "successful_call")]
     in_successful_contract_call: bool,
     topic: Vec<String>,
     value: String,
+}
+
+/// The value of `RawEvent::in_successful_contract_call` when the RPC omits it.
+fn successful_call() -> bool {
+    true
 }
 
 /// One contract event, topics and value decoded.
@@ -255,8 +265,10 @@ pub struct Event {
     pub tx_hash: TxHash,
     /// The emitting contract, as a `C…` strkey.
     pub contract_id: String,
-    /// Whether the emitting call succeeded (events of failed calls are
-    /// diagnostic only).
+    /// Whether the emitting call succeeded. `true` when the RPC omits the
+    /// field (stellar-rpc 30 does): since Protocol 23 a failed call emits
+    /// no contract events, so an RPC that sends none of the flag returns
+    /// only successful ones.
     pub in_successful_contract_call: bool,
     /// The topics, the first being the event name.
     pub topics: Vec<ScVal>,
@@ -1285,6 +1297,54 @@ mod tests {
         assert_eq!(params["filters"][0]["contractIds"][0], POOL);
         assert_eq!(params["pagination"]["limit"], 100);
         assert!(params["pagination"].get("cursor").is_none());
+    }
+
+    /// An event object in stellar-rpc 30's key set: no `pagingToken` and no
+    /// `inSuccessfulContractCall`.
+    fn rpc30_event() -> serde_json::Value {
+        let fixture = crate::fixture::mainnet_fixed_v2();
+        let event = &fixture["events"][0];
+        json!({
+            "contractId": event["contractId"], "id": event["id"],
+            "ledger": event["ledger"], "ledgerClosedAt": "2026-11-11T10:00:00Z",
+            "operationIndex": 0, "topic": event["topic"], "transactionIndex": 1,
+            "txHash": event["txHash"], "type": "contract", "value": event["value"],
+        })
+    }
+
+    async fn decode_one(event: serde_json::Value) -> Event {
+        let rpc = ScriptedRpc::start().await;
+        rpc.expect(
+            "getEvents",
+            json!({"latestLedger": 64_271_347, "latestLedgerCloseTime": "1788534414",
+                   "oldestLedger": 64_150_000, "cursor": "c-1", "events": [event]}),
+        );
+        let client = RpcClient::new(&rpc.url(), None).unwrap();
+        let mut page = client
+            .events(&EventQuery {
+                start_ledger: Some(64_150_000),
+                cursor: None,
+                contract_ids: &[POOL],
+                limit: 100,
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.events.len(), 1);
+        page.events.remove(0)
+    }
+
+    #[tokio::test]
+    async fn an_event_without_in_successful_contract_call_decodes_as_successful() {
+        let event = rpc30_event();
+        assert!(event.get("inSuccessfulContractCall").is_none());
+        assert!(decode_one(event).await.in_successful_contract_call);
+    }
+
+    #[tokio::test]
+    async fn an_event_that_says_its_call_failed_still_decodes_as_failed() {
+        let mut event = rpc30_event();
+        event["inSuccessfulContractCall"] = json!(false);
+        assert!(!decode_one(event).await.in_successful_contract_call);
     }
 
     #[tokio::test]

@@ -22,8 +22,9 @@ addresses are in that repository's `registry/mainnet.jsonl`. That spec was
 written against the fork's pre-release head `54afdae`; the three ways
 `v0.1.1` differs from it are reconciled in
 `docs/specs/2026-11-09-precept-v0.1.1-reconciliation.md` (see "The fork's
-gotchas" below and `docs/architecture.md` §6). The sandbox tier below
-still pins stock wasm: it predates Precept's releases.
+gotchas" below and `docs/architecture.md` §6). The sandbox and testnet
+tiers deploy Precept's own v0.1.1 release wasm in the live XLM/USDC
+market's shape (`docs/specs/2026-11-10-precept-sandbox-and-testnet.md`).
 
 **Status: Phase 9 complete.** Phase 1 landed the pure fixed-point math
 (`math`) and the ScVal/ledger-entry codecs (`chain::xdr`); Phase 2 landed
@@ -127,8 +128,10 @@ filled it near the ledger `fill_objective = "earliest-profitable"`
 targets, and unwound the filler's position back to zero liabilities
 (`docs/testnet-soak.md`'s own Stage 2 results). Everything Phases 1
 through 7 built still stands: the fork's differences are additions to
-this crate's arithmetic port, not corrections to it. The repository
-scaffolding is complete and enforced.
+this crate's arithmetic port, not corrections to it. Since Phase 9 both
+test tiers moved onto Precept's v0.1.1 release, deployed as the live
+XLM/USDC market, and the sandbox gained a sixth scenario,
+`free_fill_default`. The repository scaffolding is complete and enforced.
 
 **This bot is NOT non-custodial.** It is designed to hold a signing key and
 submit transactions itself — that is the point of a liquidation bot. Treat
@@ -144,9 +147,9 @@ cargo test --lib --bins             # unit tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 make sqlx-prepare                   # after changing a query in src/store.rs
-make sandbox                        # all five scenarios, ~25 min (Docker + stellar CLI); SANDBOX_SCENARIO=x for one
-make testnet-deploy                 # stand Blend v2 up on public Stellar testnet for the soak's armed stage
-make testnet-crash                  # move the testnet soak's oracle price (default $0.075)
+make sandbox                        # all six scenarios, ~30 min (Docker + stellar CLI); SANDBOX_SCENARIO=x for one
+make testnet-deploy                 # stand Precept up on public Stellar testnet for the soak's armed stage
+make testnet-crash                  # move the testnet soak's oracle price (default $0.08)
 make testnet-run                    # run the bot against testnet in dry run (no key; nothing is ever submitted)
 make testnet-run-armed              # run the bot against testnet ARMED — the only target that runs the bot armed on testnet
 make help                           # Docker Compose lifecycle
@@ -700,7 +703,7 @@ make help                           # Docker Compose lifecycle
 - `examples/capture_fixture.rs` — refreshes `tests/fixtures/` from a live
   RPC through `curl`. See that directory's README.
 - `tests/liquidation_sandbox.rs` and `tests/sandbox_harness/mod.rs` — the
-  sandbox tier's five scenario tests, and the one place outside the
+  sandbox tier's six scenario tests, and the one place outside the
   testnet soak's armed stage (`scripts/testnet/run-bot.sh --armed`) where
   the bot is run with `DRY_RUN=false` and a signing key. `tests/sandbox_harness/mod.rs`
   is the machinery every scenario shares — the standalone-network gate,
@@ -720,9 +723,12 @@ make help                           # Docker Compose lifecycle
   oracle's price, fills it, and unwinds the position it took, proved
   through the `creations`/`fills` audit rows' transaction hashes, the
   filler's on-chain position and `/metrics`. `check_config` runs
-  `RUN_MODE=check-config`'s eight table-driven exit-code and warning cases
+  `RUN_MODE=check-config`'s nine table-driven exit-code and warning cases
   against a live network — (g) and (h) pinning what a wrong
-  `NETWORK_PASSPHRASE` does (see the gotcha below) — proving none of them
+  `NETWORK_PASSPHRASE` does (see the gotcha below), and (i) a
+  `min_primary_collateral` of 10 XLM under XLM's 50 XLM `min_position`,
+  exit 2 naming `min_position 500000000`, pinning that `min_position`
+  decodes from a real v0.1.1 `ReserveConfig` — proving none of them
   sends a transaction or migrates the database. `dry_run` is the tier's
   most important safety test: across three phases — deciding to create an
   auction, an armed creator whose filler cannot fill what it creates, and
@@ -744,7 +750,14 @@ make help                           # Docker Compose lifecycle
   runs a second instance on a database that never recorded it: that bot
   adopts the auction on chain (`AuctionInProgress`, 1212) rather than
   trying to create a second one, and fills it — the only path in this
-  tier that reaches `Auctioneer::adopt`. Every scenario is `#[ignore]`d,
+  tier that reaches `Auctioneer::adopt`. `free_fill_default` runs the
+  crate's default fill timing against Precept's default path: the oracle
+  is crashed to $0.05 (`crash_at` 500000), the auction is created at
+  100%, and `free-fill` takes it 400 ledgers in, where the bid is gone,
+  so Precept sets off the borrower's 40 USDC plain supply and defaults
+  the rest inside the fill — `debt_setoff` and `defaulted_debt` with the
+  borrower in their topics, USDC's `b_rate` cut — and the filler unwinds
+  to its 100 XLM floor. Every scenario is `#[ignore]`d,
   so `cargo test` never starts a container, and each refuses to run at
   all unless `target/sandbox/sandbox.env` exists, names the standalone
   network and was deployed for that scenario. `spawn_bot` and
@@ -777,7 +790,8 @@ make help                           # Docker Compose lifecycle
   passphrase instead — one gate shared by both tiers, each pinning every
   later `stellar` call to the passphrase its own node actually answered
   with, never a tier's assumed one. `versions.env` holds every pin: the five wasm
-  URLs with their SHA-256s, the `stellar` CLI release and both tarball
+  URLs (Precept's pool, backstop and factory from release v0.1.1;
+  Blend's Comet; the SEP-40 mock oracle) with their SHA-256s, the `stellar` CLI release and both tarball
   hashes, the quickstart image by digest, `SANDBOX_PASSPHRASE`, and
   `SQLX_CLI_VERSION`, which is not the sandbox's but has the same
   two-installers problem — see the gotcha on the database sweep below.
@@ -791,11 +805,15 @@ make help                           # Docker Compose lifecycle
   either that wait or the standalone gate fails — a container it created
   and could not bring up is its to clean up, since `make sandbox` never
   reaches `down.sh` on that path and the next run refuses on it;
-  `deploy.sh` stands Blend v2 up in ten steps and writes
+  `deploy.sh` stands Precept up in ten steps and writes
   `target/sandbox/sandbox.env`, keyed by `SANDBOX_SCENARIO` (one of the
-  tier's five names, `liquidation` by default): the only thing it changes
-  is step 2's mint, which `unwind_repay` alone skips, leaving the filler's
-  wallet with no USDC to repay a fill's bid; `deploy.sh`'s own
+  tier's six names, `liquidation` by default): it changes two things,
+  step 2's mint, which `unwind_repay` alone skips, leaving the filler's
+  wallet with no USDC to repay a fill's bid, and step 9's extra submit,
+  which `free_fill_default` alone makes, the borrower's 40 USDC plain
+  supply — a separate submit after the borrow, because a single one
+  reverts: the pool transfers a supply in before it pays a borrow out,
+  and the borrower's wallet is empty until then; `deploy.sh`'s own
   `require_funded` re-requests friendbot funding every few seconds, on a
   90 s budget, while it polls Horizon for an account to exist, because
   `up.sh`'s health gate can go green before friendbot behind it is ready
@@ -833,7 +851,7 @@ make help                           # Docker Compose lifecycle
   `pull_request`, and deliberately outside `ci.yml`'s `ci-summary` needs
   list: that gate reads a skipped job as a failure, which is right for a
   workflow where nothing is conditional and wrong for one that has no
-  pull-request run to skip. `strategy.matrix.scenario` runs all five
+  pull-request run to skip. `strategy.matrix.scenario` runs all six
   scenarios, `fail-fast: false`, each its own job on its own runner,
   because each result stands on its own (`make sandbox` locally stops at
   the first failure instead, for a developer who wants that failure's
@@ -842,7 +860,7 @@ make help                           # Docker Compose lifecycle
   test step's script reads it as `"${SANDBOX_SCENARIO}"` (`make
   sandbox-test SANDBOX_SCENARIO="${SANDBOX_SCENARIO}"`), never a `${{ }}`
   spliced into the shell; the uploaded log artifact is named
-  `sandbox-logs-${{ matrix.scenario }}` so five jobs' logs do not collide.
+  `sandbox-logs-${{ matrix.scenario }}` so six jobs' logs do not collide.
   The workflow-level `concurrency` group of `sandbox`, with
   `cancel-in-progress: false`, serialises whole *workflow runs* rather
   than the matrix jobs inside one. On hosted runners every job of every
@@ -1103,6 +1121,14 @@ Status above for what remains.
   Dependabot ignores it for that reason, and `scripts/check-repo-invariants.sh`
   fails unless `Cargo.lock` holds exactly one. Two means a `stellar-xdr` bump
   moved its copy: bump this one in the same PR.
+- stellar-rpc 30 omits `inSuccessfulContractCall` from `getEvents` events
+  (testnet's 30.0.0, checked 2026-11-11). `RawEvent` defaults it to `true`:
+  since Protocol 23 a failed call emits no contract events, so absent means
+  a successful call, and the consumers that filter on it still work for an
+  RPC that sends it. The sandbox's quickstart RPC (protocol 28) still sends
+  the field, so only a newer RPC, testnet's, exercises the absent case. A
+  new required field in any RPC wire struct must be checked against the
+  newest stellar-rpc, not only the sandbox's.
 - `getLedgerEntries` omits absent keys rather than returning nulls, so a
   lookup must go by key, never by position, and "the RPC returned fewer
   entries than keys" is the normal shape of "some of these do not exist".
@@ -1428,7 +1454,9 @@ Status above for what remains.
   the same 1204 unless the backstop threshold is met and queued
   withdrawals are under 50%; the `get_config` read straight after it is
   what proves the threshold *was* met rather than the call having been a
-  no-op. Reserves are configured before it for a related reason:
+  no-op. Precept also requires the oracle to report exactly 7 decimals to
+  leave Setup (`InvalidPrice` otherwise). Reserves are configured before
+  it for a related reason:
   `queue_set_reserve`/`set_reserve` impose a timelock outside Setup. The
   pool it leaves behind reports status 0, and the bot treats that as
   active: `Service::validate` warns only past `AdminActive`, because the
@@ -1450,29 +1478,37 @@ Status above for what remains.
   transaction's own source account already satisfies the auth.
 - The scenario is exactly one price move wide, and the numbers are load
   bearing. The borrower supplies 5,000 XLM of collateral at $0.10 and
-  borrows 300 USDC: XLM's `c_factor` of 0.75 values the collateral at
-  $375, USDC's `l_factor` of 0.95 values the debt at ~$315.8, and the
-  health factor is ~1.19 — nothing to liquidate, `LIQ_HF_THRESHOLD` being
-  0.998. `crash.sh`'s default price of `750000` (the oracle reports 7
-  decimals, so $0.075) takes the collateral to $281.25 and the health
-  factor to ~0.89. It re-sends USDC's unchanged price alongside it because
+  borrows 340 USDC: XLM's `c_factor` of 0.8 values the collateral at
+  $400, USDC's `l_factor` of 1.0 values the debt at $340, and the
+  health factor is ~1.18 — nothing to liquidate, `LIQ_HF_THRESHOLD` being
+  0.998. `crash.sh`'s default price of `800000` (the oracle reports 7
+  decimals, so $0.08) takes the collateral to $320 and the health
+  factor to ~0.94. Not deeper, and not a smaller debt: on this market a
+  liquidation restores 1.06 only at (1.06 − HF) / 0.18 of the debt, so
+  from ~0.88 (a $0.075 crash) it would need ~99%, which Precept treats
+  as a full liquidation (above 95%, every position), while at ~0.94 it
+  needs ~66%, a real partial; at 300 USDC the same crash would leave
+  ~1.07, nothing to liquidate. It re-sends USDC's unchanged price alongside it because
   `set_price_stable` takes the whole vector positionally, in the `assets`
   order `set_data` was given (`[XLM, USDC]`): there is no way to set one
   price, and a caller that passed only XLM's would silently unprice USDC.
 - The sandbox test's fill budget is **measured**, never assumed. The fill
   waits on the auction's own ledger ramp — the lot ramps to full over the
   first 200 ledgers while the bid stays whole, so for this scenario — the
-  numbers are a real run's: an auction created at 69%, a 207 USDC bid
-  against a full lot of ~3,139 XLM worth ~$235 at the crashed price, plus
-  the pool's 100 bps margin — the earliest profitable ledger is 178 in,
-  and `FILL_LEDGERS` is 190, that with room for a re-plan. So
-  `fill_budget` samples the chain head (`RpcClient::latest_ledger`, the
+  numbers are a real run's: an auction created at 66%, a bid of 224.4
+  USDC, and, with the pool's 100 bps margin, a fill that landed at block
+  184, where the lot it took was ~2,838.66 XLM worth ~$227.09 at the
+  crashed price; `FILL_LEDGERS` is 200, that with room for a re-plan.
+  So `fill_budget` samples the chain head (`RpcClient::latest_ledger`, the
   RPC's `getLatestLedger`) for five seconds immediately before the wait,
-  derives `FILL_LEDGERS × seconds per ledger` plus a minute, and fails *up
-  front*, naming the rate it measured, when that exceeds the ten-minute
+  derives the scenario's ledgers × seconds per ledger plus a minute, and
+  fails *up front*, naming the rate it measured, when that exceeds its
   cap. A constant written around "quickstart closes a ledger a second"
   becomes a flake the day it does not, and it fails as "the filler never
-  filled" — a true statement about the wrong thing.
+  filled" — a true statement about the wrong thing. The budget is per
+  scenario: `free_fill_default` has its own (`FREE_FILL`, 410 ledgers, a
+  15-minute cap, against `EARLIEST_PROFITABLE_FILL`'s `FILL_LEDGERS` and
+  10-minute cap) because `free-fill` aims at `start + 400`.
 - Each sandbox scenario creates its own databases per run on the
   `DATABASE_URL` server — `sandbox_<unix seconds>`, or `sandbox_<unix
   seconds>_1` and `_2` for `restart_adopt`'s two bots, the suffixes
@@ -1537,7 +1573,7 @@ Status above for what remains.
   every network but a brand-new standalone one carries it — so
   `scripts/sandbox/deploy.sh`'s own `stellar contract asset deploy
   --asset native` would fail there. `scripts/testnet/deploy.sh`'s
-  `native_asset_id` (`scripts/testnet/deploy.sh:190-198`) takes the id
+  `native_asset_id` (`scripts/testnet/deploy.sh:191-199`) takes the id
   instead from `stellar contract id asset --asset native`, which derives
   it purely from the network passphrase, no source account or
   transaction involved.
@@ -1710,11 +1746,10 @@ three ways, all reconciled** (`docs/specs/2026-11-09-precept-v0.1.1-reconciliati
   returns zero, and raises `1200` while the reserve has any outstanding debt —
   which is always, for a reserve anybody borrows from. Orphaned collateral is
   dead capital, and the bot deliberately does not chase it.
-- **`bstop_rate` must be zero at initialize** (`1201` otherwise), which
-  both `scripts/sandbox/deploy.sh` and `scripts/testnet/deploy.sh` will have
-  to satisfy before either can stand a fork pool up: both pass
-  `--backstop_take_rate 1000000` today, which is right for the stock wasm
-  they pin and fails the fork's initialize at step 6.
+- **`bstop_rate` must be zero at initialize** (`1201` otherwise). Both
+  `scripts/sandbox/deploy.sh` and `scripts/testnet/deploy.sh` pass
+  `--backstop_take_rate 0`; Precept's factory refuses any other value with
+  `1300 InvalidPoolInitArgs`, before the pool's own `1201` could.
 
 ## Workflow
 
@@ -1734,7 +1769,7 @@ three ways, all reconciled** (`docs/specs/2026-11-09-precept-v0.1.1-reconciliati
   the build-job cap (`cargo-jobs.sh`, `cargo-jobs-config.sh`) and the
   sandbox tier (`sandbox/`).
 - `tests/` — the fixtures the math is pinned against;
-  `liquidation_sandbox.rs`, the sandbox tier's five `#[ignore]`d scenario
+  `liquidation_sandbox.rs`, the sandbox tier's six `#[ignore]`d scenario
   tests; and `sandbox_harness/mod.rs`, the harness they share.
 - `docs/` — `configuration.md` (every setting, its default and bound),
   `deploy.md` (the operator's guide from pulling the image to running it

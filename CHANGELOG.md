@@ -15,18 +15,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sharing a new `tests/sandbox_harness/mod.rs` harness that factors out
   the standalone-network gate, the spawned bot, the per-run database(s)
   and every named wait. `deploy.sh` takes `SANDBOX_SCENARIO` to pick
-  which of the five it deploys for (`liquidation` by default), and a new
+  which of the six it deploys for (`liquidation` by default), and a new
   `scripts/sandbox/mint.sh` mints the filler more USDC on a running
   network — `unwind_repay`'s way of funding a wallet its own deploy left
   empty. `.github/workflows/sandbox.yml`'s nightly run now matrices over
-  all five scenarios, one job per scenario on its own runner,
+  all six scenarios, one job per scenario on its own runner,
   `fail-fast: false`. `make sandbox-test` refuses a `SANDBOX_SCENARIO`
   that does not name exactly one test fn, rather than passing having run
   none, and `scripts/check-repo-invariants.sh` fails unless the five
   places that name the scenarios agree.
 - The testnet soak tier: `scripts/testnet/{lib.sh,deploy.sh,crash.sh,
   run-bot.sh}` and the Makefile's `testnet-deploy`, `testnet-crash`,
-  `testnet-run` and `testnet-run-armed` targets stand the same Blend v2
+  `testnet-run` and `testnet-run-armed` targets stand the same
   protocol up on public Stellar testnet, funded by friendbot's XLM, and
   run the bot against it dry (`testnet-run`) or armed
   (`testnet-run-armed`) — the only place outside the sandbox tier this
@@ -56,9 +56,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pool's tracked-user count, open auctions, and every `creations`/`fills`
   row with its `dry_run` and `tx_hash`. `docs/testnet-soak.md` is the
   runbook for both stages.
+- A sixth sandbox scenario, `free_fill_default`: a 100% auction filled with
+  the default free-fill objective at start + 400, proving Precept's set-off
+  and default path (`debt_setoff`, `defaulted_debt`) against real contract
+  code.
+- A ninth `check_config` case, (i): a `min_primary_collateral` under the
+  primary reserve's `min_position` is refused, proving `min_position`
+  decodes from a real `ReserveConfig`.
 
 ### Changed
 
+- The sandbox and testnet tiers deploy Precept's own v0.1.1 release wasm
+  (pool, backstop, factory), in the live XLM/USDC market's reserve
+  configuration — XLM collateral-only, USDC borrow-only, each with
+  Precept's `min_position` — instead of stock Blend v2. `crash.sh`'s
+  default is $0.08 in both tiers.
 - **Breaking: renamed from `blend-liquidator` to `precept-liquidator`**, to
   match the protocol it targets: Precept, Templar's audited fork of Blend
   v2, whose repository `Templar-Protocol/blend-contracts-v2` is now
@@ -108,6 +120,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The event poller accepts stellar-rpc 30's getEvents, which no longer sends inSuccessfulContractCall: every page holding an event used to fail to decode, so the poller backed off forever and the bot stopped following the pool from its first event.
 - The bot is reconciled with Precept `v0.1.1`, the release every live
   market runs. `defaulted_debt` and `debt_setoff` events, which `v0.1.1`
   emits with the borrower in topic 1, decode again — every one used to be

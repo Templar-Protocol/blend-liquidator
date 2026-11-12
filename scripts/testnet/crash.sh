@@ -2,8 +2,8 @@
 # crash.sh [PRICE] — moves the testnet soak's oracle's XLM price, which is
 # the one lever that turns deploy.sh's healthy borrower into a liquidatable
 # one. PRICE is in the oracle's own units — 7 decimals, so the default
-# 750000 is $0.075 against deploy.sh's $0.10, a 25% drop that takes the
-# borrower's health factor from ~1.19 to ~0.89. Exactly
+# 800000 is $0.08 against deploy.sh's $0.10, a 20% drop that takes the
+# borrower's health factor from ~1.18 to ~0.94. Exactly
 # scripts/sandbox/crash.sh's own scenario numbers, against our own mock
 # oracle on testnet rather than the sandbox's.
 #
@@ -22,12 +22,12 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/testnet/lib.sh
 source "${script_dir}/lib.sh"
 
-price=${1:-750000}
+price=${1:-800000}
 # Only a positive integer: the oracle reports i128 prices in fixed point,
-# and a decimal here ("0.075") would be a silently different number, not
+# and a decimal here ("0.08") would be a silently different number, not
 # an error.
 case "${price}" in
-"" | *[!0-9]*) die "crash: PRICE must be a positive integer in the oracle's 7-decimal units (750000 is \$0.075), got '${price}'" ;;
+"" | *[!0-9]*) die "crash: PRICE must be a positive integer in the oracle's 7-decimal units (800000 is \$0.08), got '${price}'" ;;
 0*) die "crash: PRICE must be positive and unpadded, got '${price}'" ;;
 esac
 

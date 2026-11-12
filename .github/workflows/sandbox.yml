@@ -1,12 +1,13 @@
 name: Sandbox
 
-# The sandbox integration tier: a throwaway Stellar network in Docker, Blend
-# v2 deployed on it, and the real binary run against it **armed** — the one
+# The sandbox integration tier: a throwaway Stellar network in Docker, Precept
+# deployed on it, and the real binary run against it **armed** — the one
 # place anything in this repository submits a transaction it signed.
 #
-# Nightly and on demand, never on `push` or `pull_request`. The tier has five
-# scenarios (liquidation, check_config, dry_run, unwind_repay, restart_adopt;
-# see tests/liquidation_sandbox.rs's module doc for what each proves), and
+# Nightly and on demand, never on `push` or `pull_request`. The tier has six
+# scenarios (liquidation, check_config, dry_run, unwind_repay, restart_adopt,
+# free_fill_default; see tests/liquidation_sandbox.rs's module doc for what
+# each proves), and
 # the job below runs every one of them as its own matrix entry, each on its
 # own runner: its own network stood up, its own eight contracts deployed, and
 # — for the scenarios that wait on an auction's ledger ramp — its own minutes
@@ -26,7 +27,7 @@ on:
 
 # This group serialises whole *workflow runs*, not the matrix jobs within
 # one: GitHub schedules every job in the matrix below on its own runner, so
-# five scenarios run at once without contending for anything. On hosted
+# six scenarios run at once without contending for anything. On hosted
 # runners a second run's jobs get fresh VMs exactly as these do, so two
 # overlapping runs would not collide either; what the group buys there is
 # one night's run finishing before the next starts, and no doubled runner
@@ -68,7 +69,7 @@ jobs:
       # state left to inspect.
       fail-fast: false
       matrix:
-        scenario: [liquidation, check_config, dry_run, unwind_repay, restart_adopt]
+        scenario: [liquidation, check_config, dry_run, unwind_repay, restart_adopt, free_fill_default]
     services:
       postgres:
         image: postgres:17-alpine
@@ -159,7 +160,7 @@ jobs:
       - name: Fetch the pinned contract artefacts
         run: ./scripts/sandbox/fetch-artifacts.sh
 
-      - name: Deploy Blend v2, leaving one borrower a price move from liquidation
+      - name: Deploy Precept, leaving one borrower a price move from liquidation
         env:
           SANDBOX_SCENARIO: ${{ matrix.scenario }}
         run: ./scripts/sandbox/deploy.sh

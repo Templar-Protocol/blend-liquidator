@@ -15,19 +15,19 @@ ENV_FILE := .env
 DATABASE_URL ?= postgres://liquidator:liquidator@127.0.0.1:55432/liquidator
 export DATABASE_URL
 
-# The sandbox tier's five scenarios. The same five names are written in
+# The sandbox tier's six scenarios. The same six names are written in
 # scripts/sandbox/deploy.sh, tests/sandbox_harness/mod.rs's SCENARIOS,
 # .github/workflows/sandbox.yml's matrix and tests/liquidation_sandbox.rs's
 # #[ignore]d test fns, and scripts/check-repo-invariants.sh fails unless
-# all five name the same set. SANDBOX_SCENARIO picks the one
+# all five places name the same set. SANDBOX_SCENARIO picks the one
 # `sandbox-deploy` and `sandbox-test` act on; SANDBOX_SCENARIOS is what
 # `sandbox` loops over when no single SANDBOX_SCENARIO is given.
 SANDBOX_SCENARIO ?= liquidation
-SANDBOX_SCENARIOS ?= liquidation check_config dry_run unwind_repay restart_adopt
+SANDBOX_SCENARIOS ?= liquidation check_config dry_run unwind_repay restart_adopt free_fill_default
 
 # testnet-crash's own oracle price, in the oracle's 7-decimal units. Empty
-# by default, which leaves crash.sh to use its own default (750000,
-# $0.075); PRICE=<n> overrides it.
+# by default, which leaves crash.sh to use its own default (800000,
+# $0.08); PRICE=<n> overrides it.
 PRICE ?=
 
 help: ## Show available commands
@@ -68,7 +68,7 @@ check: ## Run everything CI runs (needs `make db-up` first)
 
 # ── The sandbox integration tier ────────────────────
 #
-# A throwaway Stellar network in Docker, Blend v2 deployed on it, and the
+# A throwaway Stellar network in Docker, Precept deployed on it, and the
 # real binary run against it **armed**. Nothing here runs in CI's PR gate:
 # `make sandbox` takes minutes and starts containers, so it is a nightly
 # workflow (.github/workflows/sandbox.yml) and a thing you run by hand.
@@ -81,10 +81,10 @@ check: ## Run everything CI runs (needs `make db-up` first)
 sandbox-up: ## Start the pinned local Stellar network in Docker
 	./scripts/sandbox/up.sh
 
-sandbox-fetch: ## Download and verify the pinned Blend v2 wasm artefacts
+sandbox-fetch: ## Download and verify the pinned Precept, Comet and mock-oracle wasm artefacts
 	./scripts/sandbox/fetch-artifacts.sh
 
-sandbox-deploy: ## Deploy Blend v2 on the local network for SANDBOX_SCENARIO (default liquidation)
+sandbox-deploy: ## Deploy Precept on the local network for SANDBOX_SCENARIO (default liquidation)
 	SANDBOX_SCENARIO=$(SANDBOX_SCENARIO) ./scripts/sandbox/deploy.sh
 
 # `--list` first, and exactly one match required, because libtest exits 0
@@ -173,7 +173,7 @@ sandbox-down: ## Tear the sandbox down and drop the databases failed runs kept
 # deploy.sh re-verifies them itself regardless.
 #
 # SANDBOX_SCENARIOS is the list each of its own network, database and log
-# file is made for, defaulting to all five this tier has; SANDBOX_SCENARIO=x
+# file is made for, defaulting to all six this tier has; SANDBOX_SCENARIO=x
 # runs the one x instead. The loop stops at the first scenario that fails
 # and names it, because a developer running this by hand wants that
 # failure's state: its kept database and its logs, sandbox.log above all,
@@ -210,7 +210,7 @@ sandbox-down: ## Tear the sandbox down and drop the databases failed runs kept
 # container still holding port 8000 and databases still on the server —
 # precisely what the next run refuses on, and reporting success would hide
 # it until then.
-sandbox: ## fetch, then up → deploy → test → down for each of SANDBOX_SCENARIOS (default all five; SANDBOX_SCENARIO=x runs just x; SANDBOX_KEEP=1, with one scenario selected, leaves its sandbox up)
+sandbox: ## fetch, then up → deploy → test → down for each of SANDBOX_SCENARIOS (default all six; SANDBOX_SCENARIO=x runs just x; SANDBOX_KEEP=1, with one scenario selected, leaves its sandbox up)
 	@scenarios="$${SANDBOX_SCENARIO:-$(SANDBOX_SCENARIOS)}"; \
 	set -- $$scenarios; \
 	if [ "$$#" -eq 0 ]; then \
@@ -255,10 +255,10 @@ sandbox: ## fetch, then up → deploy → test → down for each of SANDBOX_SCEN
 # tear down; testnet.env, once deploy.sh writes it, is what every other
 # target here reads.
 
-testnet-deploy: ## Stand Blend v2 up on testnet for the soak's armed stage (writes target/testnet/testnet.env; refuses if it already exists)
+testnet-deploy: ## Stand Precept up on testnet for the soak's armed stage (writes target/testnet/testnet.env; refuses if it already exists)
 	./scripts/testnet/deploy.sh
 
-testnet-crash: ## Move the testnet soak's oracle price (default $0.075; PRICE=<n> in the oracle's 7-decimal units for another)
+testnet-crash: ## Move the testnet soak's oracle price (default $0.08; PRICE=<n> in the oracle's 7-decimal units for another)
 	./scripts/testnet/crash.sh $(PRICE)
 
 testnet-run: ## Run the bot against testnet in dry run (the observe stage's own pool; no key, nothing ever submitted)

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# deploy.sh — stands Blend v2 up on Stellar testnet for the soak's armed
-# stage: our own tokens, mock oracle, backstop, factory and pool, with one
-# borrower a single price move from being liquidatable. Writes
-# target/testnet/testnet.env (mode 0600) and target/testnet/deploy.log, a
-# transcript of every step and every address it produced.
+# deploy.sh — stands Precept (release v0.1.1) up on Stellar testnet for the
+# soak's armed stage: our own tokens, mock oracle, backstop, factory and
+# pool, with one borrower a single price move from being liquidatable.
+# Writes target/testnet/testnet.env (mode 0600) and
+# target/testnet/deploy.log, a transcript of every step and every address
+# it produced.
 #
 # This is scripts/sandbox/deploy.sh's own ten steps, run against testnet
 # instead of a throwaway local network — read that file's comments for the
@@ -18,8 +19,8 @@
 #     never a local quickstart instance;
 #   - the pool wasm is uploaded **before anything else** that touches the
 #     chain, as its own preflight step, and this script stops there —
-#     naming the reason — if testnet's protocol 28 refuses bytes pinned
-#     against soroban-sdk 22. Every step after it reuses that upload's
+#     naming the reason — if testnet's protocol 30 refuses bytes pinned
+#     against soroban-sdk 25. Every step after it reuses that upload's
 #     hash rather than uploading a second time;
 #   - a Soroban token approval's live-until is a ledger *number*, not a
 #     span, and testnet's is already in the millions — nowhere near the
@@ -123,7 +124,7 @@ JOIN_MAX_USDC=125010000000          #  12_501_0000000
 
 ADMIN_USDC_SUPPLY=1000000000000     # 100_000_0000000 — the pool's lendable USDC
 BORROWER_XLM_COLLATERAL=50000000000 #   5_000_0000000 — 5,000 XLM
-BORROWER_USDC_DEBT=3000000000       #     300_0000000 —   300 USDC
+BORROWER_USDC_DEBT=3400000000       #     340_0000000 —   340 USDC
 
 # i64::MAX, the allowance amount — see scripts/sandbox/deploy.sh's own
 # comment on why Comet's join_pool needs an explicit approval at all. The
@@ -223,14 +224,19 @@ trust() {
 		|| die "opening trustlines: change-trust ${asset%%:*} for ${key} failed"
 }
 
-# reserve_metadata INDEX C_FACTOR L_FACTOR UTIL — the pool's ReserveConfig
-# as JSON. Everything but the four arguments is the contracts' own
-# `default_reserve_metadata`; factors and utilisation are 7-decimal, and
-# supply_cap is an i128 so it is a string.
-reserve_metadata() {
-	printf '{"c_factor":%s,"decimals":7,"enabled":true,"index":%s,"l_factor":%s,"max_util":9500000,"r_base":100000,"r_one":500000,"r_three":15000000,"r_two":5000000,"reactivity":20,"supply_cap":"1000000000000000000","util":%s}' \
-		"$2" "$1" "$3" "$4"
-}
+# The live Precept XLM/USDC market's two reserve configs, copied field for
+# field from Templar-Protocol/precept's registry/configs/xlm-usdc.json at
+# v0.1.2: XLM collateral-only, USDC borrow-only, each with Precept's
+# min_position. Written out whole rather than built from positional
+# arguments, so neither reserve can silently inherit the other's values.
+# The live market lists USDC at index 0; this tier keeps XLM at 0 and USDC
+# at 1, the order sandbox.env and every assertion already assume — index
+# order carries no contract semantics, and the bot reads indices from
+# chain. Keys are alphabetical, ReserveConfig's own field order in the
+# CLI's JSON; i128 fields (min_position, supply_cap) are strings, and
+# supply_cap is i128::MAX, the live value.
+XLM_RESERVE_CONFIG='{"c_factor":8000000,"decimals":7,"enabled":true,"index":0,"l_factor":0,"max_util":9000000,"min_position":"500000000","r_base":1000,"r_one":0,"r_three":0,"r_two":0,"reactivity":0,"supply_cap":"170141183460469231731687303715884105727","util":8000000}'
+USDC_RESERVE_CONFIG='{"c_factor":0,"decimals":7,"enabled":true,"index":1,"l_factor":10000000,"max_util":9900000,"min_position":"10000000","r_base":1000,"r_one":799000,"r_three":1200000,"r_two":1200000,"reactivity":0,"supply_cap":"170141183460469231731687303715884105727","util":9000000}'
 
 # json_field JSON PATH STEP — the value jq's PATH selects in JSON, or a die
 # naming STEP.
@@ -273,17 +279,18 @@ require_funded_testnet "${TESTNET_KEY_FILLER}" "${FILLER}"
 # Preflight: the pool wasm, uploaded on its own, before anything else
 # touches the chain past funding.
 #
-# versions.env's five wasm files were built against soroban-sdk 22; testnet
-# runs protocol 28. Blend's own testnet deployment runs these exact
-# contracts, so this is expected to succeed — but if protocol 28 refuses
-# them, every later step would fail for the same reason under a more
-# confusing name, so this is where that question gets answered, and where
-# this script stops if the answer is no. POOL_HASH is reused by step 5
+# versions.env's five wasm files were built against soroban-sdk 25; testnet
+# runs protocol 30. Precept's own testnet deployments run these exact
+# contracts (registry/testnet.jsonl records pool wasm acf7a128…), so this is
+# expected to succeed — but if protocol 30 refuses them, every later step
+# would fail for the same reason under a more confusing name, so this is
+# where that question gets answered, and where this script stops if the
+# answer is no. POOL_HASH is reused by step 5
 # rather than uploaded a second time.
 ########################################################################
 
 log "=== preflight: pool wasm upload ==="
-log "the pin is built against soroban-sdk 22; testnet runs protocol 28 — if this is rejected, stop here rather than guessing at a workaround"
+log "the pin is built against soroban-sdk 25; testnet runs protocol 30 — if this is rejected, stop here rather than guessing at a workaround"
 sandbox_require_network
 # Only stdout is captured, exactly as deploy_wasm() above does: the CLI's
 # own progress/info lines (an already-installed "skipping" notice among
@@ -292,8 +299,8 @@ sandbox_require_network
 # uncaptured; die() here only has to say what step failed and why, not
 # repeat text that is already on screen.
 if ! POOL_HASH=$(stellar contract upload "${sandbox_network_args[@]}" \
-	--source-account "${TESTNET_KEY_ADMIN}" --wasm "${wasm_dir}/pool_v2.0.0.wasm"); then
-	die "preflight: uploading pool_v2.0.0.wasm was rejected by testnet — see the CLI's own error above; the pin is built against soroban-sdk 22, testnet runs protocol 28, and this is not something to work around by re-pinning"
+	--source-account "${TESTNET_KEY_ADMIN}" --wasm "${wasm_dir}/pool.wasm"); then
+	die "preflight: uploading pool.wasm was rejected by testnet — see the CLI's own error above; the pin is built against soroban-sdk 25, testnet runs protocol 30, and this is not something to work around by re-pinning"
 fi
 [ -n "${POOL_HASH}" ] || die "preflight: stellar contract upload printed no hash"
 log "pool wasm accepted, hash ${POOL_HASH}"
@@ -412,7 +419,7 @@ FACTORY=$(stellar contract id wasm "${sandbox_network_args[@]}" \
 [ -n "${FACTORY}" ] || die "step 5 factory: stellar contract id wasm printed no address"
 sandbox_register_role "${FACTORY}" "pool factory (predicted)"
 
-BACKSTOP=$(deploy_wasm backstop "${TESTNET_KEY_ADMIN}" "${wasm_dir}/backstop_v2.0.0.wasm" -- \
+BACKSTOP=$(deploy_wasm backstop "${TESTNET_KEY_ADMIN}" "${wasm_dir}/backstop.wasm" -- \
 	--backstop_token "${COMET}" \
 	--emitter "${ADMIN}" \
 	--blnd_token "${BLND}" \
@@ -424,7 +431,7 @@ sandbox_register_role "${BACKSTOP}" backstop
 log "deploying the pool factory at the predicted address"
 sandbox_require_network
 FACTORY_DEPLOYED=$(stellar contract deploy "${sandbox_network_args[@]}" \
-	--source-account "${TESTNET_KEY_ADMIN}" --wasm "${wasm_dir}/pool-factory_v2.0.0.wasm" \
+	--source-account "${TESTNET_KEY_ADMIN}" --wasm "${wasm_dir}/pool_factory.wasm" \
 	--salt "${FACTORY_SALT}" -- \
 	--pool_init_meta "{\"backstop\":\"${BACKSTOP}\",\"blnd_id\":\"${BLND}\",\"pool_hash\":\"${POOL_HASH}\"}") \
 	|| die "step 5 factory: deploying the pool factory failed"
@@ -441,6 +448,11 @@ sandbox_register_role "${FACTORY}" "pool factory"
 #          min_collateral: i128) -> Address
 #
 # The CLI prints a returned Address as a quoted JSON string.
+#
+# backstop_take_rate is 0 because it must be: Precept's factory refuses any
+# other value with 1300 InvalidPoolInitArgs before it deploys anything
+# (pool-factory/src/pool_factory.rs:74 at v0.1.2), and the pool's own
+# initialize would refuse it with 1201 behind that.
 ########################################################################
 
 log "=== step 6: pool ==="
@@ -449,7 +461,7 @@ POOL=$(invoke "${TESTNET_KEY_ADMIN}" "${FACTORY}" deploy \
 	--name TestnetSoak \
 	--salt "${POOL_SALT}" \
 	--oracle "${ORACLE}" \
-	--backstop_take_rate 1000000 \
+	--backstop_take_rate 0 \
 	--max_positions 4 \
 	--min_collateral 0)
 POOL=$(json_field "${POOL}" '.' "step 6 pool")
@@ -464,7 +476,9 @@ sandbox_register_role "${POOL}" "pool"
 #
 # Both must happen while the pool is in Setup (status 6): outside Setup,
 # queue_set_reserve imposes a timelock and set_reserve would be refused
-# until it expired.
+# until it expired. ReserveConfig carries Precept's min_position, between
+# supply_cap and enabled (pool/src/storage.rs:71); it must be present or the
+# argument does not encode.
 ########################################################################
 
 log "=== step 7: reserves ==="
@@ -473,12 +487,12 @@ status=$(json_field "${config}" '.status' "step 7 reserves")
 [ "${status}" = "6" ] || die "step 7 reserves: the pool reports status ${status}, not 6 (Setup) — reserves can only be set without a timelock during Setup: ${config}"
 
 invoke "${TESTNET_KEY_ADMIN}" "${POOL}" queue_set_reserve \
-	--asset "${XLM}" --metadata "$(reserve_metadata 0 7500000 7500000 5000000)" >/dev/null
+	--asset "${XLM}" --metadata "${XLM_RESERVE_CONFIG}" >/dev/null
 XLM_INDEX=$(invoke "${TESTNET_KEY_ADMIN}" "${POOL}" set_reserve --asset "${XLM}")
 [ "${XLM_INDEX}" = "0" ] || die "step 7 reserves: XLM was given reserve index ${XLM_INDEX}, expected 0"
 
 invoke "${TESTNET_KEY_ADMIN}" "${POOL}" queue_set_reserve \
-	--asset "${USDC}" --metadata "$(reserve_metadata 1 9000000 9500000 8500000)" >/dev/null
+	--asset "${USDC}" --metadata "${USDC_RESERVE_CONFIG}" >/dev/null
 USDC_INDEX=$(invoke "${TESTNET_KEY_ADMIN}" "${POOL}" set_reserve --asset "${USDC}")
 [ "${USDC_INDEX}" = "1" ] || die "step 7 reserves: USDC was given reserve index ${USDC_INDEX}, expected 1"
 
@@ -486,6 +500,13 @@ reserve_list=$(invoke_view "${TESTNET_KEY_ADMIN}" "${POOL}" get_reserve_list)
 reserve_count=$(json_field "${reserve_list}" 'length' "step 7 reserves")
 [ "${reserve_count}" = "2" ] || die "step 7 reserves: the pool lists ${reserve_count} reserves, expected 2: ${reserve_list}"
 log "reserves: ${reserve_list}"
+
+for asset_role in xlm usdc; do
+	if [ "${asset_role}" = xlm ]; then asset=${XLM} expected=500000000; else asset=${USDC} expected=10000000; fi
+	reserve=$(invoke_view "${TESTNET_KEY_ADMIN}" "${POOL}" get_reserve --asset "${asset}")
+	min_position=$(json_field "${reserve}" '.config.min_position' "step 7 reserves")
+	[ "${min_position}" = "${expected}" ] || die "step 7 reserves: ${asset_role}'s min_position reads back as ${min_position}, expected ${expected}: ${reserve}"
+done
 
 ########################################################################
 # 8. Backstop funding and activation
@@ -526,9 +547,13 @@ log "pool is active (status ${status}): ${config}"
 #   request_type: 0 Supply, 2 SupplyCollateral, 4 Borrow
 #
 # At $0.10/XLM the borrower's 5,000 XLM of collateral is worth $500, which
-# a 0.75 collateral factor values at $375, against 300 USDC of debt a 0.95
-# liability factor values at ~$315.8 — a health factor of ~1.19. crash.sh's
-# $0.075 takes the collateral to $281.25 and the health factor to ~0.89.
+# XLM's 0.8 collateral factor values at $400, against 340 USDC of debt that
+# USDC's 1.0 liability factor values at $340 — a health factor of ~1.18.
+# crash.sh's $0.08 takes the collateral to $320 and the health factor to
+# ~0.94. At 300 USDC the same crash would leave it at ~1.07, nothing to
+# liquidate. Not deeper: on this market a liquidation restores 1.06 only at
+# (1.06 - HF) / 0.18 of the debt, so from ~0.88 it would need ~99%, which
+# Precept treats as a full liquidation; ~0.94 needs ~66%, a real partial.
 ########################################################################
 
 log "=== step 9: liquidity and the borrower ==="

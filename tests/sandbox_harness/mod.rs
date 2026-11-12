@@ -54,8 +54,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use precept_liquidator::chain::xdr::AuctionType;
-use precept_liquidator::chain::{PoolReader, RpcClient};
+use precept_liquidator::chain::rpc::{EventQuery, TransactionStatus};
+use precept_liquidator::chain::xdr::{decode_pool_event, AuctionType, PoolEvent};
+use precept_liquidator::chain::{PoolReader, RpcClient, TxHash};
 use precept_liquidator::math::AuctionData;
 use precept_liquidator::store::{Store, TrackedAuction};
 use sqlx::postgres::PgPool;
@@ -67,21 +68,22 @@ use sqlx::postgres::PgPool;
 /// `sandbox.env` was produced.
 const STANDALONE_PASSPHRASE: &str = "Standalone Network ; February 2017";
 
-/// The tier's five scenarios, in the order the Makefile's `sandbox` target
-/// loops over them. The same five names are written in
+/// The tier's six scenarios, in the order the Makefile's `sandbox` target
+/// loops over them. The same six names are written in
 /// `scripts/sandbox/deploy.sh`'s accepted list, the Makefile's
 /// `SANDBOX_SCENARIOS`, `.github/workflows/sandbox.yml`'s matrix and the
 /// `#[ignore]`d test fns in `tests/liquidation_sandbox.rs`. None is derived
 /// from another — a shell script, a Makefile, a workflow and a Rust test
-/// share no build step that could — so a sixth scenario is added to all
+/// share no build step that could — so a seventh scenario is added to all
 /// five by hand, and `scripts/check-repo-invariants.sh` fails unless they
 /// name the same set.
-pub(crate) const SCENARIOS: [&str; 5] = [
+pub(crate) const SCENARIOS: [&str; 6] = [
     "liquidation",
     "check_config",
     "dry_run",
     "unwind_repay",
     "restart_adopt",
+    "free_fill_default",
 ];
 
 /// How long a bot has to bind its HTTP port and report ready. Readiness
@@ -102,27 +104,58 @@ pub(crate) const CREATION_TIMEOUT: Duration = Duration::from_secs(90);
 /// counts: the lot ramps linearly to full over the auction's first 200
 /// ledgers while the bid stays whole, so the earliest ledger at which the
 /// lot covers the bid plus the configured margin is `200 × bid_value /
-/// lot_value_at_full`. The figures are a real run's, not an illustration:
-/// the auctioneer created that scenario's auction at 69%, a bid of 207 USDC
-/// against a full lot of ~3,139 XLM worth ~$235 at the crashed price, and
-/// with the pool's 100 bps margin the fill landed at block 178. Both sides
+/// lot_value_at_full`. The figures are a real run's (Precept v0.1.1, the
+/// live XLM/USDC market's reserves): the auctioneer created that scenario's
+/// auction at 66%, with a bid of 224.4 USDC, and with the pool's 100 bps
+/// margin the fill landed at block 184, where the lot it took was ~2,838.66
+/// XLM worth ~$227.09 at the crashed price — 0.92 of the same position's
+/// full lot of 3,085.5 XLM, the lot modifier at 184 ledgers. (Counted from
+/// the auction's start, the ledger its creation landed in plus one; the
+/// creation row's own ledger is the one the bot read before submitting, a
+/// ledger or two earlier, so subtracting that overstates by one.) Both sides
 /// scale with the percent, so the break-even block is near-invariant across
 /// the band the percent walk lands in. Nothing shortens it: `force_fill`
 /// caps the target at 350 ledgers, which is later, not sooner, and this is
 /// the earliest-profitable break-even specifically — [`pools_toml`] pins
 /// `fill_objective` to `earliest-profitable` for exactly that reason, since
 /// the crate's own default, `free-fill`, aims at `start + 400` instead,
-/// well outside this budget. 190 is 178 with room for a re-plan.
-const FILL_LEDGERS: u32 = 190;
+/// well outside this budget. 200 is 184 with room for a re-plan.
+const FILL_LEDGERS: u32 = 200;
 
 /// What [`FILL_LEDGERS`] worth of measured close time is padded by, for the
 /// bot's own cadences either side of the fill itself.
 const FILL_SLACK: Duration = Duration::from_mins(1);
 
-/// The most the fill may ever be given, however slowly the sandbox closes
-/// ledgers. A sandbox that would need longer is reported as such, up front,
-/// rather than waited out.
-const FILL_TIMEOUT_CAP: Duration = Duration::from_mins(10);
+/// What one scenario's fill waits for: how many ledgers the auction's own
+/// ramp makes it wait, and the most it may ever be given however slowly
+/// the sandbox closes ledgers. A sandbox that would need longer is reported
+/// as such, up front, rather than waited out.
+pub(crate) struct FillBudget {
+    pub(crate) ledgers: u32,
+    pub(crate) cap: Duration,
+}
+
+/// Every `earliest-profitable` scenario's fill: [`FILL_LEDGERS`], capped at
+/// ten minutes.
+pub(crate) const EARLIEST_PROFITABLE_FILL: FillBudget = FillBudget {
+    ledgers: FILL_LEDGERS,
+    cap: Duration::from_mins(10),
+};
+
+/// How many ledgers `free_fill_default`'s fill waits: `free-fill` aims at
+/// `start + 400`, where the bid modifier reaches zero (Precept's
+/// `auction_timing_modifiers`, `pool/src/auctions/auction.rs:296-311`), and
+/// ten more is room for one re-plan.
+const FREE_FILL_LEDGERS: u32 = 410;
+
+/// `free_fill_default`'s fill: [`FREE_FILL_LEDGERS`], capped at fifteen
+/// minutes — about 400 ledgers at the sandbox's roughly one-a-second close
+/// rate, with room, and still inside the nightly job's 45-minute timeout
+/// alongside a cold build and the deploy.
+pub(crate) const FREE_FILL: FillBudget = FillBudget {
+    ledgers: FREE_FILL_LEDGERS,
+    cap: Duration::from_mins(15),
+};
 
 /// How long the close-rate sample runs for before the fill wait.
 const CLOSE_RATE_SAMPLE: Duration = Duration::from_secs(5);
@@ -642,25 +675,57 @@ pub(crate) async fn drop_run_database(root: &Path, maintenance_url: &str, name: 
     maintenance.close().await;
 }
 
+/// What a scenario's `POOLS_TOML` may vary. [`Default`] is every
+/// scenario's own: [`MIN_PRIMARY_COLLATERAL`] and `earliest-profitable`,
+/// which [`FILL_LEDGERS`] is measured against — the crate's own default,
+/// `free-fill`, aims at `start + 400` instead, past that measured budget.
+pub(crate) struct PoolOptions {
+    /// `min_primary_collateral`, in stroops.
+    pub(crate) min_primary_collateral: i128,
+    /// `fill_objective`: `"earliest-profitable"` or `"free-fill"`.
+    pub(crate) fill_objective: &'static str,
+}
+
+impl Default for PoolOptions {
+    fn default() -> Self {
+        Self {
+            min_primary_collateral: MIN_PRIMARY_COLLATERAL,
+            fill_objective: "earliest-profitable",
+        }
+    }
+}
+
 /// The `POOLS_TOML` a bot follows: one pool, `bid` as `supported_bid`, any
-/// lot, the primary asset floor an unwind is asserted against.
+/// lot, the primary asset floor an unwind is asserted against, with
+/// [`PoolOptions::default`].
 pub(crate) fn pools_toml(pool: &str, xlm: &str, bid: &[&str]) -> String {
+    pools_toml_with(pool, xlm, bid, &PoolOptions::default())
+}
+
+/// [`pools_toml`] with `options` in place of the defaults.
+pub(crate) fn pools_toml_with(
+    pool: &str,
+    xlm: &str,
+    bid: &[&str],
+    options: &PoolOptions,
+) -> String {
     let supported_bid = bid
         .iter()
         .map(|asset| format!("\"{asset}\""))
         .collect::<Vec<_>>()
         .join(", ");
+    let PoolOptions {
+        min_primary_collateral,
+        fill_objective,
+    } = options;
     format!(
         "[[pools]]\n\
          address = \"{pool}\"\n\
          primary_asset = \"{xlm}\"\n\
-         min_primary_collateral = \"{MIN_PRIMARY_COLLATERAL}\"\n\
+         min_primary_collateral = \"{min_primary_collateral}\"\n\
          min_health_factor = 1.5\n\
          default_profit_bps = 100\n\
-         # earliest-profitable, not the crate's free-fill default: FILL_LEDGERS\n\
-         # is measured against the lot ramp's break-even ledger, and free-fill\n\
-         # would move the fill out to start + 400, past that measured budget.\n\
-         fill_objective = \"earliest-profitable\"\n\
+         fill_objective = \"{fill_objective}\"\n\
          supported_bid = [{supported_bid}]\n\
          supported_lot = [\"*\"]\n"
     )
@@ -984,14 +1049,14 @@ pub(crate) async fn wait_for_ready(bot: &mut Bot, http: &reqwest::Client) {
 /// from it.
 ///
 /// The fill waits on the chain's clock, not the bot's: the lot ramp needs
-/// [`FILL_LEDGERS`] ledgers whatever they cost in seconds. The quickstart
+/// `budget.ledgers` ledgers whatever they cost in seconds. The quickstart
 /// image closes one a second today, and a constant written around that
 /// becomes a flake the day it does not — a slower runner would fail here
 /// with "the filler never filled", which is a true statement about the
 /// wrong thing. So the rate is measured, the budget derived, and a sandbox
-/// too slow to finish inside [`FILL_TIMEOUT_CAP`] is reported now rather
-/// than in ten minutes' time.
-pub(crate) async fn fill_budget(bot: &mut Bot, rpc: &RpcClient) -> Duration {
+/// too slow to finish inside `budget.cap` is reported now rather
+/// than once that cap has run out.
+pub(crate) async fn fill_budget(bot: &mut Bot, rpc: &RpcClient, budget: &FillBudget) -> Duration {
     let first = match rpc.latest_ledger().await {
         Ok(ledger) => ledger.sequence,
         Err(error) => fail(bot, &format!("could not read the latest ledger: {error}")),
@@ -1026,29 +1091,31 @@ pub(crate) async fn fill_budget(bot: &mut Bot, rpc: &RpcClient) -> Duration {
     let elapsed = started.elapsed().as_secs_f64();
     let closed = f64::from(last.saturating_sub(first));
     let per_ledger = elapsed / closed;
-    let ramp = match Duration::try_from_secs_f64(f64::from(FILL_LEDGERS) * per_ledger) {
+    let ramp = match Duration::try_from_secs_f64(f64::from(budget.ledgers) * per_ledger) {
         Ok(ramp) => ramp,
         Err(error) => fail(
             bot,
             &format!("a close rate of {per_ledger} s per ledger is not a duration: {error}"),
         ),
     };
-    let budget = ramp.saturating_add(FILL_SLACK);
+    let wait = ramp.saturating_add(FILL_SLACK);
     println!(
         "the sandbox closed {closed} ledgers in {elapsed:.1} s — one every {per_ledger:.2} s; the \
-         fill needs about {FILL_LEDGERS}, so its budget is {} s",
-        budget.as_secs()
+         fill needs about {}, so its budget is {} s",
+        budget.ledgers,
+        wait.as_secs()
     );
-    if budget > FILL_TIMEOUT_CAP {
+    if wait > budget.cap {
         let message = format!(
             "the sandbox closes a ledger every {per_ledger:.2} s; this scenario needs ~\
-             {FILL_LEDGERS} ledgers, which is {} s — past the {} s this test will wait",
-            budget.as_secs(),
-            FILL_TIMEOUT_CAP.as_secs()
+             {} ledgers, which is {} s — past the {} s this test will wait",
+            budget.ledgers,
+            wait.as_secs(),
+            budget.cap.as_secs()
         );
         fail(bot, &message);
     }
-    budget
+    wait
 }
 
 /// The auctioneer's audit row for one account, once a transaction has been
@@ -1941,11 +2008,23 @@ pub(crate) async fn require_standalone_rpc(url: &str) {
     println!("{url} answered getNetwork with the standalone passphrase");
 }
 
-/// Runs `scripts/sandbox/crash.sh`, which moves the oracle's XLM price and
-/// is the one thing that makes the borrower liquidatable.
+/// Runs `scripts/sandbox/crash.sh` at its default price, which moves the
+/// oracle's XLM price and is the one thing that makes the borrower
+/// liquidatable.
 pub(crate) fn crash(bot: &Bot, root: &Path) {
+    run_crash(bot, root, &[]);
+}
+
+/// [`crash`] to `price`, in the oracle's 7-decimal units — the
+/// `free_fill_default` scenario's deeper move, which no partial
+/// liquidation can answer.
+pub(crate) fn crash_at(bot: &Bot, root: &Path, price: i128) {
+    run_crash(bot, root, &[price.to_string()]);
+}
+
+fn run_crash(bot: &Bot, root: &Path, args: &[String]) {
     let script = root.join("scripts/sandbox/crash.sh");
-    match Command::new(&script).current_dir(root).output() {
+    match Command::new(&script).args(args).current_dir(root).output() {
         Ok(output) if output.status.success() => {
             println!(
                 "crash.sh: XLM is now {}",
@@ -2013,5 +2092,230 @@ pub(crate) fn log_lines_containing(bot: &Bot, needle: &str) -> Vec<String> {
             .map(str::to_string)
             .collect(),
         Err(error) => vec![format!("(could not read {}: {error})", bot.log.display())],
+    }
+}
+
+/// The percent the auctioneer's armed creation for one account recorded.
+pub(crate) const CREATION_PERCENT: &str = "SELECT percent FROM creations \
+     WHERE pool = $1 AND account = $2 AND dry_run = false AND tx_hash IS NOT NULL LIMIT 1";
+
+/// [`CREATION_PERCENT`]'s answer, or a failure naming why there is none.
+pub(crate) async fn creation_percent(bot: &Bot, store: &Store, pool: &str, account: &str) -> i16 {
+    match sqlx::query_scalar::<_, Option<i16>>(CREATION_PERCENT)
+        .bind(pool)
+        .bind(account)
+        .fetch_optional(store.pool())
+        .await
+    {
+        Ok(Some(Some(percent))) => percent,
+        Ok(Some(None)) => fail(bot, "the creation row carries no percent"),
+        Ok(None) => fail(bot, "no armed creation row with a transaction hash"),
+        Err(error) => fail(bot, &format!("could not read the creations table: {error}")),
+    }
+}
+
+/// The ledger the transaction `tx_hash` was applied in, which must have
+/// succeeded.
+pub(crate) async fn applied_ledger(bot: &Bot, rpc: &RpcClient, tx_hash: &str) -> u32 {
+    let hash = match TxHash::from_hex(tx_hash) {
+        Ok(hash) => hash,
+        Err(error) => fail(
+            bot,
+            &format!("{tx_hash} is not a transaction hash: {error}"),
+        ),
+    };
+    match rpc.transaction(&hash).await {
+        Ok(TransactionStatus::Success { ledger, .. }) => ledger,
+        Ok(other) => fail(
+            bot,
+            &format!("transaction {tx_hash} did not succeed: {other:?}"),
+        ),
+        Err(error) => fail(
+            bot,
+            &format!("could not read transaction {tx_hash}: {error}"),
+        ),
+    }
+}
+
+/// The page size [`pool_events_of`] reads `getEvents` in.
+const EVENT_PAGE_LIMIT: u32 = 200;
+
+/// The most pages [`pool_events_of`] follows before failing. A read that has
+/// not reached past its ledger by then is reported as incomplete, never
+/// treated as the whole ledger.
+const EVENT_PAGES_MAX: usize = 10;
+
+/// Every pool event `tx_hash` emitted in `ledger`, decoded. An event the
+/// decoder refuses fails the run: this scenario exists to prove every one
+/// of them decodes.
+///
+/// `getEvents` answers in ledger order, a page at a time, so the read
+/// follows the cursor until a page is short (the RPC holds nothing more) or
+/// already holds a later ledger's event. A full page that does neither is
+/// read past rather than trusted: stopping there would drop the target
+/// ledger's later events and report a missing `defaulted_debt` that the
+/// chain did emit.
+pub(crate) async fn pool_events_of(
+    bot: &Bot,
+    rpc: &RpcClient,
+    pool: &str,
+    ledger: u32,
+    tx_hash: &str,
+) -> Vec<PoolEvent> {
+    let hash = match TxHash::from_hex(tx_hash) {
+        Ok(hash) => hash,
+        Err(error) => fail(
+            bot,
+            &format!("{tx_hash} is not a transaction hash: {error}"),
+        ),
+    };
+    let contract_ids = [pool];
+    let page_limit = usize::try_from(EVENT_PAGE_LIMIT).unwrap_or(usize::MAX);
+    let mut cursor: Option<String> = None;
+    let mut decoded = Vec::new();
+    for _ in 0..EVENT_PAGES_MAX {
+        let query = EventQuery {
+            start_ledger: if cursor.is_none() { Some(ledger) } else { None },
+            cursor: cursor.as_deref(),
+            contract_ids: &contract_ids,
+            limit: EVENT_PAGE_LIMIT,
+        };
+        let page = match rpc.events(&query).await {
+            Ok(page) => page,
+            Err(error) => fail(
+                bot,
+                &format!("could not read ledger {ledger}'s events: {error}"),
+            ),
+        };
+        for event in page.events.iter().filter(|event| {
+            event.ledger == ledger && event.in_successful_contract_call && event.tx_hash == hash
+        }) {
+            match decode_pool_event(&event.topics, &event.value) {
+                Ok(Some(pool_event)) => decoded.push(pool_event),
+                Ok(None) => {}
+                Err(error) => fail(bot, &format!("event {} did not decode: {error}", event.id)),
+            }
+        }
+        if page.events.len() < page_limit || page.events.iter().any(|event| event.ledger > ledger) {
+            return decoded;
+        }
+        match page.cursor {
+            Some(next) => cursor = Some(next),
+            None => fail(
+                bot,
+                &format!(
+                    "ledger {ledger}'s events filled a {EVENT_PAGE_LIMIT}-event page with no \
+                     cursor to read on from — the read is incomplete"
+                ),
+            ),
+        }
+    }
+    fail(
+        bot,
+        &format!(
+            "ledger {ledger}'s events did not end within {EVENT_PAGES_MAX} pages of \
+             {EVENT_PAGE_LIMIT} — the read is incomplete"
+        ),
+    )
+}
+
+/// `asset`'s reserve `b_rate` in `pool`, as stored (not accrued).
+pub(crate) async fn reserve_b_rate(bot: &Bot, rpc: &RpcClient, pool: &str, asset: &str) -> i128 {
+    let snapshot = match PoolReader::new(rpc, pool).snapshot(&[]).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => fail(bot, &format!("could not read the pool: {error}")),
+    };
+    let Some(index) = snapshot.asset_index.get(asset).copied() else {
+        fail(bot, &format!("{asset} is not one of the pool's reserves"))
+    };
+    match snapshot.reserves.get(&index) {
+        Some(reserve) => reserve.data.b_rate,
+        None => fail(
+            bot,
+            &format!("the snapshot holds no reserve at index {index}"),
+        ),
+    }
+}
+
+/// Fails unless `account` holds no position at all in `pool`: no
+/// collateral, no liability, no plain supply.
+pub(crate) async fn assert_no_positions(bot: &Bot, rpc: &RpcClient, pool: &str, account: &str) {
+    let snapshot = match PoolReader::new(rpc, pool).snapshot(&[account]).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => fail(
+            bot,
+            &format!("could not read {account}'s positions: {error}"),
+        ),
+    };
+    if let Some(positions) = snapshot.positions.get(account) {
+        if !(positions.collateral.is_empty()
+            && positions.liabilities.is_empty()
+            && positions.supply.is_empty())
+        {
+            fail(
+                bot,
+                &format!("{account} still holds positions: {positions:?}"),
+            );
+        }
+    }
+}
+
+/// How long the tracker has to delete a defaulted borrower's `users` row
+/// once the fill that defaulted it has landed: one poll and one refresh.
+const USER_ROW_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// Waits for `pool`'s store to hold no `users` row for `account`.
+pub(crate) async fn wait_for_user_row_gone(
+    bot: &mut Bot,
+    store: &Store,
+    pool: &str,
+    account: &str,
+) {
+    let mut wait = Wait::new(
+        "the tracker to delete the defaulted borrower's users row",
+        USER_ROW_TIMEOUT,
+    );
+    loop {
+        let rows = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM users WHERE pool = $1 AND account = $2",
+        )
+        .bind(pool)
+        .bind(account)
+        .fetch_one(store.pool())
+        .await;
+        match rows {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(error) => fail(bot, &format!("could not read the users table: {error}")),
+        }
+        if !wait.tick(bot).await {
+            let message = wait.timed_out();
+            fail(bot, &message);
+        }
+    }
+}
+
+/// Fails if `/metrics` shows any `notifications_total` series for `kind`
+/// with a nonzero count. `Metrics::render` writes that family from what was
+/// observed — unlike the closed-enum families, a kind never notified has no
+/// series at all — so absence is the never-notified state, and a series that
+/// is present must read zero. The family's `# TYPE` line is required first:
+/// it is always written, so its absence means the family was renamed and an
+/// absence of series would prove nothing.
+pub(crate) fn assert_kind_never_notified(bot: &Bot, metrics: &str, kind: &str) {
+    if !metrics
+        .lines()
+        .any(|line| line == "# TYPE precept_liquidator_notifications_total counter")
+    {
+        fail(
+            bot,
+            "/metrics does not declare precept_liquidator_notifications_total",
+        );
+    }
+    let prefix = format!("precept_liquidator_notifications_total{{kind=\"{kind}\",");
+    for line in metrics.lines().filter(|line| line.starts_with(&prefix)) {
+        if line.rsplit(' ').next() != Some("0") {
+            fail(bot, &format!("{kind} was notified: {line}"));
+        }
     }
 }
